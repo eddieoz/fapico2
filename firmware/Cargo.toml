@@ -27,7 +27,7 @@ required-features = ["device"]
 
 [dependencies]
 defmt = "1.0"
-heapless = "0.8"
+heapless = "0.9"
 # App crates: `default-features = false` so each build enables exactly the
 # feature it needs — the device build never compiles the host/virt stacks.
 fapico2-platform = { path = "../platform" }
