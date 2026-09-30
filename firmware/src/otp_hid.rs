@@ -54,6 +54,49 @@ fn otp_app() -> &'static mut OtpApp {
 
 /// One YK4 frame → one OTP APDU → 0 or up-to-64 response bytes.
 fn frame(slot: u8, payload: &[u8; 64], resp: &mut [u8; 64]) -> usize {
+    // `SLOT_YK4_CAPABILITIES` (0x13) — the device-info TLV, CRC-terminated.
+    //
+    // This is *not* an OTP slot command, but the YK4 frame protocol routes it
+    // through the same feature-report channel, and ykman reads device info
+    // this way whenever it enumerates the key through the OTP interface
+    // (`_read_info_otp` -> `ManagementSession.read_device_info` ->
+    // `read_config` -> `send_and_receive(0x13, page)`).
+    //
+    // Without it the frame falls through to the OTP app, which answers
+    // `INS_NOT_SUPPORTED`; the transport stages no data frame, ykman's
+    // `_read_frame` raises `CommandRejectedError("No data")` — which
+    // `_read_info_otp` does not catch — `Device.connect()` raises
+    // `ValueError("Failed to connect to the device")`, and the desktop app's
+    // Slots screen retries forever behind a spinner. The version command was
+    // already answered (see `status()`), which is why the same key reads
+    // correctly over CCID and FIDO but not over OTP.
+    //
+    // The body is the management applet's own blob (one source of truth for
+    // serial/version/capabilities); the transport frames it with the CRC that
+    // `yubikit.core.otp.check_crc` verifies.
+    const SLOT_YK4_CAPABILITIES: u8 = 0x13;
+    if slot == SLOT_YK4_CAPABILITIES {
+        // Page 0 only: the blob above is complete in one page, so a
+        // continuation request is a page that does not exist.
+        if payload[0] != 0 {
+            return 0;
+        }
+        let serial =
+            crate::tasks::DEVICE_SERIAL.load(core::sync::atomic::Ordering::Relaxed).to_be_bytes();
+        let mut tlv: heapless::Vec<u8, MAX_RESPONSE> = heapless::Vec::new();
+        fapico2_mgmt::default_config_tlv(serial, &mut tlv);
+        // Return the bare blob: the transport appends the frame CRC itself
+        // (`otp_send_frame` stages `data || !crc16(data)` little-endian), which
+        // is what leaves the residual 0xF0B8 over the whole reply. Appending
+        // a second CRC here is what `yubikit`'s `check_crc` rejects.
+        let n = tlv.len();
+        if n > resp.len() {
+            return 0;
+        }
+        resp[..n].copy_from_slice(&tlv[..n]);
+        return n;
+    }
+
     let app = otp_app();
     let mut apdu = [0u8; 5 + 64];
     apdu[1] = INS_OTP;

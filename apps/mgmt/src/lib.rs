@@ -369,38 +369,46 @@ impl ManagementApp {
     /// config-lock blob; otherwise it returns the stored bytes verbatim.
     fn read_config(&self, out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         match &self.config {
-            None => {
-                let caps = caps();
-                // Overall length placeholder at [0], filled at the end.
-                out.push(0).ok();
-                // TAG_USB_SUPPORTED (which capabilities are compiled in).
-                out.extend_from_slice(&[TAG_USB_SUPPORTED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
-                // TAG_SERIAL — chipid-derived (R12); same tag/length shape
-                // as the C constant serial, so clients see no protocol
-                // change.
-                let mut serial = self.serial;
-                serial[0] &= !0xFC; // force 8-digit serial, per C
-                out.extend_from_slice(&[TAG_SERIAL, 4, serial[0], serial[1], serial[2], serial[3]]).ok();
-                // TAG_FORM_FACTOR = 1 (YubiKey 5 form factor).
-                out.extend_from_slice(&[TAG_FORM_FACTOR, 1, 0x01]).ok();
-                // TAG_VERSION = major.minor.0.
-                out.extend_from_slice(&[TAG_VERSION, 3, VERSION_MAJOR, VERSION_MINOR, 0x00]).ok();
-                // TAG_USB_ENABLED (feature-gated; same as supported here).
-                out.extend_from_slice(&[TAG_USB_ENABLED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
-                // TAG_DEVICE_FLAGS = FLAG_EJECT.
-                out.extend_from_slice(&[TAG_DEVICE_FLAGS, 1, 0x80]).ok();
-                // TAG_CONFIG_LOCK = unlocked.
-                out.extend_from_slice(&[TAG_CONFIG_LOCK, 1, 0x00]).ok();
-                if !out.is_empty() {
-                    let total = out.len();
-                    out[0] = (total - 1) as u8;
-                }
-            }
+            None => default_config_tlv(self.serial, out),
             Some(stored) => {
                 out.push(stored.len() as u8).ok();
                 out.extend_from_slice(stored).ok();
             }
         }
+    }
+}
+
+/// Emit the default `man_get_config` TLV blob for `serial` into `out`.
+///
+/// Public because the same blob is also served over the FIDO CTAPHID
+/// interface as `CTAP_READ_CONFIG` (`0x42`) — yubikit's `_read_info_ctap`
+/// reads device info that way when a client enumerates the key through its
+/// FIDO interface rather than CCID. One implementation, so the two paths
+/// cannot drift.
+pub fn default_config_tlv(serial: [u8; 4], out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+    let caps = caps();
+    // Overall length placeholder at [0], filled at the end.
+    out.push(0).ok();
+    // TAG_USB_SUPPORTED (which capabilities are compiled in).
+    out.extend_from_slice(&[TAG_USB_SUPPORTED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
+    // TAG_SERIAL — chipid-derived (R12); same tag/length shape as the C
+    // constant serial, so clients see no protocol change.
+    let mut serial = serial;
+    serial[0] &= !0xFC; // force 8-digit serial, per C
+    out.extend_from_slice(&[TAG_SERIAL, 4, serial[0], serial[1], serial[2], serial[3]]).ok();
+    // TAG_FORM_FACTOR = 1 (YubiKey 5 form factor).
+    out.extend_from_slice(&[TAG_FORM_FACTOR, 1, 0x01]).ok();
+    // TAG_VERSION = major.minor.0.
+    out.extend_from_slice(&[TAG_VERSION, 3, VERSION_MAJOR, VERSION_MINOR, 0x00]).ok();
+    // TAG_USB_ENABLED (feature-gated; same as supported here).
+    out.extend_from_slice(&[TAG_USB_ENABLED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
+    // TAG_DEVICE_FLAGS = FLAG_EJECT.
+    out.extend_from_slice(&[TAG_DEVICE_FLAGS, 1, 0x80]).ok();
+    // TAG_CONFIG_LOCK = unlocked.
+    out.extend_from_slice(&[TAG_CONFIG_LOCK, 1, 0x00]).ok();
+    if !out.is_empty() {
+        let total = out.len();
+        out[0] = (total - 1) as u8;
     }
 }
 
