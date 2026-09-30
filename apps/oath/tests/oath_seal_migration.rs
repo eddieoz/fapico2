@@ -21,8 +21,8 @@
 //! is unchanged — `migration::run` over a C partition carrying a plaintext
 //! OATH credential, then the OATH applet's boot.
 
-use fapico2_oath::oath_core::{device_id_from_chipid, OathApp, EMULATION_CHIPID};
 use fapico2_oath::oath_core::SLOT_OATH_SEAL_GENERATION;
+use fapico2_oath::oath_core::{device_id_from_chipid, OathApp, EMULATION_CHIPID};
 use fapico2_oath::OathSeal;
 use fapico2_platform::cflash::{fallback_partition_reserved, DataPartition};
 use fapico2_platform::cfs::{CFlashSource, PoolBounds};
@@ -47,7 +47,6 @@ const OTP: [u8; 32] =
 // only place that already builds a **C-format stream** from a fixture and
 // drives it through `migration::run`. The seal is a property of exactly
 // that path.
-
 
 /// A C data partition holding `stream`, laid out the way the C firmware
 /// lays one out (a backward-linked free list from `data_end` down). This is
@@ -310,7 +309,8 @@ fn c_plaintext_oath_keys_migrate_to_sealed() {
 /// just read, and the next boot re-seals at a strictly higher generation
 /// instead of skipping.
 #[test]
-fn faulted_read_refuses_and_next_boot_reseals_higher() {    use fapico2_oath::{OathSeal, SLOT_OATH_SEAL_GENERATION};
+fn faulted_read_refuses_and_next_boot_reseals_higher() {
+    use fapico2_oath::{OathSeal, SLOT_OATH_SEAL_GENERATION};
 
     /// A store that forwards everything except reads of one named key, which
     /// it answers with a medium fault. This is the shape of the M-1
@@ -460,7 +460,8 @@ fn faulted_read_refuses_and_next_boot_reseals_higher() {    use fapico2_oath::{O
 
 /// RED 3 — re-sealing the same key twice never reuses a nonce.
 #[test]
-fn resealing_the_same_key_never_reuses_a_nonce() {    use fapico2_oath::{OathSeal, SLOT_OATH_SEAL_GENERATION};
+fn resealing_the_same_key_never_reuses_a_nonce() {
+    use fapico2_oath::{OathSeal, SLOT_OATH_SEAL_GENERATION};
 
     let mut store = migrated_oath_store();
     let seal = OathSeal::derive(&OTP, UID);

@@ -86,11 +86,13 @@
 //!    `picoforge/src/hal/fido/mod.rs:863` and `:887`) — that is where an
 //!    unauthenticated process *can* read hardware state, and it is out of
 //!    scope for this story.
-//! 2. **`PhysicalVidPid` is currently stored, not applied.** The RP2350 USB
-//!    descriptors are a compile-time `CONFIG_DESC`
-//!    (`firmware/src/main.rs`, built by `Usb::new`), so writing `phy.vid_pid`
-//!    records the operator's intent and nothing reads it. The spoofing
-//!    primitive does not exist on this firmware today.
+//! 2. **`PhysicalVidPid` is stored and now applied at boot.** `Usb::new`
+//!    (`platform/src/usb.rs`) takes the stored `PhyConfig` snapshot from the
+//!    FIDO keystore (`firmware/src/main.rs`) and overrides VID/PID, product
+//!    and manufacturer field-by-field, so an identity written through this
+//!    framing takes effect on the next boot/re-plug. An all-zero VID/PID is
+//!    left unapplied — an unenumerable device cannot recover, so the boot
+//!    treats zero as "no override". The LED fields remain stored-only.
 //!
 //! There is a third fact, and it is about the **persisted record** rather
 //! than the command path, so it does not interact with either of the two
@@ -275,8 +277,9 @@ pub struct PhyConfig {
     ///
     /// Both carriers write this one field, and both go through the identity
     /// tier and the unconditional zero-mask refusal in
-    /// [`crate::vendor41`]. Stored, not applied, on the same grounds as the
-    /// rest of this struct.
+    /// [`crate::vendor41`]. Stored like the rest of this struct; unlike the
+    /// identity fields it is not yet boot-resolved (the interface mask has no
+    /// consumer — see this module's docs).
     pub enabled_usb_itf: Option<u16>,
     /// US-117: the 17-byte RS-Key LED status block — the `LED` record.
     ///

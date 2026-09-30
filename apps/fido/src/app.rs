@@ -1033,6 +1033,14 @@ impl<K: Keystore> FidoApp<K> {
         let state_pt = crypto::hmac_sha256(b"fapico2-credStoreState", &state_data);
         let state_pt = &state_pt[..16];
         let iv = crypto::random_bytes::<16>();
+        // `.clear()` first: `Ctap2Info::default()` already carries the 32
+        // zero placeholder bytes, so extending onto it yields a 64-byte field
+        // (32 zeros || IV || ciphertext) where CTAP2.1 §5.1.2 requires exactly
+        // 32. `device_core.rs::get_info` — the hardware path — has always
+        // *assigned* a freshly built vec and never hit this; only this path,
+        // which the emulation binary and therefore every pytest suite runs,
+        // did. Clearing makes the two encoders agree by construction.
+        info.enc_cred_store_state.clear();
         info.enc_cred_store_state.extend_from_slice(&iv).ok();
         info.enc_cred_store_state
             .extend_from_slice(&crypto::aes_cbc_encrypt(&key, &iv, state_pt))
@@ -1040,6 +1048,7 @@ impl<K: Keystore> FidoApp<K> {
         let id_pt = crypto::hmac_sha256(b"fapico2-encIdentifier", &auth.device_random);
         let id_pt = &id_pt[..16];
         let iv2 = crypto::random_bytes::<16>();
+        info.enc_identifier.clear();
         info.enc_identifier.extend_from_slice(&iv2).ok();
         info.enc_identifier
             .extend_from_slice(&crypto::aes_cbc_encrypt(&key, &iv2, id_pt))
@@ -1561,6 +1570,32 @@ impl<K: Keystore> FidoApp<K> {
                     if cred.rp_id_hash == rp_id_hash {
                         matched.push(cred.clone());
                     }
+                    continue;
+                }
+                // US-714 interop: a U2F key handle is *stateless* — the
+                // private key is re-derived at assertion time and no keystore
+                // entry is ever created (see `u2f::u2f_register`). So a CTAP2
+                // allowList carrying a U2F handle missed the lookup above and
+                // answered NO_CREDENTIALS, which is why
+                // `test_authenticate_ctap1_through_ctap2` — register over U2F,
+                // assert over CTAP2, the interop real authenticators perform —
+                // could never pass.
+                //
+                // `verify_handle` re-derives the key AND authenticates the
+                // handle's appId tag in constant time, so an arbitrary 64-byte
+                // blob cannot become an assertion key: a forged handle fails
+                // the tag check and is skipped, exactly as the U2F AUTHENTICATE
+                // path already treats it (u2f.rs, `stateless_valid`).
+                //
+                // Semantics deliberately inherited from U2F: `resident` is false
+                // (never discoverable — there is no stored record to enumerate),
+                // `user_handle` is empty (U2F carries no user identity), and
+                // the signature counter is the keystore-wide one, which the U2F
+                // path already treats as the global counter.
+                if let Some(cred) =
+                    self.stateless_u2f_credential_for(&desc.id, &rp_id_hash)
+                {
+                    matched.push(cred);
                 }
             }
         } else {
@@ -1675,6 +1710,79 @@ impl<K: Keystore> FidoApp<K> {
             self.ga_state = None;
         }
         assertion
+    }
+
+    /// Re-derive a U2F (stateless) credential for CTAP2 assertion.
+    ///
+    /// US-714 made U2F registration stateless: the key handle encodes the key's
+    /// derivation path plus a tag over the requesting RP, and **no keystore
+    /// entry is created**. A CTAP2 `allowList` therefore cannot find such a
+    /// handle through `keystore::get_credential`, and a credential registered
+    /// over U2F was unassertable over CTAP2 — the interop
+    /// `test_authenticate_ctap1_through_ctap2` performs, and that real
+    /// authenticators perform.
+    ///
+    /// Returns `None` unless the handle is well-formed **and** its tag
+    /// authenticates against `rp_id_hash`, so a caller cannot turn an
+    /// arbitrary blob into an assertion key by naming it in an allowList.
+    ///
+    /// `Ok(None)`-style refusals are deliberate: the caller treats "not a
+    /// credential for this RP" and "not a credential at all" identically,
+    /// which is what `NO_CREDENTIALS` already reports.
+    fn stateless_u2f_credential_for(
+        &mut self,
+        handle: &[u8],
+        rp_id_hash: &[u8; 32],
+    ) -> Option<StoredCredential> {
+        if !crate::stateless::is_stateless(handle) {
+            return None;
+        }
+        let master = crate::stateless::master_from_device_random(
+            &self.keystore.get_auth_state().device_random,
+        );
+        // Constant-time tag check; a handle minted for a different RP fails
+        // here and is skipped rather than signed.
+        if !crate::stateless::verify_handle(master.bytes(), rp_id_hash, handle) {
+            return None;
+        }
+        let scalar = crate::stateless::derive_scalar(master.bytes(), handle)?;
+        let secret = crypto::secret_key_from_bytes(scalar.bytes())?;
+        let pk = crypto::public_key_bytes(&secret.public_key());
+        // Uncompressed SEC1 point: 0x04 || X(32) || Y(32).
+        let (x, y) = pk.get(1..65).and_then(|c| {
+            let (x, y) = c.split_at(32);
+            Some((<[u8; 32]>::try_from(x).ok()?, <[u8; 32]>::try_from(y).ok()?))
+        })?;
+
+        Some(StoredCredential {
+            credential_id: handle.to_vec(),
+            public_key: CosePublicKey::es256(x, y),
+            private_key: scalar.bytes().to_vec(),
+            rp_id_hash: *rp_id_hash,
+            rp_id: None,
+            // U2F carries no user identity: the registration predates CTAP2's
+            // user entity, and asserting one must not invent a handle.
+            user_handle: Vec::new(),
+            user_name: None,
+            user_display_name: None,
+            cred_protect: 0,
+            large_blob_key: None,
+            hmac_secret: None,
+            cred_blob: None,
+            third_party_payment: false,
+            pin_complexity_policy: false,
+            // Stateless handles have no stored record, so they are never
+            // discoverable — they can only be named explicitly in an
+            // allowList, which is the only path that reaches this.
+            resident: false,
+            algorithm: -7,
+            // U2F has no per-credential counter; the U2F AUTHENTICATE path uses
+            // the keystore-wide one, and `build_assertion` reads this field.
+            counter: self.keystore.get_auth_state().cred_counter,
+            revoked: false,
+            // U2F registration cannot express an expiry.
+            expires_at: None,
+        })
     }
 
     /// Build a getAssertion CBOR response for the given credential.
@@ -2804,13 +2912,41 @@ fn generate_alg_keypair(alg: i64) -> Result<(Vec<u8>, CosePublicKey), crypto::Ke
             Ok((sk.to_bytes().to_vec(), cose))
         }
         -36 => {
+            // P-521's scalar is 66 bytes = 528 bits, but the prime field is
+            // 521 bits. A uniformly random draw is therefore a valid scalar
+            // only when its top 7 bits are clear — measured at 0.007875 over
+            // 200,000 draws (1 in 127). Against `KEYGEN_MAX_ATTEMPTS` = 8 that
+            // is a 6.1 % success rate, which is the long-standing
+            // `test_algorithms[-36]` flake: `AttemptsExhausted` surfaced as
+            // CTAP 0x7F, indistinguishable from an entropy-starved device.
+            //
+            // Masking the overflow bits makes acceptance ~1 by construction, so
+            // the sampler spends one draw instead of ~127. P-256 (32 B) and
+            // P-384 (48 B) need no mask — their draws are exactly field-sized.
+            //
+            // The mask does not *replace* the validity check: values in
+            // [n, 2^521) are still rejected, and `try_fill_valid` still bounds
+            // that residual (a fraction ~2^-262 of draws) instead of spinning.
             let mut seed = [0u8; 66];
             crypto::try_fill_valid(
                 &mut crate::crypto::TrngRng,
                 &mut seed,
-                |b| p521::ecdsa::SigningKey::from_slice(b).is_ok(),
+                |b| {
+                    if b.len() != 66 {
+                        return false;
+                    }
+                    let mut m = [0u8; 66];
+                    m.copy_from_slice(b);
+                    m[0] &= 0x01; // 528 bits -> 521: keep only bit 520
+                    p521::ecdsa::SigningKey::from_slice(&m).is_ok()
+                },
             )?;
-            let sk = p521::ecdsa::SigningKey::from_slice(&seed)
+            // Re-derive from the masked seed. The predicate above masks a
+            // *copy* (a closure cannot hand the masked value back), so the
+            // masked bytes are what must be used, not the raw draw.
+            let mut masked = seed;
+            masked[0] &= 0x01;
+            let sk = p521::ecdsa::SigningKey::from_slice(&masked)
                 .map_err(|_| crypto::KeygenError::AttemptsExhausted)?;
             let pk = p521::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
             let cose = CosePublicKey {

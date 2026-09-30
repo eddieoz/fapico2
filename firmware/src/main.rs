@@ -112,6 +112,7 @@ mod dbg;
 #[cfg(feature = "apdu-trace")]
 mod apdu_trace;
 mod tasks;
+mod otp_hid;
 
 // IRQ binding for the RP2350 hardware TRNG (the sole randomness source, US-380).
 bind_interrupts!(struct TrngIrqs {
@@ -844,6 +845,11 @@ async fn main(spawner: Spawner) -> ! {
     // of this wiring; the gate is correct on its own terms and the
     // divergence is reported in the US-143 story notes.
     otp_app.set_presence_grant(fapico2_firmware::presence::window_grant);
+    // US-OTP-HID: the Yubico OTP HID transport (keyboard-usage interface +
+    // YK4 feature-report frames) drives this same app. The handlers read the
+    // boot slot directly, so they must be installed AFTER it is initialized
+    // (above) and BEFORE the USB device is built (further down).
+    otp_hid::init();
     // S-721-2: the real OpenPGP app — opcard over the trussed client,
     // which the app owns by value (`take_client` moved it out of the
     // backend static after `DeviceBackend::boot` above). US-939: built
@@ -974,6 +980,26 @@ async fn main(spawner: Spawner) -> ! {
         boot::fatal_boot("secure partition: boot persist failed; serving suppressed");
     }
 
+    // The stored physical configuration becomes the boot-time USB identity.
+    // Until now `CONFIG_WRITE`-saved VID/PID/product/manufacturer were durable
+    // but never applied — the descriptors read only the build-time constants,
+    // so a configurator's identity change never reached the bus. Field-by-
+    // field precedence: a stored field replaces its build-time counterpart, an
+    // absent one leaves it (the C SDK's `phy_data` semantics). VID/PID can
+    // only change at enumeration, so an identity change takes effect on the
+    // next boot/re-plug. The borrow of `fido_app` ends here; `Usb::new` copies
+    // the names into write-once statics.
+    let stored_identity = {
+        let phy = fido_app.phy();
+        fapico2_platform::usb::StoredIdentity {
+            vid_pid: phy.vid_pid,
+            product: phy.product.map(|n| fapico2_platform::usb::StoredName::new(n.as_bytes())),
+            manufacturer: phy
+                .manufacturer
+                .map(|n| fapico2_platform::usb::StoredName::new(n.as_bytes())),
+        }
+    };
+
     // SAFETY: USB descriptor buffers (must be `'static` for the builder).
     let usb = Usb::new(
         p.USB,
@@ -982,6 +1008,7 @@ async fn main(spawner: Spawner) -> ! {
         unsafe { &mut *core::ptr::addr_of_mut!(MSOS_DESC) },
         unsafe { &mut *core::ptr::addr_of_mut!(CONTROL_BUF) },
         device_chipid,
+        Some(stored_identity),
     );
     let parts = usb.into_parts();
 

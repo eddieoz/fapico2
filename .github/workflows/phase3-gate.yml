@@ -20,28 +20,38 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege. This runs on `pull_request`, i.e. it executes untrusted
+# fork code; the job needs to read the repository and nothing more.
+permissions:
+  contents: read
+
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2 (Rust firmware + gate)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       # Sibling harness repo (published first, per US-725): when it is absent
       # (owner hasn't pushed pico-fido2 yet), the checkout and the gate step
       # that depends on it are skipped instead of turning this job red.
       - name: Checkout pico-fido2 (Python test suites)
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: pico-fido2
+      # This used to be `actions/setup-rust@v1`, which DOES NOT EXIST (the
+      # GitHub API 404s for that repository). The workflow therefore failed at
+      # "Set up job" on every run, before reaching a single step. `rustup`
+      # ships with the runner and rust-toolchain.toml pins the channel, so the
+      # action was never required in the first place.
       - name: Set up Rust (stable; host target for the emulator + clippy)
-        uses: actions/setup-rust@v1
-        with:
-          toolchain: stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
       - name: Install Python test dependencies

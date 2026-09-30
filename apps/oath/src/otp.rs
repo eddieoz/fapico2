@@ -1,11 +1,11 @@
 //! OTP (Yubikey-compatible slot) applet: SLOT_CONFIGURE / SLOT_SWAP with
 //! access-code protection and CRC-validated slot configs.
 
-use fapico2_platform::dispatch::{App, MAX_RESPONSE, Sw};
+use fapico2_platform::dispatch::{App, Sw, MAX_RESPONSE};
 use fapico2_platform::secure_store::{SecureStore, SecureStoreError};
 // US-143: the host/test presence fallback, mirroring `OathApp`.
-use fapico2_platform::presence::PresenceService;
 use aes::Aes128;
+use fapico2_platform::presence::PresenceService;
 // Anonymous trait imports: naming `KeyInit` would make `Hmac::new_from_slice`
 // ambiguous with `KeyInit::new_from_slice`.
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt as _, KeyInit as _};
@@ -138,8 +138,8 @@ const CFG_TKT_FLAGS: usize = 46;
 const CFG_AES_KEY: usize = 22; // 16 bytes
 const CFG_UID: usize = 16; // 6 bytes
 const CFG_CFG_FLAGS: usize = 47; // cfg_flags — CHAL_HMAC / HMAC_LT64 bits
-// C flag-update masks for SLOT_UPDATE (otp.c TKTFLAG/CFGFLAG_UPDATE_MASK; the
-// C EXTFLAG_UPDATE_MASK is 0xFF, i.e. ext_flags pass through unchanged).
+                                 // C flag-update masks for SLOT_UPDATE (otp.c TKTFLAG/CFGFLAG_UPDATE_MASK; the
+                                 // C EXTFLAG_UPDATE_MASK is 0xFF, i.e. ext_flags pass through unchanged).
 const TKTFLAG_UPDATE_MASK: u8 = 0x3F;
 const CFGFLAG_UPDATE_MASK: u8 = 0x0C;
 
@@ -164,6 +164,11 @@ pub const SLOT_COUNT: usize = 4;
 /// program-sequence counter. Do not merge the two.
 #[allow(dead_code)]
 const STATUS_LEN: usize = 6;
+
+/// The fixed 64-byte payload the YK4 HID frame carries for every command —
+/// the client pads, so the real body (52 or 58 bytes) is only recoverable by
+/// the C's greater-or-equal length discipline, never by exact match.
+const HID_FRAME_PAYLOAD: usize = 64;
 /// US-141: the `0xB0 + index` tag of the per-slot EXTENDED STATUS TLV, and
 /// the `0xA0` tag each one wraps (C `otp_status_ext`, `otp.c:559-566`).
 const STATUS_EXT_TAG_BASE: u8 = 0xB0;
@@ -237,7 +242,11 @@ fn crc16(data: &[u8]) -> u16 {
     for value in data {
         crc ^= *value as u16;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x8408 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x8408
+            } else {
+                crc >> 1
+            };
         }
     }
     crc
@@ -415,7 +424,9 @@ impl OtpApp {
         }
         out.push(u8::from(self.access_code.is_some())).ok();
         out.extend_from_slice(
-            self.access_code.as_ref().map_or(&[0u8; ACCESS_CODE_SIZE], |a| a),
+            self.access_code
+                .as_ref()
+                .map_or(&[0u8; ACCESS_CODE_SIZE], |a| a),
         )
         .ok();
         out
@@ -453,7 +464,11 @@ impl OtpApp {
     /// body — bit *i* is slot *i+1*. Bits 0/1 are the C `CONFIG1_VALID` /
     /// `CONFIG2_VALID`; bits 2/3 are the RS-Key extension C carries in the
     /// same byte.
-    fn flags(&self) -> u8 {
+    /// The slot-configured bitmask (`FLAG_SLOTi_CONFIGURED`) — the byte the
+    /// Yubico OTP HID idle status report carries at index 5 (yubikit reads
+    /// the CONFIG_SLOTS_PROGRAMMED_MASK from it). Public for the firmware's
+    /// OTP HID status handler; the CCID status path composes it internally.
+    pub fn flags(&self) -> u8 {
         let mut flags = 0;
         if self.slots[0].is_some() {
             flags |= FLAG_SLOT1_CONFIGURED;
@@ -472,7 +487,7 @@ impl OtpApp {
 
     fn status(&mut self) -> [u8; STATUS_LEN] {
         self.program_sequence = self.program_sequence.wrapping_add(1);
-        [0x03, 0x04, 0x06, self.program_sequence, self.flags(), 0x00]
+        [0x05, 0x04, 0x00, self.program_sequence, self.flags(), 0x00]
     }
 
     /// US-141 (PICOForge-COMPAT): EXTENDED STATUS, P1 `0x14` (C
@@ -589,6 +604,16 @@ impl OtpApp {
             n if n == OTP_CONFIG_SIZE + ACCESS_CODE_SIZE => {
                 (&body[..OTP_CONFIG_SIZE], Some(&body[OTP_CONFIG_SIZE..]))
             }
+            // The YK4 HID frame payload is ALWAYS the full 64 bytes — yubikit
+            // pads the command unconditionally (`send_and_receive`) and the C
+            // reads the access code off the tail of whatever arrived
+            // (`otp.c:675`), its length checks being greater-than-or-equal on
+            // both transports. A 64-byte body is therefore legal here too:
+            // config, then the optional access code, then zero padding.
+            n if n == HID_FRAME_PAYLOAD => (
+                &body[..OTP_CONFIG_SIZE],
+                Some(&body[OTP_CONFIG_SIZE..OTP_CONFIG_SIZE + ACCESS_CODE_SIZE]),
+            ),
             _ => return SW_WRONG_DATA,
         };
         let config: [u8; OTP_CONFIG_SIZE] = match config.try_into() {
@@ -759,7 +784,11 @@ impl OtpApp {
             return SW_WRONG_DATA; // C SW_WRONG_LENGTH == 0x6700 in this SDK
         }
         let slot1 = if data.is_empty() { 0 } else { data[0] as usize };
-        let slot2 = if data.is_empty() { 1 } else { 1 + data[1] as usize };
+        let slot2 = if data.is_empty() {
+            1
+        } else {
+            1 + data[1] as usize
+        };
         if slot1 >= SLOT_COUNT || slot2 >= SLOT_COUNT || slot1 == slot2 {
             return SW_INCORRECT_P1P2;
         }
@@ -918,9 +947,8 @@ impl OtpApp {
                     chal_len -= 1;
                 }
             }
-            let mut mac: Hmac<Sha1> =
-                <Hmac<Sha1> as Mac>::new_from_slice(&key)
-                    .expect("HMAC-SHA1 accepts keys of any length");
+            let mut mac: Hmac<Sha1> = <Hmac<Sha1> as Mac>::new_from_slice(&key)
+                .expect("HMAC-SHA1 accepts keys of any length");
             mac.update(&data[..chal_len]);
             for b in mac.finalize().into_bytes() {
                 resp.push(b).ok();
@@ -939,7 +967,9 @@ impl OtpApp {
             let mut block = [0u8; 16];
             block[..6].copy_from_slice(&data[..6]);
             block[6..].copy_from_slice(&self.serial_str);
-            let cipher = Aes128::new(GenericArray::from_slice(&cfg[CFG_AES_KEY..CFG_AES_KEY + 16]));
+            let cipher = Aes128::new(GenericArray::from_slice(
+                &cfg[CFG_AES_KEY..CFG_AES_KEY + 16],
+            ));
             let mut enc = GenericArray::from(block);
             cipher.encrypt_block(&mut enc);
             for b in enc.iter() {
@@ -957,6 +987,40 @@ impl App for OtpApp {
 
     fn select(&mut self, _internal: bool) -> Sw {
         SW_OK
+    }
+
+    /// Yubico OTP AID SELECT carries a 7-byte status body —
+    /// `version(3) || pgm_seq || slot_flags || 0 || status` — the same bytes
+    /// the C firmware writes in `otp_select` (`otp.c:332-346`,
+    /// `otp_status(false)`): `yubikit`'s `YubiOtpSession` over CCID parses the
+    /// first three as the OTP applet version and byte 3 as the programming
+    /// sequence (`yubikit/yubiotp.py` `YubiOtpSession.__init__`), and an
+    /// empty SELECT response made `read_info` throw before any capability
+    /// could render — the desktop app's device list degraded to the FIDO
+    /// transport alone. Version bytes mirror [`Self::status`] (5.4.0); the
+    /// sequence is read WITHOUT the increment (only a configure/update/swap
+    /// bumps it, and the client's update detection relies on that).
+    fn select_apdu(
+        &mut self,
+        internal: bool,
+        _apdu: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) -> Sw {
+        // `HeaplessVec::extend_from_slice` returns `Result<(), ()>` — the
+        // capacity check — and it is `#[must_use]`. A 7-byte body into
+        // `MAX_RESPONSE` cannot overflow, so `.ok()` matches the mgmt
+        // sibling's `write_version` rather than inventing a new convention.
+        resp.extend_from_slice(&[
+            0x05,
+            0x04,
+            0x00,
+            self.program_sequence,
+            self.flags(),
+            0x00,
+            0x00,
+        ])
+        .ok();
+        self.select(internal)
     }
 
     fn deselect(&mut self) {}
@@ -1086,7 +1150,13 @@ mod tests {
     }
 
     fn configure(app: &mut OtpApp, slot: usize, config: [u8; 52]) {
-        let mut apdu = vec![0x00, INS_OTP, SLOT_CONFIGURE, slot as u8, config.len() as u8];
+        let mut apdu = vec![
+            0x00,
+            INS_OTP,
+            SLOT_CONFIGURE,
+            slot as u8,
+            config.len() as u8,
+        ];
         apdu.extend_from_slice(&config);
         let (_, sw) = drive(app, &apdu);
         assert_eq!(sw, 0x9000);
@@ -1110,11 +1180,7 @@ mod tests {
         let mut app = OtpApp::new();
         let uid = [1, 2, 3, 4, 5, 6];
         let aes_key = [0xAAu8; 16];
-        configure(
-            &mut app,
-            0,
-            make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC),
-        );
+        configure(&mut app, 0, make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC));
 
         let challenge: Vec<u8> = (0..64).map(|i| (i * 7 + 3) as u8).collect();
         // C builds the HMAC key as aes_key(16) ‖ uid(6).
@@ -1163,7 +1229,12 @@ mod tests {
         configure(
             &mut app,
             0,
-            make_config([9, 8, 7, 6, 5, 4], aes_key, CHAL_RESP, CHAL_HMAC | HMAC_LT64),
+            make_config(
+                [9, 8, 7, 6, 5, 4],
+                aes_key,
+                CHAL_RESP,
+                CHAL_HMAC | HMAC_LT64,
+            ),
         );
         // First 60 bytes distinct; last 4 identical so the C loop trims to 60.
         let mut challenge = vec![0u8; 64];
@@ -1562,8 +1633,8 @@ mod tests {
     const DEFAULT_SERIAL_STR: [u8; 10] = *b"0000000000";
 
     fn aes_ecb_encrypt(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
-        use aes::Aes128;
         use aes::cipher::{generic_array::GenericArray, BlockEncrypt as _, KeyInit as _};
+        use aes::Aes128;
         let cipher = Aes128::new(GenericArray::from_slice(key));
         let mut out = GenericArray::clone_from_slice(block);
         cipher.encrypt_block(&mut out);
@@ -1640,7 +1711,11 @@ mod tests {
         // C quirk (otp.c): CHAL_HMAC == 0x22 *includes* the CHAL_YUBICO bit
         // (0x20), so the AES gate only rejects configs without bit 0x20 —
         // e.g. the bare HMAC sub-bit 0x02.
-        configure(&mut app, 0, make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], CHAL_RESP, 0x02));
+        configure(
+            &mut app,
+            0,
+            make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], CHAL_RESP, 0x02),
+        );
         let (body, sw) = calculate(&mut app, CALC_AES_SLOT1, &[0u8; 6]);
         assert_eq!(sw, SW_WRONG_DATA);
         assert!(body.is_empty());
@@ -1671,7 +1746,11 @@ mod tests {
     #[test]
     fn calculate_aes_requires_chal_resp_flag() {
         let mut app = OtpApp::new();
-        configure(&mut app, 0, make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], 0, CHAL_YUBICO));
+        configure(
+            &mut app,
+            0,
+            make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], 0, CHAL_YUBICO),
+        );
         let (body, sw) = calculate(&mut app, CALC_AES_SLOT1, &[0u8; 6]);
         assert_eq!(sw, SW_WRONG_DATA);
         assert!(body.is_empty());
@@ -1718,7 +1797,13 @@ mod tests {
     /// Configure a slot through the reference client's `(P1, P2)` pair.
     /// Mirrors picoforge `configure`: the 52-byte frame followed by the
     /// 6-byte *current* access code.
-    fn configure_as_client(app: &mut OtpApp, p1: u8, p2: u8, cfg: &[u8; 52], acc: &[u8; 6]) -> (Vec<u8>, u16) {
+    fn configure_as_client(
+        app: &mut OtpApp,
+        p1: u8,
+        p2: u8,
+        cfg: &[u8; 52],
+        acc: &[u8; 6],
+    ) -> (Vec<u8>, u16) {
         let mut body = cfg.to_vec();
         body.extend_from_slice(acc);
         let mut apdu = vec![0x00, INS_OTP, p1, p2, body.len() as u8];
@@ -1751,12 +1836,7 @@ mod tests {
     fn slot3_and_slot4_are_addressable() {
         // Distinct key material per slot, so a mis-addressed challenge
         // cannot pass by accident.
-        let keys: [[u8; 16]; 4] = [
-            [0xA0u8; 16],
-            [0xB0u8; 16],
-            [0xC0u8; 16],
-            [0xD0u8; 16],
-        ];
+        let keys: [[u8; 16]; 4] = [[0xA0u8; 16], [0xB0u8; 16], [0xC0u8; 16], [0xD0u8; 16]];
         let uids: [[u8; 6]; 4] = [
             [1, 1, 1, 1, 1, 1],
             [2, 2, 2, 2, 2, 2],
@@ -1765,24 +1845,50 @@ mod tests {
         ];
         // The (P1, P2) pair the client uses for each 1-based slot, for
         // configure and for challenge.
-        let config_p1p2 = [(SLOT_CONFIGURE, 0u8), (SLOT_CONFIGURE_SLOT2, 0), (SLOT_CONFIGURE, 2), (SLOT_CONFIGURE, 3)];
-        let chal_p1p2 = [(CALC_HMAC_SLOT1, 0u8), (CALC_HMAC_SLOT2, 0), (CALC_HMAC_SLOT1, 2), (CALC_HMAC_SLOT1, 3)];
+        let config_p1p2 = [
+            (SLOT_CONFIGURE, 0u8),
+            (SLOT_CONFIGURE_SLOT2, 0),
+            (SLOT_CONFIGURE, 2),
+            (SLOT_CONFIGURE, 3),
+        ];
+        let chal_p1p2 = [
+            (CALC_HMAC_SLOT1, 0u8),
+            (CALC_HMAC_SLOT2, 0),
+            (CALC_HMAC_SLOT1, 2),
+            (CALC_HMAC_SLOT1, 3),
+        ];
 
         let mut app = OtpApp::new();
         for slot in 0..4 {
             let cfg = make_config(uids[slot], keys[slot], CHAL_RESP, CHAL_HMAC);
-            let (body, sw) = configure_as_client(&mut app, config_p1p2[slot].0, config_p1p2[slot].1, &cfg, &NO_ACC);
+            let (body, sw) = configure_as_client(
+                &mut app,
+                config_p1p2[slot].0,
+                config_p1p2[slot].1,
+                &cfg,
+                &NO_ACC,
+            );
             assert_eq!(sw, SW_OK, "configure slot {} rejected", slot + 1);
             assert!(body.is_empty() || body.len() == 6, "unexpected body shape");
-            assert!(app.slot_configured(slot), "slot {} not programmed", slot + 1);
+            assert!(
+                app.slot_configured(slot),
+                "slot {} not programmed",
+                slot + 1
+            );
         }
 
         let frame = challenge_frame();
         for slot in 0..4 {
-            let (body, sw) = challenge_as_client(&mut app, chal_p1p2[slot].0, chal_p1p2[slot].1, &frame);
+            let (body, sw) =
+                challenge_as_client(&mut app, chal_p1p2[slot].0, chal_p1p2[slot].1, &frame);
             assert_eq!(sw, SW_OK, "challenge slot {} rejected", slot + 1);
             let expected = hmac_sha1(&[&keys[slot][..], &uids[slot][..]].concat(), &frame);
-            assert_eq!(body, expected, "slot {} answered with another slot's key", slot + 1);
+            assert_eq!(
+                body,
+                expected,
+                "slot {} answered with another slot's key",
+                slot + 1
+            );
         }
     }
 
@@ -1792,21 +1898,47 @@ mod tests {
     fn slot_offset_validity_matches_the_c_rule() {
         let cfg = make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], CHAL_RESP, CHAL_HMAC);
         let mut app = OtpApp::new();
-        for p1 in [SLOT_CONFIGURE, UPDATE_SLOT1, CALC_HMAC_SLOT1, CALC_AES_SLOT1] {
+        for p1 in [
+            SLOT_CONFIGURE,
+            UPDATE_SLOT1,
+            CALC_HMAC_SLOT1,
+            CALC_AES_SLOT1,
+        ] {
             for p2 in 0..=3u8 {
-                assert!(OtpApp::slot_offset_valid(p1, p2), "{p1:#04x}/{p2} must be valid");
+                assert!(
+                    OtpApp::slot_offset_valid(p1, p2),
+                    "{p1:#04x}/{p2} must be valid"
+                );
             }
-            assert!(!OtpApp::slot_offset_valid(p1, 4), "{p1:#04x}/4 must be invalid");
+            assert!(
+                !OtpApp::slot_offset_valid(p1, 4),
+                "{p1:#04x}/4 must be invalid"
+            );
         }
-        for p1 in [SLOT_CONFIGURE_SLOT2, UPDATE_SLOT2, CALC_HMAC_SLOT2, CALC_AES_SLOT2, SLOT_SWAP] {
-            assert!(OtpApp::slot_offset_valid(p1, 0), "{p1:#04x}/0 must be valid");
-            assert!(!OtpApp::slot_offset_valid(p1, 1), "{p1:#04x}/1 must be invalid");
+        for p1 in [
+            SLOT_CONFIGURE_SLOT2,
+            UPDATE_SLOT2,
+            CALC_HMAC_SLOT2,
+            CALC_AES_SLOT2,
+            SLOT_SWAP,
+        ] {
+            assert!(
+                OtpApp::slot_offset_valid(p1, 0),
+                "{p1:#04x}/0 must be valid"
+            );
+            assert!(
+                !OtpApp::slot_offset_valid(p1, 1),
+                "{p1:#04x}/1 must be invalid"
+            );
         }
         // And the two configure spellings of slot 2 are distinct slots.
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 1, &cfg, &NO_ACC);
         assert_eq!(sw, SW_OK, "(0x01,0x01) is the C's slot 2 spelling");
         assert!(app.slot_configured(1));
-        assert!(!app.slot_configured(0), "(0x01,0x01) must not have touched slot 1");
+        assert!(
+            !app.slot_configured(0),
+            "(0x01,0x01) must not have touched slot 1"
+        );
     }
 
     /// US-140 persistence decision: a device holding a **2-slot** state blob
@@ -1825,26 +1957,47 @@ mod tests {
         for slot in 0..2 {
             legacy.push(1).ok();
             legacy
-                .extend_from_slice(&make_config([slot as u8 + 1; 6], [0x5Au8; 16], CHAL_RESP, CHAL_HMAC))
+                .extend_from_slice(&make_config(
+                    [slot as u8 + 1; 6],
+                    [0x5Au8; 16],
+                    CHAL_RESP,
+                    CHAL_HMAC,
+                ))
                 .ok();
         }
         legacy.push(1).ok(); // access-code present
         legacy.extend_from_slice(&[0x77u8; 6]).ok();
-        assert_eq!(legacy.len(), STATE_SIZE_V1, "the v1 record really is 119 bytes");
+        assert_eq!(
+            legacy.len(),
+            STATE_SIZE_V1,
+            "the v1 record really is 119 bytes"
+        );
         assert_ne!(
             legacy.len(),
             STATE_SIZE,
             "the two layouts must differ, else the refusal is vacuous"
         );
-        store.write(STATE_SLOT_V1, &legacy).expect("seed the legacy record");
+        store
+            .write(STATE_SLOT_V1, &legacy)
+            .expect("seed the legacy record");
 
         let app = OtpApp::boot(&mut store);
         for slot in 0..SLOT_COUNT {
-            assert!(!app.slot_configured(slot), "slot {} must not be re-seeded", slot + 1);
+            assert!(
+                !app.slot_configured(slot),
+                "slot {} must not be re-seeded",
+                slot + 1
+            );
         }
         // The v1 record is left untouched — boot is not a wipe.
-        assert!(store.contains(STATE_SLOT_V1), "boot must not delete the legacy record");
-        assert!(!store.contains(STATE_SLOT), "boot must not invent a v2 record");
+        assert!(
+            store.contains(STATE_SLOT_V1),
+            "boot must not delete the legacy record"
+        );
+        assert!(
+            !store.contains(STATE_SLOT),
+            "boot must not invent a v2 record"
+        );
     }
 
     /// US-140 review fix: boot leaves the retired record alone (above), but
@@ -1858,12 +2011,20 @@ mod tests {
         use fapico2_platform::secure_store::HostSecureStore;
 
         let mut store = HostSecureStore::new();
-        store.write(STATE_SLOT_V1, &[0x5Au8; STATE_SIZE_V1]).expect("seed the legacy record");
-        assert!(store.contains(STATE_SLOT_V1), "precondition: the retired record is present");
+        store
+            .write(STATE_SLOT_V1, &[0x5Au8; STATE_SIZE_V1])
+            .expect("seed the legacy record");
+        assert!(
+            store.contains(STATE_SLOT_V1),
+            "precondition: the retired record is present"
+        );
 
         let mut app = OtpApp::boot(&mut store);
         app.factory_wipe();
-        assert!(app.persist_state(&mut store), "the emptied v2 record is persisted");
+        assert!(
+            app.persist_state(&mut store),
+            "the emptied v2 record is persisted"
+        );
         assert!(
             !store.contains(STATE_SLOT_V1),
             "a factory reset must remove the retired v1 record, not leave it sealed"
@@ -1884,7 +2045,12 @@ mod tests {
         let mut store = HostSecureStore::new();
         let mut app = OtpApp::boot(&mut store);
         for slot in 0..4 {
-            let cfg = make_config([slot as u8; 6], [0x11 * (slot as u8 + 1); 16], CHAL_RESP, CHAL_HMAC);
+            let cfg = make_config(
+                [slot as u8; 6],
+                [0x11 * (slot as u8 + 1); 16],
+                CHAL_RESP,
+                CHAL_HMAC,
+            );
             let (p1, p2) = match slot {
                 0 => (SLOT_CONFIGURE, 0),
                 1 => (SLOT_CONFIGURE_SLOT2, 0),
@@ -1906,7 +2072,11 @@ mod tests {
 
         let mut rebooted = OtpApp::boot(&mut store);
         for slot in 0..4 {
-            assert!(rebooted.slot_configured(slot), "slot {} lost across reboot", slot + 1);
+            assert!(
+                rebooted.slot_configured(slot),
+                "slot {} lost across reboot",
+                slot + 1
+            );
         }
         // Secret material really came back, not just the presence bits.
         let frame = challenge_frame();
@@ -1935,7 +2105,11 @@ mod tests {
         }
         app.reset();
         for slot in 0..4 {
-            assert!(!app.slot_configured(slot), "slot {} survived the reset", slot + 1);
+            assert!(
+                !app.slot_configured(slot),
+                "slot {} survived the reset",
+                slot + 1
+            );
         }
     }
 
@@ -2044,10 +2218,7 @@ mod tests {
         // static-shaped slot, so a swapped or mis-indexed TLV is visible.
         let slot1 = make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], CHAL_RESP, CHAL_HMAC);
         let slot3 = make_config([3, 3, 3, 3, 3, 3], [0xCC; 16], CHAL_RESP, CHAL_HMAC | 0x04);
-        for (p1, p2, cfg) in [
-            (SLOT_CONFIGURE, 0u8, &slot1),
-            (SLOT_CONFIGURE, 2, &slot3),
-        ] {
+        for (p1, p2, cfg) in [(SLOT_CONFIGURE, 0u8, &slot1), (SLOT_CONFIGURE, 2, &slot3)] {
             let (_, sw) = configure_as_client(&mut app, p1, p2, cfg, &NO_ACC);
             assert_eq!(sw, SW_OK);
         }
@@ -2059,8 +2230,18 @@ mod tests {
         assert_eq!(
             body,
             vec![
-                0xB0, 0x04, 0xA0, 0x02, CHAL_RESP, CHAL_HMAC, // slot 1
-                0xB2, 0x04, 0xA0, 0x02, CHAL_RESP, CHAL_HMAC | 0x04, // slot 3
+                0xB0,
+                0x04,
+                0xA0,
+                0x02,
+                CHAL_RESP,
+                CHAL_HMAC, // slot 1
+                0xB2,
+                0x04,
+                0xA0,
+                0x02,
+                CHAL_RESP,
+                CHAL_HMAC | 0x04, // slot 3
             ],
             "one TLV per configured slot, tagged 0xB0 + index"
         );
@@ -2087,7 +2268,10 @@ mod tests {
         // A completely blank device: no TLVs at all.
         let (body, sw) = read_info(&mut app);
         assert_eq!(sw, SW_OK);
-        assert!(body.is_empty(), "a blank device must emit no TLVs, got {body:02X?}");
+        assert!(
+            body.is_empty(),
+            "a blank device must emit no TLVs, got {body:02X?}"
+        );
         assert_eq!(
             client_read_info(&body),
             [ClientSlotType::Empty; 4],
@@ -2108,7 +2292,10 @@ mod tests {
         assert_eq!(sw, SW_OK);
         let (body, sw) = read_info(&mut app);
         assert_eq!(sw, SW_OK);
-        assert!(body.is_empty(), "the wiped slot's TLV must be omitted, got {body:02X?}");
+        assert!(
+            body.is_empty(),
+            "the wiped slot's TLV must be omitted, got {body:02X?}"
+        );
 
         // The counterfactual: a zero-filled TLV for that slot would read
         // back as a *programmed* Yubico-OTP slot, which is exactly the bug
@@ -2127,7 +2314,12 @@ mod tests {
     #[test]
     fn wiped_slot_does_not_read_back_as_yubico_otp() {
         let mut app = OtpApp::new();
-        for (p1, p2) in [(SLOT_CONFIGURE, 0u8), (SLOT_CONFIGURE_SLOT2, 0), (SLOT_CONFIGURE, 2), (SLOT_CONFIGURE, 3)] {
+        for (p1, p2) in [
+            (SLOT_CONFIGURE, 0u8),
+            (SLOT_CONFIGURE_SLOT2, 0),
+            (SLOT_CONFIGURE, 2),
+            (SLOT_CONFIGURE, 3),
+        ] {
             // A Yubico-OTP-shaped slot (tkt = 0, cfg = 0) — the one shape
             // the client classifies as YubicoOtp.
             let mut cfg = make_config([7; 6], [0x77; 16], 0, 0);
@@ -2150,14 +2342,23 @@ mod tests {
         let (body, sw) = read_info(&mut app);
         assert_eq!(sw, SW_OK);
         let seen = client_read_info(&body);
-        assert_eq!(seen[2], ClientSlotType::Empty, "the wiped slot must read Empty");
+        assert_eq!(
+            seen[2],
+            ClientSlotType::Empty,
+            "the wiped slot must read Empty"
+        );
         assert_ne!(
             seen[2],
             ClientSlotType::YubicoOtp,
             "a wiped slot must never read back as YubicoOtp"
         );
         for i in [0usize, 1, 3] {
-            assert_eq!(seen[i], ClientSlotType::YubicoOtp, "slot {} survived", i + 1);
+            assert_eq!(
+                seen[i],
+                ClientSlotType::YubicoOtp,
+                "slot {} survived",
+                i + 1
+            );
         }
     }
 
@@ -2171,7 +2372,10 @@ mod tests {
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &app_cfg, &NO_ACC);
         assert_eq!(sw, SW_OK);
         let (body, _) = read_info(&mut app);
-        assert_eq!(client_read_info(&body)[0], ClientSlotType::ChallengeResponse);
+        assert_eq!(
+            client_read_info(&body)[0],
+            ClientSlotType::ChallengeResponse
+        );
 
         // A SLOT_UPDATE that asks for a different cfg_flags. The C merge
         // preserves cfg_flags wholesale whenever the *current* tkt_flags
@@ -2198,7 +2402,10 @@ mod tests {
         );
         // The C merge dropped the 0x04 request (current CHAL_RESP set) and
         // kept CHAL_RESP in tkt_flags; the TLV reports exactly that.
-        assert_eq!(merged[47], CHAL_HMAC, "cfg_flags preserved wholesale under CHAL_RESP");
+        assert_eq!(
+            merged[47], CHAL_HMAC,
+            "cfg_flags preserved wholesale under CHAL_RESP"
+        );
         assert_eq!(merged[46], CHAL_RESP, "tkt_flags keeps its high bits");
         assert_eq!(body[4], CHAL_RESP);
         assert_eq!(body[5], CHAL_HMAC);
@@ -2231,7 +2438,10 @@ mod tests {
     /// non-zero value so a misplaced offset cannot pass unnoticed.
     fn full_config() -> [u8; 52] {
         let mut c = [0u8; 52];
-        for (i, b) in c[CFG_FIXED_DATA..CFG_FIXED_DATA + 16].iter_mut().enumerate() {
+        for (i, b) in c[CFG_FIXED_DATA..CFG_FIXED_DATA + 16]
+            .iter_mut()
+            .enumerate()
+        {
             *b = 0xA0 | i as u8;
         }
         c[CFG_UID..CFG_UID + 6].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
@@ -2260,7 +2470,10 @@ mod tests {
         let expect_fixed: Vec<u8> = (0..16u8).map(|i| 0xA0 | i).collect();
         let expect_key: Vec<u8> = (0..16u8).map(|i| 0xB0 | i).collect();
         assert_eq!(&cfg[CFG_FIXED_DATA..CFG_FIXED_DATA + 16], &expect_fixed[..]);
-        assert_eq!(&cfg[CFG_UID..CFG_UID + 6], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(
+            &cfg[CFG_UID..CFG_UID + 6],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
         assert_eq!(&cfg[CFG_AES_KEY..CFG_AES_KEY + 16], &expect_key[..]);
         assert_eq!(&cfg[CFG_ACC_CODE..CFG_ACC_CODE + 6], &[1, 2, 3, 4, 5, 6]);
         assert_eq!(cfg[CFG_FIXED_SIZE], 16);
@@ -2278,7 +2491,10 @@ mod tests {
         assert_eq!(crc16(&cfg), CRC_RESIDUAL, "X.25 residual 0xF0B8");
         assert_eq!(crc16(&cfg), 0xF0B8);
         // Every reference-client builder shape lands on the same residual.
-        assert_eq!(crc16(&make_config([0x11; 6], [0x22; 16], CHAL_RESP, CHAL_HMAC)), 0xF0B8);
+        assert_eq!(
+            crc16(&make_config([0x11; 6], [0x22; 16], CHAL_RESP, CHAL_HMAC)),
+            0xF0B8
+        );
         assert_eq!(crc16(&make_config([0; 6], [0; 16], 0, 0)), 0xF0B8);
         // The CRC parameters themselves: init 0xFFFF, reflected poly
         // 0x8408, and NO final XOR (the complement is stored, not folded
@@ -2365,7 +2581,10 @@ mod tests {
         // The new code unlocks the next write; the zeros do not.
         let cfg2 = make_config([6, 5, 4, 3, 2, 1], [0xBB; 16], CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &cfg2, &NO_ACC);
-        assert_eq!(sw, SW_SECURITY_STATUS_NOT_SATISFIED, "an unprotected write is refused");
+        assert_eq!(
+            sw, SW_SECURITY_STATUS_NOT_SATISFIED,
+            "an unprotected write is refused"
+        );
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &cfg2, &new_a);
         assert_eq!(sw, SW_OK, "the real code opens the device");
 
@@ -2374,7 +2593,11 @@ mod tests {
         let cfg3 = make_config_acc([9, 9, 9, 9, 9, 9], [0xCC; 16], new_b, CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &cfg3, &new_a);
         assert_eq!(sw, SW_OK, "the trailing CURRENT code authenticated");
-        assert_eq!(app.access_code, Some(new_b), "the frame's code is now the device code");
+        assert_eq!(
+            app.access_code,
+            Some(new_b),
+            "the frame's code is now the device code"
+        );
         assert_eq!(
             &app.slots[0].expect("slot 1")[CFG_ACC_CODE..CFG_ACC_CODE + 6],
             &new_b,
@@ -2382,7 +2605,10 @@ mod tests {
         );
         let cfg4 = make_config([4, 4, 4, 4, 4, 4], [0xDD; 16], CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 2, &cfg4, &new_a);
-        assert_eq!(sw, SW_SECURITY_STATUS_NOT_SATISFIED, "the superseded code is dead");
+        assert_eq!(
+            sw, SW_SECURITY_STATUS_NOT_SATISFIED,
+            "the superseded code is dead"
+        );
 
         // 3. The RESIDUAL divergence US-144 does not fix, pinned: a slot
         //    keeps its OWN acc_code field, and UPDATE authenticates against
@@ -2427,7 +2653,11 @@ mod tests {
         let mut store = HostSecureStore::new();
         app.save(&mut store).expect("persist");
         let rebooted = OtpApp::boot(&mut store);
-        assert_eq!(rebooted.access_code, Some(new_b), "boot restores the device code");
+        assert_eq!(
+            rebooted.access_code,
+            Some(new_b),
+            "boot restores the device code"
+        );
     }
 
     /// US-142 probe, **rewritten by US-144**: the trailing-payload-wins bug
@@ -2438,17 +2668,30 @@ mod tests {
     fn probe_a_zero_new_code_leaves_the_device_unprotected() {
         let new_code = [0x3Cu8; 6];
         let mut app = OtpApp::new();
-        let cfg = make_config_acc([1, 2, 3, 4, 5, 6], [0xAA; 16], new_code, CHAL_RESP, CHAL_HMAC);
+        let cfg = make_config_acc(
+            [1, 2, 3, 4, 5, 6],
+            [0xAA; 16],
+            new_code,
+            CHAL_RESP,
+            CHAL_HMAC,
+        );
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &cfg, &NO_ACC);
         assert_eq!(sw, SW_OK);
-        assert_eq!(app.access_code, Some(new_code), "US-144: the frame's code is installed");
+        assert_eq!(
+            app.access_code,
+            Some(new_code),
+            "US-144: the frame's code is installed"
+        );
 
         // Re-program with a zero acc_code field and the CURRENT code
         // trailing: the device is returned to the unprotected state.
         let plain = make_config([2, 2, 2, 2, 2, 2], [0xCC; 16], CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &plain, &new_code);
         assert_eq!(sw, SW_OK, "the current code authenticated the write");
-        assert_eq!(app.access_code, None, "a zero new code leaves the device unprotected");
+        assert_eq!(
+            app.access_code, None,
+            "a zero new code leaves the device unprotected"
+        );
 
         // ...and an unprotected device then takes a write with no code.
         let plain2 = make_config([3, 3, 3, 3, 3, 3], [0xDD; 16], CHAL_RESP, CHAL_HMAC);
@@ -2483,7 +2726,11 @@ mod tests {
             // The firmware recovers the message by trimming trailing bytes
             // equal to the frame's LAST byte, so the pad must differ from
             // it or the tail of the challenge would be eaten.
-            let pad = if *challenge.last().expect("non-empty") == PAD { 0x00 } else { PAD };
+            let pad = if *challenge.last().expect("non-empty") == PAD {
+                0x00
+            } else {
+                PAD
+            };
             frame[challenge.len()..].fill(pad);
         }
         frame
@@ -2545,18 +2792,26 @@ mod tests {
         let aes_key = [0xAAu8; 16];
         // HMAC_LT64 is what makes the trim happen at all; the reference
         // client's `build_chalresp` always sets it.
-        configure(&mut app, 0, make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC | HMAC_LT64));
+        configure(
+            &mut app,
+            0,
+            make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC | HMAC_LT64),
+        );
         let key = [&aes_key[..], &uid[..]].concat();
 
         // The three shapes the client's `pad_challenge` distinguishes.
         let cases: [&[u8]; 3] = [
-            &[1, 2, 3, 4, 5, 6, 7, 8],   // normal
-            &[0xAA, 0x7F],               // ends in the default pad -> 0x00 fill
-            &[0x7F],                     // single byte, already the pad
+            &[1, 2, 3, 4, 5, 6, 7, 8], // normal
+            &[0xAA, 0x7F],             // ends in the default pad -> 0x00 fill
+            &[0x7F],                   // single byte, already the pad
         ];
         for challenge in cases {
             let frame = client_pad_challenge(challenge);
-            assert_eq!(frame.len(), CHALLENGE_FRAME, "the client always sends 64 bytes");
+            assert_eq!(
+                frame.len(),
+                CHALLENGE_FRAME,
+                "the client always sends 64 bytes"
+            );
             // Precondition: the firmware's trim recovers the challenge.
             assert_eq!(
                 firmware_trim(&frame),
@@ -2596,7 +2851,11 @@ mod tests {
 
         // The same full frame on a slot WITHOUT HMAC_LT64 is HMACed whole.
         let mut app2 = OtpApp::new();
-        configure(&mut app2, 0, make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC));
+        configure(
+            &mut app2,
+            0,
+            make_config(uid, aes_key, CHAL_RESP, CHAL_HMAC),
+        );
         let (body, sw) = calculate(&mut app2, CALC_HMAC_SLOT1, &full);
         assert_eq!(sw, SW_OK);
         assert_eq!(body, hmac_sha1(&key, &full));
@@ -2616,7 +2875,10 @@ mod tests {
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT1, &frame);
         assert_eq!(sw, SW_OK);
         assert_eq!(body, hmac_sha1(&[&aes_key[..], &uid[..]].concat(), &frame));
-        assert_ne!(body, hmac_sha1(&[&aes_key[..], &uid[..]].concat(), challenge));
+        assert_ne!(
+            body,
+            hmac_sha1(&[&aes_key[..], &uid[..]].concat(), challenge)
+        );
     }
 
     // ---- the touch gate ----
@@ -2636,7 +2898,12 @@ mod tests {
         let mut app = OtpApp::new().with_user_presence(|| true);
         // The reference client's `build_chalresp(secret, touch = true, ..)`
         // sets exactly this bit (0x22 | 0x04 | 0x08).
-        let cfg = make_config([1, 2, 3, 4, 5, 6], [0xAA; 16], CHAL_RESP, CHAL_HMAC | HMAC_LT64 | CHAL_BTN_TRIG);
+        let cfg = make_config(
+            [1, 2, 3, 4, 5, 6],
+            [0xAA; 16],
+            CHAL_RESP,
+            CHAL_HMAC | HMAC_LT64 | CHAL_BTN_TRIG,
+        );
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &cfg, &NO_ACC);
         assert_eq!(sw, SW_OK);
         let frame = challenge_frame();
@@ -2675,7 +2942,7 @@ mod tests {
     /// OTP touch cannot open theirs.
     #[test]
     fn the_otp_presence_tag_cannot_be_confused_with_another_apple() {
-        use crate::oath_core::{PRESENCE_TAG_CALC_ALL, PRESENCE_TAG_CALCULATE};
+        use crate::oath_core::{PRESENCE_TAG_CALCULATE, PRESENCE_TAG_CALC_ALL};
         use crate::oath_core::{PRESENCE_TAG_RESET, PRESENCE_TAG_SET_CODE_CLEAR};
 
         // The OTP tag is distinct from every CCID tag in the workspace.
@@ -2684,8 +2951,8 @@ mod tests {
             PRESENCE_TAG_SET_CODE_CLEAR,
             PRESENCE_TAG_CALCULATE,
             PRESENCE_TAG_CALC_ALL,
-            0x1C, // mgmt WRITE_CONFIG
-            0x1E, // mgmt RESET
+            0x1C,        // mgmt WRITE_CONFIG
+            0x1E,        // mgmt RESET
             0x2A_9E9A,   // OpenPGP PSO:SIGN
             0x2A_8086,   // OpenPGP PSO:DECIPHER
             0x0088_0000, // OpenPGP INT-AUTH
@@ -2708,8 +2975,14 @@ mod tests {
         fn fido_tag(channel: [u8; 4]) -> u32 {
             0x8000_0000 | u32::from_be_bytes(channel)
         }
-        assert_ne!(fido_tag([0x00, 0x00, 0x00, 0x01]), PRESENCE_TAG_CHAL_BTN_TRIG);
-        assert_eq!(fido_tag([0x00, 0x00, 0x00, 0x01]) & 0x8000_0000, 0x8000_0000);
+        assert_ne!(
+            fido_tag([0x00, 0x00, 0x00, 0x01]),
+            PRESENCE_TAG_CHAL_BTN_TRIG
+        );
+        assert_eq!(
+            fido_tag([0x00, 0x00, 0x00, 0x01]) & 0x8000_0000,
+            0x8000_0000
+        );
     }
 
     /// US-143: the touch bit is reported back through EXTENDED STATUS, so a
@@ -2735,7 +3008,10 @@ mod tests {
         assert_eq!(body[5] & 0x08, 0x08, "the client reads touch as cfg & 0x08");
         // ...and the constant must be that same bit, or a slot programmed
         // with touch would be gated on a bit the client never sets.
-        assert_eq!(CHAL_BTN_TRIG, 0x08, "CFG_CHAL_BTN_TRIG is otp_config_t's 0x08");
+        assert_eq!(
+            CHAL_BTN_TRIG, 0x08,
+            "CFG_CHAL_BTN_TRIG is otp_config_t's 0x08"
+        );
     }
 
     /// US-143: a slot the client programmed with a LITERAL touch byte is
@@ -2763,7 +3039,10 @@ mod tests {
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &plain, &NO_ACC);
         assert_eq!(sw, SW_OK);
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT2, &frame);
-        assert_eq!(sw, SW_OK, "without the touch byte the challenge is never gated");
+        assert_eq!(
+            sw, SW_OK,
+            "without the touch byte the challenge is never gated"
+        );
         assert_eq!(body.len(), 20);
     }
 
@@ -2786,23 +3065,41 @@ mod tests {
         let c1 = make_config_acc([1, 2, 3, 4, 5, 6], [0xAA; 16], new, CHAL_RESP, CHAL_HMAC);
         let (body, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &c1, &NO_ACC);
         assert_eq!(sw, SW_OK);
-        assert_eq!(app.access_code, Some(new), "the frame's code is the device code");
-        assert_eq!(body.len(), STATUS_LEN, "the C returns the 6-byte status body");
+        assert_eq!(
+            app.access_code,
+            Some(new),
+            "the frame's code is the device code"
+        );
+        assert_eq!(
+            body.len(),
+            STATUS_LEN,
+            "the C returns the 6-byte status body"
+        );
 
         // 2. A protected write presenting the WRONG current code is 6982
         //    and changes nothing.
         let c2 = make_config_acc([2, 2, 2, 2, 2, 2], [0xBB; 16], new, CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &c2, &[0x99; 6]);
         assert_eq!(sw, SW_SECURITY_STATUS_NOT_SATISFIED);
-        assert!(!app.slot_configured(1), "a refused write must not program the slot");
+        assert!(
+            !app.slot_configured(1),
+            "a refused write must not program the slot"
+        );
 
         // 3. The RIGHT current code is accepted and ROTATES the device code
         //    to the one in the new frame.
         let c3 = make_config_acc([3, 3, 3, 3, 3, 3], [0xCC; 16], old, CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &c3, &new);
         assert_eq!(sw, SW_OK);
-        assert_eq!(app.access_code, Some(old), "the new frame's code is installed");
-        assert_eq!(app.slots[1].expect("slot 2")[CFG_ACC_CODE..CFG_ACC_CODE + 6], old);
+        assert_eq!(
+            app.access_code,
+            Some(old),
+            "the new frame's code is installed"
+        );
+        assert_eq!(
+            app.slots[1].expect("slot 2")[CFG_ACC_CODE..CFG_ACC_CODE + 6],
+            old
+        );
         // The superseded code no longer opens anything.
         let c4 = make_config_acc([4, 4, 4, 4, 4, 4], [0xDD; 16], new, CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 2, &c4, &new);
@@ -2813,13 +3110,20 @@ mod tests {
         //    the embedded one.
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 3, &c4, &old);
         assert_eq!(sw, SW_OK);
-        assert_eq!(app.access_code, Some(new), "the FIELD wins, not the trailing payload");
+        assert_eq!(
+            app.access_code,
+            Some(new),
+            "the FIELD wins, not the trailing payload"
+        );
 
         // 5. The 52-byte form: no trailing code, the frame's own field is
         //    both the current code and the new one (a no-op re-write).
         let same = make_config_acc([5, 5, 5, 5, 5, 5], [0xEE; 16], new, CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_raw(&mut app, SLOT_CONFIGURE, 0, same);
-        assert_eq!(sw, SW_OK, "a 52-byte write re-sending the current code is accepted");
+        assert_eq!(
+            sw, SW_OK,
+            "a 52-byte write re-sending the current code is accepted"
+        );
         // ...but a 52-byte write carrying a DIFFERENT code is not: with no
         // trailing payload the field is read as the current code.
         let other = make_config_acc([6, 6, 6, 6, 6, 6], [0xFF; 16], old, CHAL_RESP, CHAL_HMAC);
@@ -2830,8 +3134,14 @@ mod tests {
         //    unprotected one does not. The client's `delete_slot` appends
         //    `current_acc` (zeros when unprotected) in both cases.
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &[0u8; 52], &[0x77; 6]);
-        assert_eq!(sw, SW_SECURITY_STATUS_NOT_SATISFIED, "a protected erase needs the code");
-        assert!(app.slot_configured(0), "the slot must survive a refused erase");
+        assert_eq!(
+            sw, SW_SECURITY_STATUS_NOT_SATISFIED,
+            "a protected erase needs the code"
+        );
+        assert!(
+            app.slot_configured(0),
+            "the slot must survive a refused erase"
+        );
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &[0u8; 52], &new);
         assert_eq!(sw, SW_OK);
         assert!(!app.slot_configured(0), "the slot is erased");
@@ -2840,7 +3150,10 @@ mod tests {
         let c5 = make_config([7, 7, 7, 7, 7, 7], [0x11; 16], CHAL_RESP, CHAL_HMAC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 2, &c5, &new);
         assert_eq!(sw, SW_OK, "the current code authenticated the write");
-        assert_eq!(app.access_code, None, "a zero acc_code leaves the device unprotected");
+        assert_eq!(
+            app.access_code, None,
+            "a zero acc_code leaves the device unprotected"
+        );
         // ...after which an unprotected erase needs no code at all.
         let (_, sw) = configure_raw(&mut app, SLOT_CONFIGURE, 2, [0u8; 52]);
         assert_eq!(sw, SW_OK, "an unprotected erase needs no code");
@@ -2905,7 +3218,11 @@ mod tests {
         // The challenge now answers with those bytes.
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT1, &challenge_frame());
         assert_eq!(sw, SW_OK, "a static slot must not be gated by CHAL_RESP");
-        assert_eq!(body, scancodes.to_vec(), "the response is the scancode run verbatim");
+        assert_eq!(
+            body,
+            scancodes.to_vec(),
+            "the response is the scancode run verbatim"
+        );
 
         // The client classifies it as a static-password slot.
         let (info, sw) = read_info(&mut app);
@@ -2927,16 +3244,28 @@ mod tests {
         let stat = client_build_static(&[0x04, 0x05, 0x06], false, &NO_ACC);
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE_SLOT2, 0, &stat, &NO_ACC);
         assert_eq!(sw, SW_OK);
-        assert_eq!(stat[CFG_CFG_FLAGS] & 0x20, chal[CFG_CFG_FLAGS] & 0x20, "the bit really is shared");
+        assert_eq!(
+            stat[CFG_CFG_FLAGS] & 0x20,
+            chal[CFG_CFG_FLAGS] & 0x20,
+            "the bit really is shared"
+        );
 
         // Each answers with its own thing. The Yubico-AES slot is only
         // reachable through the AES opcodes (0x20/0x28).
         let (body, sw) = calculate(&mut app, CALC_AES_SLOT1, &challenge_frame()[..6]);
         assert_eq!(sw, SW_OK);
-        assert_eq!(body.len(), 16, "the AES slot returns a block, not scancodes");
+        assert_eq!(
+            body.len(),
+            16,
+            "the AES slot returns a block, not scancodes"
+        );
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT2, &challenge_frame());
         assert_eq!(sw, SW_OK);
-        assert_eq!(body, vec![0x04, 0x05, 0x06], "the static slot returns its scancodes");
+        assert_eq!(
+            body,
+            vec![0x04, 0x05, 0x06],
+            "the static slot returns its scancodes"
+        );
     }
 
     /// A cfg-0x20 slot with NO scancodes (`fixed_size == 0`) is not a static
@@ -2949,7 +3278,10 @@ mod tests {
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &cfg, &NO_ACC);
         assert_eq!(sw, SW_OK);
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT1, &challenge_frame());
-        assert_eq!(sw, SW_WRONG_DATA, "no scancodes and no CHAL_RESP -> the C's 6700");
+        assert_eq!(
+            sw, SW_WRONG_DATA,
+            "no scancodes and no CHAL_RESP -> the C's 6700"
+        );
         assert!(body.is_empty());
     }
 
@@ -2969,7 +3301,11 @@ mod tests {
         assert_eq!(sw, SW_OK);
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT1, &challenge_frame());
         assert_eq!(sw, SW_OK);
-        assert_eq!(body.len(), 38, "capped at the scancode region, never past [0..38)");
+        assert_eq!(
+            body.len(),
+            38,
+            "capped at the scancode region, never past [0..38)"
+        );
         assert_eq!(body, scancodes);
     }
 
@@ -2989,7 +3325,10 @@ mod tests {
         let (_, sw) = configure_as_client(&mut app, SLOT_CONFIGURE, 0, &cfg, &NO_ACC);
         assert_eq!(sw, SW_OK);
         let (body, sw) = calculate(&mut app, CALC_HMAC_SLOT1, &challenge_frame());
-        assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED, "a password is never typed without a touch");
+        assert_eq!(
+            sw, SW_CONDITIONS_NOT_SATISFIED,
+            "a password is never typed without a touch"
+        );
         assert!(body.is_empty());
     }
 
@@ -3031,8 +3370,15 @@ mod tests {
         // sends when `current_acc` is all zeros. Pre-US-144 this returned
         // 6982 (a stored all-zero code was treated as a real one).
         let (body, sw) = swap_as_client(&mut app, &[]);
-        assert_eq!(sw, SW_OK, "an empty-body swap on an unprotected device must succeed");
-        assert_eq!(body.len(), STATUS_LEN, "the C returns the 6-byte status body");
+        assert_eq!(
+            sw, SW_OK,
+            "an empty-body swap on an unprotected device must succeed"
+        );
+        assert_eq!(
+            body.len(),
+            STATUS_LEN,
+            "the C returns the 6-byte status body"
+        );
         // The swap really happened.
         let (r, _) = calculate(&mut app, CALC_HMAC_SLOT1, &frame);
         assert_eq!(r, hmac_sha1(&[&k1[..], &[2u8; 6][..]].concat(), &frame));
@@ -3050,7 +3396,10 @@ mod tests {
         let mut wrong = vec![0u8, 0u8];
         wrong.extend_from_slice(&[0x00; 6]);
         let (_, sw) = swap_as_client(&mut app, &wrong);
-        assert_eq!(sw, SW_SECURITY_STATUS_NOT_SATISFIED, "the wrong code is refused");
+        assert_eq!(
+            sw, SW_SECURITY_STATUS_NOT_SATISFIED,
+            "the wrong code is refused"
+        );
 
         // An empty body on a PROTECTED device is refused too (C parity:
         // the zero-initialized `access_code` cannot match).
@@ -3094,19 +3443,31 @@ mod tests {
         assert_eq!(body.len(), STATUS_LEN);
         // Slot 3 and 4 exchanged their key material.
         let b3 = key_of(&mut app, CALC_HMAC_SLOT1, 2);
-        assert_eq!(b3, hmac_sha1(&[&keys[3][..], &[3u8; 6][..]].concat(), &frame));
+        assert_eq!(
+            b3,
+            hmac_sha1(&[&keys[3][..], &[3u8; 6][..]].concat(), &frame)
+        );
         let b4 = key_of(&mut app, CALC_HMAC_SLOT1, 3);
-        assert_eq!(b4, hmac_sha1(&[&keys[2][..], &[2u8; 6][..]].concat(), &frame));
+        assert_eq!(
+            b4,
+            hmac_sha1(&[&keys[2][..], &[2u8; 6][..]].concat(), &frame)
+        );
         // Slots 1 and 2 were NOT touched.
         let b1 = key_of(&mut app, CALC_HMAC_SLOT1, 0);
-        assert_eq!(b1, hmac_sha1(&[&keys[0][..], &[0u8; 6][..]].concat(), &frame));
+        assert_eq!(
+            b1,
+            hmac_sha1(&[&keys[0][..], &[0u8; 6][..]].concat(), &frame)
+        );
 
         // `[0, 0]` is the default pair (slots 1 and 2), which is what the
         // client sends.
         let (_, sw) = swap_as_client(&mut app, &[0, 0]);
         assert_eq!(sw, SW_OK);
         let b1 = key_of(&mut app, CALC_HMAC_SLOT1, 0);
-        assert_eq!(b1, hmac_sha1(&[&keys[1][..], &[1u8; 6][..]].concat(), &frame));
+        assert_eq!(
+            b1,
+            hmac_sha1(&[&keys[1][..], &[1u8; 6][..]].concat(), &frame)
+        );
 
         // The same slot twice is 6A86 (C parity).
         let (_, sw) = swap_as_client(&mut app, &[1, 0]); // slot1+1 == slot2+0
