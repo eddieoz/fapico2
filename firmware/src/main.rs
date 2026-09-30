@@ -155,10 +155,18 @@ static SOAK_PANIC_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Panic handler: defmt-encoded over RTT so probe-rs / defmt-print can decode
 /// a crash without a UART sink. Increments the US-385 soak panic counter and
 /// emits it, so a soak driver reading RTT can count panics (zero = pass).
+///
+/// US-1306: a panic emits its own LED signature before parking. It gets a
+/// distinct reason from every policy refusal above because it is a different
+/// kind of event — a bug, not a decision the firmware made — and telling those
+/// apart from a board is the point of the story. `defmt` here has the same
+/// limitation as `fatal_boot`: the only sink is a probe, and attaching one is
+/// what this epic investigates as a trigger.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     let n = SOAK_PANIC_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     defmt::error!("SOAK-PANIC #{}", n);
+    boot::fatal_boot_sig("panic", fapico2_firmware::fatal_sig::Reason::Panic);
     loop {}
 }
 
@@ -191,7 +199,7 @@ fn boot_fido<T: Trng>(
         FidoApp::boot_in_place(core::ptr::addr_of_mut!(boot::FIDO_APP), trng, &mut *store)
     } {
         Ok(app) => app,
-        Err(_) => boot::fatal_boot("fido: keystore boot failed"),
+        Err(_) => boot::fatal_boot("fido: keystore boot failed", fapico2_firmware::fatal_sig::Reason::KeystoreFailed),
     }
 }
 
@@ -245,7 +253,7 @@ fn boot_oath<T: Trng>(
         )
     } {
         Ok(app) => app,
-        Err(_) => boot::fatal_boot("oath: keystore boot failed"),
+        Err(_) => boot::fatal_boot("oath: keystore boot failed", fapico2_firmware::fatal_sig::Reason::KeystoreFailed),
     }
 }
 
@@ -279,6 +287,10 @@ async fn main(spawner: Spawner) -> ! {
     // device that never enumerates (see `dbg::phase_blinks`).
     #[cfg(any(feature = "dbg-log", feature = "boot-timeline"))]
     crate::dbg::mark_led_ready();
+
+    // US-1306: `fatal_boot` may now drive the LED for its reason signature.
+    // Gated on the same write-once slot as the boot ladder above.
+    boot::mark_fatal_led_ready();
 
     // US-929 boot ladder, stage 1 (dbg-log builds only): main entered /
     // `.bss` cleared, the embassy HAL initialized, and the board LED
@@ -391,7 +403,7 @@ async fn main(spawner: Spawner) -> ! {
     // boot path before USB enumerates is the hang US-1001 exists to remove.
     let clock = match Rp2350Timer::require_advancing() {
         Ok(clock) => clock,
-        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the entropy wait has no deadline"),
+        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the entropy wait has no deadline", fapico2_firmware::fatal_sig::Reason::TrngRefused),
     };
     // US-1005 fix: the third argument is the configuration the probe
     // re-applies after an autocorrelation error. It is the same value
@@ -546,7 +558,7 @@ async fn main(spawner: Spawner) -> ! {
     // reads, not something worth caching a proof for.
     let mig_clock = match Rp2350Timer::require_advancing() {
         Ok(clock) => clock,
-        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the migration entropy wait has no deadline"),
+        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the migration entropy wait has no deadline", fapico2_firmware::fatal_sig::Reason::TrngRefused),
     };
     boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::MIG_PROBE),
@@ -740,7 +752,7 @@ async fn main(spawner: Spawner) -> ! {
     // `&mut` left to boot an app from.
     let device_chipid = match embassy_rp::otp::get_chipid() {
         Ok(c) => c,
-        Err(_) => boot::fatal_boot("device chipid unavailable"),
+        Err(_) => boot::fatal_boot("device chipid unavailable", fapico2_firmware::fatal_sig::Reason::ChipId),
     };
     // US-354 (S-711-2): OATH boots from the secure store, the same discipline
     // as FIDO (US-387) and OTP (US-388) — a corrupt keystore stream is fatal;
@@ -824,7 +836,7 @@ async fn main(spawner: Spawner) -> ! {
             )
         },
     ).is_none() {
-        boot::fatal_boot("migration: capture persistence failed; backend not mounted");
+        boot::fatal_boot("migration: capture persistence failed; backend not mounted", fapico2_firmware::fatal_sig::Reason::BackendNotMounted);
     }
     bphase!(crate::dbg::P_BACKEND);
     // E6 (S-391-10): construct each CCID app once into its static slot and take
@@ -1011,7 +1023,7 @@ async fn main(spawner: Spawner) -> ! {
     dlog!(crate::dbg::T_MAIN, crate::dbg::E_PSD, 0, persist_start.elapsed().as_micros() as u32);
     bphase!(crate::dbg::P_GATE2_POST);
     if !boot_persist {
-        boot::fatal_boot("secure partition: boot persist failed; serving suppressed");
+        boot::fatal_boot("secure partition: boot persist failed; serving suppressed", fapico2_firmware::fatal_sig::Reason::PersistFailed);
     }
 
     // The stored physical configuration becomes the boot-time USB identity.

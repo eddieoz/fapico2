@@ -11,6 +11,8 @@
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Output};
 use embassy_rp::peripherals::FLASH;
+// US-1306: the fatal-reason ids whose LED signatures `fatal_boot` emits.
+use fapico2_firmware::fatal_sig;
 use fapico2_fido::FidoApp;
 use fapico2_mgmt::ManagementApp;
 use fapico2_oath::{OathApp, OathSeal, OtpApp};
@@ -193,7 +195,7 @@ pub fn boot_slot_decision(key: &[u8; 32]) -> BootSlot {
             BootSlot::Fresh
         }
         SealedBootDecision::Refuse => {
-            fatal_boot("secure partition: untrusted image content; refusing to boot (US-915)")
+            fatal_boot("secure partition: untrusted image content; refusing to boot (US-915)", fatal_sig::Reason::UntrustedImage)
         }
     }
 }
@@ -246,10 +248,96 @@ impl SlotFlash for DevSlotFlash<'_> {
 
 /// Park the boot sequence: a fatal condition the device must not continue
 /// past (the serve loops never start, so nothing is served).
+///
+/// US-1306: `reason` is emitted as a countable LED signature before the park,
+/// so a person standing at a frozen board with no tools can name the cause.
+/// That matters more than it sounds: `defmt` needs an RTT sink, which needs a
+/// probe attached, and per `AGENTS.md`:98-112 a connected SWD debugger is
+/// *sufficient on its own* to make this firmware dark-boot on a board whose OTP
+/// is perfectly healthy. The only way to find out why the board died was the
+/// act that kills the board.
+///
+/// The signature is emitted **once**, then the board parks. There is no
+/// watchdog (US-1311), so this is the last thing the device will ever show —
+/// which is why it must be short enough to read at a glance and distinct from
+/// every other pattern on the pin (asserted in `fatal_sig`'s tests).
+///
+/// `msg` is still logged: the signature names the cause, the message says
+/// which call site raised it.
 #[allow(clippy::empty_loop)]
-pub fn fatal_boot(msg: &str) -> ! {
+pub fn fatal_boot(msg: &str, reason: fatal_sig::Reason) -> ! {
     defmt::error!("{}", msg);
+    emit_fatal_signature(reason);
     loop {}
+}
+
+/// Whether the LED slot has been mounted, so `fatal_boot` may drive it.
+///
+/// Declared here rather than reached for in `dbg`: `fatal_boot` is called from
+/// paths that run before `mark_led_ready()`, and from `apdu-trace` builds where
+/// `mod dbg` is compiled but `LED_READY` was never set. Reading the slot
+/// uninitialised would write through a dangling pointer, which is a worse
+/// failure than an unsignalled one — so an early fatal boot stays silent on the
+/// LED and parks with the pin in whatever state the last driver left.
+static FATAL_LED_MOUNTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Emit `reason`'s LED signature without parking — the panic handler's entry
+/// point, which has its own `loop {}` and cannot call a `-> !` helper from
+/// inside a `#[panic_handler]`.
+///
+/// Split out from [`fatal_boot`] so the panic path carries the same signature
+/// as every policy refusal, and differs from them only in the reason id.
+pub fn fatal_boot_sig(msg: &str, reason: fatal_sig::Reason) {
+    defmt::error!("{}", msg);
+    emit_fatal_signature(reason);
+}
+
+/// Drive one fatal signature on the board LED, synchronously.
+///
+/// The same pre-task discipline as `dbg::phase_blinks`: the async executor and
+/// its timers are not running this early, so a `Timer::after` would never
+/// wake. Same write-once slot, same safety argument.
+fn emit_fatal_signature(reason: fatal_sig::Reason) {
+    use fapico2_firmware::fatal_sig::{self, LIT};
+
+    if !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: the `LED_OUT` slot is written exactly once at the top of `main`
+    // before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`; this is the
+    // pre-task boot path, single-core, so no heartbeat or trussed-UI driver
+    // shares the pin.
+    let led: &mut Output<'static> =
+        unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
+    for pulse in fatal_sig::signature(reason) {
+        // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303).
+        if pulse.on == LIT {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
+        busy_wait_us(pulse.us);
+    }
+}
+
+/// µs busy-wait on the RP2350's 1 MHz `TIMERAWL` counter — the same
+/// wrap-correct wait the boot ladder uses, for the same reason: no timers are
+/// running this early. Duplicated rather than shared because `dbg` is a
+/// diagnostic-feature module and `fatal_boot` must work in every build.
+fn busy_wait_us(us: u32) {
+    let target = rp_pac::TIMER0.timerawl().read().wrapping_add(us);
+    while ((rp_pac::TIMER0.timerawl().read().wrapping_sub(target)) as i32) < 0 {}
+}
+
+/// Flip `fatal_boot`'s LED gate on, once `LED_OUT` is mounted.
+///
+/// Called from `main` immediately after the write-once slot is filled, beside
+/// `dbg::mark_led_ready()`. Until this runs, a fatal boot has no LED to speak
+/// through and parks silently — which is correct, because the alternative is
+/// writing through an uninitialised pin.
+pub fn mark_fatal_led_ready() {
+    FATAL_LED_MOUNTED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 // The secure store lives outside the async main() future (in static memory,
@@ -282,9 +370,9 @@ pub fn migration_authority() -> Option<&'static dyn fapico2_platform::trusted_ba
     let store = init_static_slot(core::ptr::addr_of_mut!(AUTH_STORE), store_handle());
     if !migration::has_openpgp_capture(store) { return None; }
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable"));
+        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
     let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable"));
+        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // US-939: the authority (~98 KiB, it owns the migration scratch) is
     // constructed field-by-field directly into its `PIN_AUTHORITY` static
     // slot — letting the value transit this function's stack frame (then
@@ -299,7 +387,7 @@ pub fn migration_authority() -> Option<&'static dyn fapico2_platform::trusted_ba
             &otp,
             &uid.to_be_bytes(),
         )
-    }.unwrap_or_else(|_| fatal_boot("migration: authority initialization failed")))
+    }.unwrap_or_else(|_| fatal_boot("migration: authority initialization failed", fatal_sig::Reason::MigrationFailed)))
 }
 
 /// US-413 S-413-5: migration working buffers (~96 KiB, bss — never on the
@@ -580,9 +668,9 @@ pub unsafe fn init_drbg(
     >,
 > {
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)"));
+        .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)", fatal_sig::Reason::OtpKeyRow));
     let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("drbg: chipid unavailable (cannot seed)"));
+        .unwrap_or_else(|_| fatal_boot("drbg: chipid unavailable (cannot seed)", fatal_sig::Reason::ChipId));
 
     let otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
     let uid: &'static mut [u8; 8] =
@@ -596,7 +684,7 @@ pub unsafe fn init_drbg(
     // Fail-closed: no constructor hands back an unseeded generator, and a
     // refusal is fatal at boot (see the doc comment above).
     let drbg = fapico2_platform::trng::DrbgTrng::try_new(source)
-        .unwrap_or_else(|_| fatal_boot("drbg: seed refused (see SeedError) — no generator"));
+        .unwrap_or_else(|_| fatal_boot("drbg: seed refused (see SeedError) — no generator", fatal_sig::Reason::DrbgRefused));
     init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg)
 }
 
@@ -1167,9 +1255,9 @@ fn read_otp_key_1() -> Option<[u8; 32]> {
 #[inline(never)]
 pub fn derive_boot_store_key() -> [u8; 32] {
     let otp_key_1 = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("secure partition: OTP key row unavailable"));
+        .unwrap_or_else(|| fatal_boot("secure partition: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
     let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("secure partition: chipid unavailable"));
+        .unwrap_or_else(|_| fatal_boot("secure partition: chipid unavailable", fatal_sig::Reason::ChipId));
     fapico2_platform::store_v3::derive_store_key(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1187,9 +1275,9 @@ pub fn derive_boot_store_key() -> [u8; 32] {
 #[inline(never)]
 pub fn derive_oath_seal() -> OathSeal {
     let otp_key_1 = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("oath seal: OTP key row unavailable"));
+        .unwrap_or_else(|| fatal_boot("oath seal: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
     let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("oath seal: chipid unavailable"));
+        .unwrap_or_else(|_| fatal_boot("oath seal: chipid unavailable", fatal_sig::Reason::ChipId));
     OathSeal::derive(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1254,7 +1342,7 @@ pub fn ensure_boot_entropy(
         }
     }
     if fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).is_err() {
-        fatal_boot("boot entropy: TRNG refused inside the budget; nothing to guarantee the slot with");
+        fatal_boot("boot entropy: TRNG refused inside the budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
@@ -1580,13 +1668,13 @@ pub fn restore_openpgp_at_boot(
         return;
     }
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable"));
+        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
     let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable"));
+        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // Boot-only exclusive access; runtime has not started.
     let bufs = unsafe { &mut *core::ptr::addr_of_mut!(MIG_BUFS) };
     if app.restore_at_boot(store, &otp, &uid.to_be_bytes(), bufs).is_err() {
-        fatal_boot("migration: OpenPGP restore failed");
+        fatal_boot("migration: OpenPGP restore failed", fatal_sig::Reason::MigrationFailed);
     }
 }
 
@@ -1643,7 +1731,7 @@ pub fn run_first_boot_migration(store: &mut DeviceStore) {
             };
             defmt::info!("migration skipped: {}", what)
         }
-        Err(_) => fatal_boot("migration failed; refusing destructive backend boot"),
+        Err(_) => fatal_boot("migration failed; refusing destructive backend boot", fatal_sig::Reason::MigrationFailed),
     }
 }
 

@@ -89,6 +89,8 @@ pub mod ccid_reasm;
 /// US-1304: the boot-phase blink ladder's level sequence (pure, host-tested;
 /// the device bin drives the pin over it).
 pub mod boot_ladder;
+/// US-1306: fatal-boot reason ids and their LED signatures (pure, host-tested).
+pub mod fatal_sig;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
