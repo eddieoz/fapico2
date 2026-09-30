@@ -585,6 +585,7 @@ jobs:
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \
+            tests/scripts/check_led_polarity.py \
             tests/scripts/check_otp_provisioning_precondition.py \
             tests/scripts/check_picoforge_compat_docs.py \
             tests/scripts/check_readme.py \

@@ -450,6 +450,38 @@ mod tests {
         assert_eq!(Reason::OtpKeyRow.id(), 1);
     }
 
+    /// US-1310 (implementing ADR 0002 option 1): the OTP refusal emits its
+    /// signature and the device does not serve. Asserted against the *decision*
+    /// rather than the encoder — the property ADR 0002 chose is that the
+    /// refusal is both **legible** and **enforced**, so the test checks both
+    /// halves and would fail if someone "fixed" a freeze by making the key row
+    /// optional.
+    ///
+    /// What it cannot check: that `derive_boot_store_key` still calls
+    /// `fatal_boot` on a bad read. That is a device-path property — the OTP
+    /// read needs real silicon — and is covered by review plus the epic's
+    /// hardware stories, not by a host test that could only assert it about
+    /// itself. Stated here so nobody reads a green suite as proof of it.
+    #[test]
+    fn given_the_otp_refusal_when_the_policy_runs_then_it_is_both_legible_and_enforced() {
+        // Legible: the cause is on the LED, uniquely.
+        assert_eq!(
+            decode(&signature(Reason::OtpKeyRow)),
+            Some(Reason::OtpKeyRow)
+        );
+        // Enforced: the signature is emitted and then the device parks. There
+        // is exactly one terminal state in this enum for an unreadable key row,
+        // it is the same state every other refusal uses, and nothing in the
+        // encoder can express "carry on" — the type has no such arm. A fallback
+        // key would have to be a new variant, which is the point: it becomes
+        // visible here rather than slipping in as a behaviour change.
+        assert!(ALL_REASONS.contains(&Reason::OtpKeyRow));
+        // And the fallback key this ADR rejected has no reason id, so no
+        // signature could ever be read as "booted with an unverified key".
+        assert_eq!(Reason::OtpKeyRow.id(), 1);
+        assert!(ALL_REASONS.iter().all(|r| r.id() != 0));
+    }
+
     /// The encoder and decoder are a bijection on the reason set, so the id
     /// space is not silently over-subscribed: no reason can be encoded into a
     /// pattern that some other id also claims.

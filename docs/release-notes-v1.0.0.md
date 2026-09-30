@@ -36,6 +36,26 @@ One firmware, one binary — a single UF2 serving one USB composite device
 | **FIDO2/U2F** (CTAP HID) | **v1.0.0 capability note (SUPERSEDED by the Phase-7 addendum below):** a CTAP-HID **shell** — `getInfo` + vendor vault + error responses; the only durable secret is the persisted hkey (keydev). Resident-credential CTAP2 serving is post-cutover; migrated FIDO credentials are preserved in `fido.keystore.v1` |
 | **PIV** | **deferred — post-v1.0.0**; use the C firmware for PIV (see cutover decision) |
 
+## After a BOOTSEL session or a debugger attach: power-cycle the device
+
+**If the device shows no USB after flashing, changing a setting, or attaching a
+debugger: unplug the USB cable and plug it back in. That is the fix. A reset
+button press or a re-flash will not clear it.**
+
+This is a real operator-visible requirement, not a footnote. The firmware's
+hardware key material can be left unreadable by those three actions, and a plain
+system reset does **not** clear that state — only removing power does
+(`docs/SECURITY-ASSESSMENT-ROUND2.md` §22, reproduced on hardware 2026-09-28).
+Until the device is power-cycled it will not enumerate.
+
+The device now says which failure it is on the LED, so you do not have to
+attach a probe to find out — and on this hardware **attaching a probe is itself
+enough to cause the failure**. See [`docs/boot-freeze.md`](boot-freeze.md) for
+how to read the LED and what each signature means. The policy decision is
+[ADR 0002](adr/0002-fatal-boot-recovery-policy.md): the device refuses to serve
+when it cannot read its hardware identity, and says so rather than serving with
+an unverified one.
+
 ## Migration from the C firmware (first Rust boot)
 
 On the first boot on a board that ran the C `pico-fido2` firmware, the Rust
