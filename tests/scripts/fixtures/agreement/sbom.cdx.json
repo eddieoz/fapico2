@@ -1,0 +1,34 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000000",
+  "metadata": {
+    "timestamp": "2026-09-29T00:00:00Z",
+    "tools": [
+      {
+        "vendor": "CycloneDX",
+        "name": "cargo-cyclonedx",
+        "version": "0.5.9"
+      }
+    ],
+    "component": {
+      "type": "application",
+      "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0",
+      "name": "fapico2-firmware",
+      "version": "0.1.0"
+    },
+    "properties": [
+      {
+        "name": "cdx:fapico2:uf2:sha256",
+        "value": "28ee0611d654a1f9ecf3b338ffa629449125bb50598fe36f16d5a3cf4bc6c42d"
+      },
+      {
+        "name": "cdx:fapico2:fixture",
+        "value": "true"
+      }
+    ]
+  },
+  "components": [],
+  "dependencies": []
+}

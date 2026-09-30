@@ -1,0 +1,175 @@
+[package]
+name = "fapico2-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+heapless = "0.8"
+libc = { version = "0.2", optional = true }
+
+# US-181 (PICOForge-COMPAT): the receive-side command-chain accumulator
+# (`apdu_chain.rs`) reads each fragment's header and lengths with `iso7816`'s
+# own `CommandView` instead of a second, hand-rolled length parser. Same pin
+# `apps/openpgp` already carries (`iso7816 = "0.2.0"`; `Cargo.lock` pins
+# `iso7816 0.2.0`), so this adds no new crate to the lock — and it keeps
+# exactly ONE length parser in play for both halves of a chain, which is what
+# makes the fail-closed argument hold.
+iso7816 = "0.2.0"
+
+# Trussed platform/service seam (S-721-1, US-331): the no_std trussed-core
+# client/service wiring opcard's card logic runs on (S-721-2 wires
+# `opcard::Card` onto the client this produces). no_std, heap-free on the
+# device path. Versions are the ones the workspace lock already carries via
+# apps/openpgp's opcard/virt path — do not bump.
+trussed = { version = "0.2", default-features = false, features = [
+  "crypto-client", "filesystem-client", "ui-client", "serde-extensions",
+  "p256", "p384", "p521", "ed255", "x255", "aes256-cbc", "hmac-sha256",
+  "hmac-sha512", "sha256", "shared-secret", "trng", "chacha8-poly1305",
+] }
+# S-724 (RSA through the OpenPGP interface, supersedes the S-723-C1 ECC-only
+# decision): the software-RSA `trussed::backend::Backend` (rsa crate over an
+# allocator) serving the Rsa2048/3072/4096Pkcs1v15 mechanisms opcard's card
+# logic requests. Host builds ride std's allocator; the device build installs
+# a static `linked_list_allocator` heap (see firmware). Requires `alloc` in
+# every binary that links this backend.
+trussed-rsa-alloc = { version = "0.5", optional = true }
+# Arm-only allocator behind the software-RSA static heap (see `rsa_heap.rs`).
+linked-list-allocator = { package = "linked_list_allocator", version = "0.10", optional = true }
+# S-724: software secp256k1 trussed backend (k256, allocation-free — unlike
+# the RSA side it needs no heap on the device). Serves the
+# Secp256k1/Secp256k1Prehashed mechanisms opcard requests for the
+# EcDsaSecp256k1/EcDhSecp256k1 algorithm attributes (the C reference
+# firmware's `algorithm_attr_p256k1` contract).
+trussed-secp256k1 = { path = "../vendor/trussed-secp256k1", optional = true }
+# US-944: software Brainpool trussed backend (bp256/bp384, allocation-free on
+# the device — the same pattern as the secp256k1 side). Serves the
+# BrainpoolP256R1/BrainpoolP384R1 (+Prehashed) mechanisms opcard requests for
+# the Brainpool P-256r1/P-384r1 algorithm attributes. BrainpoolP512R1 is NOT
+# served — no bp512 crate exists (see docs/known-gate-divergences.md).
+trussed-brainpool = { path = "../vendor/trussed-brainpool", optional = true }
+# `trussed-core` direct dep: the `syscall!` macro + API types the dispatch
+# and the seam tests use (opcard carries the same direct dep).
+trussed-core = { version = "0.2", default-features = false }
+trussed-auth = "0.5"
+trussed-auth-backend = "0.2"
+trussed-chunked = "0.3"
+trussed-staging = { version = "0.5", features = ["chunked", "wrap-key-to-file"] }
+trussed-wrap-key-to-file = "0.3"
+littlefs2 = { version = "0.8", default-features = false }
+littlefs2-core = "0.1"
+rand_core = "0.6"
+
+# C-firmware migration crypto (US-413 S-413-4). RustCrypto stack, no_std,
+# no-heap: mirrors mbedtls SHA-256 / HKDF / HMAC / AES-CBC / AES-GCM exactly.
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+hmac = { version = "0.12", default-features = false }
+# US-1070: the `digest` traits behind `platform::sha512`'s rolled compression.
+# Not a new crate in `Cargo.lock` — `sha2 0.10` already resolves to
+# `digest 0.10.7` and every RustCrypto stack here is on that generation. It is
+# declared directly because the module implements `UpdateCore` /
+# `FixedOutputCore` itself rather than delegating: to be a *drop-in* the type
+# has to satisfy the same trait contract `sha2` satisfies, and implementing it
+# from a re-export would be borrowing a trait from the crate it replaces.
+# `default-features = false` keeps `alloc` and `std` out of the device build;
+# `core-api` (which carries the `CoreWrapper` the drop-in is built on) comes
+# in through the `block-buffer` half of the default set, so it is named
+# explicitly here rather than relied upon.
+digest = { version = "0.10", default-features = false, features = ["core-api"] }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", default-features = false }
+
+# `iso7816` again, for the US-181 chain tests only. An integration test in
+# `tests/` does not inherit the library's `[dependencies]`, and
+# `platform/tests/apdu_chain.rs::the_chain_bit_is_the_one_iso7816_reads`
+# needs to compare our CLA bit against `Class::chain()` directly — the whole
+# point of the test is that it asks the *other* crate rather than a copy of
+# its constants.
+[dev-dependencies]
+iso7816 = "0.2.0"
+
+# US-1070: the differential test's **oracle**. The rolled SHA-512 in
+# `platform::sha512` is a `digest`-trait drop-in, and the only safety argument
+# worth anything is byte-identity with what it replaces — so
+# `tests/sha512_differential.rs` hashes every case twice, once with stock
+# `sha2` and once with the port, and requires the two to be
+# indistinguishable. Re-declaring the pin the library already carries adds no
+# new crate to `Cargo.lock`. The generic bounds in that test are written
+# against `sha2::digest`'s re-export, which is what keeps the harness
+# implementation-agnostic: it names no particular hasher type of its own.
+sha2 = { version = "0.10", default-features = false }
+
+[features]
+# `host-backend` rides the default so the platform's own seam tests
+# (which run the lifted `trusted_backend::host` platform) build under any
+# test invocation — a standalone `cargo test -p fapico2-platform` included
+# (feature unification from a sibling member's dev-dep is not reliable
+# there). It is a no-op on arm: the module is gated
+# `all(feature = "host-backend", not(target_arch = "arm"))`, so no device
+# build ever compiles it.
+default = ["device", "host-backend", "rsa-backend", "secp256k1-backend", "brainpool-backend"]
+# `defmt`: the persist gate's failure log on device (US-421/US-422) — same
+# no-logger no-op / target-scoped discipline as the embassy HAL deps below.
+# `cortex-m` (SCB::system_reset in the trussed UI, S-721-1) and `embassy-time`
+# (uptime/wink in the trussed UI) join the arm-only HAL scope.
+device = [
+  "dep:embassy-rp",
+  "dep:embassy-usb",
+  "dep:defmt",
+  "dep:cortex-m",
+  "dep:embassy-time",
+  "dep:rp-pac",
+]
+emulation = ["dep:libc"]
+# Host (non-arm) trussed platform for the emulation binary + the
+# `apps/openpgp` device-path tests (S-721-2, D-D): `trusted_backend::host`
+# (OS entropy + heap-backed littlefs2 stores + no-op UI) behind the same
+# "call thyself" `SyscallRunner` as the device — the host analog of
+# `trusted_backend::device`. On by default (see the `default` feature
+# docs); never compiles for arm (module cfg).
+host-backend = []
+# S-724: software-RSA trussed backend (see the `trussed-rsa-alloc` dep note).
+# On by default; the module wiring is cfg'd in `trusted_backend/dispatch.rs`.
+rsa-backend = ["dep:trussed-rsa-alloc", "dep:linked-list-allocator"]
+# S-724: software secp256k1 trussed backend (see the `trussed-secp256k1`
+# dep note). On by default; the module wiring is cfg'd in
+# `trusted_backend/dispatch.rs`.
+secp256k1-backend = ["dep:trussed-secp256k1"]
+# US-944: software Brainpool trussed backend (see the `trussed-brainpool`
+# dep note). On by default; the module wiring is cfg'd in
+# `trusted_backend/dispatch.rs`. Serves P-256r1/P-384r1 only — never
+# brainpoolp512r1.
+brainpool-backend = ["dep:trussed-brainpool"]
+
+# Device-only HAL deps. RP2350 (Pico 2) is the only supported target (EPIC
+# RUST-MIGRATION): its 4 MB flash + TEE secure storage are deliberate over the
+# dropped RP2040. `rp235xa` selects the rp235x peripheral-access crate; switch to
+# `rp235xb` for the b-variant silicon.
+#
+# These are arm-only: embassy-rp's RP235x stack-guard code (and cortex-m's
+# msplim module) assume an ARMv8-M target, so they must not be compiled for the
+# host (x86_64) unit-test / emulation builds. Declaring them under the arm
+# target scope keeps `cargo test` on the host green while the firmware still
+# links them for thumbv8m.main via the `device` feature.
+[target.'cfg(target_arch = "arm")'.dependencies]
+embassy-rp = { version = "0.10", features = ["defmt", "rt", "critical-section-impl", "time-driver", "rp235xa"], optional = true }
+# US-1005: the bounded device `TrngProbe` (`Rp2350Probe`) reads the TRNG
+# health-test status bits directly, and they are NOT reachable through
+# `embassy-rp`: its `Trng` exposes no status accessor (the wait is private and
+# unbounded — it retries an `autocorr_err` forever, and the RP2350 documents
+# that state as never clearing until reset), and `embassy_rp::pac` is
+# `pub(crate)` without the `unstable-pac` feature. `rp-pac` is the same
+# register block the driver uses, published with the fields public. The
+# firmware already depends on it directly for the same reason (see its
+# `Cargo.toml` note on the QSPI-CS button read). Same justification, same pin
+# (7), no new crate in the lock.
+rp-pac = { version = "7", optional = true }
+embassy-usb = { version = "0.6", features = ["max-interface-count-4", "max-handler-count-8"], optional = true }
+embassy-time = { version = "0.5", optional = true }
+defmt = { version = "1.0", optional = true }
+cortex-m = { version = "0.7", optional = true }

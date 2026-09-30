@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # The workspace itself: crates.io dependencies for the firmware, platform,
+  # apps and the fuzz targets.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # A firmware image is a single flash budget; unrelated dependency bumps
+      # each cost a slot against the 3.5 MiB ceiling, so land them together.
+      cargo-deps:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # GitHub Actions. The release workflow signs and attests, so an unpinned
+  # action is a supply-chain path to a signing key.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

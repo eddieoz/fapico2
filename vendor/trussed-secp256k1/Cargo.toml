@@ -1,0 +1,28 @@
+[package]
+name = "trussed-secp256k1"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = """
+Software secp256k1 trussed backend (ECDSA + ECDH over the k256 crate, \
+allocation-free — S-724).
+"""
+
+[dependencies]
+k256 = { version = "0.13.4", default-features = false, features = [
+    "sha256",
+    "ecdh",
+    "ecdsa",
+] }
+trussed = { version = "0.2", default-features = false }
+# `crypto-client` gates the request/reply types this backend serves
+# (GenerateKey/Sign/Agree/…); `secp256k1` gates the Mechanism variants.
+trussed-core = { version = "0.2", default-features = false, features = [
+    "crypto-client",
+    "secp256k1",
+] }
+
+[dev-dependencies]
+# Test-only RNG for the in-memory FakeKeystore (mirrors trussed-brainpool).
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }

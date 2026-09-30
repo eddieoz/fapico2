@@ -1,0 +1,3 @@
+# Per-run soak artifacts (cycle log, device log, summary) — never committed.
+logs/
+__pycache__/

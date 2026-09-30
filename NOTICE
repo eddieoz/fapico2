@@ -1,0 +1,66 @@
+fapico2 — Rust rewrite of the merged firmware (RUST-MIGRATION epic).
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+Vendored third-party crates whose licenses are compatible with AGPL-3.0
+(Apache-2.0, MIT, or BSD-3-Clause) are recorded below. The fapico2
+firmware as a whole remains AGPL-3.0; the permissive licenses of these
+dependencies are one-way compatible into AGPL-3.0 and do not relax any
+fapico2 user's rights under the AGPL.
+
+**The AGPL network clause and the emulation binary.** A hardware token
+serves no network, so section 13 (Remote Network Interaction) is inert for
+the flashed firmware. The emulation binary is different: it serves CCID +
+CTAP-HID over TCP sockets. Anyone who offers *that* as a network service
+owes its users the corresponding source, exactly as section 13 requires.
+
+## Crates and their licenses
+
+| Crate          | License        | Notes                                            |
+|----------------|----------------|--------------------------------------------------|
+| embassy-rp     | MIT OR Apache-2.0 | HAL for RP2040/RP235x                              |
+| embassy-executor | MIT OR Apache-2.0 | async executor for embedded                     |
+| embassy-time   | MIT OR Apache-2.0 | async timers                                      |
+| defmt        | MIT OR Apache-2.0 | efficient logging framework                       |
+| defmt-rtt    | MIT OR Apache-2.0 | RTT transport for defmt                            |
+| heapless     | MIT OR Apache-2.0 | no-std collections (no allocator required)         |
+| critical-section | MIT OR Apache-2.0 | cross-crate critical-section impl                |
+| ed448-goldilocks | BSD-3-Clause | Vendored at `vendor/ed448-goldilocks`; https://github.com/crate-crypto/Ed448-Goldilocks |
+| x448 | BSD-3-Clause | Vendored at `vendor/x448`; https://github.com/crate-crypto/x448 |
+
+## C baseline (frozen reference)
+
+The C firmware in the sibling `pico-fido2/` repository is the frozen reference
+baseline. fapico2 v1.1.0 is the shipped Rust firmware. The C baseline's
+components include:
+
+* pico-keys-sdk — AGPL-3.0-or-later (Copyright Pol Henarejos).
+  Source: https://github.com/polhenarejos/pico-keys-sdk
+
+fapico2 does NOT link to or vendor pico-keys-sdk; it is a clean-room Rust
+rewrite on the Trussed/embassy-rp stack. The NOTICE here records the
+licensing posture only.
+
+## FIDO attestation development key
+
+`apps/fido/src/attestation_key.bin` is a public, self-signed development
+attestation key compiled into every build. The production path is per-device
+attestation-key generation via TRNG.
+
+## Vendored opcard-rs
+
+opcard-rs 1.8.0 (LGPL-3.0-only) — https://github.com/Nitrokey/opcard-rs
+Vendored at fapico2/vendor/opcard (commit 34fd394cf6932ab0afdd6b99dc04653f477ac933), trimmed: examples/fuzz/CI and dev-dependencies removed. The library sources are **modified and extended** in-tree (remaining LGPL-3.0-only throughout; every modified file carries its SPDX header, and the modified source is conveyed here). LGPL-3.0-only is compatible with distribution under this AGPL-3.0 project.

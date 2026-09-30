@@ -1,0 +1,49 @@
+[package]
+name = "fapico2-oath"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The device (thumbv8m) build is `no_std` (US-386), so the crypto deps are
+# pinned to their no_std core (no `std`/`alloc` default features) — otherwise
+# `digest/std` pulls `crypto-common`'s `extern crate std` onto the device
+# target. The host build only ever uses the no_std core APIs (Hmac/Digest).
+fapico2-platform = { path = "../../platform" }
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+# AES-128 single-block ECB for the Yubico AES challenge-response (US-712);
+# no_std core, same pin as the platform/piv crates.
+aes = { version = "0.8", default-features = false }
+heapless = "0.8"
+# US-1030: the OATH credential-key unseal scratch is zeroized on both the
+# success and the AEAD-failure path, so a plaintext key does not outlive the
+# record it produced in the boot frame. no_std core, same as the platform's.
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+
+# US-131 (PICOForge-COMPAT): the YKOATH access key is derived **on the host**,
+# never on the device — `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`
+# (picoforge `src/hal/applets/oath.rs` `derive_access_key`). The applet only
+# ever sees the 16-byte key. So PBKDF2 is a *test-only* dependency here: it
+# exists to mirror the reference client so the tests can prove the device holds
+# the key picoforge would hand it. It is deliberately NOT a normal dependency —
+# it would drag `password-hash`/`sha2`/alloc onto the `no_std` thumbv8m build
+# for code the device never runs.
+[dev-dependencies]
+# US-1030: the C-migration acceptance tests build a C-format stream with a
+# literal OTP row, the same way `apps/openpgp/tests/migration_restore.rs`
+# does. A dev-dependency only; the device build never sees it.
+hex-literal = "0.4"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha1"] }
+
+[features]
+default = ["host"]
+# `host` keeps the crate `std` and compiles the full OATH implementation
+# (`oath.rs`) for the host/emulation build (US-386).
+host = []
+# `device` selects the `no_std` back end for the RP2350 build (US-386): the OTP
+# applet is shared (no_std), and the OATH applet uses the `oath_device.rs`
+# wiring shell (full compute + TRNG + persistence is US-388).
+device = []

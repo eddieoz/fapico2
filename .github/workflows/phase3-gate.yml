@@ -1,0 +1,59 @@
+# Phase 3 integration gate (US-360).
+#
+# One job that builds the Rust emulation binary ONCE and runs every Phase 3
+# suite against it:
+#   oath-otp  cargo host unit tests  (OATH + OTP, fapico2-oath) + platform
+#               (dispatcher / US-359 app-switching parity) — no emulator.
+#   fido      pico-fido2/tests/pico-fido    pytest, HID transport
+#   openpgp   pico-fido2/tests/openpgp      pytest, CCID transport
+#   merged    pico-fido2/tests/merged       pytest, interleaved cross-app
+# Each pytest suite runs against its own fresh emulator instance (isolated — a
+# failure in one suite never cascades into another). run_all_tests.sh prints a
+# per-suite PASS/FAIL summary and exits non-zero if any suite fails.
+name: Phase 3 Gate
+
+on:
+  push:
+    # main is the default branch after the US-724 history rewrite; master is
+    # kept so the transition (and any old clones pushing to master) stay green.
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fapico2 (Rust firmware + gate)
+        uses: actions/checkout@v4
+        with:
+          path: fapico2
+      # Sibling harness repo (published first, per US-725): when it is absent
+      # (owner hasn't pushed pico-fido2 yet), the checkout and the gate step
+      # that depends on it are skipped instead of turning this job red.
+      - name: Checkout pico-fido2 (Python test suites)
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: pico-fido2
+      - name: Set up Rust (stable; host target for the emulator + clippy)
+        uses: actions/setup-rust@v1
+        with:
+          toolchain: stable
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python test dependencies
+        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
+        run: |
+          python -m venv .test-venv
+          ./.test-venv/bin/pip install --upgrade pip
+          ./.test-venv/bin/pip install -r pico-fido2/tests/requirements.txt
+      - name: Phase 3 integration gate
+        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
+        env:
+          # Both repos are siblings under $GITHUB_WORKSPACE; run_all_tests.sh
+          # derives FAPICO2 and TESTS from PICO_ROOT.
+          PICO_ROOT: $GITHUB_WORKSPACE
+        run: fapico2/run_all_tests.sh

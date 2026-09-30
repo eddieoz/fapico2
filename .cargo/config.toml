@@ -1,0 +1,25 @@
+# Workspace cargo config.
+#
+# RP2350 (Pico 2) is the only supported board (EPIC RUST-MIGRATION). Its
+# Cortex-M33 core is ARMv8-M, so the default device target is
+# `thumbv8m.main-none-eabi` (the dropped RP2040 used `thumbv6m-none-eabi`).
+# Host / emulation builds override this explicitly with `--target
+# x86_64-unknown-linux-gnu`.
+[build]
+target = "thumbv8m.main-none-eabi"
+
+[target.thumbv8m.main-none-eabi]
+runner = "elf2uf2-rs -d"
+# rustc >=1.80 no longer emits the `armv8m_main` cfg for this target, but
+# embassy-rp 0.10's RP235x stack-guard code (and cortex-m's msplim module) are
+# gated on it; passing --cfg restores the ARMv8-M register/method resolution.
+rustflags = [
+  "--cfg", "armv8m_main",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+[unstable]
+# `embassy-rp` build scripts rely on this being opt-in; kept here for parity
+# with the upstream reference binaries. Omit to use the stable path.
+# build-std = ["core", "compiler_builtins"]

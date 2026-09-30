@@ -1,0 +1,203 @@
+# cargo-deny policy for the fapico2 workspace (RS-KEY-ADOPT US-1060).
+#
+# This file is the *machine* half of the supply-chain story; the parts of the
+# epic's rule set that a Cargo graph cannot express live in
+# `tests/scripts/check_crate_graph.py` and are described in
+# `docs/supply-chain.md`. Read that document before changing anything here:
+# every list in this file is a claim about the graph, and the gate is what
+# stops a list from becoming a comfortable fiction.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE CAN AND CANNOT ASSERT — read before adding a rule
+# ---------------------------------------------------------------------------
+#
+# cargo-deny can say things about the *resolved crate graph*: which crates are
+# in it, where they came from, what licence they carry, which advisories
+# match them, and which of them are duplicated. It cannot say anything about
+# the *edges between the workspace's own crates* — not in 0.20.2, and not in
+# any version. So the two rules the epic names for US-1060 —
+#
+#   R1  no apps/* crate may depend on another apps/* crate
+#   R2  only `platform` may name a hash or signature backend
+#
+# are NOT encoded here. They are encoded in `deny-graph.toml` (a sibling file,
+# because cargo-deny 0.20.2 hard-errors on an unknown top-level key — verified,
+# it refuses to run rather than ignoring it), which `check_crate_graph.py`
+# reads, and they are enforced by comparing that data against `cargo metadata`.
+# Putting them here as a comment would have been the comfortable choice and
+# would have produced a config that reads like it enforces isolation and
+# enforces nothing.
+#
+# The third rule the epic names — RS-Key's R2, applet isolation — **cannot be
+# expressed as a graph rule at all in this tree**, and no amount of
+# configuration changes that. fapico2 builds one trussed `Client` and hands the
+# same service set to every applet, so an applet's reachable key material is
+# a property of the service-set split (architecture), not of a manifest edge.
+# What R1 (in deny-graph.toml) really buys is: applets cannot *import each other's code*, and
+# the one place that does (`fapico2-apps`, the AID registry) is named and
+# counted. That is a real, useful, and much weaker property than isolation.
+# It is stated as a weaker property rather than sold as the stronger one.
+# See `docs/supply-chain.md` ("Known divergences").
+
+[graph]
+# `all-features` because the device and host builds are feature-divergent: a
+# rule evaluated against the default feature set would not see the reduced
+# build that `check_advertise_serve_coupling.py` measures, nor the software
+# RSA / secp256k1 / Brainpool backends that only `platform` turns on.
+all-features = true
+# Both targets the tree ever builds for. cargo-deny's default is the host
+# triple only, which would have silently excluded the RP2350 dependency edge
+# set (embassy-rp, rp-pac, defmt-rtt, ...) from every check below.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "thumbv8m.main-none-eabi",
+]
+
+# ---------------------------------------------------------------------------
+# advisories
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
+# Every id here is an ACCEPTED, KNOWN finding with a stated reason, not a
+# suppression of something unexamined. `tests/scripts/check_supply_chain.py`
+# (US-1061) fails if an id appears here without a `# RUSTSEC-…: reason`
+# comment on the line above it, so this list cannot grow by accident — the
+# usual way an advisory list rots into a list nobody reads.
+#
+# One of the six is a real *vulnerability*, not an unmaintained-crate notice.
+# It is listed first because it is the one that matters.
+#
+# RUSTSEC-2023-0071: `rsa` 0.9.10, Marvin attack — non-constant-time RSA
+#   leaking private-key bits through timing. NO PATCH EXISTS
+#   (RustCrypto/RSA#626; still affected as of 2026-09-12). It arrives through
+#   `trussed-rsa-alloc`, the software-RSA backend `platform` installs for the
+#   Rsa2048/3072/4096Pkcs1v15 mechanisms. The upstream workaround is "avoid
+#   settings where attackers can observe timing"; on a USB token the timing is
+#   observable by anyone holding the device, so that workaround does not hold
+#   and this is accepted with eyes open, not waved through. Removing the
+#   exposure means dropping software RSA, which is a product decision and not
+#   a CI change. (Related and already known independently: RSA *key
+#   generation* does not complete on the RP2350 — see the top-level
+#   AGENTS.md.)
+ignore = [
+  # RUSTSEC-2023-0071: `rsa` Marvin attack, no upstream patch — see above.
+  "RUSTSEC-2023-0071",
+  # RUSTSEC-2021-0127: `serde_cbor` unmaintained. `apps/piv` needs CBOR
+  # because the PIV certificate data objects *are* CBOR, and `apps/fido`
+  # carries it as a dev-dependency for CTAP2 canonical-CBOR tests. The
+  # alternatives (ciborium, minicbor) are a different wire behaviour, not a
+  # drop-in. Also named in the `[bans]` wrapper allowlist below, which makes
+  # "which crates pull it" a checked answer rather than a guess.
+  "RUSTSEC-2021-0127",
+  # RUSTSEC-2023-0089: `atomic-polyfill` unmaintained, reached through
+  # `heapless 0.7` -> `aead` -> `aes-gcm` -> apps/fido. No maintained
+  # replacement exists.
+  "RUSTSEC-2023-0089",
+  # RUSTSEC-2026-0110: `bare-metal` deprecated, reached through
+  # `cortex-m` -> `embassy-executor` / `embassy-rp`. Embassy 0.10 has not
+  # moved off it; there is no version of our dependency tree that does.
+  "RUSTSEC-2026-0110",
+  # RUSTSEC-2024-0436: `paste` unmaintained, reached through
+  # `pio-core` -> `pio` -> `embassy-rp`. Archived upstream; no fix.
+  "RUSTSEC-2024-0436",
+  # RUSTSEC-2026-0173: `proc-macro-error2` unmaintained, reached through
+  # `pio-proc` -> `pio` -> `embassy-rp`. Build-time only (proc-macro
+  # expansion), so it is not linked into the image, but it *is* in the graph
+  # and is therefore declared rather than omitted.
+  "RUSTSEC-2026-0173",
+]
+
+# ---------------------------------------------------------------------------
+# bans
+# ---------------------------------------------------------------------------
+[bans]
+# 40 crates in the locked graph resolve to more than one version. That is the
+# honest state of a workspace that spans three generations of RustCrypto
+# (`sha2` 0.9/0.10/0.11, `digest` likewise) because trussed, opcard and our
+# own code pin different ones. "warn" is a deliberate choice, not a shrug: a
+# NEW duplicate still shows up as a warning, and `check_crate_graph.py` rule
+# G5 fails the build on one, which is the half a warning cannot do on its own.
+multiple-versions = "warn"
+# Wildcard version requirements are a supply-chain hole (`foo = "*"` resolves
+# to whatever is newest at build time, and that is a very different review
+# problem from a pinned one).
+#
+# This is "warn" and NOT "deny" for exactly one reason, and it is a
+# third-party reason: the vendored `opcard` (LGPL-3.0, crates.io-published,
+# excluded from this workspace) declares its own path dependencies without
+# versions, and cargo-deny cannot exempt a path wildcard on a published crate
+# (`allow-wildcard-paths` only covers unpublished path deps — verified on
+# cargo-deny 0.20.2). Our own manifests ARE covered: `check_crate_graph.py`
+# rule G4 fails the build on a `= "*"` in any workspace-owned manifest, so the
+# only wildcards that survive are the ones in the vendored tree, and the gate
+# says how many it expects there.
+wildcards = "warn"
+allow-wildcard-paths = true
+# The wrapper allowlist (US-1060: "named `wrappers` allowlists plus
+# `-D unused-wrapper` so the lists cannot rot").
+#
+# `wrappers` is cargo-deny's record of *which* direct dependents of a banned
+# crate are permitted to pull it. Listing them here does two things: it lets
+# the banned crate through the build at all, and — because CI runs
+# `cargo deny check bans --deny unused-wrapper` — it makes an entry that no
+# longer corresponds to a real edge a RED. That is the anti-rot property the
+# epic asks for, and it is cargo-deny's own diagnostic rather than a
+# home-grown one: a stale wrapper here fails `cargo deny` with
+# `error[unused-wrapper]: wrapper for banned crate was not encountered`.
+#
+# `serde_cbor` is the real case: unmaintained (RUSTSEC-2021-0127, accepted
+# above with a reason), and in the graph because exactly two crates need it.
+deny = [
+  { name = "serde_cbor", wrappers = ["fapico2-piv", "fapico2-fido"] },
+]
+
+# ---------------------------------------------------------------------------
+# sources
+# ---------------------------------------------------------------------------
+[sources]
+# Every byte of third-party code in the shipped image comes from crates.io, or
+# from a path under this repository (the vendored trees: opcard,
+# ed448-goldilocks/x448, and the two trussed backends). A new git source is a
+# red, which is the property that matters: a git dependency is a build-time
+# network fetch whose content is pinned by no lock file cargo ships.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# licences
+# ---------------------------------------------------------------------------
+[licenses]
+# AGPL-3.0-or-later is this project's licence (2026-09-30: moved from
+# GPL-3.0-or-later — the provenance audit, docs/provenance.md, showed the
+# re-implementation derives from AGPL-3.0 upstreams, so AGPL is the honest
+# label; sole copyright holder, so the relicensing is unilateral). It covers
+# the workspace crates themselves. The rest is the union of what the locked
+# graph actually carries, measured with `cargo deny list` on this tree —
+# not a list copied from a template.
+#
+# `opcard` is LGPL-3.0-only (modified and extended in-tree, sources
+# conveyed); LGPL-3.0-only is compatible with distribution under
+# AGPL-3.0-or-later and opcard stays a separable library, so the obligation
+# is satisfied by the licence of the whole. `r-efi` (LGPL-2.1-or-later) and
+# `wasi` (Apache-2.0 WITH LLVM-exception) are the only other non-permissive
+# entries, and both are upstream-ecosystem crates we do not modify.
+allow = [
+  "AGPL-3.0-or-later",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "GPL-3.0-or-later",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "LGPL-3.0-only",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8

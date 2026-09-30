@@ -1,0 +1,221 @@
+[package]
+name = "fapico2-firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "fapico2_firmware"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fapico2-firmware"
+path = "src/main.rs"
+required-features = ["device"]
+
+[[bin]]
+name = "fapico2-emulation"
+path = "src/emul_main.rs"
+required-features = ["emulation"]
+
+# E2 bridge (US-391, S-391-3): partition-read isolation on the bringup base.
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
+required-features = ["device"]
+
+[dependencies]
+defmt = "1.0"
+heapless = "0.8"
+# App crates: `default-features = false` so each build enables exactly the
+# feature it needs — the device build never compiles the host/virt stacks.
+fapico2-platform = { path = "../platform" }
+# CCID app registry (single source of truth for the device AID set, US-386).
+fapico2-apps = { path = "../apps", optional = true, default-features = false }
+fapico2-fido = { path = "../apps/fido", optional = true, default-features = false }
+fapico2-oath = { path = "../apps/oath", optional = true, default-features = false }
+fapico2-openpgp = { path = "../apps/openpgp", optional = true, default-features = false }
+fapico2-mgmt = { path = "../apps/mgmt", optional = true, default-features = false }
+# PIV stays out of the device build (deferred out of v1.0.0); emulation only.
+fapico2-piv = { path = "../apps/piv", optional = true }
+# US-160 (PICOForge-COMPAT): the RS-Key vendor LED applet, a `no_std` applet
+# like the other four, so the device build carries it too.
+fapico2-vendor-led = { path = "../apps/vendor_led", optional = true, default-features = false }
+# US-161/162/163 (PICOForge-COMPAT Phase H): the unauthenticated Rescue applet
+# (AID A0 58 3F C1 9B 7E 4F 21, CLA 0x80). A `no_std` applet like the other
+# five, so the DEVICE build carries it too — the client reaches it over CCID,
+# which is a device transport, and US-163's BOOTSEL reboot means nothing on a
+# host process. See `docs/tasks/rescue-threat-model.md` for what shipping it
+# costs and why that is accepted.
+fapico2-rescue = { path = "../apps/rescue", optional = true, default-features = false }
+# Host-only (emulation binary); must stay outside the arm scope.
+env_logger = { version = "0.11", optional = true }
+
+# Device-only HAL deps (arm target scope, platform-crate parity): the
+# embassy/cortex-m stack assumes an ARMv8-M target and must not be compiled
+# for the host (x86_64) unit-test builds of the pure lib (`ctap_hid`). On
+# arm they still link for thumbv8m.main via the `device` feature.
+[target.'cfg(target_arch = "arm")'.dependencies]
+# `set-msplim`: every hardware-observed artifact in the US-391 boot ladder
+# (E1 baseline disasm onward) was built with cortex-m-rt's MSPLIM setup
+# active (`msr MSPLIM, r0` at 0x10000202); MSPLIM was exonerated as a dark
+# cause but is build-config parity for the ladder, so the bridge keeps it.
+cortex-m = { version = "0.7", optional = true }
+cortex-m-rt = { version = "0.7", optional = true, features = ["set-msplim"] }
+# `task-arena-size-32768`: fapico2 spawns multi-KB composite-USB serve-loop
+# tasks. Pre-E6, ccid_task's live state was ~11 KB (the 2066+2066-byte CCID
+# reassembly buffers + the 4096-byte response Vec + the Dispatcher<4> + the
+# four app objects); embassy's default 4 KB task arena was exhausted by the
+# first large spawn, which panics "task arena is full" and wedges the executor
+# (dark, no USB enumeration — E5 evidence). Still required after E6
+# (S-391-10) moved the app objects + dispatcher to static memory: the task
+# frame still holds the buffers.
+#
+# US-956 right-sized this from a *measured* demand rather than a round guess.
+# The arena is a fixed-size byte reservoir; embassy's `TaskPoolRef::get`
+# bump-allocates one `TaskPool<F, 1>` per task on first spawn and panics "task
+# arena is full" on overflow. Demand measured at the US-956 tip with
+# `RUSTFLAGS=-Zprint-type-sizes cargo +nightly build --release
+# --target thumbv8m.main-none-eabi` (sum of the six `TaskPool<{async fn
+# body of ..}, 1>` types):
+#
+#   ccid_task 8,600 · hid_task 8,136 · usb_task 736 ·
+#   __embassy_main 160 · led_heartbeat 56 · button_poll 56   = 17,744 B
+#
+# 32,768 B is **1.85x** that. The 64 KiB it replaces was 3.7x — 46 KiB of SRAM
+# the linker was spending on an arena that is 84 % empty, out of a 532,480 B
+# part the boot path already claims 527,420 B of (docs/size-report.md).
+# `TASK_ARENA_DEMAND_B` in `src/lib.rs` records the measured total and
+# `tests/scripts/check_boot_chain.py` fails if it stops fitting the arena:
+# re-measure with the command above whenever a spawned task's future grows.
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "task-arena-size-32768"], optional = true }
+embassy-rp = { version = "0.10", features = ["defmt", "rt", "critical-section-impl", "time-driver", "rp235xa"], optional = true }
+embassy-time = { version = "0.5", features = ["generic-queue-8"], optional = true }
+# US-702: the BOOTSEL button read (QSPI-CS trick) pokes IO_QSPI/SIO pads
+# directly (C `button.c` parity); `embassy_rp::pac` is behind
+# `unstable-pac`, so the HAL's own rp-pac is a direct dep instead.
+rp-pac = { version = "7", optional = true }
+defmt-rtt = { version = "1.0", optional = true }
+
+[features]
+# US-919: the foreign-image wipe is selected by the BUILD PARAMETER
+# `FAPICO2_FOREIGN_IMAGE_WIPE` (1/0), published by `firmware/build.rs` as
+# `cfg(FAPICO2_FOREIGN_IMAGE_WIPE)` — NOT by a cargo feature, which is
+# gone.
+#
+# It was a feature, in `default`, and that was the defect: the manifest
+# hash changes on every legitimate firmware update, so the control fired
+# once per update and destroyed the keystore every time. The pure
+# decision + the whole-image hash + the mismatch log stay UNCONDITIONAL;
+# only the wipe EXECUTION is behind the parameter.
+#
+# Defaults, resolved in `build.rs` and pinned by
+# `tests/scripts/check_foreign_image_wipe.py`:
+#   device build    -> OFF (shipping default: flashing new firmware must not
+#                      destroy the user's credentials — see the long comment
+#                      in `build.rs`)
+#   emulation / host -> ON  (the e2e arms that PROVE the wipe must keep it)
+default = ["device"]
+# Temporary CCID-wedge diagnostic channel (S-721-2 live diagnosis,
+# 2026-09-16): a 12 KiB RAM event ring in `dbg.rs`, drained over the
+# CTAP-HID vendor command 0x42 on a per-boot random channel (US-922:
+# TRNG-seeded at boot, printed to the RTT console only). OFF by default —
+# production builds are unaffected (every instrumentation site and the
+# ring itself cfg out; `dlog!` compiles to nothing). RELEASE-FORBIDDEN
+# (US-922): only debug-profile device builds may enable it
+# (`cargo build --features dbg-log`); a release build is refused by the
+# compile_error! in `src/lib.rs` and the CI gate
+# `tests/scripts/check_dbg_release_gate.py`. Host/emulation builds may
+# enable it at any profile.
+dbg-log = []
+# US-933: APDU-level CCID trace for the OpenPGP PW3-change capture. OFF by
+# default (never in default/device/emulation) — ordinary builds are
+# unaffected (every call site and the module cfg out). Unlike dbg-log,
+# this feature is deliberately RELEASE-ALLOWED: the failing transport
+# US-933 captures is a release image (US-929 — dev-profile device builds
+# dark-boot pre-main), so the capture procedure builds
+# `cargo build --release --features apdu-trace`, flashes it, reproduces
+# the failing session, drains the trace (CTAP-HID vendor cmd 0x42, the
+# US-922 drain surface) and reflashes the clean release image.
+# ⚠️ The trace records full APDU bytes — VERIFY / CHANGE REFERENCE DATA
+# carry PIN material in the clear — so it is a dedicated capture build,
+# never a shipping configuration.
+apdu-trace = []
+# Boot-phase timeline: the measurement channel for the "first boot after a
+# reflash takes 22 s / 30 s / >90 s" investigation. One `E_PHASE` record per
+# boot boundary, drained over the same CTAP-HID vendor command 0x42.
+#
+# Why not `dbg-log`, which already does this: `dbg-log` is debug-profile-only,
+# and a **dev-profile device image does not boot at all** — US-932, 10/10,
+# 11/11 and 1/1 repros, every miss before `main()`
+# (`docs/tasks/security-hardware-bdd.md`). A debug image is also 3.5 MB and
+# reaches `0x101AE700`, which overwrites ~706 KB of the trussed littlefs2
+# window (`0x102000..0x202000`) and so *manufactures* a `Filesystem::format`
+# that the release image never performs. Both effects are the measurement
+# contaminating the thing being measured. This feature is therefore
+# RELEASE-ALLOWED and release-profile, so the timeline is read off an image
+# that differs from the shipping one only by the ring itself.
+#
+# Unlike `apdu-trace` this feature does NOT pull in `apdu_trace`, so the ring
+# cannot record APDU bytes — VERIFY / CHANGE REFERENCE DATA carry PIN
+# material in the clear. Boot phase ids and timings only.
+boot-timeline = []
+device = [
+    "dep:cortex-m", "dep:cortex-m-rt",
+    "dep:embassy-executor", "dep:embassy-rp", "dep:embassy-time", "dep:rp-pac",
+    "dep:defmt-rtt",
+    "fapico2-platform/device",
+    # US-386: wire the CCID apps + the FIDO HID app into the serve loop.
+    "dep:fapico2-apps", "fapico2-apps/device",
+    "dep:fapico2-fido", "fapico2-fido/device",
+    "dep:fapico2-oath", "fapico2-oath/device",
+    # US-962 (I2): the OpenPGP algorithm groups are the app crate's single
+    # switches, each of which turns on the platform's serving backend *and*
+    # opcard's advertising allow-list bit together. The device build takes all
+    # three, which is exactly the set it served before this story; a trimmed
+    # build now omits a name from FA and refuses its PUT DATA instead of
+    # keeping the bit while dropping the backend.
+    "dep:fapico2-openpgp", "fapico2-openpgp/device",
+    "fapico2-openpgp/rsa-backend",
+    "fapico2-openpgp/secp256k1-backend",
+    "fapico2-openpgp/brainpool-backend",
+    "dep:fapico2-mgmt", "fapico2-mgmt/device", "fapico2-mgmt/otp",
+    # US-160: the fifth CCID app (vendor LED, AID F0 00 00 00 01).
+    "dep:fapico2-vendor-led", "fapico2-vendor-led/device",
+    # US-161/162/163: the sixth CCID app (Rescue, AID A0 58 3F ... 4F 21).
+    "dep:fapico2-rescue", "fapico2-rescue/device",
+]
+emulation = [
+    "dep:env_logger",
+    "fapico2-platform/emulation",
+    # S-721-2 (D-D): the emulation serves the real OpenPGP app (opcard on
+    # the S-721-1 `SyscallRunner` client, host backend) — the device
+    # feature of the app crate + the platform's host backend (on by
+    # default, explicit here for the emulation's intent).
+    "fapico2-platform/host-backend",
+    "dep:fapico2-fido", "fapico2-fido/host",
+    "dep:fapico2-oath", "fapico2-oath/host",
+    # US-962 (I2): the OpenPGP algorithm groups are the app crate's single
+    # switches, each of which turns on the platform's serving backend *and*
+    # opcard's advertising allow-list bit together. The device build takes all
+    # three, which is exactly the set it served before this story; a trimmed
+    # build now omits a name from FA and refuses its PUT DATA instead of
+    # keeping the bit while dropping the backend.
+    "dep:fapico2-openpgp", "fapico2-openpgp/device",
+    "fapico2-openpgp/rsa-backend",
+    "fapico2-openpgp/secp256k1-backend",
+    "fapico2-openpgp/brainpool-backend",
+    # US-104: the emulation is the ONE build that registers `PivApp` as a CCID
+    # app, so it is the one build whose management caps word may advertise
+    # PIV. The `device` feature (above) deliberately does not enable `piv`.
+    "dep:fapico2-mgmt", "fapico2-mgmt/host", "fapico2-mgmt/otp", "fapico2-mgmt/piv",
+    "dep:fapico2-piv",
+    # US-160: the emulation serves the vendor LED applet too, on the `device`
+    # feature (the applet is `no_std` either way, so both builds run the same
+    # code over the emulation secure store).
+    "dep:fapico2-vendor-led", "fapico2-vendor-led/host",
+    # US-161/162/163: the emulation serves the Rescue applet too, so
+    # `tests/harness/test_rescue_*.py` drive the real applet over CCID.
+    "dep:fapico2-rescue", "fapico2-rescue/host",
+]

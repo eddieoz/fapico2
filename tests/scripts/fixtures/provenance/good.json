@@ -1,0 +1,52 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "fapico2.uf2",
+      "digest": {
+        "sha256": "a8737b10e3ca86dc89376ad51d87c6b5baf08d2b14f91159afa5addb12c89e94"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://github.com/actions/runner/github-hosted",
+      "externalParameters": {
+        "workflow": {
+          "ref": "refs/tags/v1.0.0",
+          "repository": "https://github.com/eddieoz/pico-fido2",
+          "path": ".github/workflows/release.yml"
+        },
+        "inputs": {}
+      },
+      "internalParameters": {
+        "github": {
+          "event_name": "push"
+        }
+      },
+      "resolvedDependencies": [
+        {
+          "uri": "git+https://github.com/eddieoz/pico-fido2@refs/tags/v1.0.0",
+          "digest": {
+            "gitCommit": "0000000000000000000000000000000000000000"
+          }
+        },
+        {
+          "uri": "pkg:github/fapico2/firmware/fapico2.uf2",
+          "digest": {
+            "sha256": "a8737b10e3ca86dc89376ad51d87c6b5baf08d2b14f91159afa5addb12c89e94"
+          }
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": "https://github.com/eddieoz/pico-fido2/.github/workflows/release.yml@refs/tags/v1.0.0"
+      },
+      "metadata": {
+        "invocationId": "https://github.com/eddieoz/pico-fido2/actions/runs/1/attempts/1"
+      }
+    }
+  }
+}

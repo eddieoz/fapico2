@@ -1,0 +1,150 @@
+[package]
+name = "fapico2-openpgp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# US-962 (I2): `default-features = false`, so this crate — the one place
+# that can see BOTH the serving side (`fapico2-platform`'s `OpcardDispatch`
+# backend table) and the advertising side (opcard's `default_gen` allow-list)
+# — is the switchboard. Leaving the platform's defaults on here would mean a
+# `rsa-backend = false` request from a build of *this* crate was silently
+# overridden by the platform's own `default`, and the reduced configuration
+# US-962 needs to test would not exist. The device build gets
+# `fapico2-platform/device` from this crate's `device` feature below, and the
+# host test build gets `host-backend` from the dev-dependency.
+fapico2-platform = { path = "../../platform", default-features = false }
+heapless = "0.8"
+heapless09 = { package = "heapless", version = "0.9" }
+iso7816 = "0.2.0"
+# S-721-2: one vendored opcard crate, optional, plain (no_std). The `virt`
+# feature below additionally enables `opcard/virt` (the host trussed-virt
+# seam) on the same crate instance — Cargo cannot take two optional edges
+# to one package, so the flavor is a feature, not a second dep.
+# S-724 (supersedes the S-723-C1 ECC-only generation contract): RSA
+# 2048/3072/4096 join the generation/import gates so PUT DATA key-attribute
+# and GENERATE serve RSA (the C reference firmware's contract). The
+# generation is executed by the software-RSA trussed backend wired in the
+# platform dispatch (`rsa-backend` feature) — the feature flag alone would
+# compile the request paths but keygen would fail at the backend.
+#
+# US-962 (I2): `rsa4096-gen` is NO LONGER named here. It gates opcard's RSA
+# *advertisement* (`default_gen`) and its virt `Backend::Rsa` arm, and it
+# used to be unconditionally on while the platform's `rsa-backend` was a
+# separate switch — the exact shape of the divergence US-962 removes. It now
+# comes from this crate's `rsa-backend` feature, which turns on both sides.
+opcard = { path = "../../vendor/opcard", optional = true }
+# The generic app names `trussed_core::types::Location` — the type of
+# `opcard::Options::storage`, which opcard does not re-export.
+trussed-core = { version = "0.2", default-features = false, optional = true }
+# US-934: the provisioned-serial file path is a littlefs2 `Path` — the
+# same `littlefs2-core` the trussed/opcard filesystem layer uses.
+littlefs2-core = { version = "0.1", optional = true }
+trussed = { version = "0.2", optional = true, features = ["virt"] }
+
+zeroize = { version = "1", default-features = false }
+
+[dev-dependencies]
+test-log = "0.2"
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+# S-724: secp256k1 verification/agreement fixtures for the device- and
+# virt-path tests (host only — dev-deps never enter the device binary).
+k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
+# US-946: Brainpool verification/agreement fixtures for the device- and
+# virt-path tests (host only — dev-deps never enter the device binary).
+# Same crates the US-944 `trussed-brainpool` backend rides (elliptic-curve
+# 0.14 line); the explicit elliptic-curve dep enables its `ecdh`/`sec1`
+# features for the shared 0.14.1 instance.
+# US-966: `bp384` is gone. P-384r1 is deferred, so no host-side fixture
+# verifies a P-384r1 signature any more; the refusal test
+# (`brainpool_p384r1_is_refused_device_path`) names the attribute bytes, which
+# need no curve arithmetic.
+bp256 = { version = "0.14.0", features = ["arithmetic", "ecdsa"] }
+elliptic-curve = { version = "0.14", features = ["ecdh", "sec1"] }
+# bp256 does not re-export the `ecdsa` crate; the host-side prehash-verification
+# types (`Signature`/`VerifyingKey` + `PrehashVerifier`) come straight from the
+# same ecdsa 0.17 the bp* crates ride.
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "der", "digest"] }
+sha2 = "0.10"
+# US-972: the host-side reference v4 fingerprint in `tests/do_c5_fingerprint.rs`
+# — that test computes what GnuPG would put in DO C5 and compares it against
+# what the card stored. `sha1` 0.10 is already in the workspace lock via
+# apps/fido and apps/oath, so this pulls no new crate into any build.
+# Host only — dev-deps never enter the device binary.
+sha1 = "0.10"
+hex-literal = "0.4"
+# US-940: deterministic RSA-2048 test-key generation (host-side, seeded rng)
+# and PKCS#1 v1.5 public-key verification of the PSO:SIGN signatures the
+# card returns. Host only — dev-deps never enter the device binary.
+rsa = "0.9"
+rand = "0.8"
+# US-941: host-side AES-256 block decryption to compute the exact expected
+# plaintext of the AES decipher route (SM routing guard, `0x02` prefix).
+# Host only — dev-deps never enter the device binary.
+aes = "0.8"
+zeroize = { version = "1", default-features = false }
+# US-1006: `tests/rng_stall.rs` calls `RngCore::try_fill_bytes` on the host
+# backend's RNG twin directly, to pin that a refused entropy draw is really
+# an `Err` and leaves the buffer untouched. Same pin (0.6) the platform
+# declares, so no second `rand_core` enters the lock. Host only — dev-deps
+# never enter the device binary.
+rand_core = "0.6"
+# US-962 (I2): `virt` alone — the advertisement features come from this
+# crate's `rsa-backend` / `secp256k1-backend` / `brainpool-backend`, so a
+# reduced test build really does have no backends to advertise.
+opcard = { path = "../../vendor/opcard", features = ["virt"] }
+# The device-path test (tests/dispatch.rs, S-721-2 D-F) builds the app over
+# the S-721-1 no_std `SyscallRunner` client on the host backend — the
+# platform's `host-backend` feature (test context only).
+fapico2-platform = { path = "../../platform", default-features = false, features = ["host-backend"] }
+
+[features]
+# US-962 (I2): one switch per algorithm group, and each one moves BOTH sides
+# at once — the platform's serving backend and opcard's advertising allow-list
+# bit. `--no-default-features --features "virt,device"` is therefore a build
+# with no backends at all, which is the configuration that used to advertise
+# algorithms nothing served.
+default = ["virt", "device", "rsa-backend", "secp256k1-backend", "brainpool-backend"]
+# Host/emulation legacy seam: opcard over trussed-virt (RAM) — the
+# `with_ram_client` closure the pre-S-721-2 tests use.
+virt = ["dep:opcard", "opcard?/virt", "dep:trussed", "std"]
+std = []
+# S-721-2 (US-331): the real opcard command set on the S-721-1
+# `SyscallRunner` client — opcard (no_std, no virt) run unmodified, over
+# the device backend (RP2350, `trusted_backend::device`) or the host
+# backend (`trusted_backend::host`, host builds/emulation only).
+# US-962 (I2): the `device` feature no longer hard-codes
+# `opcard?/brainpool-backend`. It used to, which meant turning the *platform's*
+# `brainpool-backend` off still left the card advertising Brainpool. The
+# algorithm groups are now the three features below, and whoever turns a
+# backend on or off does it through those.
+device = ["dep:opcard", "dep:trussed-core", "dep:littlefs2-core", "fapico2-platform/device"]
+
+# ---- US-962 (I2): the advertise/serve switches -----------------------------
+# Each of these enables the platform feature that puts a backend in front of
+# trussed Core (so the mechanism is *served*) together with the opcard
+# feature that adds the matching bit to `default_gen`/`default_import` (so it
+# is *advertised* and accepted by the PUT DATA gate). The two cannot be
+# separated through this crate, which is the property the story needs: a
+# feature that exists is a feature that is both served and offered.
+#
+#   - `rsa-backend` → platform `Backend::Rsa`; opcard `rsa4096-gen`, which
+#     implies `rsa3072-gen` → `rsa2048-gen`, so all three RSA sizes come in
+#     together (advertised and served, or neither).
+#   - `secp256k1-backend` → platform `Backend::Secp256k1`; opcard
+#     `secp256k1-backend` (its virt dispatch needs the same crate).
+#   - `brainpool-backend` → platform `Backend::Brainpool`; opcard
+#     `brainpool-backend`.
+#
+# P-256/P-384/P-521, Ed25519 and X25519 have no switch here because they have
+# none to have: both the platform's `trussed` and opcard's `trussed-core`
+# enable p256/p384/p521/ed255/x255 unconditionally, so trussed Core serves
+# them in every configuration and there is no build in which they could be
+# advertised unserved. See the note in `default_gen`.
+rsa-backend = ["fapico2-platform/rsa-backend", "opcard?/rsa4096-gen"]
+secp256k1-backend = ["fapico2-platform/secp256k1-backend", "opcard?/secp256k1-backend"]
+brainpool-backend = ["fapico2-platform/brainpool-backend", "opcard?/brainpool-backend"]

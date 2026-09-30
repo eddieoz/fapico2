@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["firmware", "platform", "apps", "apps/fido", "apps/oath", "apps/openpgp", "apps/mgmt", "apps/piv", "apps/vendor_led", "apps/rescue"]
+exclude = ["vendor/opcard", "emu-harness"]
+default-members = ["firmware"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = "z"
+
+# S-724: software-RSA big-integer math must not run at opt-level "z" in dev
+# builds — RSA-2048 keygen would take minutes instead of seconds (upstream
+# opcard carries the same overrides; profiles only take effect at the
+# workspace root).
+[profile.dev.package.rsa]
+opt-level = 2
+[profile.dev.package.num-bigint-dig]
+opt-level = 2
+[profile.test.package.rsa]
+opt-level = 2
+[profile.test.package.num-bigint-dig]
+opt-level = 2
+
+# S-701-5: no_std patch for the vendor vault's X448 dependency chain (upstream
+# ed448-goldilocks pulls std-only `hex` for its unit tests and does not declare
+# #![no_std]). Vendored under vendor/ed448-goldilocks (BSD-3-Clause).
+[patch.crates-io]
+ed448-goldilocks = { path = "vendor/ed448-goldilocks" }
+x448 = { path = "vendor/x448" }

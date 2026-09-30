@@ -1,0 +1,36 @@
+[package]
+name = "fapico2-mgmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fapico2-platform = { path = "../../platform" }
+heapless = "0.8"
+
+# US-711 host tests: the factory-reset fixture drives the real FIDO keystore
+# and OATH app reset primitives against the same store (dev-only — the
+# device build never links these here).
+[dev-dependencies]
+fapico2-fido = { path = "../fido" }
+fapico2-oath = { path = "../oath" }
+
+[features]
+default = ["host", "otp"]
+# `host` keeps the crate `std` (host/emulation build). When off (device build)
+# the crate is `no_std` (US-386) — the same heapless implementation compiles
+# for both, so this feature is a marker that selects the memory model.
+host = []
+# Device (RP2350) back end marker (US-386): the firmware enables this to build
+# the app for `thumbv8m` `no_std`.
+device = []
+# The OTP capability is compiled in only when this feature is enabled, mirroring
+# the C firmware's `ENABLE_OTP_APP` gate (US-212 / RUST US-351): a trimmed build that
+# disables OTP must not advertise the OTP bit in its management caps.
+otp = []
+# US-104: the PIV capability is compiled in only for the host emulation binary,
+# which registers a fifth CCID app (`PivApp`, `firmware/src/emul_main.rs`). The
+# device path registers only the four AIDs in `CCID_AIDS` and must not advertise
+# PIV, so no device build enables this.
+piv = []

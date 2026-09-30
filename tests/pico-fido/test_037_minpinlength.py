@@ -1,0 +1,163 @@
+"""
+/*
+ * This file is part of the Pico Fido distribution (https://github.com/polhenarejos/pico-fido).
+ * Copyright (c) 2022 Pol Henarejos.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+"""
+
+
+import os
+import pytest
+from fido2.ctap2.extensions import CredProtectExtension
+from fido2.webauthn import UserVerificationRequirement
+from fido2.ctap import CtapError
+from fido2.ctap2.pin import PinProtocolV2, ClientPin
+from fido2.ctap2 import Config
+
+PIN='12345678'
+MINPINLENGTH=6
+MAX_RPIDS_MINPIN_LENGTH=120
+
+@pytest.fixture(scope="function")
+def MCMinPin(device):
+    res = device.doMC(rk=True, extensions={'minPinLength': True})['res'].attestation_object
+    return res
+
+@pytest.fixture(scope="function")
+def SetMinPin(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(MINPINLENGTH,rp_ids=['example.com'])
+
+@pytest.fixture(scope="function")
+def SetMinPinWrongRpid(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(MINPINLENGTH,rp_ids=['notanexample.com'])
+
+def PinToken(device):
+    return ClientPin(device.client()._backend.ctap2).get_pin_token(PIN, permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL | ClientPin.PERMISSION.AUTHENTICATOR_CFG)
+
+def FidoConfig(device):
+    pt = PinToken(device)
+    pin_protocol = PinProtocolV2()
+    return Config(device.client()._backend.ctap2, pin_protocol, pt)
+
+def test_supports_minpin(info):
+    assert info.extensions
+    assert 'minPinLength' in info.extensions
+    assert info.options
+    assert 'setMinPINLength' in info.options
+    assert info.options['setMinPINLength'] is True
+
+def test_minpin(SetMinPin, MCMinPin):
+    assert MCMinPin.auth_data.extensions
+    assert "minPinLength" in MCMinPin.auth_data.extensions
+    assert MCMinPin.auth_data.extensions['minPinLength'] == MINPINLENGTH
+
+def test_minpin_bad_rpid(SetMinPinWrongRpid, MCMinPin):
+    assert not MCMinPin.auth_data.extensions
+    #assert "minPinLength" not in MCMinPin.auth_data.extensions
+
+def test_setminpin(device, SetMinPin, MCMinPin):
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(MINPINLENGTH+2,rp_ids=['example.com'])
+    res = device.doMC(rk=True, extensions={'minPinLength': True})['res'].attestation_object
+    assert res.auth_data.extensions
+    assert "minPinLength" in res.auth_data.extensions
+    assert res.auth_data.extensions['minPinLength'] == MINPINLENGTH+2
+
+def test_no_setminpin(device, SetMinPin, MCMinPin):
+    cfg = FidoConfig(device)
+    with pytest.raises(CtapError) as e:
+        cfg.set_min_pin_length(MINPINLENGTH-2,rp_ids=['example.com'])
+    assert e.value.code == CtapError.ERR.PIN_POLICY_VIOLATION
+
+def test_setminpin_rejects_above_max_pin_length(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    with pytest.raises(CtapError) as e:
+        cfg.set_min_pin_length(256, rp_ids=['example.com'])
+    assert e.value.code == CtapError.ERR.PIN_POLICY_VIOLATION
+
+def test_setminpin_too_many_rpids(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    # Keep the encoded Config request below GetInfo.maxMsgSize (1024).  Recent
+    # python-fido2 releases reject oversized requests locally, before the
+    # authenticator can enforce its maxRPIDsForSetMinPINLength limit.
+    rp_ids = [f"r{i}" for i in range(MAX_RPIDS_MINPIN_LENGTH + 1)]
+    with pytest.raises(CtapError) as e:
+        cfg.set_min_pin_length(MINPINLENGTH,rp_ids=rp_ids)
+    # ponytail: a count limit is not a storage exhaustion. US-302 changed the
+    # authenticator to return LIMIT_EXCEEDED (0x15) instead of KEY_STORE_FULL.
+    assert e.value.code == CtapError.ERR.LIMIT_EXCEEDED
+
+
+def test_toggle_always_uv_config_subcommand(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    ctap = device.client()._backend.ctap2
+    before = ctap.get_info().options["alwaysUv"]
+
+    cfg.toggle_always_uv()
+
+    assert ctap.get_info().options["alwaysUv"] is not before
+
+
+def test_pin_complexity_policy_extension(device):
+    device.reset()
+    ClientPin(device.client()._backend.ctap2).set_pin(PIN)
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(
+        MINPINLENGTH,
+        rp_ids=["example.com"],
+        pin_complexity_policy=True,
+    )
+
+    assert device.client()._backend.ctap2.get_info().pin_complexity_policy is True
+    client_data_hash = os.urandom(32)
+    pin_token = ClientPin(device.client()._backend.ctap2).get_pin_token(
+        PIN, permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL
+    )
+    protocol = PinProtocolV2()
+    response = device.MC(
+        client_data_hash=client_data_hash,
+        rp={"id": "example.com", "name": "Example RP"},
+        extensions={"pinComplexityPolicy": True},
+        pin_uv_protocol=protocol.VERSION,
+        pin_uv_param=protocol.authenticate(pin_token, client_data_hash),
+    )
+    assert response["res"].auth_data.extensions["pinComplexityPolicy"] is True
+
+def test_setminpin_check_force(device, SetMinPin, MCMinPin):
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(len(PIN)+1,rp_ids=['example.com'])
+    info = device.client()._backend.ctap2.get_info()
+    assert info.force_pin_change == True
+
+@pytest.mark.parametrize(
+    "force", [True, False]
+)
+def test_setminpin_set_forcee(device, SetMinPin, MCMinPin, force):
+    cfg = FidoConfig(device)
+    cfg.set_min_pin_length(MINPINLENGTH,rp_ids=['example.com'],force_change_pin=force)
+    info = device.client()._backend.ctap2.get_info()
+    assert info.force_pin_change == force

@@ -1,0 +1,21 @@
+[package]
+name = "fapico2-vendor-led"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fapico2-platform = { path = "../../platform" }
+heapless = "0.8"
+
+[features]
+default = ["host"]
+# `host` keeps the crate `std` (host/emulation build). When off (device build)
+# the crate is `no_std` — the same heapless implementation compiles for both,
+# so this feature is a marker that selects the memory model (the same shape
+# `apps/mgmt/Cargo.toml` uses).
+host = []
+# Device (RP2350) back end marker: the firmware enables this to build the applet
+# for `thumbv8m` `no_std`.
+device = []
