@@ -37,7 +37,8 @@ it can and cannot establish is stated in [What is not known](#what-is-not-known)
 
 ## Do not attach a debugger
 
-`AGENTS.md`:98-112 records, from a prior investigation on this hardware, that **a
+[`AGENTS.md`:98-112](../../AGENTS.md) (the sibling repo root, one level above
+`fapico2/`) records, from a prior investigation on this hardware, that **a
 connected SWD debugger is sufficient on its own** to produce this exact failure
 on a board whose OTP is perfectly healthy:
 
@@ -54,15 +55,17 @@ separating it is the epic's pivot (US-1301) — which is **still open**: see
 The house rules stand unchanged: *"Validate detached, over BOOTSEL (copy the
 UF2, no probe connected)"* and *"Use the probe to READ, never to RUN."*
 
-> **Citation note (2026-10-01).** The epic that quotes these rules cites them
-> as `AGENTS.md`:98-112 and `:98-135`. **There is no `AGENTS.md` in this
-> repository** — the file is absent from the working tree, so those line
-> numbers cannot be checked by a reader here. The quoted text is reproduced
-> verbatim from [`docs/SECURITY-ASSESSMENT-ROUND2.md`](SECURITY-ASSESSMENT-ROUND2.md)
-> §22, which is the account that measured it, and that is what this document
-> cites. If `AGENTS.md` is meant to exist, it needs restoring with its
-> hardware-validation section intact; the watchdog refusal below belongs in it
-> and currently has no such home.
+> **Citation note (2026-10-01, corrected later the same day).** An earlier
+> revision of this document recorded that `AGENTS.md` did not exist. That was
+> wrong, and the mistake was looking only inside the repository: the file lives
+> at [`../../AGENTS.md`](../../AGENTS.md), one level above `fapico2/`, outside
+> the git worktree. Lines 98-135 were then checked and match the epic's quotes
+> exactly — including the register map (OTP controller `0x4012_0000`, ECC
+> `OTP_DATA` at `0x4013_0000`, `OTP_DATA_RAW` at `0x4013_4000`) and the note that
+> `0x400D_8100` is the **RP2040** map and reads all zeros on RP2350.
+>
+> The watchdog refusal below belongs in that file's hardware-validation section
+> and is not yet there.
 
 ## 1. The boot phase ladder
 
