@@ -234,54 +234,42 @@ def main(argv: list[str]) -> int:
         result["verdict"] = "NOT-STARTABLE"
         return _emit(result, args.out)
 
-    print(f"[{args.arm} #{args.index}] device up. Rebooting to BOOTSEL…", flush=True)
-    try:
-        sw = rescue_reboot(True)
-        result["detail"] = f"reboot APDU -> {sw[0]:02x}{sw[1]:02x}"
-    except Exception as exc:  # the device leaves the bus mid-APDU by design
-        result["detail"] = f"reboot APDU: {type(exc).__name__} (expected: it reboots)"
-
-    entered = wait_for(lambda: in_bootsel()[0], BOOTSEL_TIMEOUT_S, "BOOTSEL")
-    mount = in_bootsel()[1] if entered else None
-    if not entered or mount is None:
-        result["verdict"] = "FAILED-TO-ENTER-BOOTSEL"
-        result["detail"] += "; never entered BOOTSEL"
-        return _emit(result, args.out)
-    print(f"[{args.arm} #{args.index}] BOOTSEL up at {mount}", flush=True)
-
-    if args.arm == "flash":
-        dest = mount / args.uf2.name
-        # The ROM's MSC can still be settling when it first appears: cycle 2
-        # hit EACCES on a volume that was writable a second later. Wait for it
-        # rather than treating a not-yet-ready mount as a failed cycle.
-        for _ in range(20):
-            try:
-                dest.touch(exist_ok=True)
-                break
-            except OSError:
-                time.sleep(0.5)
-        shutil.copyfile(args.uf2, dest)
-        print(f"[{args.arm} #{args.index}] copied {args.uf2.name} -> {dest}",
+    if args.arm == "save":
+        # The save arm writes over CCID, so it must NOT enter BOOTSEL first:
+        # rebooting to the ROM removes the reader the save itself needs. (An
+        # earlier revision did exactly that and stranded the board in BOOTSEL
+        # with nothing to talk to.)
+        print(f"[{args.arm} #{args.index}] device up. Changing one setting…",
               flush=True)
-        # The ROM writes flash as the copy lands; eject is the "write finished"
-        # signal, same as the US-1302 probe's --after-eject arm.
-        time.sleep(WRITE_SETTLE_S)
-        wait_for(lambda: not in_bootsel()[0], 120.0, "BOOTSEL eject")
-        result["detail"] += f"; flashed {args.uf2.name}"
-    else:
-        print(f"[{args.arm} #{args.index}] changing one setting and saving…", flush=True)
         w1, w2, note = mgmt_write_config()
-        result["detail"] += f"; save -> {w1:02x}{w2:02x} ({note})"
+        result["detail"] = f"save -> {w1:02x}{w2:02x} ({note})"
         print(f"[{args.arm} #{args.index}] {note}: {w1:02x}{w2:02x}", flush=True)
         if (w1, w2) != (0x90, 0x00):
             result["verdict"] = "SAVE-REJECTED"
             return _emit(result, args.out)
-        # Reboot to exercise the save-then-boot path.
+        # Now reboot, which is the step whose aftermath is being measured.
         try:
             rescue_reboot(False)
         except Exception:
             pass
-        result["detail"] += "; rebooted"
+        result["detail"] += "; rebooted (normal)"
+    else:
+        print(f"[{args.arm} #{args.index}] device up. Rebooting to BOOTSEL…",
+              flush=True)
+        try:
+            sw = rescue_reboot(True)
+            result["detail"] = f"reboot APDU -> {sw[0]:02x}{sw[1]:02x}"
+        except Exception as exc:  # the device leaves the bus mid-APDU by design
+            result["detail"] = f"reboot APDU: {type(exc).__name__} (expected: it reboots)"
+
+        entered = wait_for(lambda: in_bootsel()[0], BOOTSEL_TIMEOUT_S, "BOOTSEL")
+        mount = in_bootsel()[1] if entered else None
+        if not entered or mount is None:
+            result["verdict"] = "FAILED-TO-ENTER-BOOTSEL"
+            result["detail"] += "; never entered BOOTSEL"
+            return _emit(result, args.out)
+        print(f"[{args.arm} #{args.index}] BOOTSEL up at {mount}", flush=True)
+        _flash_and_wait(args, result, mount)
 
     print(f"[{args.arm} #{args.index}] waiting for the device to enumerate…",
           flush=True)
@@ -297,12 +285,31 @@ def main(argv: list[str]) -> int:
         print(f"[{args.arm} #{args.index}] *** DID NOT ENUMERATE in "
               f"{ENUM_TIMEOUT_S:.0f}s — freeze reproduction ***", flush=True)
         print("  Per R2-26 only VBUS removal clears this state. Unplug the "
-              "cable, wait a few seconds, replug, and record that you did — a "
-              "human power cycle is the only recovery, and the run cannot "
-              "continue without it.", flush=True)
+              "cable, WAIT 5 SECONDS, replug, and record that you did.", flush=True)
 
     result["elapsed_s"] = round(elapsed, 1)
     return _emit(result, args.out)
+
+
+def _flash_and_wait(args, result: dict, mount: Path) -> None:
+    """Copy the image to the ROM's MSC and wait for the write to land."""
+    dest = mount / args.uf2.name
+    # The ROM's MSC can still be settling when it first appears: cycle 2 hit
+    # EACCES on a volume that was writable a second later. Wait for it rather
+    # than treating a not-yet-ready mount as a failed cycle.
+    for _ in range(20):
+        try:
+            dest.touch(exist_ok=True)
+            break
+        except OSError:
+            time.sleep(0.5)
+    shutil.copyfile(args.uf2, dest)
+    print(f"[flash #{args.index}] copied {args.uf2.name} -> {dest}", flush=True)
+    # The ROM writes flash as the copy lands; eject is the "write finished"
+    # signal, same as the US-1302 probe's --after-eject arm.
+    time.sleep(WRITE_SETTLE_S)
+    wait_for(lambda: not in_bootsel()[0], 120.0, "BOOTSEL eject")
+    result["detail"] += f"; flashed {args.uf2.name}"
 
 
 def _emit(result: dict, out: Path | None) -> int:
