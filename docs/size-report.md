@@ -763,30 +763,58 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 761,600 | `0x10000200` | no (flash) |
-| `.rodata` | 18,708 | `0x100ba100` | no (flash) |
+| `.text` | 761,936 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100ba250` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100beae0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 419,668 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x2006681c` | yes |
-| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bec40` | non-alloc, not in Berkeley `text` |
+| `.bss` | 419,680 | `0x200000c8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20066828` | yes |
+| `.defmt` | 35 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 759,724 (`.text`) + 18,628 (`.rodata`) + 276
+Berkeley `text` = 760,060 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **811,612**. That identity is stated so a reader can check
+the `X` flag) = **811,804**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 813,568 B** · **`.data` = 196 B** · **`.bss` = 420,692 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 813,912 B** · **`.data` = 196 B** · **`.bss` = 420,704 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 420,888 B** (420,892 B address-to-address: `__sheap` `0x20066c1c` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c1c` → **main stack zone = 111,588 B** of 532,480 B of SRAM.
+**RAM statics = 420,900 B** (420,904 B address-to-address: `__sheap` `0x20066c28` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c28` → **main stack zone = 111,576 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
+
+### BOOT-FREEZE-POST-FLASH (US-1302…US-1306), 2026-10-01
+
+**Measured: `text` 813,568 → 813,912 B (+344 B); Berkeley `bss` 420,692 →
+420,704 B (+12 B); RAM statics 420,888 → 420,900 B (+12 B); main stack zone
+111,588 → 111,576 B (−12 B); UF2 3,053 → 3,055 blocks (3055 blocks, 1 absolute preamble + 3054
+ARM_S payload). Shipping sha256 `0f08de2a8f4b…`.**
+
+The +344 B of `text` and the +12 B of `bss` are the boot-freeze epic's
+instrumentation, and both are worth naming rather than rounding:
+
+- **`fatal_sig` (US-1306)** is the bulk of the `text`: a ten-variant reason
+  enum, an encoder, and a decoder, all of them reachable from the shipping
+  image because `fatal_boot` calls the encoder on every pre-USB refusal. The
+  decoder is device-side dead weight in the strict sense — nothing on the
+  device reads its own signature back — and it is carried anyway so the format
+  and the reader cannot drift apart. That is a deliberate trade: it is the same
+  trade `ctap_hid` already makes, and the cost is 344 B against a 3,670,016 B
+  ceiling.
+- **The +12 B of `bss` is `FATAL_LED_MOUNTED`**, one `AtomicBool` that gates
+  `fatal_boot`'s LED output until the `LED_OUT` slot is mounted. It is the
+  guard that stops a pre-slot refusal writing through an uninitialised pin.
+- **`boot_ladder` (US-1304) costs no static RAM at all** — its level sequence is
+  an iterator, evaluated in registers while the pin is driven. Worth stating
+  because "a new boot-ladder module" is exactly the kind of change that would
+  otherwise be assumed to cost a table.
+
+Task-arena demand is **unchanged** at 17,760 B: nothing here spawns a task.
 
 ### What this fix cost, against the US-1011/US-1012 tip
 

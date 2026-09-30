@@ -315,6 +315,12 @@ _B_SIZE_REPORT = Break(
     #      because that pass re-measured the report (+8 B text, +8 B .bss).
     #   3. 2026-09-29 (US-1010, the MAX_PARTS fix) — re-measured again
     #      (text 811,976 → 811,956, bss unchanged).
+    #   5. 2026-10-01 (BOOT-FREEZE-POST-FLASH, US-1302…US-1306) — the same
+    #      recurrence a fifth time, from the same cause: the epic added code,
+    #      so the report was re-measured (text 813,568 → 813,912 B, `.text`
+    #      761,600 → 761,936) and the anchor tracked the old number. The
+    #      note above predicts exactly this, and the prediction is why the
+    #      cost is re-nomination rather than a silently-passing gate.
     #   4. 2026-09-29 (US-1010, the RAM-gating pass) — the anchor MOVED, not
     #      because a number rotted but because the headline text line it
     #      pointed at was replaced by a *generated block*, which is what
@@ -340,8 +346,8 @@ _B_SIZE_REPORT = Break(
     # edit here is a gate weakening, which is the one outcome to avoid.
     # Re-nominating is the honest cost; the harness says so out loud rather
     # than passing quietly.
-    "| `.text` | 759,928 | `0x10000200` | no (flash) |",
-    "| `.text` | 759,929 | `0x10000200` | no (flash) |",
+    "| `.text` | 761,936 | `0x10000200` | no (flash) |",
+    "| `.text` | 761,937 | `0x10000200` | no (flash) |",
     "the generated ELF section table in docs/size-report.md is one byte out — "
     "the interior was hand-copied and re-measured without the headline, so the "
     "gate passed over a stale detail. The report is the RAM/flash argument; a "
