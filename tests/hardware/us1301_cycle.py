@@ -193,13 +193,18 @@ def mgmt_write_config() -> tuple[int, int, str]:
         # The write blocks on presence; give the self-serving window room.
         t0 = time.monotonic()
         while True:
-            w1, w2 = conn.transmit([0x00, 0x1C, 0x00, 0x00, len(body)] + list(body))
+            _r, w1, w2 = conn.transmit([0x00, 0x1C, 0x00, 0x00, len(body)] + list(body))
             if (w1, w2) == (0x90, 0x00):
                 return w1, w2, f"{note}, saved"
-            if w2 == 0x69 and time.monotonic() - t0 < 30.0:
-                # Conditions of use not satisfied — the presence window has
-                # not self-served yet. Wait and retry; do not press anything.
-                time.sleep(1.0)
+            # 6982 (security status not satisfied) and 6985 (conditions of use
+            # not satisfied) are both the presence gate refusing, not a real
+            # rejection. Per the 2026-09-30 hardware session the window
+            # self-serves after ~8-9 s, so wait and retry rather than pressing
+            # anything — a finger on the pad is a variable this measurement
+            # does not want.
+            presence_refusal = (w1, w2) in ((0x69, 0x82), (0x69, 0x85))
+            if presence_refusal and time.monotonic() - t0 < 45.0:
+                time.sleep(1.5)
                 continue
             return w1, w2, f"{note}, WRITE_CONFIG -> {w1:02x}{w2:02x}"
     finally:
