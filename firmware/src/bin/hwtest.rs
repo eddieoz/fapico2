@@ -65,6 +65,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         unsafe { &mut *core::ptr::addr_of_mut!(MSOS_DESC) },
         unsafe { &mut *core::ptr::addr_of_mut!(CONTROL_BUF) },
         chipid,
+        // Diagnostics: no keystore to consult, so the build-time identity stands.
+        None,
     );
     let parts = usb.into_parts();
     spawner.spawn(usb_task(parts.device)).unwrap();

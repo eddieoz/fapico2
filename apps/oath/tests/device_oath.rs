@@ -152,7 +152,6 @@ fn record(fid: u16, payload: &[u8]) -> Vec<u8> {
     r
 }
 
-
 /// US-1030: assert the persisted stream is the C-parity stream, with every
 /// credential key **sealed** rather than in the clear.
 ///
@@ -177,11 +176,18 @@ fn assert_stream_is_c_parity(actual: &[u8], expected: &[u8]) {
     let seal = OathSeal::emul();
     for ((fid, got), (_, want)) in got.iter().zip(&want) {
         if !is_credential_fid(*fid) {
-            assert_eq!(got, want, "record {fid:#06x} is not a credential and must be byte-exact");
+            assert_eq!(
+                got, want,
+                "record {fid:#06x} is not a credential and must be byte-exact"
+            );
             continue;
         }
         for tag in [0x71u8, 0x7A, 0x78] {
-            assert_eq!(oath_tlv(got, tag), oath_tlv(want, tag), "record {fid:#06x} tag {tag:#04x} moved");
+            assert_eq!(
+                oath_tlv(got, tag),
+                oath_tlv(want, tag),
+                "record {fid:#06x} tag {tag:#04x} moved"
+            );
         }
         let sealed = oath_tlv(got, 0x73).expect("a credential carries TAG_KEY");
         assert!(
@@ -189,10 +195,14 @@ fn assert_stream_is_c_parity(actual: &[u8], expected: &[u8]) {
             "record {fid:#06x} key is not in the sealed form"
         );
         let mut plain = [0u8; 128];
-        let n = seal.open(&sealed, &mut plain).expect("the sealed key must open");
+        let n = seal
+            .open(&sealed, &mut plain)
+            .expect("the sealed key must open");
         assert_eq!(
             &plain[..n],
-            oath_tlv(want, 0x73).as_deref().expect("C payload has a key"),
+            oath_tlv(want, 0x73)
+                .as_deref()
+                .expect("C payload has a key"),
             "record {fid:#06x} does not open back to the C key"
         );
     }
@@ -218,17 +228,32 @@ fn assert_streams_hold_the_same_credentials(before: &[u8], after: &[u8]) {
     let seal = OathSeal::emul();
     for ((fid, a), (_, b)) in after.iter().zip(&before) {
         if !is_credential_fid(*fid) {
-            assert_eq!(a, b, "record {fid:#06x} is not a credential and must be byte-exact");
+            assert_eq!(
+                a, b,
+                "record {fid:#06x} is not a credential and must be byte-exact"
+            );
             continue;
         }
         for tag in [0x71u8, 0x7A, 0x78] {
-            assert_eq!(oath_tlv(a, tag), oath_tlv(b, tag), "record {fid:#06x} tag {tag:#04x} moved");
+            assert_eq!(
+                oath_tlv(a, tag),
+                oath_tlv(b, tag),
+                "record {fid:#06x} tag {tag:#04x} moved"
+            );
         }
         let mut ka = [0u8; 128];
         let mut kb = [0u8; 128];
-        let na = seal.open(&oath_tlv(a, 0x73).expect("key"), &mut ka).expect("open after");
-        let nb = seal.open(&oath_tlv(b, 0x73).expect("key"), &mut kb).expect("open before");
-        assert_eq!(&ka[..na], &kb[..nb], "record {fid:#06x} key changed across the reboot");
+        let na = seal
+            .open(&oath_tlv(a, 0x73).expect("key"), &mut ka)
+            .expect("open after");
+        let nb = seal
+            .open(&oath_tlv(b, 0x73).expect("key"), &mut kb)
+            .expect("open before");
+        assert_eq!(
+            &ka[..na],
+            &kb[..nb],
+            "record {fid:#06x} key changed across the reboot"
+        );
     }
 }
 
@@ -262,7 +287,10 @@ fn oath_stream_records(stream: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let fid = u16::from_le_bytes([stream[i], stream[i + 1]]);
         let len = u32::from_le_bytes(stream[i + 2..i + 6].try_into().unwrap()) as usize;
         i += 6;
-        assert!(i + len <= stream.len(), "record {fid:#06x} overruns the stream");
+        assert!(
+            i + len <= stream.len(),
+            "record {fid:#06x} overruns the stream"
+        );
         out.push((fid, stream[i..i + len].to_vec()));
         i += len;
     }
@@ -310,17 +338,22 @@ fn migration_stream_restores_and_recalculates() {
     assert_eq!(OATH_AID, &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]);
     let stream = {
         let mut s = Vec::new();
-        s.extend(record(
-            0xBA00,
-            &cred_payload(b"kaka", &KAKA_KEY, None),
-        ));
+        s.extend(record(0xBA00, &cred_payload(b"kaka", &KAKA_KEY, None)));
         s.extend(record(
             0xBA01,
-            &cred_payload(b"totp", &[0x21, 6, b'f', b'o', b'o', b' ', b'b', b'a', b'r'], None),
+            &cred_payload(
+                b"totp",
+                &[0x21, 6, b'f', b'o', b'o', b' ', b'b', b'a', b'r'],
+                None,
+            ),
         ));
         s.extend(record(
             0xBA02,
-            &cred_payload(b"hotp", &[0x11, 6, b'k', b'a', b'k', b'a'], Some(0x0000_0000_FF00_FFFF)),
+            &cred_payload(
+                b"hotp",
+                &[0x11, 6, b'k', b'a', b'k', b'a'],
+                Some(0x0000_0000_FF00_FFFF),
+            ),
         ));
         s.extend(record(0xBAFF, &AUTH_CODE));
         s
@@ -328,11 +361,19 @@ fn migration_stream_restores_and_recalculates() {
 
     let mut store = HostSecureStore::new();
     write_migration_stream(&mut store, &stream);
-    let mut booted = OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul())
-        .expect("boot from migration stream");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot from migration stream");
 
     // A clean boot is not dirty: persist is a no-op until a command mutates.
-    assert!(!booted.persist_state(&mut store), "clean boot must not persist");
+    assert!(
+        !booted.persist_state(&mut store),
+        "clean boot must not persist"
+    );
 
     // US-901: the stream holds credentials, so the booted session starts
     // unvalidated (no self-grant on boot).
@@ -387,7 +428,9 @@ fn migration_stream_restores_and_recalculates() {
             0xA2,
             0,
             0,
-            &[0x71, 4, b'k', b'a', b'k', b'a', 0x74, 8, 0, 0, 0, 0, 0, 0, 0, 1],
+            &[
+                0x71, 4, b'k', b'a', b'k', b'a', 0x74, 8, 0, 0, 0, 0, 0, 0, 0, 1,
+            ],
         ),
     );
     assert_eq!(sw, 0x9000);
@@ -400,7 +443,9 @@ fn migration_stream_restores_and_recalculates() {
             0xA2,
             0,
             1,
-            &[0x71, 4, b't', b'o', b't', b'p', 0x74, 8, 0, 0, 0, 0, 2, 0xbc, 0xad, 0xc8],
+            &[
+                0x71, 4, b't', b'o', b't', b'p', 0x74, 8, 0, 0, 0, 0, 2, 0xbc, 0xad, 0xc8,
+            ],
         ),
     );
     assert_eq!(sw, 0x9000);
@@ -449,17 +494,22 @@ fn migration_stream_restores_and_recalculates() {
     assert!(app.persist_state(&mut store));
     let expected = {
         let mut s = Vec::new();
-        s.extend(record(
-            0xBA00,
-            &cred_payload(b"kaka", &KAKA_KEY, None),
-        ));
+        s.extend(record(0xBA00, &cred_payload(b"kaka", &KAKA_KEY, None)));
         s.extend(record(
             0xBA01,
-            &cred_payload(b"totp", &[0x21, 6, b'f', b'o', b'o', b' ', b'b', b'a', b'r'], None),
+            &cred_payload(
+                b"totp",
+                &[0x21, 6, b'f', b'o', b'o', b' ', b'b', b'a', b'r'],
+                None,
+            ),
         ));
         s.extend(record(
             0xBA02,
-            &cred_payload(b"hotp", &[0x11, 6, b'k', b'a', b'k', b'a'], Some(0x0000_0000_FF01_0001)),
+            &cred_payload(
+                b"hotp",
+                &[0x11, 6, b'k', b'a', b'k', b'a'],
+                Some(0x0000_0000_FF01_0001),
+            ),
         ));
         s.extend(record(0xBAFF, &AUTH_CODE));
         s
@@ -470,8 +520,13 @@ fn migration_stream_restores_and_recalculates() {
 #[test]
 fn reboot_preserves_creds_and_access_code() {
     let mut store = HostSecureStore::new();
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot fresh");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot fresh");
 
     // 20 TOTP creds + 1 HOTP with IMF — large enough to span two chunked
     // parts, so the reboot crosses a multi-part set.
@@ -489,7 +544,9 @@ fn reboot_preserves_creds_and_access_code() {
         assert_eq!(sw, 0x9000, "PUT cred-{:02}", i);
     }
     {
-        let mut data = vec![0x71, 7, b'h', b'o', b't', b'p', b'-', b'0', b'1', 0x73, 8, 0x11, 6];
+        let mut data = vec![
+            0x71, 7, b'h', b'o', b't', b'p', b'-', b'0', b'1', 0x73, 8, 0x11, 6,
+        ];
         data.extend_from_slice(b"seed-1");
         data.extend_from_slice(&[0x7a, 8, 0, 0, 0, 0, 0, 0, 0x42]);
         let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
@@ -520,8 +577,13 @@ fn reboot_preserves_creds_and_access_code() {
     let image = store.partition_image();
     let mut store2 = HostSecureStore::new();
     store2.from_partition_image(&image);
-    let mut app2 = OathApp::boot(&mut HostTrng::new(), &mut store2, emul_device_id(), OathSeal::emul())
-        .expect("boot after reboot");
+    let mut app2 = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store2,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot after reboot");
 
     // US-901: the rebooted app holds credentials and an access code, so its
     // session starts unvalidated — SELECT locks it (and issues a challenge).
@@ -545,9 +607,19 @@ fn reboot_preserves_creds_and_access_code() {
     // until the access code validates it.
     let (body, sw) = drive(&mut app2, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
-    assert_eq!(body.len(), 21 * 10, "21 LIST entries of [0x72, 8, alg, name(7)]");
-    assert_eq!(&body[0..10], [0x72, 8, 0x21, b'c', b'r', b'e', b'd', b'-', b'0', b'0']);
-    assert_eq!(&body[200..210], [0x72, 8, 0x11, b'h', b'o', b't', b'p', b'-', b'0', b'1']);
+    assert_eq!(
+        body.len(),
+        21 * 10,
+        "21 LIST entries of [0x72, 8, alg, name(7)]"
+    );
+    assert_eq!(
+        &body[0..10],
+        [0x72, 8, 0x21, b'c', b'r', b'e', b'd', b'-', b'0', b'0']
+    );
+    assert_eq!(
+        &body[200..210],
+        [0x72, 8, 0x11, b'h', b'o', b't', b'p', b'-', b'0', b'1']
+    );
 
     // Re-persist after the reboot: the stream is byte-identical (no drift).
     // Re-running SET_CODE with the same code makes the app dirty again (C
@@ -568,16 +640,19 @@ fn reboot_preserves_creds_and_access_code() {
 fn access_code_locks_until_validate() {
     let stream = {
         let mut s = Vec::new();
-        s.extend(record(
-            0xBA00,
-            &cred_payload(b"kaka", &KAKA_KEY, None),
-        ));
+        s.extend(record(0xBA00, &cred_payload(b"kaka", &KAKA_KEY, None)));
         s.extend(record(0xBAFF, &AUTH_CODE));
         s
     };
     let mut store = HostSecureStore::new();
     write_migration_stream(&mut store, &stream);
-    let mut app = OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
 
     // SELECT with an access code on file locks the session and issues a
     // fresh challenge.
@@ -769,7 +844,11 @@ fn midstream_command_resets_chunk_state() {
     // An interposed LIST answers normally and kills the stream.
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000, "LIST answered fresh");
-    assert_eq!(body.len(), 68 * 43, "full LIST body (68 × [0x72,41,alg,name])");
+    assert_eq!(
+        body.len(),
+        68 * 43,
+        "full LIST body (68 × [0x72,41,alg,name])"
+    );
 
     let (_, sw) = drive(&mut app, &apdu(0xA5, 0, 0, &[]));
     assert_eq!(sw, 0x6985, "mid-stream state was reset");
@@ -797,7 +876,10 @@ fn oversized_list_reports_error_sw_not_truncation() {
     }
 
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(sw, 0x6A84, "oversized LIST must report an error SW, not truncate");
+    assert_eq!(
+        sw, 0x6A84,
+        "oversized LIST must report an error SW, not truncate"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -844,8 +926,13 @@ fn select_returns_version_deviceid_and_challenge() {
     // same shape `test_auth` uses.
     let mut store = HostSecureStore::new();
     write_migration_stream(&mut store, &record(0xBAFF, &AUTH_CODE));
-    let mut app = OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul())
-        .expect("boot with access code");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot with access code");
 
     let sel = select(&mut app);
     let parsed = tlvs(&sel);
@@ -875,8 +962,13 @@ fn select_returns_version_deviceid_and_challenge() {
     // verifier) and nothing else.
     let mut pin_store = HostSecureStore::new();
     write_migration_stream(&mut pin_store, &record(0xBA44, &[0x09u8; 49]));
-    let mut pin_app = OathApp::boot(&mut HostTrng::new(), &mut pin_store, emul_device_id(), OathSeal::emul())
-        .expect("boot with OTP PIN");
+    let mut pin_app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut pin_store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot with OTP PIN");
     // The record must actually have decoded into a PIN, or the case is void.
     let (_, sw) = drive(&mut pin_app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(
@@ -1034,7 +1126,11 @@ fn picoforge_set_code_data(key: &[u8], challenge: &[u8; 8]) -> Vec<u8> {
 
 /// The VALIDATE body picoforge's `validate` builds: `TAG_RESPONSE_FULL(0x75)`
 /// `HMAC-SHA1(key, select_challenge)` plus the host's own 8-byte challenge.
-fn picoforge_validate_data(key: &[u8], select_challenge: &[u8], host_challenge: &[u8; 8]) -> Vec<u8> {
+fn picoforge_validate_data(
+    key: &[u8],
+    select_challenge: &[u8],
+    host_challenge: &[u8; 8],
+) -> Vec<u8> {
     let response = hmac_sha1(key, select_challenge);
     let mut data = vec![0x75, response.len() as u8];
     data.extend_from_slice(&response);
@@ -1097,14 +1193,11 @@ fn validate_accepts_picoforge_pbkdf2_sha1_key() {
     let set_data = picoforge_set_code_data(&key, &set_challenge);
     let sent: Vec<u8> = apdu(0x03, 0, 0, &set_data);
     assert!(
-        !sent
-            .windows(PF_PASSWORD.len())
-            .any(|w| w == PF_PASSWORD),
+        !sent.windows(PF_PASSWORD.len()).any(|w| w == PF_PASSWORD),
         "the passphrase must not appear anywhere in the SET_CODE APDU"
     );
     assert_eq!(
-        PICOFORGE_ACCESS_KEY_LEN,
-        16,
+        PICOFORGE_ACCESS_KEY_LEN, 16,
         "only the 16 derived key bytes cross the wire"
     );
     assert_ne!(
@@ -1125,19 +1218,22 @@ fn validate_accepts_picoforge_pbkdf2_sha1_key() {
     // different challenge from the SET_CODE one, so the stored key cannot be
     // replayed from the commissioning exchange.
     let sel = select(&mut app);
-    assert_eq!(select_device_id(&sel), salt, "device-id is stable across SELECT");
+    assert_eq!(
+        select_device_id(&sel),
+        salt,
+        "device-id is stable across SELECT"
+    );
     let device_challenge = select_challenge(&sel);
     assert_ne!(
-        device_challenge, set_challenge.to_vec(),
+        device_challenge,
+        set_challenge.to_vec(),
         "the device must issue a fresh challenge after SET_CODE"
     );
 
     let host_challenge = [0x99u8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22];
     let vdata = picoforge_validate_data(&key, &device_challenge, &host_challenge);
     assert!(
-        !vdata
-            .windows(PF_PASSWORD.len())
-            .any(|w| w == PF_PASSWORD),
+        !vdata.windows(PF_PASSWORD.len()).any(|w| w == PF_PASSWORD),
         "the passphrase must not appear in the VALIDATE APDU either"
     );
     let (body, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &vdata));
@@ -1243,7 +1339,10 @@ fn validate_rejects_wrong_challenge_hmac() {
             &picoforge_validate_data(&key, &[0xDEu8; 8], &host_challenge),
         ),
     );
-    assert_eq!(sw, 0x6984, "VALIDATE against a challenge the device never issued");
+    assert_eq!(
+        sw, 0x6984,
+        "VALIDATE against a challenge the device never issued"
+    );
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x6982, "still locked");
 
@@ -1333,14 +1432,20 @@ fn picoforge_bare_reset_wipes_without_validate() {
 
     // The bare picoforge reset — no unlock.
     let (_, sw) = drive(&mut app, &apdu(0x04, 0xDE, 0xAD, &[]));
-    assert_eq!(sw, 0x9000, "US-132: a bare 00 04 DE AD with a touch must succeed");
+    assert_eq!(
+        sw, 0x9000,
+        "US-132: a bare 00 04 DE AD with a touch must succeed"
+    );
 
     // Wiped: virgin again, so LIST is granted and empty, and SELECT no longer
     // advertises a challenge (the access code is gone too).
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(!select(&mut app).contains(&0x74), "the access code was wiped");
+    assert!(
+        !select(&mut app).contains(&0x74),
+        "the access code was wiped"
+    );
 }
 
 /// US-132: the same bare RESET with the touch withheld is refused (0x6985)
@@ -1424,7 +1529,10 @@ fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(!select(&mut app).contains(&0x74), "the access code was wiped");
+    assert!(
+        !select(&mut app).contains(&0x74),
+        "the access code was wiped"
+    );
 }
 
 /// A frame too short to carry even a case-1 header is still garbage: 3 bytes
@@ -1441,7 +1549,8 @@ fn frames_shorter_than_a_case1_header_are_still_refused() {
     ] {
         let (_, sw) = drive(&mut app, &frame);
         assert_eq!(
-            sw, 0x6D00,
+            sw,
+            0x6D00,
             "a {}-byte frame is not a command: {frame:02X?}",
             frame.len()
         );
@@ -1560,7 +1669,8 @@ fn list_ext_apdu() -> Vec<u8> {
 fn put_accepts_bare_property_tlv() {
     // Presence is *withheld*: a PUT carrying `78 02` must not store a
     // credential that then reveals itself to any host command.
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
 
     let data = picoforge_put_data_touch(b"kaka", &KAKA_KEY);
     let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
@@ -1594,9 +1704,14 @@ fn put_accepts_bare_property_tlv() {
         stream.windows(2).any(|w| w == [0x78, 0x02]),
         "the persisted record carries the property object: {stream:02X?}"
     );
-    let mut rebooted = OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul())
-        .expect("reboot with a stored property")
-        .with_user_presence(|| false);
+    let mut rebooted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("reboot with a stored property")
+    .with_user_presence(|| false);
     let (_, sw) = drive(&mut rebooted, &list_ext_apdu());
     assert_eq!(sw, 0x6982, "reboot is locked (credentials exist)");
 
@@ -1618,7 +1733,8 @@ fn put_accepts_bare_property_tlv() {
 
     // A virgin app (still auto-validated) whose stored credential demands
     // touch: CALCULATE must refuse without a grant.
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     let (_, sw) = drive(
         &mut app,
         &apdu(0x01, 0, 0, &picoforge_put_data_touch(b"kaka", &KAKA_KEY)),
@@ -1635,7 +1751,8 @@ fn put_accepts_bare_property_tlv() {
 
     // With the grant the same APDU answers the unchanged fixed vector, so
     // the gate gates the reveal and nothing else.
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     let (_, sw) = drive(
         &mut app,
         &apdu(0x01, 0, 0, &picoforge_put_data_touch(b"kaka", &KAKA_KEY)),
@@ -1656,7 +1773,8 @@ fn put_accepts_bare_property_tlv() {
 /// `7A 04` header lands on counter 0 and answers something else.
 #[test]
 fn bare_property_tlv_does_not_corrupt_the_following_imf() {
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     let mut data = picoforge_put_data_touch(b"hotp", &[0x11, 6, b'k', b'a', b'k', b'a']);
     data.extend_from_slice(&[0x7a, 8, 0, 0, 0, 0, 0xFF, 0x00, 0xFF, 0xFF]);
     let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
@@ -1705,8 +1823,8 @@ fn unsupported_property_bit_is_refused_not_dropped() {
 #[test]
 fn calc_all_cannot_bypass_require_touch() {
     let chal = [0u8, 0, 0, 0, 0, 0, 0, 1];
-    let mut deny =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut deny = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     let (_, sw) = drive(
         &mut deny,
         &apdu(0x01, 0, 0, &picoforge_put_data_touch(b"kaka", &KAKA_KEY)),
@@ -1721,8 +1839,8 @@ fn calc_all_cannot_bypass_require_touch() {
     );
     assert!(body.is_empty(), "no code leaked in the refused response");
 
-    let mut allow =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut allow = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     let (_, sw) = drive(
         &mut allow,
         &apdu(0x01, 0, 0, &picoforge_put_data_touch(b"kaka", &KAKA_KEY)),
@@ -2330,8 +2448,8 @@ fn reset_gates_are_the_magic_and_the_touch_and_nothing_else() {
         false
     }
     let build = |touch: fn() -> bool| {
-        let mut app =
-            OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(touch);
+        let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+            .with_user_presence(touch);
         put_kaka(&mut app);
         app
     };

@@ -1,14 +1,53 @@
-**Date:** 2026-09-30 (**code-quality review: dead-code removal + four
-security/correctness fixes**). The image moved, so the measurement is re-taken
-rather than carried; the direction is the useful part, so it is stated first.
-**Measured: `text` 811,816 → 811,648 B (**−168 B**); Berkeley `.bss` 420,476 B
-(**unchanged**); task-arena demand 17,760 B (**unchanged**; re-measured with
-`measure_task_arena.py`, which is the authority, and re-stamped
-`0a35e1b87cf878b8…`); UF2 **3,046 blocks** (1 absolute preamble + 3,045 ARM_S
-payload), 1,559,552 bytes. Shipping sha256
-**`32273c7ee44f…`**.**
+**Date:** 2026-09-30 (**US-OTP-HID: the Yubico OTP HID transport** — a second
+HID interface, the YK4 feature-report state machine, and the composite
+`HidInterfacesHandler` that routes both — plus the `encCredStoreState` and
+P-521 key-generation fixes below). The image grew, so the measurement is
+re-taken rather than carried; the direction is the useful part, so it is stated
+first.
+**Measured: `text` 811,648 → 813,512 B (**+1,864 B**); Berkeley `.bss` 420,476 →
+420,692 B (**+216 B**); task-arena demand 17,760 B (**unchanged** — the OTP-HID
+handlers are synchronous, strictly inside the USB control transfer, and spawn
+no task); UF2 **3,053 blocks** (1 absolute preamble + 3,052 ARM_S
+payload), 1,563,136 bytes. Shipping sha256
+**`293d8e3f821a…`**.**
 Command, verbatim: `./build.sh` (which runs `cargo build --release` and stages
-the UF2), then `check_size_report.py`'s own `measure_elf()`.
+the UF2), then `check_size_report.py`'s own `measure_elf()`. `build.sh`'s own
+line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3053 blocks (1 absolute preamble + 3052 ARM_S payload), 1563136 bytes
+```
+
+**The growth is the feature, and it is bought twice over.** The +1,860 B of
+`text` is the second HID interface's descriptors, the composite handler's two
+extra routing arms, and the `otp_hid` frame state machine (`FRAME_RX`,
+`FRAME_TX`, sequence counters, CRC-16). The +216 B of `.bss` is that state
+machine's buffers. None of it is on a path that existed before.
+
+**Three smaller edits in the same change cost zero bytes**, and are worth
+recording because "it grew" would otherwise absorb them silently:
+
+- `HidControlHandler` — 48 lines (struct + `Handler` impl) — was **dead**. The
+  composite `HidInterfacesHandler` replaced it and routes strictly more (CTAP
+  and OTP control requests), so the old type had zero code references and the
+  linker had already dropped it. Deleting unreachable code cannot move the
+  image, and did not.
+- `bytes.len() <= MAX_IDENTITY_STRING - 1` → `bytes.len() < MAX_IDENTITY_STRING`
+  in `StoredName::new` — clippy's `int_plus_one`; identical semantics, identical
+  codegen.
+- the unused `Persist` import in `firmware/src/otp_hid.rs` — `persist_one` is a
+  free function, not a trait method, so no code was behind it.
+
+**RAM, which is the tighter constraint, absorbed the `.bss` growth.** `.bss`
+grew 216 B and the **main stack zone shrank to match**, 111,804 → 111,588 B;
+`bss + stack + .data` is 532,476 B against 532,480 B of SRAM either way. That
+4 B is not a margin — it is `ALIGN(4)` slack in `cortex-m-rt`'s `link.x`, where
+`_stack_start` is pinned to the top of RAM and `_stack_end` is *derived* from
+the statics. **The stack zone is elastic: statics grow into it.** What fails a
+regression is the linker refusing to place `.bss`, and behind that the
+`check_boot_chain.py` call-chain ceiling (`CHAIN_CEILING` = 98,304 B), which
+turns a link error into a dark board. Both still pass, and the gate below
+enforces them.
 
 **The −168 B is dead code leaving the image, not a behaviour change**, and the
 four security fixes that shipped alongside it cost less than the code they
@@ -724,15 +763,16 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 759,760 | `0x10000200` | no (flash) |
-| `.rodata` | 18,628 | `0x100b99d0` | no (flash) |
+| `.text` | 761,600 | `0x10000200` | no (flash) |
+| `.rodata` | 18,708 | `0x100ba100` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100be360` | non-alloc, not in Berkeley `text` |
-| `.bss` | 419,452 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20066744` | yes |
-| `.defmt` | 33 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100beae0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 419,668 | `0x200000c8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x2006681c` | yes |
+| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
-| `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |<!-- END measured ELF sections -->
+| `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
+<!-- END measured ELF sections -->
 
 Berkeley `text` = 759,724 (`.text`) + 18,628 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
@@ -741,11 +781,12 @@ the `X` flag) = **811,612**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 811,648 B** · **`.data` = 196 B** · **`.bss` = 420,476 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 813,568 B** · **`.data` = 196 B** · **`.bss` = 420,692 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 420,672 B** (420,676 B address-to-address: `__sheap` `0x20066b44` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066b44` → **main stack zone = 111,804 B** of 532,480 B of SRAM.
+**RAM statics = 420,888 B** (420,892 B address-to-address: `__sheap` `0x20066c1c` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c1c` → **main stack zone = 111,588 B** of 532,480 B of SRAM.
 
-`bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.<!-- END measured ELF summary -->
+`bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
+<!-- END measured ELF summary -->
 
 ### What this fix cost, against the US-1011/US-1012 tip
 

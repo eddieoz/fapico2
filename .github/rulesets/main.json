@@ -1,0 +1,57 @@
+{
+  "name": "main — require PR, review of the gates, and green CI",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_approving_review_count": 1,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["squash"],
+        "dismissal_restriction": {
+          "users": [],
+          "teams": []
+        }
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": true,
+        "required_status_checks": [
+          { "context": "cargo test --workspace" },
+          { "context": "cargo clippy -D warnings" },
+          { "context": "device integration gate (RP2350)" },
+          { "context": "supply chain (deny.toml graph assertions)" },
+          { "context": "assurance gates (structural, no device build)" },
+          { "context": "heap gate (one sanctioned allocator, nothing allocates pre-boot)" },
+          { "context": "persist gate (one implementation)" },
+          { "context": "attestation gate (per-device provisioning)" },
+          { "context": "rng path gate (every nonce via the DRBG)" },
+          { "context": "erase budget gate (docs/erase-budget.md matches the measurement)" },
+          { "context": "advertise/serve coupling gate (default + reduced)" },
+          { "context": "pytest gate (Phase 3 exit config)" }
+        ]
+      }
+    }
+  ]
+}
+

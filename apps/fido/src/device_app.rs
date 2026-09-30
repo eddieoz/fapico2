@@ -421,6 +421,17 @@ impl FidoApp {
         &mut self.keystore
     }
 
+    /// The stored physical configuration (`PhyConfig`, keystore auth-map key
+    /// 6) — read-only, for the boot path that resolves the USB identity.
+    ///
+    /// The descriptors consume VID/PID and the identity names; LED fields stay
+    /// with the LED task. Immutable on purpose: `&mut keystore()` would force
+    /// the boot to take a mutable borrow of the whole app just to read four
+    /// fields.
+    pub fn phy(&self) -> &crate::vendorff::PhyConfig {
+        &self.keystore.phy
+    }
+
     /// US-907: attach the user-presence source (the board button poll on
     /// device). `None` uses the build default: fail-closed on the device
     /// build (no press → no grant → CTAP2 UpRequired), auto-ack on

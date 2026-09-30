@@ -295,6 +295,17 @@ pub fn pin_uv_auth(token: &[u8], data: &[u8]) -> Vec<u8> {
 
 #[allow(dead_code)] // shared helpers: not every test binary uses every one
 pub fn make_mc_request(hash: &[u8; 32], rp_id: &str, token: &[u8]) -> Vec<u8> {
+    make_mc_request_alg(hash, rp_id, token, -7)
+}
+
+/// [`make_mc_request`] with an explicit COSE `alg` in the key parameters.
+///
+/// ES256 (`-7`) remains the default so every existing caller is unchanged.
+/// The parameterisation exists because the four advertised curves fail key
+/// generation for different reasons and only a per-curve test can tell those
+/// apart — see the P-521 regression test in `keygen.rs`.
+#[allow(dead_code)]
+pub fn make_mc_request_alg(hash: &[u8; 32], rp_id: &str, token: &[u8], alg: i64) -> Vec<u8> {
     cbor::encode(&Value::M(vec![
         (Value::U(0x01), Value::B(hash.to_vec())),
         (
@@ -315,7 +326,7 @@ pub fn make_mc_request(hash: &[u8; 32], rp_id: &str, token: &[u8]) -> Vec<u8> {
             Value::U(0x04),
             Value::A(vec![Value::M(vec![
                 (Value::T("type".to_string()), Value::T("public-key".to_string())),
-                (Value::T("alg".to_string()), Value::N(-7)),
+                (Value::T("alg".to_string()), Value::N(alg)),
             ])]),
         ),
         (Value::U(0x08), Value::B(pin_uv_auth(token, hash))),

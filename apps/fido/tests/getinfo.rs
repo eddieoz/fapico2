@@ -548,3 +548,67 @@ fn getinfo_0x15_lists_physical_ids() {
         "US-122: the host and device getInfo encoders must agree on 0x15"
     );
 }
+
+// ---------------------------------------------------------------------------
+// US-FIX (encCredStoreState length): the 32-byte field must be 32 bytes on
+// the wire, from the path the EMULATOR and the suite actually run.
+// ---------------------------------------------------------------------------
+//
+// This closes a hole that let a real defect ship. Two `getInfo`
+// implementations exist:
+//
+//   * `device_core.rs::get_info` — builds `enc_state` in a fresh vec and
+//     ASSIGNS it (`info.enc_cred_store_state = enc_state`). 32 B. Correct.
+//   * `app.rs::get_info` — starts from `Ctap2Info::default()`, which already
+//     holds 32 zero bytes, and APPENDS IV(16) || ciphertext(16). 64 B.
+//
+// `firmware/src/emul_main.rs -> process_ctap2` goes through `app.rs`, so the
+// emulator — and therefore every pytest suite — served a 64-byte
+// encCredStoreState, and `test_get_info_enc_cred_store_state_is_32_bytes`
+// above still passed, because it asserts on `Ctap2Info::default()` and never
+// invokes either `get_info`. A gate that cannot fail is not a gate.
+//
+// CTAP2.1 §6.5.1: encCredStoreState is a 16-byte AES-CBC IV followed by
+// exactly one 16-byte ciphertext block = 32 bytes.
+
+/// Pull getInfo key `0x1E` (encCredStoreState) out of an encoded response.
+///
+/// The response is `[0x00 status][CBOR map]`; this walks the map rather than
+/// trusting an offset, so a key-order change cannot silently pass this.
+fn enc_state_len_from_response(resp: &[u8]) -> usize {
+    use fapico2_fido::cbor::Value;
+
+    let (decoded, _) = fapico2_fido::cbor::decode(&resp[1..])
+        .expect("getInfo response must be a CBOR map");
+    let Value::M(entries) = decoded else {
+        panic!("getInfo response must be a CBOR map");
+    };
+    entries
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (Value::U(0x1E), Value::B(b)) => Some(b.len()),
+            (Value::U(0x1E), other) => {
+                panic!("encCredStoreState (0x1E) must be a bstr, got {other:?}")
+            }
+            _ => None,
+        })
+        .expect("getInfo must carry encCredStoreState (0x1E)")
+}
+
+#[test]
+fn test_get_info_wire_enc_state_is_32_bytes_on_the_app_path() {
+    use fapico2_fido::app::FidoApp;
+    use fapico2_fido::keystore::MemoryKeystore;
+
+    let mut app = FidoApp::with_keystore(MemoryKeystore::new());
+    // CTAP2_GET_INFO = 0x04.
+    let resp = app.process_ctap2(0x04, &[], [1, 2, 3, 4]);
+
+    assert_eq!(
+        enc_state_len_from_response(&resp),
+        32,
+        "CTAP2.1 §5.1.2: encCredStoreState (0x1E) is IV(16) || one AES-CBC \
+         block(16) = 32 bytes. A longer field means the 32-byte default in \
+         `Ctap2Info::default()` was appended to instead of replaced."
+    );
+}

@@ -2,7 +2,7 @@
 //! plus the OTP PIN lifecycle (SET/VERIFY/CHANGE PIN) and RESET.
 
 use crate::ct::ct_eq;
-use fapico2_platform::dispatch::{App, MAX_RESPONSE, Sw};
+use fapico2_platform::dispatch::{App, Sw, MAX_RESPONSE};
 use fapico2_platform::presence::PresenceService;
 use heapless::Vec as HeaplessVec;
 use hmac::{Hmac, Mac};
@@ -355,7 +355,9 @@ impl OathApp {
     }
 
     fn find_cred(&self, name: &[u8]) -> Option<usize> {
-        self.creds.iter().position(|c| c.as_ref().map(|c| &c.name).is_some_and(|n| n == name))
+        self.creds
+            .iter()
+            .position(|c| c.as_ref().map(|c| &c.name).is_some_and(|n| n == name))
     }
 
     /// Compute the OATH response body for a credential (digits + hmac or the
@@ -400,7 +402,12 @@ impl App for OathApp {
         SW_OK
     }
 
-    fn select_apdu(&mut self, internal: bool, _apdu: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> Sw {
+    fn select_apdu(
+        &mut self,
+        internal: bool,
+        _apdu: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) -> Sw {
         let sw = self.select(internal);
         if sw == SW_OK {
             let mut data = Vec::new();
@@ -429,7 +436,14 @@ impl App for OathApp {
 }
 
 impl OathApp {
-    fn handle(&mut self, ins: u8, p1: u8, p2: u8, data: Vec<u8>, resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> Sw {
+    fn handle(
+        &mut self,
+        ins: u8,
+        p1: u8,
+        p2: u8,
+        data: Vec<u8>,
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) -> Sw {
         match ins {
             INS_PUT => self.cmd_put(data),
             INS_DELETE => self.cmd_delete(data),
@@ -615,7 +629,12 @@ impl OathApp {
         SW_OK
     }
 
-    fn cmd_calculate(&mut self, p2: u8, data: Vec<u8>, resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> Sw {
+    fn cmd_calculate(
+        &mut self,
+        p2: u8,
+        data: Vec<u8>,
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) -> Sw {
         if p2 != 0 && p2 != 1 {
             return SW_INCORRECT_P1P2;
         }
@@ -660,7 +679,12 @@ impl OathApp {
         SW_OK
     }
 
-    fn cmd_calculate_all(&mut self, p2: u8, data: Vec<u8>, resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> Sw {
+    fn cmd_calculate_all(
+        &mut self,
+        p2: u8,
+        data: Vec<u8>,
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) -> Sw {
         if p2 != 0 && p2 != 1 {
             return SW_INCORRECT_P1P2;
         }
@@ -673,7 +697,9 @@ impl OathApp {
             None => return SW_INCORRECT_PARAMS,
         };
         for idx in 0..self.creds.len() {
-            let Some(ref cred) = self.creds[idx] else { continue };
+            let Some(ref cred) = self.creds[idx] else {
+                continue;
+            };
             let (name, key) = (cred.name.clone(), cred.key.clone());
             resp.push(TAG_NAME).ok();
             resp.push(name.len() as u8).ok();

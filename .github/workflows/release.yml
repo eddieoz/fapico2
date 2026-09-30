@@ -9,8 +9,12 @@
 # otherwise. What HAS been exercised, on every push, is the policy those
 # steps feed: `check_release_provenance.py` and `check_artefact_agreement.py`
 # run against committed fixtures with negative controls, through the same
-# functions a release calls. The first real tag is when the other half gets
-# its first real test, and it should be expected to need fixing.
+# functions a release calls.
+#
+# That gap is now closable on demand: `workflow_dispatch` takes a `dry_run`
+# input, defaulting to TRUE, which runs the entire build -> sign -> attest ->
+# verify chain and publishes nothing. Dispatch it once and this header becomes
+# false; until you have, it is still true. Expect the first run to need fixing.
 #
 # The chain of custody, and why there is only ONE mechanism per property
 # ------------------------------------------------------------------------
@@ -49,9 +53,44 @@ on:
         description: release tag, e.g. v1.0.0
         required: true
         type: string
+  # Manual release (the primary path). A merge to main publishes NOTHING —
+  # see the design note below.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'release tag to build and publish, e.g. v1.0.0'
+        required: true
+        type: string
+      dry_run:
+        description: >-
+          Build, sign, attest and verify, but publish nothing. DEFAULT TRUE.
+          The first dispatch of this workflow should be a dry run: the signing
+          and attestation steps below have still never executed, so use this
+          to exercise them before anything is published.
+        required: false
+        default: true
+        type: boolean
   push:
     tags:
       - 'v*'
+
+# WHY THERE IS NO RELEASE-ON-MERGE
+# ------------------------------------------------------------------------
+# Publishing is manual, deliberately. Auto-publishing on every merge to main
+# would mint a Fulcio certificate and a public Rekor entry per merge, which
+# turns a mistyped push or a compromised dependency into a *signed, published*
+# artefact. Attestation is cheap; publishing signed things automatically is
+# the expensive part.
+#
+# The cost of that choice is that this path stays unexercised until a human
+# runs it, which is what `dry_run` above exists to bound: run it, watch it
+# fail, fix it, and only then publish.
+#
+# Note also what CI is and is not allowed to build. The secure-boot private
+# key is deliberately OUTSIDE this repository (see .gitignore: `secrets/*`),
+# so the artefact produced here is UNSIGNED for secure boot. cosign and the
+# attestation prove *provenance* — that these bytes came from this workflow —
+# and say nothing about the device's boot seal. See docs/secureboot.md.
 
 permissions:
   contents: read
@@ -59,7 +98,7 @@ permissions:
 jobs:
   release:
     name: build, sign and attest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       # Keyless signing needs an OIDC token. This is the whole reason there
       # is no key to leak.
@@ -70,12 +109,18 @@ jobs:
       contents: write
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: fapico2
           persist-credentials: false
+      # No third-party action: `rustup` ships with the runner and the committed
+      # rust-toolchain.toml pins the channel. dtolnay/rust-toolchain resolves
+      # its toolchain from a *branch* (stable, `protected: false`), so
+      # SHA-pinning it would freeze the action code while leaving the
+      # ref -> toolchain mapping mutable — in the one job that holds
+      # `id-token: write`. Removing the dependency removes the question.
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi
@@ -183,8 +228,13 @@ jobs:
           fi
           echo "ok: UF2, SBOM and attestation agree"
 
+      # Publication is the ONLY step the dry run skips. Everything above it —
+      # the gates, the build, the cosign signature, the attestation, and both
+      # verification gates — runs identically either way, so a dry run is a
+      # real exercise of the signing path and not a rehearsal of it.
       - name: Publish the release artefacts
-        uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run != true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fapico2-release
           path: |
@@ -193,3 +243,29 @@ jobs:
             fapico2/dist/fapico2.uf2.pem
             fapico2/dist/sbom.cdx.json
             fapico2/dist/provenance.json
+
+      # A dry run that ends in silence is indistinguishable from a broken
+      # workflow. Say so explicitly, and name what was exercised.
+      - name: "DRY RUN — signing path exercised, nothing published"
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "### Dry run — no artefact was published" >&2
+          echo "" >&2
+          echo "- built \`dist/fapico2.uf2\` from this run's source" >&2
+          echo "- cosign-signed it keyless via the GitHub Actions OIDC token" >&2
+          echo "- minted a build-provenance attestation for it" >&2
+          echo "- passed check_release_provenance.py and check_artefact_agreement.py" >&2
+          echo "" >&2
+          echo "Re-run with dry_run=false to publish." >&2
+          {
+            echo "### Dry run — signing path exercised, nothing published"
+            echo ""
+            echo "| step | result |"
+            echo "|---|---|"
+            echo "| build + UF2 | ok |"
+            echo "| cosign keyless signature | ok |"
+            echo "| build-provenance attestation | ok |"
+            echo "| provenance policy (US-1063) | ok |"
+            echo "| artefact agreement (US-1064) | ok |"
+            echo "| publish | **skipped (dry run)** |"
+          } >> "$GITHUB_STEP_SUMMARY"

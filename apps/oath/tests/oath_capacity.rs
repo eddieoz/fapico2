@@ -96,7 +96,11 @@ fn durable_maximal_creds() -> usize {
         // the length is the maximal one.
         let mut name = [b'c'; MAXIMAL_NAME];
         name[MAXIMAL_NAME - 2..].copy_from_slice(&i.to_le_bytes());
-        assert_eq!(put_cred(&mut app, &name, &secret), 0x9000, "PUT {i} must be accepted");
+        assert_eq!(
+            put_cred(&mut app, &name, &secret),
+            0x9000,
+            "PUT {i} must be accepted"
+        );
         if !app.persist_state(&mut store) {
             return n;
         }
@@ -165,7 +169,11 @@ fn the_documented_credential_ceiling_is_the_measured_one() {
 
     // Restate the arithmetic so a reader can check the number rather than trust
     // it, and so a future change to either constant breaks something.
-    assert_eq!(MEASURED_STREAM_BYTES / DOCUMENTED, 182, "182 B per maximal credential");
+    assert_eq!(
+        MEASURED_STREAM_BYTES / DOCUMENTED,
+        182,
+        "182 B per maximal credential"
+    );
     assert_eq!(
         MEASURED_STREAM_BYTES.div_ceil(chunked::PART_PAYLOAD_MAX),
         MEASURED_PARTS,

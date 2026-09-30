@@ -44,8 +44,16 @@ pub const MANAGEMENT_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x
 
 /// Firmware version reported on SELECT, mirroring `man_select`'s
 /// `"PICO_FIDO_VERSION_MAJOR.PICO_FIDO_VERSION_MINOR.0"`.
-pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 0;
+///
+/// The version is a **client-compatibility contract**, not a changelog. yubikit
+/// gates its management `read_device_info` on `>= 4.1` — below that the
+/// desktop app degrades to legacy applet scanning and can never learn FIDO2
+/// or the serial (`yubikit/support.py` `_read_info_ccid`). 5.4 is a real
+/// YubiKey 5 firmware version, matching the YubiKey 5 PID this build
+/// enumerates as, and stays distinct from the RS-Key SDK major (8, rescue
+/// SELECT byte 2) whose separation the rescue protocol test pins.
+pub const VERSION_MAJOR: u8 = 5;
+pub const VERSION_MINOR: u8 = 4;
 
 /// Fixed emulation chipid — host/emulation builds have no OTP row, so a
 /// fixed stand-in (ASCII `"fapico2"` + `0x00`) keeps the derived serial
@@ -344,7 +352,7 @@ impl ManagementApp {
     }
 
     /// Emit the `man_select` version string ("MAJOR.MINOR.0") without `std`.
-    /// Single-digit major/minor (the shipped build reports 1.0.0).
+    /// Single-digit major/minor (the shipped build reports 5.4.0).
     fn write_version(out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         let buf = [
             b'0' + VERSION_MAJOR,
@@ -616,7 +624,7 @@ mod tests {
         sel.extend_from_slice(MANAGEMENT_AID);
         let sw = app.select_apdu(false, &sel, &mut resp);
         assert_eq!(sw, SW_OK);
-        assert_eq!(&resp.as_slice(), b"1.0.0");
+        assert_eq!(&resp.as_slice(), b"5.4.0");
     }
 
     /// The advertised capability word tracks the feature gates at compile time

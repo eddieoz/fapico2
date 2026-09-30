@@ -1035,6 +1035,23 @@ impl RescueConfigHandler for DeviceRescueConfigHandler {
             // not, and the Rescue applet exists for recovery.
             return 0x6F00;
         }
+        // A store write is **RAM state**; the partition image is what survives
+        // a power cycle (a system reset keeps SRAM, which is why a write can
+        // look durable across a `REBOOT` and vanish across an unplug). No
+        // transport gate runs for this applet — it is not one of the
+        // dispatcher's apps, and the keystore it wrote is a private copy, so
+        // nothing is left dirty for the CCID gate to program. The program step
+        // therefore belongs here, before the ack, exactly as the gate would
+        // have done it (US-425 durable-before-ack).
+        // SAFETY: FLASH_DEV is initialized on the boot path before any task
+        // spawns; this is a strictly-synchronous section, the same accessor
+        // the OpenPGP migration path uses.
+        let flash = unsafe { (&mut *core::ptr::addr_of_mut!(FLASH_DEV)).as_mut_ptr() };
+        let mut sink = crate::tasks::secure_slot_sink(unsafe { &mut *flash });
+        if !fapico2_platform::persist::snapshot_and_program(store, &mut sink) {
+            defmt::error!("rescue: partition image program failed; refusing (6F00)");
+            return 0x6F00;
+        }
         RESCUE_PHY_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         fapico2_platform::dispatch::SW_OK
     }
