@@ -70,7 +70,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
           persist-credentials: false
@@ -184,7 +184,7 @@ jobs:
           echo "ok: UF2, SBOM and attestation agree"
 
       - name: Publish the release artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fapico2-release
           path: |

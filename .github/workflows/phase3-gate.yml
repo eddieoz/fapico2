@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2 (Rust firmware + gate)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       # Sibling harness repo (published first, per US-725): when it is absent
@@ -33,7 +33,7 @@ jobs:
       # that depends on it are skipped instead of turning this job red.
       - name: Checkout pico-fido2 (Python test suites)
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: pico-fido2
       - name: Set up Rust (stable; host target for the emulator + clippy)
@@ -41,7 +41,7 @@ jobs:
         with:
           toolchain: stable
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install Python test dependencies

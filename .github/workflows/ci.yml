@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable)
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable + clippy)
@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable + clippy)
@@ -223,7 +223,7 @@ jobs:
           fi
           echo "size-report gate PASS"
       - name: Upload release ELF (RP2350)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fapico2-firmware-rp2350
           path: fapico2/target/thumbv8m.main-none-eabi/release/fapico2-firmware
@@ -309,7 +309,7 @@ jobs:
           fi
           echo "flash-budget ratchet PASS: ${SHIPPING} B <= ${BUDGET_BYTES} B"
       - name: Upload flashable UF2 (RP2350)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fapico2-rp2350-uf2
           path: fapico2/firmware/fapico2.uf2
@@ -334,7 +334,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable)
@@ -373,7 +373,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: "Heap gate: one sanctioned allocator + pre-boot allocation invariant"
@@ -402,7 +402,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: "Grep: one persist implementation (no code-level snapshot/program re-sequence)"
@@ -432,7 +432,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: "Grep: no repo-committed attestation material (blobs gone, no include_bytes!)"
@@ -460,7 +460,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: "Grep: no code-level peripheral draw outside platform/src/trng.rs"
@@ -489,7 +489,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: "Measure: erases per persist, and gate docs/erase-budget.md on it"
@@ -535,7 +535,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable)
@@ -594,7 +594,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (stable)
@@ -714,7 +714,7 @@ jobs:
           - fido_cred_state
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       - name: Set up Rust (nightly)
@@ -750,7 +750,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fapico2 (Rust firmware)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fapico2
       # Sibling harness repo (published first, per US-725): when it is absent
@@ -758,12 +758,12 @@ jobs:
       # depends on it are skipped instead of turning this job red.
       - name: Checkout pico-fido2 (Python test suites)
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ github.repository_owner }}/pico-fido2
           path: pico-fido2
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Set up Rust (stable; host target for the emulator)
@@ -800,7 +800,7 @@ jobs:
         run: ${{ github.workspace }}/.test-venv/bin/python -m pytest merged/ -q
       - name: Archive emulator logs
         if: ${{ always() && hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pytest-gate-emulator-logs
           path: pico-fido2/tests/build/
