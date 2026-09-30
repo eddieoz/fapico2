@@ -521,6 +521,18 @@ _B_AGREEMENT = Break(
     "them describing a build that was never signed",
 )
 
+_B_LED_POLARITY = Break(
+    "platform/src/trusted_backend/device.rs",
+    "            trussed::types::ui::Status::Processing => led.set_low(),",
+    "            trussed::types::ui::Status::Processing => led.set_high(),",
+    "the trussed activity LED claims a polarity the Pico 2's GPIO25 does not "
+    "have, so the 'working' indicator shows the LED OFF while the device is "
+    "busy (US-1303/US-1305). This is the inversion that is invisible rather "
+    "than merely wrong: the code compiles, the comment above it stays "
+    "self-consistent with the line, and the only symptom is a device that "
+    "looks idle while it is not",
+)
+
 GATES: tuple[Gate, ...] = (
     Gate(
         "check_persist_gate.py",
@@ -540,6 +552,12 @@ GATES: tuple[Gate, ...] = (
     Gate(
         "check_debug_strip.py",
         breaks=(_B_DEBUG_STRIP,),
+    ),
+    Gate(
+        "check_led_polarity.py",
+        breaks=(_B_LED_POLARITY,),
+        note="claim-forbiddance archetype (LED polarity), one allowlisted "
+             "true claim keyed on path + subject",
     ),
     Gate(
         "check_readme.py",
