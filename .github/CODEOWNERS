@@ -1,0 +1,77 @@
+# CODEOWNERS — fapico2
+#
+# WHAT THIS DOES AND DOES NOT DO, read this before assuming it is active.
+#
+# A CODEOWNERS file is INERT on its own. It assigns an owner to paths; nothing
+# enforces anything until a branch RULESET is configured with the
+# `require_code_owner_review` rule. Applying the ruleset is a separate,
+# manual step — see docs/superpowers/specs/2026-09-30-github-ci-security-design.md
+# §5.4 and .github/rulesets/main.json. Until that is applied, this file
+# documents intent and nothing more.
+#
+# WHY THESE PATHS
+#
+# The property that makes this tree trustworthy is that its gates are hard to
+# weaken by accident. That property has exactly one weak point: a pull request
+# that edits the gate that judges it. Everything below is either a gate, the
+# policy a gate enforces, or code whose failure mode is a security failure
+# rather than a test failure.
+#
+# Ordering: later matches win in CODEOWNERS, so the specific paths come after
+# the broad .github/ catch-all and correctly override it.
+
+# --- The gates themselves, and the machinery that judges the build ----------
+# ci.yml's 13 jobs call these scripts; release.yml's signing path calls four of
+# them directly. A PR that relaxes a threshold or deletes a negative control is
+# the highest-value edit available to an attacker who can open a PR.
+/.github/CODEOWNERS @eddieoz
+/.github/workflows/ @eddieoz
+/tests/scripts/ @eddieoz
+/supply-chain/ @eddieoz
+
+# --- Supply-chain policy -----------------------------------------------------
+# deny.toml decides which licences, advisories and duplicate versions are
+# refused; deny-graph.toml carries the workspace's own edge assertions. Both
+# are policy, and both are enforced by the supply-chain job.
+/deny.toml @eddieoz
+/deny-graph.toml @eddieoz
+
+# --- Build configuration -----------------------------------------------------
+# .cargo/config.toml selects the target and injects rustflags; the ARM linker
+# flags are load-bearing for the RP2350 image, and a change here changes what
+# bytes ship without changing a line of Rust.
+/.cargo/ @eddieoz
+/Cargo.toml @eddieoz
+/Cargo.lock @eddieoz
+/rust-toolchain.toml @eddieoz
+/.cargo/config.toml @eddieoz
+
+# --- Secure-boot and key-handling surface -----------------------------------
+# boot.rs is where the OTP key row is read and the OTP write-lock is applied
+# (see AGENTS.md: the write-lock is runtime-only and does not persist across a
+# reset — a known limitation, US-918). uf2gen.py produces the only flashable
+# image format the RP2350 bootrom accepts. secrets/ is ignored except its
+# README; keeping it listed means a proposal to commit a key is caught here
+# rather than by luck.
+/firmware/src/boot.rs @eddieoz
+/firmware/uf2gen.py @eddieoz
+/secrets/ @eddieoz
+
+# --- Security documentation --------------------------------------------------
+# SECURITY.md is the vulnerability-reporting policy and the statement of what
+# this firmware does and does not guarantee. Editing it changes what users are
+# told about their threat model.
+/SECURITY.md @eddieoz
+/docs/SECURITY-ASSESSMENT-ROUND2.md @eddieoz
+/docs/secureboot.md @eddieoz
+/docs/supply-chain.md @eddieoz
+
+# NOTE ON SCOPE: `/vendor/` is NOT listed.
+#
+# The vendored trees (vendor/opcard, vendor/ed448-goldilocks, vendor/x448) are
+# AGPL/LGPL code carried from upstream. They are ordinary dependencies from a
+# review standpoint — a change there is a change to third-party code, gated by
+# cargo-deny/cargo-vet and the SBOM like any other. Requiring owner review on
+# them would make every upstream sync a bottleneck without adding a property,
+# because a malicious edit there is caught by the same gates that catch a
+# malicious edit anywhere else in the dependency graph.

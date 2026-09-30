@@ -85,17 +85,34 @@ fn reselect_after_put_locks_session() {
     // Host-issued SELECT: no access code on file, so the SELECT response
     // carries no challenge TLV — but the session must NOT be granted either.
     let sel = select(&mut app);
-    assert!(!sel.contains(&0x74), "no challenge TLV without an access code");
+    assert!(
+        !sel.contains(&0x74),
+        "no challenge TLV without an access code"
+    );
 
     for (ins, data) in [
-        (0xA1u8, Vec::new()),          // LIST
+        (0xA1u8, Vec::new()),                          // LIST
         (0xA2, vec![0x74, 8, 1, 2, 3, 4, 5, 6, 7, 8]), // CALCULATE (challenge only)
-        (0x01, vec![0x71, 4, b'x', b'y', b'z', b'z', 0x73, 4, 0x21, 6, b's', b'k']), // PUT
+        (
+            0x01,
+            vec![
+                0x71, 4, b'x', b'y', b'z', b'z', 0x73, 4, 0x21, 6, b's', b'k',
+            ],
+        ), // PUT
         (0x02, vec![0x71, 4, b't', b'e', b's', b't']), // DELETE
-        (0x05, vec![0x71, 4, b't', b'e', b's', b't', 0x71, 4, b'o', b't', b'h', b'r']), // RENAME
+        (
+            0x05,
+            vec![
+                0x71, 4, b't', b'e', b's', b't', 0x71, 4, b'o', b't', b'h', b'r',
+            ],
+        ), // RENAME
     ] {
         let (_, sw) = drive(&mut app, &apdu(ins, 0, 0, &data));
-        assert_eq!(sw, 0x6982, "INS {:#04x} must be refused after re-SELECT", ins);
+        assert_eq!(
+            sw, 0x6982,
+            "INS {:#04x} must be refused after re-SELECT",
+            ins
+        );
     }
 
     // The refused PUT/DELETE/RENAME left the table untouched: persist and
@@ -103,8 +120,13 @@ fn reselect_after_put_locks_session() {
     // boots locked, proving the credential survived the refused commands.
     app.mark_dirty();
     assert!(app.persist_state(&mut store));
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     let _ = select(&mut booted);
     let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x6982, "booted non-virgin app stays locked");
@@ -120,11 +142,19 @@ fn boot_restore_of_non_virgin_app_is_locked() {
     app.mark_dirty();
     assert!(app.persist_state(&mut store), "state persisted");
 
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     select(&mut booted);
     let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(sw, 0x6982, "boot-restore must not leave a non-virgin app validated");
+    assert_eq!(
+        sw, 0x6982,
+        "boot-restore must not leave a non-virgin app validated"
+    );
 }
 
 /// With an access code set, SELECT advertises the challenge TLV (0x74) and the
@@ -154,7 +184,10 @@ fn access_code_select_advertises_challenge_and_locks() {
     let mut want_name = vec![0x71, DEVICE_ID_LEN as u8];
     want_name.extend_from_slice(&device_id_from_chipid(EMULATION_CHIPID));
     assert_eq!(&sel[5..15], &want_name[..], "name TLV");
-    let cpos = sel.iter().position(|&b| b == 0x74).expect("challenge TLV advertised");
+    let cpos = sel
+        .iter()
+        .position(|&b| b == 0x74)
+        .expect("challenge TLV advertised");
     assert_eq!(sel[cpos + 1], 8);
     assert_eq!(sel.len(), cpos + 10, "challenge is the last TLV");
 
@@ -183,8 +216,13 @@ fn boot_with_only_access_code_is_locked() {
     app.mark_dirty();
     assert!(app.persist_state(&mut store));
 
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     let _ = select(&mut booted);
     let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x6982, "access-code-only app boots locked");
@@ -198,7 +236,10 @@ fn boot_with_only_access_code_is_locked() {
 fn validate_virgin_empty_data_is_refused() {
     let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
     let (_, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &[]));
-    assert_eq!(sw, 0x6A80, "no-challenge VALIDATE is refused by parse order");
+    assert_eq!(
+        sw, 0x6A80,
+        "no-challenge VALIDATE is refused by parse order"
+    );
 }
 
 /// US-902 (deliberate C-parity break): VALIDATE on an app with no access code
@@ -215,7 +256,10 @@ fn validate_without_access_code_never_grants() {
 
     // VALIDATE did not un-grant the virgin session either: LIST still OK.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(sw, 0x9000, "virgin session stays granted after refused VALIDATE");
+    assert_eq!(
+        sw, 0x9000,
+        "virgin session stays granted after refused VALIDATE"
+    );
 
     // Now a locked session: put a credential and re-SELECT (non-virgin).
     put_cred(&mut app, b"locked", b"secret-2");
@@ -242,7 +286,10 @@ fn validate_with_access_code_handshake() {
     set_code(&mut app, code_secret);
 
     let sel = select(&mut app);
-    let cpos = sel.iter().position(|&b| b == 0x74).expect("challenge TLV advertised");
+    let cpos = sel
+        .iter()
+        .position(|&b| b == 0x74)
+        .expect("challenge TLV advertised");
     assert_eq!(sel[cpos + 1], 8);
     let challenge: Vec<u8> = sel[cpos + 2..cpos + 10].to_vec();
 
@@ -256,10 +303,17 @@ fn validate_with_access_code_handshake() {
 
     // Correct HMAC over the SELECT-issued challenge.
     let good = hmac_sha1(code_secret, &challenge);
-    let (body, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)));
+    let (body, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)),
+    );
     assert_eq!(sw, 0x9000, "correct HMAC response must grant");
     assert_eq!(body[0], 0x75, "response TLV present");
-    assert_eq!(&body[2..], &hmac_sha1(code_secret, &challenge)[..], "HMAC over the client challenge");
+    assert_eq!(
+        &body[2..],
+        &hmac_sha1(code_secret, &challenge)[..],
+        "HMAC over the client challenge"
+    );
 
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000, "granted session lists credentials");
@@ -318,8 +372,8 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 fn reset_without_prior_validate_succeeds_with_presence_and_wipes() {
     // A credential exists, so a host-issued SELECT starts the session
     // unvalidated (US-901) — this is the state picoforge's Reset runs in.
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-4");
     let _ = select(&mut app);
     // The session really is unvalidated: LIST is refused with 0x6982.
@@ -354,8 +408,8 @@ fn reset_without_prior_validate_succeeds_with_presence_and_wipes() {
 /// the presence gate, never the (removed) session gate.
 #[test]
 fn reset_without_prior_validate_and_without_presence_is_refused() {
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-5");
     let _ = select(&mut app);
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
@@ -380,7 +434,8 @@ fn reset_without_prior_validate_and_without_presence_is_refused() {
 /// the presence gate rather than short-circuiting.)
 #[test]
 fn reset_validated_without_presence_is_refused() {
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     // PUT while the virgin session is granted; PUT does not clear it.
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-5");
 
@@ -403,7 +458,8 @@ fn reset_validated_without_presence_is_refused() {
 #[test]
 fn reset_validated_with_presence_wipes_and_persists_empty() {
     let mut store = HostSecureStore::new();
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     // PUT while the virgin session is granted; PUT does not clear it.
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-6");
 
@@ -414,8 +470,13 @@ fn reset_validated_with_presence_wipes_and_persists_empty() {
     assert!(app.persist_state(&mut store), "emptied state persisted");
 
     // Boot from the store yields a virgin app: LIST answers 9000, empty.
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     let _ = select(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
@@ -454,8 +515,8 @@ fn reset_presence_grant_binds_to_the_reset_tag() {
 /// `PRESENCE_TAG_RESET` and refused here, so the wipe does not run.
 #[test]
 fn reset_presence_grant_never_armed_for_reset_is_refused() {
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_presence_grant(|_| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_presence_grant(|_| false);
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-8");
 
     let (_, sw) = drive(&mut app, &apdu(0x04, 0xDE, 0xAD, &[]));
@@ -475,13 +536,16 @@ fn reset_presence_grant_never_armed_for_reset_is_refused() {
 /// talked into a wipe.
 #[test]
 fn reset_wrong_p1p2_is_parse_error_first() {
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     put_cred(&mut app, b"x", b"s");
     let _ = select(&mut app);
     for (p1, p2) in [(0xDEu8, 0xAEu8), (0xADu8, 0xDEu8), (0x00, 0x00)] {
         let (_, sw) = drive(&mut app, &apdu(0x04, p1, p2, &[]));
-        assert_eq!(sw, 0x6A86, "bad P1/P2 magic {p1:#04x}/{p2:#04x} is a parse error");
+        assert_eq!(
+            sw, 0x6A86,
+            "bad P1/P2 magic {p1:#04x}/{p2:#04x} is a parse error"
+        );
     }
     // No mistyped magic wiped anything: the credential survived all three.
     let mut booted = boot_after_persist(&mut app);
@@ -496,7 +560,13 @@ fn boot_after_persist(app: &mut OathApp) -> OathApp {
     let mut store = HostSecureStore::new();
     app.mark_dirty();
     assert!(app.persist_state(&mut store));
-    OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot")
+    OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot")
 }
 
 // ---------------------------------------------------------------------------
@@ -563,12 +633,8 @@ fn pin_record_from_stream(stream: &[u8]) -> Option<Vec<u8>> {
     let mut i = 0;
     while i < stream.len() {
         let fid = u16::from_le_bytes([stream[i], stream[i + 1]]);
-        let len = u32::from_le_bytes([
-            stream[i + 2],
-            stream[i + 3],
-            stream[i + 4],
-            stream[i + 5],
-        ]) as usize;
+        let len = u32::from_le_bytes([stream[i + 2], stream[i + 3], stream[i + 4], stream[i + 5]])
+            as usize;
         let payload = &stream[i + 6..i + 6 + len];
         if fid == FID_OTP_PIN {
             return Some(payload.to_vec());
@@ -588,15 +654,25 @@ fn set_pin_salted_verifier_and_per_app_salt() {
     assert_eq!(set_pin(&mut app1, pin), 0x9000);
     let (counter1, salt1, verifier1) = app1.otp_pin_record().expect("pin record exposed");
     assert_eq!(counter1, 3, "fresh record starts at the full retry budget");
-    assert_ne!(verifier1, legacy_pin_verifier(pin), "not the legacy unsalted form");
+    assert_ne!(
+        verifier1,
+        legacy_pin_verifier(pin),
+        "not the legacy unsalted form"
+    );
     assert_ne!(verifier1, bare_sha256(pin), "not a bare hash of the PIN");
     assert_ne!(salt1, [0u8; 16], "salt is drawn from the TRNG pool");
 
     let mut app2 = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
     assert_eq!(set_pin(&mut app2, pin), 0x9000);
     let (_, salt2, verifier2) = app2.otp_pin_record().expect("pin record exposed");
-    assert_ne!(salt1, salt2, "same PIN on two apps must yield different salts");
-    assert_ne!(verifier1, verifier2, "salted verifiers differ with the salt");
+    assert_ne!(
+        salt1, salt2,
+        "same PIN on two apps must yield different salts"
+    );
+    assert_ne!(
+        verifier1, verifier2,
+        "salted verifiers differ with the salt"
+    );
 }
 
 /// The pin record survives boot: after persist + boot the same PIN verifies
@@ -612,8 +688,13 @@ fn pin_record_survives_reboot_and_burns_counter() {
     assert!(app.persist_state(&mut store), "pin record persisted");
 
     // First reboot: right PIN verifies, wrong PIN burns one retry.
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     assert_eq!(
         verify_pin(&mut booted, pin),
         0x9000,
@@ -630,8 +711,13 @@ fn pin_record_survives_reboot_and_burns_counter() {
     // Second reboot: verification still works (counter change was persisted).
     app.mark_dirty();
     assert!(booted.persist_state(&mut store));
-    let mut booted2 =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot 2");
+    let mut booted2 = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot 2");
     assert_eq!(
         verify_pin(&mut booted2, pin),
         0x9000,
@@ -652,10 +738,17 @@ fn legacy_pin_record_migrates_on_successful_verify() {
         p
     };
     let stream = stream_record(FID_OTP_PIN, &legacy_payload);
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
     // The legacy verifier verifies (no salt present yet).
     let (_, salt, _) = app.otp_pin_record().expect("legacy record loaded");
     assert_eq!(salt, [0u8; 16], "legacy record carries no salt");
@@ -675,13 +768,26 @@ fn legacy_pin_record_migrates_on_successful_verify() {
     let n = fapico2_platform::secure_store::chunked::read_chunked(&mut store, STATE_SLOT, &mut buf)
         .expect("stream readable");
     let persisted = pin_record_from_stream(&buf[..n]).expect("pin record in stream");
-    assert_eq!(persisted.len(), 49, "persisted form is [counter][salt 16][verifier 32]");
+    assert_eq!(
+        persisted.len(),
+        49,
+        "persisted form is [counter][salt 16][verifier 32]"
+    );
 
     // Boot again: the salted record loads and the PIN still verifies.
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot 2");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot 2");
     assert_ne!(booted.otp_pin_record().expect("salted record").1, [0u8; 16]);
-    assert_eq!(verify_pin(&mut booted, pin), 0x9000, "PIN verifies from the salted record");
+    assert_eq!(
+        verify_pin(&mut booted, pin),
+        0x9000,
+        "PIN verifies from the salted record"
+    );
 }
 
 /// CHANGE_PIN re-salts the record and persists it: the old PIN stops
@@ -695,16 +801,26 @@ fn change_pin_re_saults_and_persists() {
     app.mark_dirty();
     assert!(app.persist_state(&mut store));
 
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
     let change = change_pin_data(b"old-pin", b"new-pin");
     let (_, sw) = drive(&mut booted, &apdu(0xB3, 0, 0, &change));
     assert_eq!(sw, 0x9000, "CHANGE_PIN with the correct old PIN");
     assert!(booted.is_dirty(), "CHANGE_PIN marks the state dirty");
     assert!(booted.persist_state(&mut store));
 
-    let mut booted2 =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot 2");
+    let mut booted2 = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot 2");
     assert_eq!(
         verify_pin(&mut booted2, b"new-pin"),
         0x9000,
@@ -729,10 +845,17 @@ fn wrong_pin_against_legacy_record_burns_without_migrating() {
     let mut payload = vec![3u8];
     payload.extend_from_slice(&legacy_pin_verifier(pin));
     let stream = stream_record(FID_OTP_PIN, &payload);
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
     assert_eq!(verify_pin(&mut app, b"wrong"), 0x6982);
     let (counter, salt, verifier) = app.otp_pin_record().expect("record still present");
     assert_eq!(counter, 2, "wrong PIN burned one retry");
@@ -758,8 +881,13 @@ fn wrong_pin_against_legacy_record_burns_without_migrating() {
         "a failed verify must not write the 49-byte salted form"
     );
 
-    let mut rebooted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("reboot");
+    let mut rebooted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("reboot");
     let (_, salt, verifier) = rebooted.otp_pin_record().expect("still a legacy record");
     assert_eq!(salt, [0u8; 16], "rebooted record is still the legacy form");
     assert_eq!(verifier, legacy_pin_verifier(pin));
@@ -792,8 +920,13 @@ fn burned_pin_budget_survives_reboot() {
     // Persist (the counter changes marked the state dirty) and reboot.
     assert!(app.is_dirty(), "burned retries mark the state dirty");
     assert!(app.persist_state(&mut store), "state persisted");
-    let mut booted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("boot");
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
 
     // The correct PIN is still refused: the budget exhaustion is durable.
     assert_eq!(
@@ -811,14 +944,18 @@ fn burned_pin_budget_survives_reboot() {
 /// still required afterwards).
 #[test]
 fn set_code_clear_without_presence_is_refused() {
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     let code_secret = b"consent-code";
     set_code(&mut app, code_secret);
 
     // Re-grant the session through the VALIDATE handshake.
     let challenge = select_challenge(&mut app);
     let good = hmac_sha1(code_secret, &challenge);
-    let (_, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)),
+    );
     assert_eq!(sw, 0x9000, "VALIDATE grants the session");
 
     // Empty-data SET_CODE with presence denied: refused, code stays.
@@ -837,13 +974,17 @@ fn set_code_clear_without_presence_is_refused() {
 /// (0x9000) — SELECT no longer advertises the challenge TLV.
 #[test]
 fn set_code_clear_with_presence_succeeds() {
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| true);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| true);
     let code_secret = b"consent-code-2";
     set_code(&mut app, code_secret);
 
     let challenge = select_challenge(&mut app);
     let good = hmac_sha1(code_secret, &challenge);
-    let (_, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)),
+    );
     assert_eq!(sw, 0x9000, "VALIDATE grants the session");
 
     let (_, sw) = drive(&mut app, &apdu(0x03, 0, 0, &[]));
@@ -859,7 +1000,8 @@ fn set_code_clear_with_presence_succeeds() {
 /// does not block it (C parity).
 #[test]
 fn set_code_clear_without_access_code_is_noop() {
-    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_user_presence(|| false);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_user_presence(|| false);
     // Virgin app: the session is granted, but there is nothing to clear.
     let (_, sw) = drive(&mut app, &apdu(0x03, 0, 0, &[]));
     assert_eq!(sw, 0x9000, "clear-code with nothing to clear is a no-op");
@@ -870,7 +1012,10 @@ fn set_code_clear_without_access_code_is_noop() {
 /// then).
 fn select_challenge(app: &mut OathApp) -> [u8; 8] {
     let sel = select(app);
-    let cpos = sel.iter().position(|&b| b == 0x74).expect("challenge TLV advertised");
+    let cpos = sel
+        .iter()
+        .position(|&b| b == 0x74)
+        .expect("challenge TLV advertised");
     assert_eq!(sel[cpos + 1], 8, "challenge TLV is 8 bytes");
     let mut chal = [0u8; 8];
     chal.copy_from_slice(&sel[cpos + 2..cpos + 10]);
@@ -896,7 +1041,12 @@ fn malformed_pin_record_is_boot_corruption() {
     store.write(STATE_SLOT, &stream).expect("stream written");
     assert!(
         matches!(
-            OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()),
+            OathApp::boot(
+                &mut HostTrng::new(),
+                &mut store,
+                emul_device_id(),
+                OathSeal::emul()
+            ),
             Err(SecureStoreError::Corrupt)
         ),
         "a 34-byte pin record must refuse boot"
@@ -952,8 +1102,8 @@ fn oath_reset_granted_on_second_call_wipes_once() {
 
     GATE_MODE.store(2, core::sync::atomic::Ordering::SeqCst);
     GATE_CALLS.store(0, core::sync::atomic::Ordering::SeqCst);
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_presence_grant(windowed_grant);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_presence_grant(windowed_grant);
     // PUT while the virgin session is granted (PUT needs no consent).
     put_cred(&mut app, b"GitHub:eddieoz", b"secret-9");
 
@@ -987,15 +1137,18 @@ fn oath_set_code_clear_granted_on_second_call() {
 
     GATE_MODE.store(2, core::sync::atomic::Ordering::SeqCst);
     GATE_CALLS.store(0, core::sync::atomic::Ordering::SeqCst);
-    let mut app =
-        OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul()).with_presence_grant(windowed_grant);
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
+        .with_presence_grant(windowed_grant);
     let code_secret = b"windowed-clear";
     set_code(&mut app, code_secret);
 
     // Re-grant the session through the VALIDATE handshake.
     let challenge = select_challenge(&mut app);
     let good = hmac_sha1(code_secret, &challenge);
-    let (_, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)),
+    );
     assert_eq!(sw, 0x9000, "VALIDATE grants the session");
 
     // First clear attempt: refused, the access code survives.
@@ -1015,7 +1168,10 @@ fn oath_set_code_clear_granted_on_second_call() {
     // above did not re-grant the session, US-901).
     let challenge = select_challenge(&mut app);
     let good = hmac_sha1(code_secret, &challenge);
-    let (_, sw) = drive(&mut app, &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &validate_data(&challenge, &good)),
+    );
     assert_eq!(sw, 0x9000);
     let (_, sw) = drive(&mut app, &apdu(0x03, 0, 0, &[]));
     assert_eq!(sw, 0x9000, "the windowed retry clears the code");
@@ -1101,16 +1257,27 @@ fn legacy_record_still_reports_pinset_until_migrated() {
     let mut store = HostSecureStore::new();
     let mut stream = stream_record(FID_ACCESS_CODE_STREAM, &us136_access_code_payload());
     stream.extend(stream_record(FID_OTP_PIN, &legacy_pin_payload(3, pin)));
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
 
     // The record loaded; it was not dropped or re-seeded on the way in.
     let (counter, salt, verifier) = app.otp_pin_record().expect("legacy record loaded");
     assert_eq!(counter, 3, "the retry budget carried over");
     assert_eq!(salt, [0u8; 16], "a legacy record carries no salt");
-    assert_eq!(verifier, legacy_pin_verifier(pin), "and the legacy verifier");
+    assert_eq!(
+        verifier,
+        legacy_pin_verifier(pin),
+        "and the legacy verifier"
+    );
 
     // Grant the session through the access code, so SET_PIN reaches its own
     // "a PIN is already set" branch instead of stopping at the session gate.
@@ -1133,7 +1300,10 @@ fn legacy_record_still_reports_pinset_until_migrated() {
     // (The counter is 2, not 3, because the failed VERIFY_PIN above burned a
     // retry — the record is very much live, just still legacy.)
     let (counter, salt, verifier) = app.otp_pin_record().expect("record still present");
-    assert_eq!(counter, 2, "the failed VERIFY_PIN burned a retry, nothing more");
+    assert_eq!(
+        counter, 2,
+        "the failed VERIFY_PIN burned a retry, nothing more"
+    );
     assert_eq!(salt, [0u8; 16], "still unmigrated");
     assert_eq!(verifier, legacy_pin_verifier(pin), "verifier untouched");
 }
@@ -1155,10 +1325,17 @@ fn legacy_verifier_record_migrates_on_first_successful_verify() {
     let pin = b"us136-migrate";
     let mut store = HostSecureStore::new();
     let stream = stream_record(FID_OTP_PIN, &legacy_pin_payload(3, pin));
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
     let (_, salt, _) = app.otp_pin_record().expect("legacy record loaded");
     assert_eq!(salt, [0u8; 16], "precondition: the record starts legacy");
 
@@ -1169,14 +1346,21 @@ fn legacy_verifier_record_migrates_on_first_successful_verify() {
     // under it, so it is no longer the unsalted legacy form.
     let (counter, salt, verifier) = app.otp_pin_record().expect("upgraded record");
     assert_ne!(salt, [0u8; 16], "the upgrade drew a salt");
-    assert_ne!(verifier, legacy_pin_verifier(pin), "the verifier is now salted");
+    assert_ne!(
+        verifier,
+        legacy_pin_verifier(pin),
+        "the verifier is now salted"
+    );
     assert_eq!(
         verifier,
         pin_verifier_ref(pin, &salt),
         "the verifier is re-derived under the fresh salt"
     );
     assert_eq!(counter, 3, "a successful verify rewrites the full budget");
-    assert!(app.is_dirty(), "the upgrade marks the state dirty for persist");
+    assert!(
+        app.is_dirty(),
+        "the upgrade marks the state dirty for persist"
+    );
 }
 
 /// `SHA256(salt || pin)` — the salted verifier, recomputed independently of
@@ -1197,10 +1381,17 @@ fn legacy_migration_is_durable_across_reboot() {
     let pin = b"us136-durable";
     let mut store = HostSecureStore::new();
     let stream = stream_record(FID_OTP_PIN, &legacy_pin_payload(3, pin));
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
     assert_eq!(verify_pin(&mut app, pin), 0x9000, "legacy PIN verifies");
     assert!(app.persist_state(&mut store), "the upgrade is persisted");
 
@@ -1216,22 +1407,42 @@ fn legacy_migration_is_durable_across_reboot() {
     );
 
     // Reboot: the record comes back salted, not legacy.
-    let mut rebooted =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("reboot");
+    let mut rebooted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("reboot");
     let (counter, salt, verifier) = rebooted.otp_pin_record().expect("record reloaded");
-    assert_ne!(salt, [0u8; 16], "the reloaded record is not the legacy form");
+    assert_ne!(
+        salt, [0u8; 16],
+        "the reloaded record is not the legacy form"
+    );
     assert_ne!(
         verifier,
         legacy_pin_verifier(pin),
         "the reloaded verifier is not the legacy digest"
     );
     assert_eq!(counter, 3, "the full retry budget persisted");
-    assert_eq!(persisted[1..17].to_vec(), salt.to_vec(), "salt round-tripped");
-    assert_eq!(persisted[17..49].to_vec(), verifier.to_vec(), "verifier round-tripped");
+    assert_eq!(
+        persisted[1..17].to_vec(),
+        salt.to_vec(),
+        "salt round-tripped"
+    );
+    assert_eq!(
+        persisted[17..49].to_vec(),
+        verifier.to_vec(),
+        "verifier round-tripped"
+    );
 
     // And it still behaves as a salted record: the PIN verifies, the retry
     // budget burns on a wrong one.
-    assert_eq!(verify_pin(&mut rebooted, pin), 0x9000, "PIN verifies post-reboot");
+    assert_eq!(
+        verify_pin(&mut rebooted, pin),
+        0x9000,
+        "PIN verifies post-reboot"
+    );
     assert_eq!(verify_pin(&mut rebooted, b"wrong"), 0x6982);
     assert_eq!(rebooted.otp_pin_record().expect("record").0, 2);
 }
@@ -1249,19 +1460,34 @@ fn legacy_record_is_not_migrated_by_set_code() {
     // behind to be reachable at all.
     let mut stream = stream_record(FID_ACCESS_CODE_STREAM, &us136_access_code_payload());
     stream.extend(stream_record(FID_OTP_PIN, &legacy_pin_payload(3, pin)));
-    store.write(STATE_SLOT, &stream).expect("legacy stream written");
+    store
+        .write(STATE_SLOT, &stream)
+        .expect("legacy stream written");
 
-    let mut app =
-        OathApp::boot(&mut HostTrng::new(), &mut store, emul_device_id(), OathSeal::emul()).expect("legacy boot");
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("legacy boot");
     grant_session_via_validate(&mut app);
     set_code(&mut app, b"a-brand-new-access-code");
 
     let (counter, salt, verifier) = app.otp_pin_record().expect("record still present");
     assert_eq!(salt, [0u8; 16], "SET_CODE does not migrate the PIN record");
-    assert_eq!(verifier, legacy_pin_verifier(pin), "the legacy verifier survives");
+    assert_eq!(
+        verifier,
+        legacy_pin_verifier(pin),
+        "the legacy verifier survives"
+    );
     assert_eq!(counter, 3, "and the retry budget is untouched");
 
     // The legacy PIN still verifies through the legacy path — proof the
     // record was neither dropped nor converted.
-    assert_eq!(verify_pin(&mut app, pin), 0x9000, "the legacy PIN still verifies");
+    assert_eq!(
+        verify_pin(&mut app, pin),
+        0x9000,
+        "the legacy PIN still verifies"
+    );
 }

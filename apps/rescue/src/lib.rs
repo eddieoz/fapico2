@@ -97,7 +97,7 @@
 //! name path cannot fire and **byte 2 alone decides**.
 //!
 //! The EPIC's US-161a also says to *"align it with US-102's version constant"*,
-//! and US-102's target is `1.1.0` — so `fapico2_mgmt::VERSION_MAJOR` is `1`
+//! and US-102's target is `1.1.0` — so `fapico2_mgmt::VERSION_MAJOR` is `5`
 //! (`apps/mgmt/src/lib.rs:42`). **Those two instructions contradict each
 //! other and cannot both be satisfied.** A byte 2 of `1` classifies this device
 //! as `PicoFido` and gates off every RS-Key-only client path, which is the
@@ -390,7 +390,7 @@ pub const PRODUCT_TYPE_FIDO: u8 = 2;
 /// module docs' "`RSKEY_SDK_MAJOR` is 8 and must never be "fixed" to 1" before
 /// changing it: the client requires `data[2] >= 8`
 /// (`picoforge/src/hal/transport/pcsc.rs:75-81`), and
-/// `fapico2_mgmt::VERSION_MAJOR` is `1`.
+/// `fapico2_mgmt::VERSION_MAJOR` is `5`.
 pub const RSKEY_SDK_MAJOR: u8 = 8;
 /// `[3]` of the SELECT block — the RS-Key SDK minor version. The client reads
 /// it (`ops.rs:222`) and uses it only for a log line

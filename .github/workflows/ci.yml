@@ -44,8 +44,8 @@ env:
   # (firmware/fapico2.uf2), not on the ELF text — the UF2 is what actually
   # occupies flash, and it is the artifact that is flashed.
   #
-  # 1524 KiB against a measured 1559552 B (1523.0 KiB, 3046 blocks): one KiB of
-  # slack. Tight on purpose. A ratchet with 20 % headroom is a number nobody
+  # 1528 KiB against a measured 1563136 B (1526.5 KiB, 3053 blocks): ~1.5 KiB
+  # of slack. Tight on purpose. A ratchet with 20 % headroom is a number nobody
   # reads; this one turns ordinary growth into a red that says "raise it
   # deliberately, and say why in docs/size-report.md". The absolute backstop is
   # still the 3.5 MiB text ceiling in the device-build job, which this does not
@@ -58,7 +58,28 @@ env:
   # regenerated the artefact and measured 3046 blocks; the build chain check
   # (`cmp` against a fresh uf2gen run) is what makes that drift impossible to
   # repeat silently. See the US-1080 entry at the top of docs/size-report.md.
-  FIRMWARE_FLASH_BUDGET_KIB: 1524
+  #
+  # US-OTP-HID raised this from 1524 to 1528. The +7 blocks / +3,584 B is the
+  # second HID interface, the YK4 feature-report state machine, and the
+  # composite `HidInterfacesHandler` — a feature, not drift. Three edits in the
+  # same change cost 0 B (a dead 48-line handler the linker had already
+  # dropped, an `int_plus_one` lint rewrite, and an unused import); that they
+  # cost nothing is recorded in docs/size-report.md so this raise is not later
+  # read as covering them. See the dated entry at the top of that file.
+  FIRMWARE_FLASH_BUDGET_KIB: 1528
+
+# Least privilege by default. This workflow runs on `pull_request`, which
+# EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
+# the largest exposure in the tree. Previously this file declared no
+# `permissions:` block at all, which meant every job inherited the
+# repository-default token — typically read/write on most repos.
+#
+# `contents: read` is all any job here needs: they check out this repo and
+# build. Nothing in CI publishes, attests or signs, so nothing needs write,
+# and no job needs `id-token: write` (that is the release lane's alone —
+# see release.yml, and do not widen it here).
+permissions:
+  contents: read
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -73,14 +94,21 @@ jobs:
   # ---------------------------------------------------------------------------
   host-tests:
     name: cargo test --workspace
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
+      # No third-party action: `rustup` ships with the runner and the committed
+      # rust-toolchain.toml pins the channel and target. dtolnay/rust-toolchain
+      # resolves its toolchain from a *branch* (stable/nightly, both
+      # `protected: false`), so SHA-pinning it would freeze the action code
+      # while leaving the ref -> toolchain mapping mutable. Removing the
+      # dependency removes the question.
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Workspace host unit tests
         working-directory: fapico2
         run: cargo test --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware
@@ -105,16 +133,16 @@ jobs:
   # ---------------------------------------------------------------------------
   clippy:
     name: cargo clippy -D warnings
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: Set up Rust (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
       - name: clippy (workspace, host target, all targets)
         working-directory: fapico2
         run: cargo clippy --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware --all-targets -- -D warnings
@@ -130,16 +158,16 @@ jobs:
   # ---------------------------------------------------------------------------
   device-build:
     name: device integration gate (RP2350)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: Set up Rust (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi
@@ -223,7 +251,7 @@ jobs:
           fi
           echo "size-report gate PASS"
       - name: Upload release ELF (RP2350)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fapico2-firmware-rp2350
           path: fapico2/target/thumbv8m.main-none-eabi/release/fapico2-firmware
@@ -309,7 +337,7 @@ jobs:
           fi
           echo "flash-budget ratchet PASS: ${SHIPPING} B <= ${BUDGET_BYTES} B"
       - name: Upload flashable UF2 (RP2350)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fapico2-rp2350-uf2
           path: fapico2/firmware/fapico2.uf2
@@ -331,14 +359,15 @@ jobs:
   # ---------------------------------------------------------------------------
   advertise-serve-gate:
     name: advertise/serve coupling gate (default + reduced)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: "Gate: FA advertises exactly what the dispatch serves, in both configurations"
         working-directory: fapico2
         run: |
@@ -370,11 +399,12 @@ jobs:
   # ---------------------------------------------------------------------------
   no-heap:
     name: heap gate (one sanctioned allocator, nothing allocates pre-boot)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: "Heap gate: one sanctioned allocator + pre-boot allocation invariant"
         working-directory: fapico2
@@ -399,11 +429,12 @@ jobs:
   # ---------------------------------------------------------------------------
   persist-gate:
     name: persist gate (one implementation)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: "Grep: one persist implementation (no code-level snapshot/program re-sequence)"
         working-directory: fapico2
@@ -429,11 +460,12 @@ jobs:
   # ---------------------------------------------------------------------------
   attestation-gate:
     name: attestation gate (per-device provisioning)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: "Grep: no repo-committed attestation material (blobs gone, no include_bytes!)"
         working-directory: fapico2
@@ -457,11 +489,12 @@ jobs:
   # ---------------------------------------------------------------------------
   rng-path-gate:
     name: rng path gate (every nonce via the DRBG)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: "Grep: no code-level peripheral draw outside platform/src/trng.rs"
         working-directory: fapico2
@@ -486,11 +519,12 @@ jobs:
   # ---------------------------------------------------------------------------
   erase-budget-gate:
     name: erase budget gate (docs/erase-budget.md matches the measurement)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: "Measure: erases per persist, and gate docs/erase-budget.md on it"
         working-directory: fapico2
@@ -532,14 +566,15 @@ jobs:
   # ---------------------------------------------------------------------------
   gates:
     name: assurance gates (structural, no device build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: "Gates: the remaining gate scripts, unconditionally"
         working-directory: fapico2
         run: |
@@ -591,14 +626,15 @@ jobs:
   # ---------------------------------------------------------------------------
   supply-chain:
     name: supply chain (deny.toml graph assertions)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: cargo-deny — the resolved third-party graph
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
@@ -698,7 +734,7 @@ jobs:
   # ---------------------------------------------------------------------------
   fuzz:
     name: fuzz ${{ matrix.target }} (15-min smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -714,13 +750,20 @@ jobs:
           - fido_cred_state
     steps:
       - name: Checkout fapico2
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
+      # Nightly is addressed EXPLICITLY, on purpose. `rust-toolchain.toml` pins
+      # the ACTIVE toolchain to `stable`, so a `rustup show`-style probe always
+      # succeeds here and would never install nightly — and a bare
+      # `rustup component add rust-src` would attach rust-src to STABLE, not
+      # nightly, which is not the toolchain `cargo +nightly` builds with. Naming
+      # `--toolchain nightly` on both the install and the component is what makes
+      # this correct rather than merely plausible.
       - name: Set up Rust (nightly)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src --no-self-update
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
       - name: "Fuzz smoke (15 min)"
@@ -747,27 +790,29 @@ jobs:
   # ---------------------------------------------------------------------------
   pytest-gate:
     name: pytest gate (Phase 3 exit config)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout fapico2 (Rust firmware)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: fapico2
       # Sibling harness repo (published first, per US-725): when it is absent
       # (owner hasn't pushed pico-fido2 yet), the checkout and every step that
       # depends on it are skipped instead of turning this job red.
       - name: Checkout pico-fido2 (Python test suites)
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: ${{ github.repository_owner }}/pico-fido2
           path: pico-fido2
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
       - name: Set up Rust (stable; host target for the emulator)
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Install Python test dependencies
         if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
         run: |
@@ -800,7 +845,7 @@ jobs:
         run: ${{ github.workspace }}/.test-venv/bin/python -m pytest merged/ -q
       - name: Archive emulator logs
         if: ${{ always() && hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pytest-gate-emulator-logs
           path: pico-fido2/tests/build/

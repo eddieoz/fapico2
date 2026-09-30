@@ -44,8 +44,16 @@ pub const MANAGEMENT_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x
 
 /// Firmware version reported on SELECT, mirroring `man_select`'s
 /// `"PICO_FIDO_VERSION_MAJOR.PICO_FIDO_VERSION_MINOR.0"`.
-pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 0;
+///
+/// The version is a **client-compatibility contract**, not a changelog. yubikit
+/// gates its management `read_device_info` on `>= 4.1` — below that the
+/// desktop app degrades to legacy applet scanning and can never learn FIDO2
+/// or the serial (`yubikit/support.py` `_read_info_ccid`). 5.4 is a real
+/// YubiKey 5 firmware version, matching the YubiKey 5 PID this build
+/// enumerates as, and stays distinct from the RS-Key SDK major (8, rescue
+/// SELECT byte 2) whose separation the rescue protocol test pins.
+pub const VERSION_MAJOR: u8 = 5;
+pub const VERSION_MINOR: u8 = 4;
 
 /// Fixed emulation chipid — host/emulation builds have no OTP row, so a
 /// fixed stand-in (ASCII `"fapico2"` + `0x00`) keeps the derived serial
@@ -344,7 +352,7 @@ impl ManagementApp {
     }
 
     /// Emit the `man_select` version string ("MAJOR.MINOR.0") without `std`.
-    /// Single-digit major/minor (the shipped build reports 1.0.0).
+    /// Single-digit major/minor (the shipped build reports 5.4.0).
     fn write_version(out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         let buf = [
             b'0' + VERSION_MAJOR,
@@ -361,38 +369,46 @@ impl ManagementApp {
     /// config-lock blob; otherwise it returns the stored bytes verbatim.
     fn read_config(&self, out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         match &self.config {
-            None => {
-                let caps = caps();
-                // Overall length placeholder at [0], filled at the end.
-                out.push(0).ok();
-                // TAG_USB_SUPPORTED (which capabilities are compiled in).
-                out.extend_from_slice(&[TAG_USB_SUPPORTED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
-                // TAG_SERIAL — chipid-derived (R12); same tag/length shape
-                // as the C constant serial, so clients see no protocol
-                // change.
-                let mut serial = self.serial;
-                serial[0] &= !0xFC; // force 8-digit serial, per C
-                out.extend_from_slice(&[TAG_SERIAL, 4, serial[0], serial[1], serial[2], serial[3]]).ok();
-                // TAG_FORM_FACTOR = 1 (YubiKey 5 form factor).
-                out.extend_from_slice(&[TAG_FORM_FACTOR, 1, 0x01]).ok();
-                // TAG_VERSION = major.minor.0.
-                out.extend_from_slice(&[TAG_VERSION, 3, VERSION_MAJOR, VERSION_MINOR, 0x00]).ok();
-                // TAG_USB_ENABLED (feature-gated; same as supported here).
-                out.extend_from_slice(&[TAG_USB_ENABLED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
-                // TAG_DEVICE_FLAGS = FLAG_EJECT.
-                out.extend_from_slice(&[TAG_DEVICE_FLAGS, 1, 0x80]).ok();
-                // TAG_CONFIG_LOCK = unlocked.
-                out.extend_from_slice(&[TAG_CONFIG_LOCK, 1, 0x00]).ok();
-                if !out.is_empty() {
-                    let total = out.len();
-                    out[0] = (total - 1) as u8;
-                }
-            }
+            None => default_config_tlv(self.serial, out),
             Some(stored) => {
                 out.push(stored.len() as u8).ok();
                 out.extend_from_slice(stored).ok();
             }
         }
+    }
+}
+
+/// Emit the default `man_get_config` TLV blob for `serial` into `out`.
+///
+/// Public because the same blob is also served over the FIDO CTAPHID
+/// interface as `CTAP_READ_CONFIG` (`0x42`) — yubikit's `_read_info_ctap`
+/// reads device info that way when a client enumerates the key through its
+/// FIDO interface rather than CCID. One implementation, so the two paths
+/// cannot drift.
+pub fn default_config_tlv(serial: [u8; 4], out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+    let caps = caps();
+    // Overall length placeholder at [0], filled at the end.
+    out.push(0).ok();
+    // TAG_USB_SUPPORTED (which capabilities are compiled in).
+    out.extend_from_slice(&[TAG_USB_SUPPORTED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
+    // TAG_SERIAL — chipid-derived (R12); same tag/length shape as the C
+    // constant serial, so clients see no protocol change.
+    let mut serial = serial;
+    serial[0] &= !0xFC; // force 8-digit serial, per C
+    out.extend_from_slice(&[TAG_SERIAL, 4, serial[0], serial[1], serial[2], serial[3]]).ok();
+    // TAG_FORM_FACTOR = 1 (YubiKey 5 form factor).
+    out.extend_from_slice(&[TAG_FORM_FACTOR, 1, 0x01]).ok();
+    // TAG_VERSION = major.minor.0.
+    out.extend_from_slice(&[TAG_VERSION, 3, VERSION_MAJOR, VERSION_MINOR, 0x00]).ok();
+    // TAG_USB_ENABLED (feature-gated; same as supported here).
+    out.extend_from_slice(&[TAG_USB_ENABLED, 2, (caps >> 8) as u8, (caps & 0xFF) as u8]).ok();
+    // TAG_DEVICE_FLAGS = FLAG_EJECT.
+    out.extend_from_slice(&[TAG_DEVICE_FLAGS, 1, 0x80]).ok();
+    // TAG_CONFIG_LOCK = unlocked.
+    out.extend_from_slice(&[TAG_CONFIG_LOCK, 1, 0x00]).ok();
+    if !out.is_empty() {
+        let total = out.len();
+        out[0] = (total - 1) as u8;
     }
 }
 
@@ -616,7 +632,7 @@ mod tests {
         sel.extend_from_slice(MANAGEMENT_AID);
         let sw = app.select_apdu(false, &sel, &mut resp);
         assert_eq!(sw, SW_OK);
-        assert_eq!(&resp.as_slice(), b"1.0.0");
+        assert_eq!(&resp.as_slice(), b"5.4.0");
     }
 
     /// The advertised capability word tracks the feature gates at compile time

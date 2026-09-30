@@ -1857,6 +1857,64 @@ impl FidoApp {
                 no_heap::push_bstr(out, &encrypted).ok();
                 Ok(())
             }
+            0x06 => {
+                // getPinUvAuthTokenUsingUvWithPermissions.
+                //
+                // The no-PIN leg of the token exchange: the client proves
+                // nothing but a user-presence gesture, and this build's
+                // authenticator has no separate user-verification secret to
+                // check. It is what a client falls back to when the key has
+                // no PIN, and it is advertised as reachable because GetInfo
+                // reports the `uv` option — so it has to answer rather than
+                // refuse, or the client has no way to obtain a pinUvAuthToken
+                // at all and the resident-credential screens never resolve.
+                //
+                // Fail-closed on presence: the grant is the only thing being
+                // asserted, so without a press this answers `UpRequired` and
+                // the transport opens a keepalive window and retries. A
+                // token is therefore never minted without a real touch.
+                let permissions = permissions.ok_or(err(Ctap2Response::MissingParameter))?;
+                let ka = key_agreement.ok_or(err(Ctap2Response::MissingParameter))?;
+                let client_pub =
+                    crypto::parse_cose_ec2_p256_bytes(&ka[..32], &ka[32..]).ok_or(err(Ctap2Response::PinAuthInvalid))?;
+                if !self.user_present(crate::device_app::presence_tag_from_channel(
+                    self.current_channel,
+                )) {
+                    return Err(err(Ctap2Response::UpRequired));
+                }
+                let shared = self.derive_shared(protocol, &client_pub);
+                let mut enc_key = [0u8; 32];
+                enc_key.copy_from_slice(&shared[32..]);
+
+                let mut token = [0u8; 32];
+                self.draw_random(&mut token);
+                self.pin_token = Some(token);
+                self.token_permissions = permissions;
+                // A UV token is not bound to an rpId — the permission mask
+                // is the whole of its scope.
+                self.token_rp_id.clear();
+
+                let mut encrypted: HeaplessVec<u8, 96> = HeaplessVec::new();
+                if protocol == 1 {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(&token);
+                    crypto::pin_cbc_encrypt_zero_iv(&enc_key, &mut buf).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+                    encrypted.extend_from_slice(&buf).ok();
+                } else {
+                    let mut iv = [0u8; 16];
+                    self.draw_random(&mut iv);
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(&token);
+                    crypto::aes256_cbc_encrypt_into(&enc_key, &iv, &mut buf)
+                        .map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+                    encrypted.extend_from_slice(&iv).ok();
+                    encrypted.extend_from_slice(&buf).ok();
+                }
+                no_heap::push_map_header(out, 1).ok();
+                no_heap::push_uint(out, 2).ok();
+                no_heap::push_bstr(out, &encrypted).ok();
+                Ok(())
+            }
             _ => Err(err(Ctap2Response::InvalidParameter)),
         }
     }
@@ -2059,6 +2117,94 @@ use crate::device_app::{CmCredState, CmRpState, LbPending, VaultPending};
 /// CTAP2.1 largeBlobs response/checksum geometry.
 const LB_CHECKSUM_LEN: usize = 16;
 
+/// Which CBOR dialect a credentialManagement request arrived in.
+///
+/// Two are in the wild and they are *not* interchangeable:
+///
+/// * **PicoForge** — the first-party management client. Key `0x02` holds a
+///   *map* of sub-command parameters, `pinUvAuthProtocol` sits at `0x03` and
+///   `pinUvAuthParam` at `0x04`. Sub-commands `0x01`/`0x02` are
+///   getCredsMetadata / enumerateRpsBegin. This is the layout this command
+///   was originally written against and it must keep working byte for byte.
+/// * **CTAP2** — what every third-party client speaks (ykman, Yubico
+///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
+///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
+///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
+///   getCredsMetadata — the *reverse* of PicoForge's.
+///
+/// The two are told apart by the CBOR type at the low keys: PicoForge puts a
+/// map at `0x02` and an integer at `0x03`, CTAP2 puts an integer at `0x02`
+/// and a byte string at `0x03`. Neither layout can be mistaken for the other.
+///
+/// The response key sets genuinely collide (PicoForge `0x04` is rpIdHash,
+/// CTAP2 `0x04` is userID; PicoForge `0x07` is credentialID, CTAP2 `0x07`
+/// is totalRPs), so a merged map is impossible — each dialect has to be
+/// answered in its own shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmDialect {
+    PicoForge,
+    Ctap2,
+}
+
+impl Default for CmDialect {
+    fn default() -> Self {
+        // Spec is the safe default: an unrecognised request is far more
+        // likely to come from a third-party client than from PicoForge.
+        CmDialect::Ctap2
+    }
+}
+
+/// Canonical credMgmt sub-command identity, independent of the wire dialect.
+///
+/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
+/// parser maps a PicoForge wire value onto these before anything downstream
+/// looks at it, so the dispatch arms need no dialect branches.
+const CM_GET_METADATA: u8 = 0x02;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
+const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
+const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
+const CM_DELETE_CRED: u8 = 0x06;
+const CM_UPDATE_USER: u8 = 0x07;
+
+/// Identify the dialect of a credentialManagement request body.
+///
+/// A pre-scan of the top-level map's *types* only. PicoForge's key `0x02` is
+/// a map and CTAP2's is an integer, and neither dialect ever puts the other's
+/// type in that slot, so the two cannot be confused. When key `0x02` is
+/// absent (PicoForge omits it for sub-commands that take no parameters) the
+/// integer at key `0x03` is the fallback signal, because CTAP2's key `0x03`
+/// is always pinUvAuthParam — a byte string.
+fn cm_dialect(data: &[u8]) -> CmDialect {
+    let mut p = Parser::new(data);
+    let Ok(Item::Map(n)) = p.next() else {
+        return CmDialect::Ctap2;
+    };
+    for _ in 0..n {
+        let Ok(Item::U(k)) = p.next() else {
+            return CmDialect::Ctap2;
+        };
+        match k {
+            2 => match p.next() {
+                Ok(Item::Map(_)) => return CmDialect::PicoForge,
+                Ok(Item::U(_)) | Ok(Item::N(_)) => return CmDialect::Ctap2,
+                // Consumed by the `next()` above; nothing left to skip.
+                _ => {}
+            },
+            3 => match p.next() {
+                Ok(Item::U(_)) | Ok(Item::N(_)) => return CmDialect::PicoForge,
+                _ => {}
+            },
+            _ => {
+                if p.skip().is_err() {
+                    return CmDialect::Ctap2;
+                }
+            }
+        }
+    }
+    CmDialect::Ctap2
+}
+
 impl FidoApp {
     // -- credMgmt (0x0A) ---------------------------------------------------
 
@@ -2080,7 +2226,11 @@ impl FidoApp {
         if data.is_empty() {
             return Err(err(Ctap2Response::MissingParameter));
         }
-        let mut subcommand: u8 = 0;
+        let dialect = cm_dialect(data);
+        // The response encoders read this: the two dialects' key sets collide,
+        // so a request has to be answered in the shape its sender asked in.
+        self.cm_dialect = dialect;
+        let mut wire_subcommand: u8 = 0;
         let mut protocol: u8 = 2;
         let mut param: Option<HeaplessVec<u8, 64>> = None;
         let mut rp_id_hash: Option<[u8; 32]> = None;
@@ -2088,7 +2238,15 @@ impl FidoApp {
         let mut user_id: Option<HeaplessVec<u8, 64>> = None;
         let mut user_name: Option<HeaplessVec<u8, TEXT_MAX>> = None;
         let mut user_dn: Option<HeaplessVec<u8, TEXT_MAX>> = None;
+        // Byte-exact copies of what the client signed over. PicoForge signs
+        // `subCommand ‖ CBOR(subCommandParams)`; CTAP2 signs
+        // `subCommand ‖ rpIdHash ‖ credentialID ‖ user`. Either way these are
+        // the bytes *as received*, never rebuilt from the parsed fields — a
+        // client signs exactly the encoding it sent, key order included.
         let mut raw_params: Option<HeaplessVec<u8, 256>> = None;
+        let mut raw_rp: Option<HeaplessVec<u8, 64>> = None;
+        let mut raw_cred: Option<HeaplessVec<u8, 160>> = None;
+        let mut raw_user: Option<HeaplessVec<u8, 224>> = None;
 
         {
             let mut p = Parser::new(data);
@@ -2100,9 +2258,131 @@ impl FidoApp {
                     Item::U(k) => k,
                     _ => return Err(err(Ctap2Response::InvalidCbor)),
                 };
+                if dialect == CmDialect::Ctap2 {
+                    // CTAP2 §12.1.6: flat top-level keys, no nesting. Every
+                    // value the pinUvAuth message covers is captured raw
+                    // before it is decoded.
+                    match key {
+                        1 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                            Item::U(u) => wire_subcommand = u as u8,
+                            _ => return Err(err(Ctap2Response::InvalidCbor)),
+                        },
+                        2 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                            Item::U(u) => protocol = u as u8,
+                            _ => return Err(err(Ctap2Response::InvalidCbor)),
+                        },
+                        3 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                            Item::B(b) => {
+                                let mut v = HeaplessVec::new();
+                                if v.extend_from_slice(b).is_err() {
+                                    return Err(err(Ctap2Response::InvalidLength));
+                                }
+                                param = Some(v);
+                            }
+                            _ => return Err(err(Ctap2Response::InvalidCbor)),
+                        },
+                        4 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                            // rpIdHash — signed over as the bare 32 bytes,
+                            // not as a CBOR byte string.
+                            Item::B(b) if b.len() == 32 => {
+                                let mut h = [0u8; 32];
+                                h.copy_from_slice(b);
+                                rp_id_hash = Some(h);
+                                let mut v: HeaplessVec<u8, 64> = HeaplessVec::new();
+                                if v.extend_from_slice(b).is_err() {
+                                    return Err(err(Ctap2Response::InvalidLength));
+                                }
+                                raw_rp = Some(v);
+                            }
+                            _ => return Err(err(Ctap2Response::InvalidCbor)),
+                        },
+                        5 => {
+                            // credentialID — signed over as its CBOR map.
+                            let start = p.pos();
+                            p.skip().map_err(|_| err(Ctap2Response::InvalidCbor))?;
+                            let end = p.pos();
+                            let mut raw: HeaplessVec<u8, 160> = HeaplessVec::new();
+                            if raw.extend_from_slice(&data[start..end]).is_err() {
+                                return Err(err(Ctap2Response::InvalidLength));
+                            }
+                            raw_cred = Some(raw);
+                            let mut q = Parser::new(&data[start..end]);
+                            let Item::Map(cm) =
+                                q.next().map_err(|_| err(Ctap2Response::InvalidCbor))?
+                            else {
+                                return Err(err(Ctap2Response::InvalidCbor));
+                            };
+                            let mut id: HeaplessVec<u8, 64> = HeaplessVec::new();
+                            for _ in 0..cm {
+                                match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                    Item::T("id") => match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                        Item::B(b) => {
+                                            if id.extend_from_slice(b).is_err() {
+                                                return Err(err(Ctap2Response::InvalidLength));
+                                            }
+                                        }
+                                        _ => return Err(err(Ctap2Response::InvalidCbor)),
+                                    },
+                                    _ => q.skip().map_err(|_| err(Ctap2Response::InvalidCbor))?,
+                                }
+                            }
+                            cred_id = Some(id);
+                        }
+                        6 => {
+                            // user — signed over as its CBOR map.
+                            let start = p.pos();
+                            p.skip().map_err(|_| err(Ctap2Response::InvalidCbor))?;
+                            let end = p.pos();
+                            let mut raw: HeaplessVec<u8, 224> = HeaplessVec::new();
+                            if raw.extend_from_slice(&data[start..end]).is_err() {
+                                return Err(err(Ctap2Response::InvalidLength));
+                            }
+                            raw_user = Some(raw);
+                            let mut q = Parser::new(&data[start..end]);
+                            let Item::Map(um) =
+                                q.next().map_err(|_| err(Ctap2Response::InvalidCbor))?
+                            else {
+                                return Err(err(Ctap2Response::InvalidCbor));
+                            };
+                            for _ in 0..um {
+                                match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                    Item::T("id") => match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                        Item::B(b) => {
+                                            let mut v = HeaplessVec::new();
+                                            let _ = v.extend_from_slice(b);
+                                            user_id = Some(v);
+                                        }
+                                        _ => return Err(err(Ctap2Response::InvalidCbor)),
+                                    },
+                                    Item::T("name") => match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                        Item::T(s) => {
+                                            let mut v = HeaplessVec::new();
+                                            let _ = v.extend_from_slice(s.as_bytes());
+                                            user_name = Some(v);
+                                        }
+                                        _ => return Err(err(Ctap2Response::InvalidCbor)),
+                                    },
+                                    Item::T("displayName") => match q.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
+                                        Item::T(s) => {
+                                            let mut v = HeaplessVec::new();
+                                            let _ = v.extend_from_slice(s.as_bytes());
+                                            user_dn = Some(v);
+                                        }
+                                        _ => return Err(err(Ctap2Response::InvalidCbor)),
+                                    },
+                                    _ => q.skip().map_err(|_| err(Ctap2Response::InvalidCbor))?,
+                                }
+                            }
+                        }
+                        _ => p.skip().map_err(|_| err(Ctap2Response::InvalidCbor))?,
+                    }
+                    continue;
+                }
+                // PicoForge: sub-command parameters nested under key 0x02,
+                // pinUvAuthProtocol at 0x03, pinUvAuthParam at 0x04.
                 match key {
                     1 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
-                        Item::U(u) => subcommand = u as u8,
+                        Item::U(u) => wire_subcommand = u as u8,
                         _ => return Err(err(Ctap2Response::InvalidCbor)),
                     },
                     3 => match p.next().map_err(|_| err(Ctap2Response::InvalidCbor))? {
@@ -2211,12 +2491,23 @@ impl FidoApp {
                 }
             }
         }
-        if subcommand == 0 {
+        if wire_subcommand == 0 {
             return Err(err(Ctap2Response::MissingParameter));
         }
 
+        // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
+        // CTAP2 numbers them the other way round. Everything below works in
+        // the canonical CTAP2 numbering, so PicoForge's pair is swapped here
+        // and nowhere else. `wire_subcommand` — not this value — is what goes
+        // into the pinUvAuth message, in both dialects.
+        let subcommand = match (dialect, wire_subcommand) {
+            (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
+            (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,
+            (_, w) => w,
+        };
+
         // PIN auth: every subcommand except the enumerate-next pair.
-        let needs_pincmd = !matches!(subcommand, 0x03 | 0x05);
+        let needs_pincmd = !matches!(subcommand, CM_ENUMERATE_RPS_NEXT | CM_ENUMERATE_CREDS_NEXT);
         if needs_pincmd {
             let param = match param {
                 Some(p) => p,
@@ -2225,17 +2516,57 @@ impl FidoApp {
             if protocol != 1 && protocol != 2 {
                 return Err(err(Ctap2Response::InvalidParameter));
             }
-            if self.keystore.pin_state.pin_hash.is_none() {
+            // A PIN is not the only way to be authorised: a factory-fresh key
+            // has none, and CTAP2 expects a pinUvAuthToken minted from built-in
+            // user verification to stand in for it. Gating on "a PIN is set"
+            // alone left such a key unable to use credentialManagement at all,
+            // so the real requirement — a live token — is checked instead.
+            // Nothing is weakened: the token below is still verified, and one
+            // can only exist if a token sub-command succeeded (0x06 only after
+            // a user-presence grant). With neither, this is still PinNotSet.
+            if self.keystore.pin_state.pin_hash.is_none() && self.pin_token.is_none() {
                 return Err(err(Ctap2Response::PinNotSet));
             }
             if self.keystore.pin_state.needs_power_cycle {
                 return Err(err(Ctap2Response::PinAuthBlocked));
             }
             let token = self.pin_token.ok_or(err(Ctap2Response::PinAuthInvalid))?;
-            let mut auth_msg: HeaplessVec<u8, 280> = HeaplessVec::new();
-            auth_msg.push(subcommand).ok();
-            if let Some(raw) = &raw_params {
-                auth_msg.extend_from_slice(raw.as_slice()).ok();
+            let mut auth_msg: HeaplessVec<u8, 512> = HeaplessVec::new();
+            auth_msg.push(wire_subcommand).ok();
+            match dialect {
+                // PicoForge signs `subCommand ‖ CBOR(subCommandParams)` —
+                // one opaque blob, captured at parse time.
+                CmDialect::PicoForge => {
+                    if let Some(raw) = &raw_params {
+                        auth_msg.extend_from_slice(raw.as_slice()).ok();
+                    }
+                }
+                // CTAP2 §12.1.6 signs the parameters that the sub-command
+                // actually carries, concatenated in spec order and never
+                // CBOR-wrapped: rpIdHash for enumerateCredentialsBegin,
+                // credentialID for deleteCredential, and credentialID ‖ user
+                // for updateUserInformation.
+                CmDialect::Ctap2 => match subcommand {
+                    CM_ENUMERATE_CREDS_BEGIN => {
+                        if let Some(raw) = &raw_rp {
+                            auth_msg.extend_from_slice(raw.as_slice()).ok();
+                        }
+                    }
+                    CM_DELETE_CRED => {
+                        if let Some(raw) = &raw_cred {
+                            auth_msg.extend_from_slice(raw.as_slice()).ok();
+                        }
+                    }
+                    CM_UPDATE_USER => {
+                        if let Some(raw) = &raw_cred {
+                            auth_msg.extend_from_slice(raw.as_slice()).ok();
+                        }
+                        if let Some(raw) = &raw_user {
+                            auth_msg.extend_from_slice(raw.as_slice()).ok();
+                        }
+                    }
+                    _ => {}
+                },
             }
             if !crypto::pin_verify_auth(protocol, &token, auth_msg.as_slice(), &param) {
                 return Err(self.note_pin_auth_failure());
@@ -2247,8 +2578,11 @@ impl FidoApp {
         }
 
         match subcommand {
-            0x01 => {
-                // metadata 0x0B
+            CM_GET_METADATA => {
+                // Keys 1/2 are the spec's existingResidentCredentialsCount /
+                // maxPossibleRemainingResidentCredentialsCount; key 3 (total
+                // capacity) is the PicoForge extension. Both dialects read the
+                // first two, and CTAP2 clients ignore the unknown third.
                 let existing = self.keystore.cred_count();
                 let remaining = self.keystore.max_remaining_creds();
                 no_heap::push_map_header(out, 3).ok();
@@ -2260,7 +2594,7 @@ impl FidoApp {
                 no_heap::push_uint(out, (existing + remaining) as u64).ok();
                 Ok(())
             }
-            0x02 => {
+            CM_ENUMERATE_RPS_BEGIN => {
                 // enumerateRpsBegin
                 let mut rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }> =
                     heapless::Vec::new();
@@ -2280,22 +2614,45 @@ impl FidoApp {
                 }
                 let total = rps.len();
                 let (hash, rp_id) = rps.remove(0);
-                self.cm_rp_state = Some(CmRpState { rps, cursor: 0, channel: self.current_channel });
-                no_heap::push_map_header(out, 3).ok();
-                no_heap::push_uint(out, 3).ok();
-                no_heap::push_map_header(out, 1).ok();
-                no_heap::push_tstr(out, "id").ok();
-                no_heap::push_tstr(out, core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?).ok();
-                no_heap::push_uint(out, 4).ok();
-                no_heap::push_bstr(out, &hash).ok();
-                no_heap::push_uint(out, 5).ok();
-                no_heap::push_uint(out, total as u64).ok();
+                self.cm_rp_state = Some(CmRpState { rps, cursor: 0, channel: self.current_channel, dialect: self.cm_dialect });
+                let rp_str =
+                    core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?;
+                match self.cm_dialect {
+                    // CTAP2 §12.1.6: rp(1) ‖ rpID(2) ‖ totalRPs(7). A client
+                    // that cannot find keys 1/2/7 has nothing to render,
+                    // which is what left the Slots and Passkeys screens
+                    // spinning forever.
+                    CmDialect::Ctap2 => {
+                        no_heap::push_map_header(out, 3).ok();
+                        no_heap::push_uint(out, 1).ok();
+                        no_heap::push_map_header(out, 1).ok();
+                        no_heap::push_tstr(out, "id").ok();
+                        no_heap::push_tstr(out, rp_str).ok();
+                        no_heap::push_uint(out, 2).ok();
+                        no_heap::push_bstr(out, &hash).ok();
+                        no_heap::push_uint(out, 7).ok();
+                        no_heap::push_uint(out, total as u64).ok();
+                    }
+                    // PicoForge: rp(3) ‖ rpIdHash(4) ‖ totalRps(5), byte for
+                    // byte what it has always been sent.
+                    CmDialect::PicoForge => {
+                        no_heap::push_map_header(out, 3).ok();
+                        no_heap::push_uint(out, 3).ok();
+                        no_heap::push_map_header(out, 1).ok();
+                        no_heap::push_tstr(out, "id").ok();
+                        no_heap::push_tstr(out, rp_str).ok();
+                        no_heap::push_uint(out, 4).ok();
+                        no_heap::push_bstr(out, &hash).ok();
+                        no_heap::push_uint(out, 5).ok();
+                        no_heap::push_uint(out, total as u64).ok();
+                    }
+                }
                 Ok(())
             }
-            0x03 => {
+            CM_ENUMERATE_RPS_NEXT => {
                 // enumerateRpsGetNext
                 let mut done = false;
-                let result = (|| -> Result<([u8; 32], heapless::Vec<u8, 64>), Err> {
+                let result = (|| -> Result<([u8; 32], heapless::Vec<u8, 64>, CmDialect), Err> {
                     let Some(state) = self.cm_rp_state.as_mut() else {
                         return Err(err(Ctap2Response::NotAllowed));
                     };
@@ -2311,22 +2668,38 @@ impl FidoApp {
                     if state.cursor >= state.rps.len() {
                         done = true;
                     }
-                    Ok(item)
+                    Ok((item.0, item.1, state.dialect))
                 })();
-                let (hash, rp_id) = result?;
+                let (hash, rp_id, dialect) = result?;
+                // This request's own bytes cannot say which dialect it is —
+                // both dialects send exactly `{1: 0x03}` here — so the
+                // enumeration it continues decides the response shape.
+                self.cm_dialect = dialect;
                 if done {
                     self.cm_rp_state = None;
                 }
+                let rp_str =
+                    core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?;
+                // CTAP2 omits totalRps here — only the Begin response carries
+                // it (key 7). PicoForge's two-key shape is unchanged.
+                let rp_key = match self.cm_dialect {
+                    CmDialect::Ctap2 => 1u64,
+                    CmDialect::PicoForge => 3,
+                };
+                let hash_key = match self.cm_dialect {
+                    CmDialect::Ctap2 => 2u64,
+                    CmDialect::PicoForge => 4,
+                };
                 no_heap::push_map_header(out, 2).ok();
-                no_heap::push_uint(out, 3).ok();
+                no_heap::push_uint(out, rp_key).ok();
                 no_heap::push_map_header(out, 1).ok();
                 no_heap::push_tstr(out, "id").ok();
-                no_heap::push_tstr(out, core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?).ok();
-                no_heap::push_uint(out, 4).ok();
+                no_heap::push_tstr(out, rp_str).ok();
+                no_heap::push_uint(out, hash_key).ok();
                 no_heap::push_bstr(out, &hash).ok();
                 Ok(())
             }
-            0x04 => {
+            CM_ENUMERATE_CREDS_BEGIN => {
                 // enumerateCredsBegin
                 let hash = rp_id_hash.ok_or(err(Ctap2Response::MissingParameter))?;
                 let mut ids: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }> =
@@ -2351,12 +2724,12 @@ impl FidoApp {
                 }
                 let total = ordered.len();
                 let first = ordered.remove(0);
-                self.cm_cred_state = Some(CmCredState { creds: ordered, total, channel: self.current_channel });
+                self.cm_cred_state = Some(CmCredState { creds: ordered, total, channel: self.current_channel, dialect: self.cm_dialect });
                 self.cm_cred_response(&first, total, out)
             }
-            0x05 => {
+            CM_ENUMERATE_CREDS_NEXT => {
                 // enumerateCredsGetNext
-                let result = (|| -> Result<(heapless::Vec<u8, 64>, usize), Err> {
+                let result = (|| -> Result<(heapless::Vec<u8, 64>, usize, CmDialect), Err> {
                     let Some(state) = self.cm_cred_state.as_mut() else {
                         return Err(err(Ctap2Response::NotAllowed));
                     };
@@ -2367,9 +2740,16 @@ impl FidoApp {
                         self.cm_cred_state = None;
                         return Err(err(Ctap2Response::NotAllowed));
                     }
-                    Ok((state.creds.remove(0), state.total))
+                    Ok((state.creds.remove(0), state.total, state.dialect))
                 })();
-                let (id, total) = result?;
+                let (id, total, dialect) = result?;
+                // PicoForge sends `{1: 0x05}` for this sub-command and CTAP2
+                // sends `{1: 0x05}` too — identical bytes, so the request
+                // cannot be classified. The enumeration it continues can:
+                // PicoForge reads `User` at 0x06 and got a CTAP2-shaped
+                // reply here, which is what surfaced as "User not found in
+                // EnumerateCredentialsGetNextCredential response".
+                self.cm_dialect = dialect;
                 if self
                     .cm_cred_state
                     .as_ref()
@@ -2380,7 +2760,7 @@ impl FidoApp {
                 }
                 self.cm_cred_response(&id, total, out)
             }
-            0x06 => {
+            CM_DELETE_CRED => {
                 // deleteCredential
                 let id = cred_id.ok_or(err(Ctap2Response::MissingParameter))?;
                 if id.is_empty() {
@@ -2391,7 +2771,7 @@ impl FidoApp {
                     Err(_) => Err(err(Ctap2Response::NoCredentials)),
                 }
             }
-            0x07 => {
+            CM_UPDATE_USER => {
                 // updateUserInformation
                 let id = cred_id.ok_or(err(Ctap2Response::MissingParameter))?;
                 let uid = user_id.ok_or(err(Ctap2Response::MissingParameter))?;
@@ -2431,9 +2811,17 @@ impl FidoApp {
         if cred.cred_protect > 0 { n += 1; }
         if cred.large_blob_key.is_some() { n += 1; }
         if cred.third_party_payment { n += 1; }
+        // CTAP2 §12.1.6 numbers these 1/2/3/4/5/6/7; PicoForge numbers the
+        // same seven things 6/7/8/9/0x0A/0x0B/0x0C. The two sets overlap
+        // (key 6 is `user` to PicoForge and `largeBlobKey` to CTAP2), so one
+        // response cannot satisfy both — it is written in the sender's shape.
+        let (k_user, k_cred, k_pk, k_total, k_protect, k_blob, k_tpp) =
+            match self.cm_dialect {
+                CmDialect::Ctap2 => (1u64, 2, 3, 4, 5, 6, 7),
+                CmDialect::PicoForge => (6, 7, 8, 9, 0x0A, 0x0B, 0x0C),
+            };
         no_heap::push_map_header(out, n).ok();
-        // user (6)
-        no_heap::push_uint(out, 6).ok();
+        no_heap::push_uint(out, k_user).ok();
         let mut un = 1usize;
         if !cred.user_name.is_empty() { un += 1; }
         if !cred.user_display_name.is_empty() { un += 1; }
@@ -2448,29 +2836,27 @@ impl FidoApp {
             no_heap::push_tstr(out, "displayName").ok();
             no_heap::push_tstr(out, core::str::from_utf8(cred.user_display_name.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?).ok();
         }
-        // credentialId (7)
-        no_heap::push_uint(out, 7).ok();
+        no_heap::push_uint(out, k_cred).ok();
         no_heap::push_map_header(out, 2).ok();
         no_heap::push_tstr(out, "id").ok();
         no_heap::push_bstr(out, cred_id).ok();
         no_heap::push_tstr(out, "type").ok();
         no_heap::push_tstr(out, "public-key").ok();
-        // publicKey (8) — standard COSE wire format
-        no_heap::push_uint(out, 8).ok();
+        // publicKey — standard COSE wire format
+        no_heap::push_uint(out, k_pk).ok();
         cred.public_key.encode_wire(out).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
-        // totalCredentials (9)
-        no_heap::push_uint(out, 9).ok();
+        no_heap::push_uint(out, k_total).ok();
         no_heap::push_uint(out, total as u64).ok();
         if cred.cred_protect > 0 {
-            no_heap::push_uint(out, 0x0A).ok();
+            no_heap::push_uint(out, k_protect).ok();
             no_heap::push_uint(out, cred.cred_protect as u64).ok();
         }
         if let Some(k) = &cred.large_blob_key {
-            no_heap::push_uint(out, 0x0B).ok();
+            no_heap::push_uint(out, k_blob).ok();
             no_heap::push_bstr(out, k).ok();
         }
         if cred.third_party_payment {
-            no_heap::push_uint(out, 0x0C).ok();
+            no_heap::push_uint(out, k_tpp).ok();
             no_heap::push_bool(out, true).ok();
         }
         Ok(())

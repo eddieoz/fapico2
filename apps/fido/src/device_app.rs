@@ -89,6 +89,11 @@ pub struct FidoApp {
     pub(crate) cm_rp_state: Option<CmRpState>,
     /// Pending credMgmt credential enumeration.
     pub(crate) cm_cred_state: Option<CmCredState>,
+    /// Which CBOR dialect the credMgmt command being served arrived in. The
+    /// response encoders read this: the PicoForge and CTAP2 key sets collide
+    /// (see `device_core::CmDialect`), so a request has to be answered in the
+    /// shape its sender asked in.
+    pub(crate) cm_dialect: crate::device_core::CmDialect,
     /// Pending largeBlobs write (fragment assembly).
     pub(crate) lb_pending: Option<LbPending>,
     /// Pending vault enrollment (vendor 0x41 0x05 ENROLL_BEGIN state).
@@ -200,6 +205,14 @@ pub struct CmRpState {
     pub(crate) rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }>,
     pub(crate) cursor: usize,
     pub(crate) channel: [u8; 4],
+    /// The dialect of the `enumerateRpsBegin` that armed this enumeration.
+    ///
+    /// A Next request cannot be classified from its own bytes: PicoForge and
+    /// CTAP2 both send exactly `{1: 0x03}` for `enumerateRpsNext`, because
+    /// the Next sub-commands carry no `pinUvAuthParam` in either dialect —
+    /// the layouts are indistinguishable here. The enumeration is a
+    /// continuation, so it is answered in the dialect that started it.
+    pub(crate) dialect: crate::device_core::CmDialect,
 }
 
 /// credMgmt credential enumeration state.
@@ -207,6 +220,9 @@ pub struct CmCredState {
     pub(crate) creds: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }>,
     pub(crate) total: usize,
     pub(crate) channel: [u8; 4],
+    /// See [`CmRpState::dialect`] — `enumerateCredentialsGetNextCredential`
+    /// is likewise `{1: 0x05}` and nothing else in both dialects.
+    pub(crate) dialect: crate::device_core::CmDialect,
 }
 
 /// largeBlobs fragment assembly state.
@@ -261,6 +277,7 @@ impl FidoApp {
             rng_cursor: 0,
             cm_rp_state: None,
             cm_cred_state: None,
+            cm_dialect: crate::device_core::CmDialect::default(),
             lb_pending: None,
             vault_pending: None,
             presence: None,
@@ -403,6 +420,8 @@ impl FidoApp {
         core::ptr::addr_of_mut!((*app).rng_cursor).write(0);
         core::ptr::addr_of_mut!((*app).cm_rp_state).write(None);
         core::ptr::addr_of_mut!((*app).cm_cred_state).write(None);
+        core::ptr::addr_of_mut!((*app).cm_dialect)
+            .write(crate::device_core::CmDialect::default());
         core::ptr::addr_of_mut!((*app).lb_pending).write(None);
         core::ptr::addr_of_mut!((*app).vault_pending).write(None);
         core::ptr::addr_of_mut!((*app).presence).write(None);
@@ -419,6 +438,17 @@ impl FidoApp {
     /// command path (S-701-4+).
     pub fn keystore(&mut self) -> &mut DeviceKeystore {
         &mut self.keystore
+    }
+
+    /// The stored physical configuration (`PhyConfig`, keystore auth-map key
+    /// 6) — read-only, for the boot path that resolves the USB identity.
+    ///
+    /// The descriptors consume VID/PID and the identity names; LED fields stay
+    /// with the LED task. Immutable on purpose: `&mut keystore()` would force
+    /// the boot to take a mutable borrow of the whole app just to read four
+    /// fields.
+    pub fn phy(&self) -> &crate::vendorff::PhyConfig {
+        &self.keystore.phy
     }
 
     /// US-907: attach the user-presence source (the board button poll on
