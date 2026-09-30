@@ -802,6 +802,15 @@ async fn main(spawner: Spawner) -> ! {
     // R12: the mgmt TAG_SERIAL derives from the OTP chipid, so each device
     // presents a distinct serial (fleet fingerprinting closed). The chip-id
     // itself is read above, next to the OATH boot that shares it.
+    // Publish the chipid-derived serial for the FIDO task's
+    // `CTAP_READ_CONFIG` (`0x42`) answer. Same derivation as the applet's
+    // TAG_SERIAL and the USB descriptor (`usb_ident::serial_hash4`), so all
+    // three agree by construction.
+    tasks::DEVICE_SERIAL.store(
+        u32::from_be_bytes(fapico2_mgmt::serial_from_chipid(device_chipid)),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     let management_app = boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::MANAGEMENT_APP),
         ManagementApp::boot(&mut *store)
