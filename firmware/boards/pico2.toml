@@ -1,0 +1,69 @@
+# Board definition — Raspberry Pi Pico 2 (RP2350, 4 MiB QSPI).
+#
+# US-1080. This file is the single source of truth for what "the board" means:
+# the pins the firmware drives, the flash the linker may use, and the USB
+# identity the device advertises. Before it, those were `pub const` literals in
+# `platform/src/lib.rs` and `platform/src/identity.rs` with a test asserting the
+# literals — a test that could not fail, because nothing could change the value
+# without editing the constant it asserted.
+#
+# THE SECOND BOARD IS A DATA CHANGE. Copy this file to
+# `firmware/boards/<name>.toml`, edit the values, and build:
+#
+#     FAPICO2_BOARD=<name> cargo build --release -p fapico2-firmware
+#
+# or, for a file that is not in this directory,
+#
+#     FAPICO2_BOARD_PATH=/path/to/<name>.toml cargo build -p fapico2-firmware
+#
+# No `.rs` file is edited, and `firmware/memory.x` — which used to be a
+# checked-in hand-written linker script — is now generated from `flash_size_kb`
+# below. `platform/tests/board_def.rs` is the test that holds that promise.
+#
+# One file ships because one board exists (EPIC US-1080: "not a board zoo").
+#
+# Keys are validated at build time: an unknown key, a duplicate, a missing key,
+# a pin above GPIO29, a flash size outside the supported window, or an identity
+# string too long for the USB descriptor is a hard build failure naming this
+# file and line. Nothing here silently falls back to a default.
+
+[board]
+# Board name. Becomes a `cfg` (`board_pico2`) and the build-directory tag, so it
+# must be [a-z0-9_-].
+name = "pico2"
+
+# Activity LED. Matches the C firmware's PICO_DEFAULT_LED_PIN (GPIO25), which
+# is what the shipped hardware has and what the C `led.c` drives.
+led_pin = 25
+
+# BOOTSEL button. The Pico 2 wires BOOTSEL to QSPI CS, which the C `button.c`
+# reads as the `CS_BIT` of the high IO; `embassy-rp` exposes it as GPIO1.
+button_pin = 1
+
+# Total QSPI flash in KiB, INCLUDING the 64 KiB secure-partition region that
+# `build.rs` reserves off the top (at 0x103F0000 on this board). The linker
+# script it generates gives the app 4096 - 64 = 4032 KiB and keeps app text out
+# of the keystore partition; `firmware/src/boot.rs` derives the secure-slot
+# offsets from the same number.
+flash_size_kb = 4096
+
+[usb]
+# USB VID:PID, the `VVVV:PPPP` shape `FAPICO2_VID_PID` already takes.
+#
+# fa20:0002 is the group contract's "The BLOCO Community / fapico2" identity
+# (S-391-14), bus-verified on this board. `0xfa20` is NOT a USB-IF-registered
+# vendor id: a release intended for sale needs a registered one, which is a
+# data change in this file and nothing else.
+vidpid = "FA20:0002"
+
+# USB iProduct.
+product = "fapico2"
+
+# USB iManufacturer. Renamed from "EddieOz" to "The BLOCO Community" in the
+# group contract on 2026-09-28, but units flashed before that still enumerate
+# as "EddieOz", so the shipped default stays what the field already has — a
+# mixed fleet is the operator's problem to finish, and an unrequested
+# descriptor change is not this story's to make. 7 bytes including the NUL,
+# against the 32-byte ceiling `MAX_IDENTITY_STRING` imposes on both the
+# descriptor and the PHY TLV tag.
+manufacturer = "The BLOCO Community"

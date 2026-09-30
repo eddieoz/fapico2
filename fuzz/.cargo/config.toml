@@ -1,0 +1,7 @@
+# cargo-fuzz builds the harnesses for the HOST (libFuzzer needs a hosted
+# target with a C runtime). The parent `.cargo/config.toml` defaults the whole
+# tree to the RP2350 device target, so override it here. Only `[build].target`
+# is overridden — the parent's thumbv8m-specific `rustflags`/`runner` are
+# scoped to that target and do not apply to host builds.
+[build]
+target = "x86_64-unknown-linux-gnu"

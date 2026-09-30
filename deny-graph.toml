@@ -1,0 +1,155 @@
+# US-1060 (RS-KEY-ADOPT Phase 7) — graph assertions cargo-deny cannot express.
+#
+# Read `deny.toml` first. That file is cargo-deny's half of this story: the
+# resolved third-party graph (sources, licences, advisories, duplicates, and
+# the named `wrappers` allowlist that `-D unused-wrapper` keeps honest). This
+# file is the other half — the rules about the *edges between the workspace's
+# own crates*, which cargo-deny has no setting for in any version (0.20.2
+# hard-errors on an unknown top-level key rather than ignoring it, which is
+# why this is a sibling file and not a section of `deny.toml`).
+#
+# The only reader is `tests/scripts/check_crate_graph.py`, which compares what
+# is written here against `cargo metadata`. Both directions are checked: an
+# edge that appears without being listed is a red, and a listed edge that no
+# longer exists is *also* a red. The second direction is the one that matters
+# — an allowlist that only ever grows is a list of stale promises nobody
+# re-reads, which is the failure mode the epic's US-1060 "so the lists cannot
+# rot" is aimed at.
+#
+# What these rules are NOT
+# -----------------------
+# R1 is frequently read as "applet isolation". It is not, and the difference
+# is not academic. fapico2 constructs ONE trussed `Client` and hands the same
+# service set to every applet, so which key material an applet can reach is
+# decided by the service-set split in `platform/src/trusted_backend/`, not by
+# any manifest edge. R1 buys the weaker, still-useful property: an applet
+# cannot *import another applet's code*, and the one crate that does
+# (`fapico2-apps`, the AID registry) has every edge it holds named below.
+# Isolation itself is architecture and is recorded as a known divergence in
+# `docs/supply-chain.md` — it is not claimed here.
+
+# ---------------------------------------------------------------------------
+# R1 — applet-to-applet edges
+# ---------------------------------------------------------------------------
+#
+# "Applet crate" = a workspace member whose manifest lives at `apps/<name>/`.
+# `fapico2-apps` (apps/Cargo.toml) is the AID registry, not an applet, and is
+# the single sanctioned aggregator: every edge it holds is listed by name.
+# Every other crate under apps/ must reach its neighbours only through
+# `fapico2-platform`.
+#
+# Only *normal* dependencies count. Dev-dependencies are listed separately in
+# the gate's report because they are real edges a reader would otherwise not
+# know about — `apps/mgmt` dev-depends on `apps/fido` and `apps/oath` for
+# cross-applet tests, and `apps/rescue` dev-depends on `apps/mgmt` — but they
+# never enter the shipped binary, so making them red would be a rule that
+# cries wolf and gets muted.
+#
+# Format: "<from> -> <to>". `from == to` is never valid.
+applet_edges_allow = [
+  "fapico2-apps -> fapico2-mgmt",
+  "fapico2-apps -> fapico2-oath",
+  "fapico2-apps -> fapico2-openpgp",
+  "fapico2-apps -> fapico2-rescue",
+  "fapico2-apps -> fapico2-vendor-led",
+]
+
+# ---------------------------------------------------------------------------
+# R2 — hash/signature backend crates
+# ---------------------------------------------------------------------------
+#
+# What belongs here is the crates that *choose an implementation* for a
+# mechanism — the ones a trussed `Backend` is assembled from. What
+# deliberately does not belong here: `sha2`, `hmac`, `p256`, `ecdsa`,
+# `ed25519-dalek`, `x448` and the rest of the RustCrypto stack. Those are
+# ordinary library uses the applets legitimately have for their own protocol
+# logic (OATH hashes a MAC, FIDO hashes a PRF, PIV signs nothing itself).
+# Listing them would produce a rule that reads far stronger than it is, which
+# is the same mistake as claiming applet isolation from a manifest line.
+#
+# Naming one of these from any crate other than `backend_owner` is a red: it
+# would be a second place able to decide which implementation serves a
+# mechanism, and `platform/src/trusted_backend/dispatch.rs` is the only one
+# allowed to.
+backend_crates = [
+  "trussed-auth-backend",
+  "trussed-brainpool",
+  "trussed-rsa-alloc",
+  "trussed-secp256k1",
+  # The heap that lets the software-RSA backend run at all. Present for the
+  # same reason the backends are: it is a platform-private implementation
+  # choice, and an applet acquiring it would put a second `#[global_allocator]`
+  # within reach of an applet crate — which is the class of thing
+  # `check_heap_gate.py` exists to keep singular.
+  "linked_list_allocator",
+]
+# R3 — the only crate permitted to name a backend at all.
+backend_owner = "fapico2-platform"
+
+# ---------------------------------------------------------------------------
+# G4 — wildcard version requirements in workspace-owned manifests
+# ---------------------------------------------------------------------------
+#
+# `foo = "*"` resolves to whatever is newest at build time. cargo-deny's
+# `wildcards` setting cannot be turned on for this tree, because the vendored
+# `opcard` (LGPL-3.0, published on crates.io, excluded from the workspace)
+# declares its own path dependencies without versions and cargo-deny has no
+# way to exempt a path wildcard on a published crate. So the rule is enforced
+# here instead, where it can be scoped: the gate requires ZERO wildcard
+# version requirements in any workspace-owned manifest (this file, the
+# workspace root, `firmware/`, `platform/`, `apps/`, and the two vendored
+# trussed backends) and reports the count it found in `vendor/opcard`, which
+# is the one tree the rule does not cover.
+#
+# Both numbers are derived from the manifests on every run; if the vendored
+# opcard is ever re-vendored with versions filled in, the report says so
+# rather than the rule quietly becoming narrower than its comment.
+owned_manifest_globs = [
+  "Cargo.toml",
+  "firmware/Cargo.toml",
+  "platform/Cargo.toml",
+  "apps/Cargo.toml",
+  "apps/*/Cargo.toml",
+  "vendor/trussed-*/Cargo.toml",
+]
+# Manifests the rule does NOT cover, with the reason each is excluded. An
+# entry naming a path that does not exist is a red (stale exemption); an
+# excluded path that DOES start enforcing is a red too, because the comment
+# above it would then be describing a different tree than the one on disk.
+wildcard_exempt = [
+  "vendor/opcard",
+]
+
+# ---------------------------------------------------------------------------
+# G5 — the duplicated-crate set, made a gate out of a warning
+# ---------------------------------------------------------------------------
+#
+# 40 crates in `Cargo.lock` resolve to more than one version, because trussed,
+# opcard and our own code pin three different generations of RustCrypto
+# (`sha2` 0.9 / 0.10 / 0.11, `digest` likewise, and so on down the tree). That
+# is the real, honest state of the lock, not something to be tidied away in a
+# CI story.
+#
+# cargo-deny reports each one as `warning[duplicate]`, and cargo-deny exits 0
+# on warnings — so on its own this set is a log nobody reads. Listing it here
+# turns the half a warning cannot do: a crate that BECOMES duplicated is a
+# red, and a crate that stops being duplicated is *also* a red, because the
+# entry is then describing a lock file that no longer exists. The list is
+# derived from `Cargo.lock` on every run; the copy below is the measured one
+# (389 packages, 2026-09-29) and the gate recomputes it rather than trusting
+# the number written here.
+#
+# Multiple versions are not automatically wrong — a build that links two
+# generations of the same primitive is worth knowing about, which is what this
+# list is for. What must not happen is the set changing without somebody
+# deciding it should.
+duplicate_crates = [
+  "base16ct", "bitfield", "bitflags", "block-buffer", "const-oid",
+  "cpufeatures", "crypto-bigint", "crypto-common", "der", "digest", "ecdsa",
+  "elliptic-curve", "embassy-hal-internal", "embedded-hal", "embedded-io",
+  "embedded-io-async", "ff", "getrandom", "group", "half", "hash32",
+  "heapless", "hkdf", "hmac", "itertools", "nb", "p256", "pkcs8",
+  "primeorder", "rand_core", "rfc6979", "rustc_version", "sec1", "semver",
+  "sha2", "shlex", "signature", "spki", "syn", "synstructure",
+]
+

@@ -1,0 +1,195 @@
+# Release (RS-KEY-ADOPT Phase 7, US-1062 / US-1063 / US-1064).
+#
+# WHAT IS EXERCISED AND WHAT IS NOT — read this before trusting a green run
+# ------------------------------------------------------------------------
+# This workflow has NEVER RUN. It was written in a session with no GitHub
+# Actions runner, no OIDC issuer, no Fulcio, no Rekor, and no RP2350. The
+# cosign step and the attestation step below are therefore *unexercised
+# code*, and nothing in this repository should be read as claiming
+# otherwise. What HAS been exercised, on every push, is the policy those
+# steps feed: `check_release_provenance.py` and `check_artefact_agreement.py`
+# run against committed fixtures with negative controls, through the same
+# functions a release calls. The first real tag is when the other half gets
+# its first real test, and it should be expected to need fixing.
+#
+# The chain of custody, and why there is only ONE mechanism per property
+# ------------------------------------------------------------------------
+#   1. the image is a function of the source
+#        -> ci.yml, device-build, US-1043: two independent builds from two
+#           source directories, compared with `cmp`, plus the flash-budget
+#           ratchet. Not repeated here. A second copy of that check would be
+#           two ratchets to keep in step, which is the failure mode US-1043
+#           was written to end.
+#   2. the committed UF2 is that image
+#        -> ci.yml, US-1080 staleness gate; and again here, as a `cmp`
+#           against the artefact about to be published, because "the file in
+#           the repository" and "the file being released" are different claims
+#           on different machines.
+#   3. the released UF2, its SBOM and its provenance all describe the same
+#      bytes
+#        -> check_artefact_agreement.py (US-1064), which is the only place
+#           the three are compared.
+#
+# Signing
+# ------------------------------------------------------------------------
+# cosign in KEYLESS mode. There is no private key in this repository and
+# none should ever be: the only key this project should hold is the future
+# secure-boot key, which is a different thing for a different subsystem
+# (US-1082, not this epic). Keyless means the signing identity is the
+# GitHub Actions OIDC token, bound to this repository, this workflow and
+# this ref by Fulcio — so a signature says WHO built the artefact, not
+# merely that somebody with a key pressed a button.
+
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: release tag, e.g. v1.0.0
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build, sign and attest
+    runs-on: ubuntu-latest
+    permissions:
+      # Keyless signing needs an OIDC token. This is the whole reason there
+      # is no key to leak.
+      id-token: write
+      # `actions/attest-build-provenance` pushes an attestation to the
+      # repository's own attestation store.
+      attestations: write
+      contents: write
+    steps:
+      - name: Checkout fapico2
+        uses: actions/checkout@v4
+        with:
+          path: fapico2
+          persist-credentials: false
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add RP2350 target + ARM ELF linker
+        run: |
+          rustup target add thumbv8m.main-none-eabi
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+
+      # UNEXERCISED until the first tag. Kept honest by the fact that every
+      # gate it calls is exercised on every push.
+      - name: "Gate: the crate graph and the supply chain (US-1060/US-1061)"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          python3 tests/scripts/check_crate_graph.py
+          python3 tests/scripts/check_supply_chain.py
+          echo "ok: crate graph + supply chain green"
+      - name: "Gate: the SBOM matches the locked graph (US-1062)"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          python3 tests/scripts/check_sbom.py
+          echo "ok: SBOM green"
+
+      - name: Build the release image
+        working-directory: fapico2
+        run: |
+          set -euo pipefail
+          cargo build --release --target thumbv8m.main-none-eabi
+          python3 firmware/uf2gen.py \
+            target/thumbv8m.main-none-eabi/release/fapico2-firmware \
+            dist/fapico2.uf2 >/dev/null
+      # Step 2 of the chain of custody: the image published here is built from
+      # the tag's source by this run — no build output is committed, so there
+      # is no separate "committed image" that could drift from what ships. CI
+      # (ci.yml) has already established that this build is reproducible, and
+      # the provenance attestation below binds this exact dist/fapico2.uf2 to
+      # this workflow run.
+      - name: "Gate: the image is a product of this build"
+        working-directory: fapico2
+        run: |
+          set -euo pipefail
+          test -s dist/fapico2.uf2
+          echo "ok: releasing the image this run built ($(stat -c %s dist/fapico2.uf2) B)"
+
+      # US-1062: the SBOM travels WITH the artefacts, not merely in the repo.
+      - name: Attach the SBOM to the release artefacts
+        working-directory: fapico2
+        run: |
+          set -euo pipefail
+          cp supply-chain/sbom.cdx.json dist/sbom.cdx.json
+          # Release mode: the SBOM must be present NEXT TO the artefact being
+          # published, or the release is refused. This is the US-1062 red.
+          python3 tests/scripts/check_sbom.py --artifacts dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+      - name: "Sign the UF2 — keyless, via the GitHub Actions OIDC token"
+        working-directory: fapico2
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --output-certificate dist/fapico2.uf2.pem \
+            --output-signature dist/fapico2.uf2.sig dist/fapico2.uf2
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: fapico2/dist/fapico2.uf2
+      - name: Fetch the attestation for the policy check
+        working-directory: fapico2
+        run: |
+          set -euo pipefail
+          gh attestation download fapico2/dist/fapico2.uf2 \
+            --format jsonl --output dist/provenance.jsonl || \
+            gh attestation download fapico2/dist/fapico2.uf2 \
+            --format json --output dist/provenance.json
+      # US-1063's refusal half: the attestation has to name THIS reusable
+      # workflow (`job_workflow_ref`), not merely come from something that
+      # passed CI. cosign has already checked the signature by this point;
+      # this checks that the statement is about the artefact we are about to
+      # publish, produced by the workflow we say produced it.
+      - name: "Gate: the attestation is about this artefact and this workflow"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          ATT=dist/provenance.json
+          [ -f "$ATT" ] || ATT=dist/provenance.jsonl
+          if ! python3 tests/scripts/check_release_provenance.py \
+               --attestation "$ATT" \
+               --certificate dist/fapico2.uf2.pem \
+               --subject dist/fapico2.uf2 \
+               --expected-workflow .github/workflows/release.yml; then
+            echo "::error::The build-provenance attestation was refused: it does not name this reusable release workflow, or its subject digest is not this UF2 (US-1063)."
+            exit 1
+          fi
+      # US-1064: the three artefacts must agree. This is the story that makes
+      # the other three non-decorative.
+      - name: "Gate: UF2, SBOM and attestation agree"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          if ! python3 tests/scripts/check_artefact_agreement.py \
+               --artifacts dist \
+               --attestation dist/provenance.json \
+               --certificate dist/fapico2.uf2.pem; then
+            echo "::error::The released UF2, its SBOM and its provenance attestation do not agree. Refusing to publish (US-1064)."
+            exit 1
+          fi
+          echo "ok: UF2, SBOM and attestation agree"
+
+      - name: Publish the release artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fapico2-release
+          path: |
+            fapico2/dist/fapico2.uf2
+            fapico2/dist/fapico2.uf2.sig
+            fapico2/dist/fapico2.uf2.pem
+            fapico2/dist/sbom.cdx.json
+            fapico2/dist/provenance.json

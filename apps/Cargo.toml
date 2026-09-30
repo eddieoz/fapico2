@@ -1,0 +1,66 @@
+[package]
+name = "fapico2-apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The `apps` crate owns the single source of truth for "which CCID apps the
+# device wires behind the AID dispatcher" (US-386): the AID constants +
+# `register_ccid_apps` in `registry.rs`, which only need the platform trait
+# types. The app crates themselves are optional and host-gated so the
+# firmware's device build can depend on this crate (for the registry) without
+# compiling the host/virt app stacks — the firmware depends on the app crates
+# directly with their `device` features.
+fapico2-platform = { path = "../platform" }
+fapico2-mgmt = { path = "mgmt", optional = true }
+fapico2-oath = { path = "oath", optional = true }
+fapico2-openpgp = { path = "openpgp", optional = true }
+# US-160 (PICOForge-COMPAT): the vendor LED applet is NOT optional, because
+# `CCID_AIDS` is a non-gated `const` that names its AID — a feature-gated
+# entry would make the registered AID set differ between builds.
+# `default-features = false` (no `host`) keeps it `no_std` for this crate,
+# which is `#![no_std]` itself; the applet's `host` feature is turned on by the
+# builds that link it for the host, not from here.
+fapico2-vendor-led = { path = "vendor_led", default-features = false }
+# US-161/162/163 (PICOForge-COMPAT Phase H): the Rescue applet, same shape as
+# the vendor LED applet above and for the same reason — `CCID_AIDS` is a
+# non-gated `const` that names its AID, so a feature-gated entry would make the
+# registered AID set differ between builds. `default-features = false` (no
+# `host`) keeps it `no_std` for this crate, which is `#![no_std]` itself.
+fapico2-rescue = { path = "rescue", default-features = false }
+
+[features]
+default = ["host"]
+# Host (emulation / registry tests): the tests construct the real apps.
+host = ["dep:fapico2-mgmt", "dep:fapico2-oath", "dep:fapico2-openpgp"]
+# Device (RP2350): only the no_std registry is needed.
+device = []
+# US-104: the host emulation binary registers a fifth CCID app (`PivApp`), so
+# only that build advertises the PIV capability bit. Forwarded to `fapico2-mgmt`
+# so `apps`'s own test can assert the emulation word as well as the device one.
+piv = ["fapico2-mgmt/piv"]
+
+[dev-dependencies]
+heapless = "0.8"
+# US-182 (PICOForge-COMPAT): the per-applet status-word sweep covers PIV, the
+# seventh CCID app. `PivApp` is a **normal dependency of the emulation binary
+# only** (`firmware/src/emul_main.rs`), never of the device firmware, so it is
+# a dev-dependency here — the status-word sweep is a test, and a test may not
+# become a reason the shipped binary links an applet. It is deliberately NOT
+# folded into the `piv` feature: that feature gates the *advertised capability
+# bit* in `fapico2-mgmt` (US-104), and PIV's status words are a property of
+# the applet's source, not of whether any build advertises it.
+fapico2-piv = { path = "piv" }
+# US-182: the OATH status-word sweep has to *authenticate* to reach the
+# session-gated branches (6982 "security status not satisfied", 6984 "data
+# invalid", 6700 "wrong data", 6A84, and the 61xx chunking path) — the OATH
+# access-code model (US-901/US-902) grants a session only through a correct
+# HMAC, so an unauthenticated sweep can only ever see the virgin-app half of
+# the applet. These are the same two crates `fapico2-oath` already links, and
+# the same reason `apps/oath` carries a `pbkdf2` dev-dependency: the test must
+# be able to *mirror the reference client* rather than assert against the
+# applet's own constants. dev-dependencies never enter the firmware binary.
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }

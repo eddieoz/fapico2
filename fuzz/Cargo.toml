@@ -1,0 +1,95 @@
+[package]
+name = "fapico2-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Required so `cargo fuzz` recognises this as a cargo-fuzz manifest.
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone cargo-fuzz workspace. The empty `[workspace]` table keeps this
+# crate OUT of the parent workspace (whose `.cargo/config.toml` defaults the
+# build target to `thumbv8m.main-none-eabi`); the harnesses build for the host
+# via `fuzz/.cargo/config.toml`. See `README.md` for how to run these.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Parsers under test (US-384 "fuzz the parsers"):
+#   fapico2_fido::cbor::decode                 - CTAP2 CBOR parser
+#   fapico2_fido::process_u2f_apdu             - U2F (CTAP1) APDU parser
+#   iso7816::command::CommandView::try_from    - ISO7816 APDU parser (openpgp/mgmt)
+fapico2-fido = { path = "../apps/fido" }
+iso7816 = "0.2.0"
+# US-920: the CCID bulk-OUT reassembler (wedge-resync state machine).
+fapico2-firmware = { path = "../firmware" }
+# US-1050..US-1055 — the Phase-6 boundary targets. `fapico2-platform` is the
+# crate under test for `store_v3`, `persist_sink` and `migration`;
+# `fapico2-oath` carries the OATH TLV parser (`oath_core`, the heapless core
+# the device actually runs — not the host-only `oath.rs` twin).
+fapico2-platform = { path = "../platform" }
+fapico2-oath = { path = "../apps/oath" }
+heapless = "0.8"
+
+# One `[[bin]]` per fuzz target. `harness = false` because libFuzzer supplies
+# its own `main` (the `libfuzzer_sys::fuzz_target!` hook); cargo must not add
+# the default test harness.
+[[bin]]
+name = "ctap_cbor"
+path = "fuzz_targets/ctap_cbor.rs"
+harness = false
+
+[[bin]]
+name = "apdu_parse"
+path = "fuzz_targets/apdu_parse.rs"
+harness = false
+
+[[bin]]
+name = "ccid_reasm"
+path = "fuzz_targets/ccid_reasm.rs"
+harness = false
+
+# ---------------------------------------------------------------------------
+# Phase 6 (US-1050..US-1055) — the six *semantic* targets. These assert a
+# property that can regress (round-trip identity, a wear optimisation, a
+# fail-closed decision, a transactional rollback), not merely absence of a
+# panic; each is documented in `fuzz/README.md` with the mutation that was
+# used to prove its assertions actually bite.
+# ---------------------------------------------------------------------------
+[[bin]]
+name = "store_v3"
+path = "fuzz_targets/store_v3.rs"
+harness = false
+
+[[bin]]
+name = "persist_sink"
+path = "fuzz_targets/persist_sink.rs"
+harness = false
+
+[[bin]]
+name = "migration"
+path = "fuzz_targets/migration.rs"
+harness = false
+
+[[bin]]
+name = "attest_provision"
+path = "fuzz_targets/attest_provision.rs"
+harness = false
+
+[[bin]]
+name = "oath_tlv"
+path = "fuzz_targets/oath_tlv.rs"
+harness = false
+
+[[bin]]
+name = "fido_cred_state"
+path = "fuzz_targets/fido_cred_state.rs"
+harness = false
+
+# Fuzz builds run optimised (release) but with debug assertions left on, so an
+# out-of-bounds index is a hard failure rather than silently "working".
+[profile.release]
+debug-assertions = true

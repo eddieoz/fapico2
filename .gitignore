@@ -1,0 +1,68 @@
+# Rust target dir
+/target
+**/target/
+
+# Cargo lock for libraries — keep only for the binary/firmware
+# (cargo lockfiles are committed for binaries by convention)
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+
+# Python
+__pycache__/
+.venv/
+.test-venv/
+.serena/
+.pytest_cache/
+*.pyc
+
+# Firmware build artifacts. Nothing produced by a build is committed: the
+# flashable image and the ELF are produced by CI (release.yml) or locally by
+# build.sh / build-signed.sh, and a committed binary is a binary nobody
+# remembers to refresh. CI regenerates the UF2 from the release ELF and gates
+# on reproducibility and the flash-budget ratchet instead of on staleness
+# against a checked-in copy.
+*.uf2
+*.elf
+# US-1064: the artefact-agreement fixtures are named after the artefact they
+# stand in for, because the gate looks for exactly that filename in a release
+# directory. These are tiny hand-written stand-ins, not build output.
+!tests/scripts/fixtures/agreement/fapico2.uf2
+# The sealed image and its OTP config are deployment-specific build outputs
+# (produced by build.sh). Regenerate them; never commit a signed artifact or
+# the fingerprint it carries.
+firmware/fapico2.signed.uf2
+
+# Signing material for RP2350 signed secure boot: the private key plus
+# everything derived from it (public key, OTP config, fingerprint). They are
+# co-located on purpose — a stale fingerprint beside a new public key is how
+# you brick a board with its own firmware.
+#
+# secrets/README.md is the ONLY thing that belongs in version control here.
+# The private key must never reach the repository. The public key, the OTP
+# config and the fingerprint are per-developer (build.sh auto-generates a
+# key), so they are ignored too; a RELEASE should publish them deliberately
+# alongside the image.
+secrets/*
+!secrets/README.md
+
+# Local build/slop artifacts (POLISH-PUB US-721)
+/build/
+soak_*.log
+*.kh
+/.hermes/
+.superpowers/
+
+# cargo-cyclonedx per-crate output (only supply-chain/sbom.cdx.json is tracked)
+/*.cdx.json
+apps/*.cdx.json
+apps/*/*.cdx.json
+platform/*.cdx.json
+vendor/*/*.cdx.json
+firmware/*.cdx.json

@@ -1,0 +1,26 @@
+# Cargo config for the fapico2 firmware crate.
+#
+# RP2350 (Pico 2) is the only supported board (EPIC RUST-MIGRATION). Its
+# Cortex-M33 core is ARMv8-M, so we target `thumbv8m.main-none-eabi`; the
+# dropped RP2040 used `thumbv6m-none-eabi`. elf2uf2-rs produces the flashable
+# .uf2. When building from the workspace root the sibling
+# `.cargo/config.toml` is authoritative; this file applies when building from
+# inside `firmware/`.
+[build]
+target = "thumbv8m.main-none-eabi"
+
+[target.thumbv8m.main-none-eabi]
+runner = "elf2uf2-rs -d"
+# rustc >=1.80 no longer emits the `armv8m_main` cfg for this target, but
+# embassy-rp 0.10's RP235x stack-guard code (and cortex-m's msplim module) are
+# gated on it; passing --cfg restores the ARMv8-M register/method resolution.
+rustflags = [
+  "--cfg", "armv8m_main",
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+codegen-units = 1

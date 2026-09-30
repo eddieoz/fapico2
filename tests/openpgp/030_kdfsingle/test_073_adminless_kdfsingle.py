@@ -1,0 +1,1 @@
+from card_test_personalize_admin_less_2 import *

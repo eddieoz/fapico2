@@ -1,0 +1,5 @@
+# The emu-harness is a host-only binary (it links rp2350-emu, a std crate) and
+# must NOT inherit the workspace's default target (thumbv8m.main-none-eabi).
+# Override to the host triple so cargo builds a native executable.
+[build]
+target = "x86_64-unknown-linux-gnu"

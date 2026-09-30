@@ -1,0 +1,28 @@
+[package]
+name = "fapico2-piv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Ported from `pico-openpgp/src/openpgp/piv.c` (GPLv3) per EPIC RUST-MIGRATION
+# Phase 4. Symmetric-only today: the PIN/mgm-key derivation chain (HKDF-SHA256,
+# HMAC, AES-{128,192,256}-ECB/CBC, 3DES-CBC). P-256/P-384 ECDSA/ECDH per
+# ADR 0001 is not implemented yet — `crypto.rs` serves key *import* only.
+fapico2-platform = { path = "../../platform" }
+heapless = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes = "0.8"
+des = "0.8"
+cipher = "0.4"
+
+# Host (emulation / tests) persistence: CBOR snapshot of the PIV state, written
+# through the platform secure store (RP2350 secure partition on device).
+# Device-side persistence is future work, mirroring the fido/oath crates
+# (the `emulation` feature is what wires this app into the host binary).
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_cbor = "0.11"

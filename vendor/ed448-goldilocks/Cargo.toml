@@ -1,0 +1,24 @@
+[package]
+name = "ed448-goldilocks"
+version = "0.7.2"
+edition = "2018"
+license = "BSD-3-Clause"
+description = "A pure-Rust implementation of Ed448 and Curve448 and Decaf (fapico2 no_std patch)"
+repository = "https://github.com/crate-crypto/Ed448-Goldilocks"
+
+# fapico2 patch (S-701-5): the crates.io release pulls `hex` (std-only) as a
+# hard dependency for its unit tests and does not declare `#![no_std]`; both
+# are fixed here so the vendor vault's X448 can run on the RP2350.
+# Upstream: BSD-3-Clause, https://github.com/crate-crypto/Ed448-Goldilocks
+
+[dependencies]
+subtle = { version = "2.2.2", default-features = false }
+fiat-crypto = { version = "0.1.4", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+default = ["fiat_u64_backend"]
+fiat_u64_backend = ["fiat-crypto"]
+u32_backend = []

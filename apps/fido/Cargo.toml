@@ -1,0 +1,151 @@
+[package]
+name = "fapico2-fido"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["host"]
+# Host (emulation / tests): the full CTAP2.1 + U2F + attestation + PIN stack.
+# Every host-only crypto dependency below is optional and enabled only here,
+# so the `device` feature never compiles the std-pulling parts of the stack.
+host = [
+    "dep:sha2",
+    "dep:hmac",
+    "dep:hkdf",
+    "dep:aes",
+    "dep:cbc",
+    "dep:cipher",
+    "dep:x448",
+    "dep:aes-gcm",
+    "dep:sha1",
+    "dep:p384",
+    "dep:p521",
+    "dep:ed25519-dalek",
+]
+# Device (RP2350): the no_std FidoApp shell plus the no-heap CTAP2 crypto
+# core (S-701-1) — sha2/hmac/hkdf/aes/cbc/cipher are no_std-capable crates,
+# so the device feature simply compiles them in (feature wiring, not
+# reimplementation). U2F, attestation and PIN keystore land with S-701-3+.
+device = [
+    "dep:sha2",
+    "dep:hmac",
+    "dep:hkdf",
+    "dep:aes",
+    "dep:cbc",
+    "dep:cipher",
+    "dep:x448",
+    "dep:aes-gcm",
+]
+
+[dependencies]
+# Sole randomness source (US-380): app randomness routes through the platform
+# TRNG (RP2350 hardware TRNG on device, OS entropy on host) — never a `rand`
+# RNG directly. `rand_core` is the traits-only crate (no PRNG implementation);
+# it lets the curve crates' `::random(&mut rng)` constructors consume a
+# TRNG-backed adapter.
+fapico2-platform = { path = "../../platform" }
+rand_core = "0.6"
+heapless = "0.8"
+# Always on (no_std-safe): the device shell derives its persistent P-256
+# key-agreement key (hkey) with these. `default-features = false` is
+# load-bearing: p256's defaults enable `std` + `pem`, which break the
+# thumbv8m build (`extern crate std` / getrandom std).
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "ecdh"] }
+elliptic-curve = "0.13"
+ecdsa = { version = "0.16", features = ["signing", "verifying"] }
+
+# RFC 8439 ChaCha20-Poly1305, for the RS-Key `0x41` backup / soft-lock /
+# org-attestation channel (US-171, US-172, US-175). `default-features = false`
+# for the same reason `p256` carries it: the defaults pull `std`, which breaks
+# the thumbv8m build. Already in `Cargo.lock` as a transitive of the
+# `trussed-*` crates, so this adds no dependency churn.
+#
+# This replaced three independent hand-written ChaCha20 + Poly1305
+# implementations (one per Phase I sub-module). Each was individually correct
+# against RFC 8439's vectors, and three correct copies of a block cipher in a
+# security applet is a review liability, not a redundancy win. The wire format
+# is dictated by the client (`picoforge/src/hal/fido/backup.rs:51, 61-78`),
+# so there is no cipher agility to trade against it.
+chacha20poly1305 = { version = "0.10", default-features = false }
+
+# Host-only crypto (optional; enabled by the `host` feature).
+sha2 = { version = "0.10", optional = true, default-features = false }
+hmac = { version = "0.12", optional = true, default-features = false }
+hkdf = { version = "0.12", optional = true, default-features = false }
+aes = { version = "0.8", optional = true, default-features = false }
+cbc = { version = "0.1", optional = true, features = ["block-padding"] }
+cipher = { version = "0.4", optional = true }
+x448 = { version = "0.6", optional = true, default-features = false }
+aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "heapless"] }
+sha1 = { version = "0.10", optional = true }
+p384 = { version = "0.13", optional = true }
+p521 = { version = "0.13", optional = true }
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+
+[dev-dependencies]
+serde_cbor = "0.11"
+hex-literal = "0.4"
+
+# The integration suite drives the full host stack (app/keystore/cbor/hid/
+# ctap2), so it is skipped when the `host` feature is off (e.g. a
+# `--features device` test run, which exercises only the no_std shell).
+[[test]]
+name = "cbor"
+required-features = ["host"]
+[[test]]
+name = "canonical_device"
+required-features = ["host"]
+[[test]]
+name = "credmgmt"
+required-features = ["host"]
+[[test]]
+name = "enterprise"
+required-features = ["host"]
+[[test]]
+name = "getinfo"
+required-features = ["host"]
+[[test]]
+name = "hid"
+required-features = ["host"]
+[[test]]
+name = "pin_perms"
+required-features = ["host"]
+[[test]]
+name = "pin"
+required-features = ["host"]
+[[test]]
+name = "restart"
+required-features = ["host"]
+[[test]]
+name = "selection"
+required-features = ["host"]
+[[test]]
+name = "store"
+required-features = ["host"]
+[[test]]
+name = "uv"
+required-features = ["host"]
+[[test]]
+name = "vendor41"
+required-features = ["host"]
+[[test]]
+name = "vendor41_state"
+required-features = ["host"]
+[[test]]
+name = "vendor_att"
+required-features = ["host"]
+[[test]]
+name = "vendor_audit"
+required-features = ["host"]
+[[test]]
+name = "vendor_backup"
+required-features = ["host"]
+[[test]]
+name = "vendor_lock"
+required-features = ["host"]
+
+[[test]]
+name = "r2_keystore_decode"
+required-features = ["host"]

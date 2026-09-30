@@ -1,0 +1,11 @@
+[package]
+name = "fapico2-emu-harness"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+rp2350-emu = "0.2"
+elf = "0.7"
+clap = { version = "4", features = ["derive"] }

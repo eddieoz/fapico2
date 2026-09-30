@@ -1,0 +1,14 @@
+[package]
+name = "x448"
+version = "0.6.0"
+edition = "2018"
+license = "BSD-3-Clause"
+description = "A pure-Rust implementation of X448 (fapico2 no_std patch: unused std-only hex dependency removed)"
+repository = "https://github.com/crate-crypto/x448"
+
+[dependencies]
+ed448-goldilocks = { version = "0.7.0", default-features = false, features = ["u32_backend"] }
+rand_core = { version = "0.5", default-features = false }
+
+[dev-dependencies]
+rand = "0.7"

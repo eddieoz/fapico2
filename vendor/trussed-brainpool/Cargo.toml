@@ -1,0 +1,74 @@
+[package]
+name = "trussed-brainpool"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = """
+Software Brainpool trussed backend (ECDSA + ECDH over the bp256 crate, \
+allocation-free — US-944; P-384r1 deferred by US-966).
+"""
+
+[dependencies]
+# US-944: the Brainpool crates ride the elliptic-curve 0.14 line (there is no
+# bp* release on the 0.13 line the k256-based secp256k1 backend uses), so the
+# signing/agreement calls differ slightly from `trussed-secp256k1`; the RNG
+# surface is rand_core 0.10, hence the thin adapter over trussed's rand_core
+# 0.6 ChaCha8 RNG below. bp512 does not exist on crates.io (checked
+# 2026-09-26) — BrainpoolP512R1 is deliberately not served; see
+# docs/tasks/known-gate-divergences.md.
+#
+# US-966 (2026-09-27): `bp384` is gone. P-384r1 is deferred to a follow-up
+# release — not on a feature switch, but unconditionally, which is the whole
+# point of the choice: there is then no build in which the mechanism is
+# served and no build in which the card advertises it, so the advertise/serve
+# coupling US-962 built has nothing left to couple. Putting the half behind a
+# `brainpool-p384r1` feature would instead put a fourth switch next to the
+# three `check_advertise_serve_coupling.py` already reasons about, for a curve
+# with no identified OpenPGP-card user. Restoring it later is the same edit in
+# the other direction: put the macro instantiation, the mechanism arms and the
+# `default_gen`/`default_import` bits back, and — if it is ever to be
+# optional — route it through a switch exactly the way SECP256K1 is.
+bp256 = { version = "0.14.0", default-features = false, features = [
+    "arithmetic",
+    "ecdsa",
+    "sha256",
+] }
+ecdsa = { version = "0.17", default-features = false, features = [
+    "algorithm",
+    "der",
+    "digest",
+] }
+elliptic-curve = { version = "0.14", default-features = false, features = [
+    "arithmetic",
+    "ecdh",
+    "sec1",
+] }
+# The keystore hands out rand_core 0.6 RNGs; the bp* stack wants rand_core
+# 0.10. Both trait sets are needed for the adapter in `src/lib.rs`.
+rand_core = { version = "0.6", default-features = false }
+rand-core-010 = { package = "rand_core", version = "0.10", default-features = false }
+trussed = { version = "0.2", default-features = false }
+# `crypto-client` gates the request/reply types this backend serves;
+# `brainpoolp256r1` gates the Mechanism variants.
+# US-966: `brainpoolp384r1` is no longer enabled here — nothing in the served
+# set needs the variant. It is re-enabled under `[dev-dependencies]` purely so
+# the unit tests can name `Mechanism::BrainpoolP384R1` and assert that this
+# backend *refuses* it, which is the assertion that keeps a deferred curve from
+# drifting back in unnoticed. brainpoolp512r1 is likewise never enabled
+# (no bp512 crate exists).
+trussed-core = { version = "0.2", default-features = false, features = [
+    "crypto-client",
+    "brainpoolp256r1",
+] }
+
+[dev-dependencies]
+rand_chacha = { version = "0.3", default-features = false }
+# Test-only: extra trussed-core mechanism variants so the tests can assert
+# that foreign mechanisms *and* the deferred Brainpool P-384r1/P-512r1
+# mechanisms are all rejected with `RequestNotAvailable` rather than served.
+trussed-core = { version = "0.2", default-features = false, features = [
+    "secp256k1",
+    "p256",
+    "brainpoolp384r1",
+    "brainpoolp512r1",
+] }

@@ -1,0 +1,252 @@
+// Copyright (C) 2022 Nitrokey GmbH
+// SPDX-License-Identifier: LGPL-3.0-only
+
+[
+    IoTest(
+        name: "GET CHALLENGE",
+        cmd_resp: [
+            IoData(
+                input: "00 84 0000 0A",
+                output: And([NonZero, Len(0x0A)])
+            ),
+            IoData(
+                input: "00 84 0000 00 0400",
+                output: And([NonZero, Len(0x0400)])
+            )
+        ]
+    ),
+    IoTest(
+        name: "Pw1 changes and verification",
+        cmd_resp:  [
+            Verify(pin: Pw1),
+            Change(pin: Pw1, new_value: Str("New Pin")),
+            Select,
+            Verify(pin: Pw1, value: Str("New Pin")),
+            Verify(pin: Pw1, expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, expected_status: RemainingRetries(0)),
+            Verify(pin: Pw1, expected_status: RemainingRetries(0)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(0)),
+            FactoryReset(),
+            Verify(pin: Pw1),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(0)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(0)),
+            Select,
+            Verify(pin: Pw1, expected_status: RemainingRetries(0)),
+        ]
+    ),
+    IoTest(
+        name: "Pw3 changes and verification",
+        cmd_resp:  [
+            Verify(pin: Pw3),
+            Change(pin: Pw3, new_value: Str("New Pin but long enough for PW3")),
+            Select,
+            Verify(pin: Pw3, value: Str("New Pin but long enough for PW3")),
+            Verify(pin: Pw3, expected_status: RemainingRetries(2)),
+            Verify(pin: Pw3, expected_status: RemainingRetries(1)),
+            Verify(pin: Pw3, expected_status: RemainingRetries(0)),
+            Verify(pin: Pw3, expected_status: RemainingRetries(0)),
+            Verify(pin: Pw3, value: Str("New Pin but long enough for PW3"), expected_status: RemainingRetries(0)),
+            FactoryReset(already_failed: 3),
+            Verify(pin: Pw3),
+        ]
+    ),
+    IoTest(
+        name: "Reset with admin",
+        cmd_resp:  [
+            Verify(pin: Pw1),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(0)),
+            Verify(pin: Pw1, value: Str("New pin"), expected_status: RemainingRetries(0)),
+            UnblockPin(expected_status: SecurityStatusNotSatisfied),
+            Verify(pin: Pw3),
+            Verify(pin: Pw1, expected_status: RemainingRetries(0)),
+            UnblockPin(),
+        ]
+    ),
+    IoTest(
+        name: "Reset with bad code",
+        cmd_resp:  [
+            Verify(pin: Pw3),
+            PutData(tag: ResettingCode, value: "AABBCCDDEEFF0011223344556677889900"),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(0)),
+            UnblockPin(reset_code: "BADBADBADBADBADBADBADBAD", expected_status: RemainingRetries(2)),
+            UnblockPin(reset_code: "BADBADBADBADBADBADBADBAD", expected_status: RemainingRetries(1)),
+            UnblockPin(reset_code: "BADBADBADBADBADBADBADBAD", expected_status: RemainingRetries(0)),
+            UnblockPin(reset_code: "AABBCCDDEEFF0011223344556677889900", expected_status: RemainingRetries(0)),
+        ]
+    ),
+    IoTest(
+        name: "Reset with code",
+        cmd_resp:  [
+            Verify(pin: Pw3),
+            PutData(tag: ResettingCode, value: "AABBCCDDEEFF0011223344556677889900"),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(0)),
+            UnblockPin(reset_code: "AABBCCDDEEFF0011223344556677889900"),
+        ]
+    ),
+    IoTest(
+        name: "Reset with deleted code",
+        cmd_resp:  [
+            Verify(pin: Pw3),
+            PutData(tag: ResettingCode, value: "AABBCCDDEEFF0011223344556677889900"),
+            PutData(tag: ResettingCode, value: ""),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(2)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(1)),
+            Verify(pin: Pw1, value: Str("bad pin"), expected_status: RemainingRetries(0)),
+            UnblockPin(reset_code: "AABBCCDDEEFF0011223344556677889900", expected_status: SecurityStatusNotSatisfied),
+        ]
+    ),
+    IoTest(
+        name: "AES",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            Verify(pin: Pw82),
+            ImportKey(
+                private_key: "FFEEDDCCBBAA00998877665544332211FFEEDDCCBBAA00998877665544332211",
+                key_kind: Aes,
+            ),
+            // Encrypt with AES
+            IoData(
+                input: "00 2A 86 80 10 00112233445566778899AABBCCDDEEFF 00",
+                output: Data("02 d9d2ca17e160427aee649db6912dbfad"),
+            ),
+            Decrypt(
+                key_kind: Aes,
+                input: "d9d2ca17e160427aee649db6912dbfad",
+                output: "00112233445566778899AABBCCDDEEFF"
+            )
+        
+        ]
+    ),
+    IoTest(
+        name: "X25519 import",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            Verify(pin: Pw82),
+            SetAttributes (key_type: Dec, key_kind: X25519),
+            ImportKey(
+                private_key: "2a2cb91da5fb77b12a99c0eb872f4cdf4566b25172c1163c7da518730a6d0777",
+                public_key: "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+                key_type: Dec,
+                key_kind: X25519,
+            ),
+            ReadKey(
+                public_key: "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+                key_kind: X25519,
+                key_type: Dec,
+            ),
+            Decrypt(
+                key_kind: X25519,
+                input: "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+                output: "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+            )
+        ]
+    ),
+    IoTest(
+        name: "Ed25519 import",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            Verify(pin: Pw82),
+            SetAttributes (key_type: Sign, key_kind: Ed25519),
+            ImportKey(
+                private_key: "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
+                public_key: "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+                key_type: Sign,
+                key_kind: Ed25519,
+            ),
+            ReadKey(
+                public_key: "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+                key_kind: Ed25519,
+                key_type: Sign,
+            ),
+        ]
+    ),
+    IoTest(
+        name: "X25519 import",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            Verify(pin: Pw82),
+            SetAttributes (key_type: Dec, key_kind: X25519),
+            ImportKey(
+                private_key: "56ca9c48fec3ef2874f3e4c39730a7014da61cf77f50af086998957102837b00",
+                public_key: "38B64BB09D88839BDC98DB56CF640ED80D3618E5A7EF2FA6EAD6DDDF1D3CB642",
+                key_type: Dec,
+                key_kind: X25519,
+            ),
+            ReadKey(
+                public_key: "38B64BB09D88839BDC98DB56CF640ED80D3618E5A7EF2FA6EAD6DDDF1D3CB642",
+                key_kind: X25519,
+                key_type: Dec,
+            ),
+        ]
+    ),
+    IoTest(
+        name: "Large certificate",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: First),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: Second),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: Third),
+
+            PutLargeData(tag: CardHolderCertificate, start: 1, len: 2058, occurence: First),
+            GetLargeData(tag: CardHolderCertificate, start: 1, len: 2058, occurence: First),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: Second),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: Third),
+
+            PutLargeData(tag: CardHolderCertificate, start: 2, len: 2058, occurence: Second),
+            GetLargeData(tag: CardHolderCertificate, start: 2, len: 2058, occurence: Second),
+            GetLargeData(tag: CardHolderCertificate, start: 1, len: 2058, occurence: First),
+            GetData(tag: CardHolderCertificate, expected_value: "", occurence: Third),
+
+            PutLargeData(tag: CardHolderCertificate, start: 3, len: 2058, occurence: Third),
+            GetLargeData(tag: CardHolderCertificate, start: 3, len: 2058, occurence: Third),
+            GetLargeData(tag: CardHolderCertificate, start: 1, len: 2058, occurence: First),
+        ]
+    ),
+    IoTest(
+        name: "Key not found",
+        cmd_resp: [
+            Verify(pin: Pw1),
+            Sign(
+                expected_status: KeyReferenceNotFound,
+            ),
+            Verify(pin: Pw82),
+            Decrypt(
+                key_kind: Rsa2048,
+                expected_status: KeyReferenceNotFound,
+            ),
+            Authenticate(
+                expected_status: KeyReferenceNotFound,
+            ),
+        ],
+    ),
+    IoTest(
+        name: "Multiple generation",
+        cmd_resp: [
+            Verify(pin: Pw3),
+            GenerateKey(key_type: Aut),
+            GenerateKey(key_type: Aut),
+            SetAttributes(key_type: Aut, key_kind: Ed25519),
+            GenerateKey(key_type: Aut),
+            GenerateKey(key_type: Aut),
+            GenerateKey(key_type: Sign),
+            GenerateKey(key_type: Sign),
+            SetAttributes(key_type: Sign, key_kind: Ed25519),
+            GenerateKey(key_type: Sign),
+            GenerateKey(key_type: Sign),
+            GenerateKey(key_type: Dec),
+            GenerateKey(key_type: Dec),
+            SetAttributes(key_type: Dec, key_kind: X25519),
+            GenerateKey(key_type: Dec),
+            GenerateKey(key_type: Dec),
+        ],
+    )
+]
