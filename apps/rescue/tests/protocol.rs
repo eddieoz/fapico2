@@ -324,7 +324,7 @@ fn rescue_select_returns_12_data_bytes_plus_status() {
 /// (`picoforge/src/hal/transport/pcsc.rs:75-81`).
 ///
 /// The second assertion is the one that matters for a future reader: byte 2 is
-/// **not** the firmware version, and `fapico2_mgmt::VERSION_MAJOR` is `1`
+/// **not** the firmware version, and `fapico2_mgmt::VERSION_MAJOR` is `5`
 /// (`apps/mgmt/src/lib.rs:42`). A "consistency" edit that set it to 1 would
 /// satisfy the EPIC's "align it with US-102's version constant" and silently
 /// disable every RS-Key-only client path. Failing here is the intended outcome.

@@ -18,6 +18,26 @@ use crate::boot::DeviceStore;
 use fapico2_platform::usb::{Endpoint, EndpointIn, EndpointOut, In, Out};
 use heapless::Vec as HeaplessVec;
 
+/// The device's 4-byte chipid-derived serial, published once at boot.
+///
+/// Serves the `CTAP_READ_CONFIG` (`0x42`) answer below, which must carry the
+/// *same* serial the management applet and the USB descriptor present — all
+/// three derive from `usb_ident::serial_hash4(chipid)`. Kept as a static
+/// rather than a task argument because the HID task does not own (and must
+/// not borrow) the management applet, which the CCID task holds mutably.
+pub static DEVICE_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `CTAP_READ_CONFIG` (`0x42`) — yubikit's `CTAP_VENDOR_FIRST + 2`.
+///
+/// When a host enumerates this key through its **FIDO** interface rather than
+/// CCID, `yubikit.support._read_info_ctap` asks for device info this way. If
+/// it fails, ykman falls back to a synthesised "YubiKey 3.0, U2F only, no
+/// serial" record — and since that record reports no FIDO2 capability, the
+/// FIDO2 application is declared unsupported. `ykman fido info` printed
+/// `CTAP2: Not supported` on every run, which is what left the desktop
+/// app's Slots and Passkeys screens loading forever.
+const CTAP_READ_CONFIG: u8 = 0x42;
+
 use crate::boot::{DevFlash, HID_RESP, SECURE_PRIMARY_OFFSET, SECURE_SHADOW_OFFSET, SECURE_SLOT_BYTES};
 use fapico2_firmware::ccid_reasm::{CcidReassembler, Reasm, MAX_WIRE};
 use fapico2_firmware::ctap_hid::*;
@@ -697,11 +717,32 @@ async fn dispatch_hid_cmd(
         inner[..nonce.len()].copy_from_slice(nonce);
         inner[8..12].copy_from_slice(&new_channel);
         inner[12] = 0x02; // versionInterface (2 = CTAP HID v2)
-        inner[13] = 0x02; // versionMajor
-        inner[14] = 0x01; // versionMinor
+        // Bytes 13..15 are the **YubiKey firmware version**, not the CTAPHID
+        // protocol version. yubikit reads them as `device_version`
+        // (`_ManagementCtapBackend`) and gates `read_device_info` on
+        // `>= 4.1`; reporting 2.1.0 here made every host treat this
+        // interface as a pre-YubiKey-4 key and synthesise a U2F-only device
+        // record, so `ykman fido info` said `CTAP2: Not supported`. Same
+        // version the management applet publishes in TAG_VERSION.
+        inner[13] = fapico2_mgmt::VERSION_MAJOR;
+        inner[14] = fapico2_mgmt::VERSION_MINOR;
         inner[15] = 0x00; // versionBuild
         inner[16] = 0x04; // capFlags: CBOR supported
         reply_hid(hid_in, channel, 0x06, &inner).await;
+    } else if cmd == CTAP_READ_CONFIG {
+        // DeviceInfo page 0 over the FIDO interface. The payload is the
+        // page number (yubikit sends `int2bytes(page)`, i.e. a single zero
+        // byte for page 0); anything past page 0 is a page this device does
+        // not paginate, and the blob below is complete in one page, so those
+        // get the empty page the client expects at the end of a sequence.
+        if payload.len() > 1 || (payload.len() == 1 && payload[0] != 0) {
+            reply_hid(hid_in, channel, cmd, &[0x00]).await;
+            return;
+        }
+        let serial = DEVICE_SERIAL.load(core::sync::atomic::Ordering::Relaxed).to_be_bytes();
+        let mut tlv: HeaplessVec<u8, MAX_RESPONSE> = HeaplessVec::new();
+        fapico2_mgmt::default_config_tlv(serial, &mut tlv);
+        reply_hid(hid_in, channel, cmd, tlv.as_slice()).await;
     } else if cmd == CTAP_HID_CBOR {
         if !payload.is_empty() {
             let ctap_cmd = payload[0];
@@ -733,8 +774,17 @@ async fn dispatch_hid_cmd(
             // (`picoforge/src/hal/fido/ops.rs:1514-1554`), so a touch
             // requirement on the token-authorised path would hang the Config
             // screen until its 30 s timeout (`ops.rs:1550`).
+            // authenticatorClientPIN (0x06) joins them because its
+            // `getPinUvAuthTokenUsingUvWithPermissions` (sub-command 0x06)
+            // answers `UpRequired` when no press has been observed — that is
+            // the only way a client on a PIN-less key can obtain a
+            // pinUvAuthToken at all. The window is entered on the *answer*,
+            // so the PIN-based sub-commands (0x05/0x09), which never answer
+            // `UpRequired`, are unaffected and send no keepalive.
             let presence_windowed =
-                up_request || ctap_cmd == fapico2_fido::vendor41::CMD;
+                up_request
+                    || ctap_cmd == fapico2_fido::vendor41::CMD
+                    || ctap_cmd == 0x06;
             // SOAK-FINDING-1: the store is bound for the command so growth
             // mutations commit transactionally (durable or rejected) — the
             // gate below then finds either a persistable dirty state or a

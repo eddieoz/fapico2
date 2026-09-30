@@ -59,6 +59,10 @@ pub mod ccid;
 /// HID class-control decisions + CCID class descriptor (US-391 E7).
 pub mod hid_control;
 
+// Yubico OTP HID transport (frame protocol + descriptors). Host-testable
+// like `hid_control`; the `usb.rs` glue wires it onto the control endpoint.
+pub mod otp_hid;
+
 /// RS-Key / pico-fido PHY record TLV codec (US-116, built by US-114 for the
 /// `0x41` `CONFIG_READ` response). `no_std`, no-alloc; the twelve tags are
 /// [`phy_tlv::PhyTag`] and the framing is one-byte tag + one-byte length.

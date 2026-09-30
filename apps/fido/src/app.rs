@@ -127,13 +127,78 @@ struct GaOptions {
 // credMgmt request
 // ------------------------------------------------------------------
 
+/// Which CBOR dialect a credentialManagement request arrived in.
+///
+/// Two are in the wild and they are *not* interchangeable:
+///
+/// * **PicoForge** — the first-party management client. Key `0x02` holds a
+///   *map* of sub-command parameters, `pinUvAuthProtocol` sits at `0x03` and
+///   `pinUvAuthParam` at `0x04`. Sub-commands `0x01`/`0x02` are
+///   getCredsMetadata / enumerateRpsBegin. This is the layout this code was
+///   originally written against and it must keep working byte for byte.
+/// * **CTAP2** — what every third-party client speaks (ykman, Yubico
+///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
+///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
+///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
+///   getCredsMetadata — the *reverse* of PicoForge's.
+///
+/// The two are told apart by the CBOR type of key `0x02`: PicoForge puts a
+/// map there, CTAP2 puts an integer. The layouts never collide on that key
+/// and both clients always set it, so it is a sound discriminator with no
+/// negotiation needed.
+///
+/// The response key sets genuinely collide (PicoForge `0x04` is rpIdHash,
+/// CTAP2 `0x04` is userID; PicoForge `0x07` is credentialID, CTAP2 `0x07`
+/// is totalRPs), so a merged map is impossible — each dialect must be
+/// answered in its own shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmDialect {
+    PicoForge,
+    Ctap2,
+}
+
+impl Default for CmDialect {
+    fn default() -> Self {
+        // Spec is the safe default: an unrecognised request is far more
+        // likely to come from a third-party client than from PicoForge.
+        CmDialect::Ctap2
+    }
+}
+
+/// Canonical sub-command identity, independent of the wire dialect.
+///
+/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
+/// parser maps a PicoForge wire value onto these before anything downstream
+/// looks at it, so the dispatch below needs no dialect branches.
+const CM_GET_METADATA: u8 = 0x02;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
+const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
+const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
+const CM_DELETE_CRED: u8 = 0x06;
+const CM_UPDATE_USER: u8 = 0x07;
+
 struct CmRequest {
+    /// Canonical sub-command (see the `CM_*` constants), not the wire byte.
     subcommand: u8,
+    /// The byte as it arrived on the wire. The pinUvAuth message is signed
+    /// over the wire value in *both* dialects, so it must be preserved
+    /// separately from the canonical one.
+    wire_subcommand: u8,
+    dialect: CmDialect,
     pin_uv_protocol: u8,
     pin_uv_auth_param: Option<Vec<u8>>,
     rp_id_hash: Option<Vec<u8>>,
     cred_id: Option<CredDescriptor>,
     user: Option<CmUser>,
+    /// PicoForge only: the sub-command parameter map exactly as received,
+    /// re-encoded.
+    sub_params_cbor: Option<Vec<u8>>,
+    /// CTAP2 only: the credentialID and user maps exactly as received.
+    /// CTAP2 signs those maps verbatim, so a re-encode could diverge from
+    /// what the client actually signed (key order included).
+    raw_cred_cbor: Option<Vec<u8>>,
+    raw_user_cbor: Option<Vec<u8>>,
 }
 
 struct CmUser {
@@ -151,6 +216,12 @@ struct CmRpState {
     rps: Vec<(String, [u8; 32])>,
     cursor: usize,
     channel: [u8; 4],
+    /// Dialect of the `enumerateRpsBegin` that armed this enumeration.
+    /// A Next request is `{1: 0x03}` and nothing else in *both* dialects —
+    /// the Next sub-commands carry no `pinUvAuthParam` — so it cannot be
+    /// classified from its own bytes and is answered in the dialect that
+    /// started the enumeration.
+    dialect: CmDialect,
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +229,8 @@ struct CmCredState {
     creds: Vec<StoredCredential>,
     cursor: usize,
     channel: [u8; 4],
+    /// See [`CmRpState::dialect`].
+    dialect: CmDialect,
 }
 
 // ------------------------------------------------------------------
@@ -204,6 +277,10 @@ pub struct FidoApp<K: Keystore = MemoryKeystore> {
     cm_rp_state: Option<CmRpState>,
     /// Volatile credMgmt enumeration state for enumerate_creds begin/next.
     cm_cred_state: Option<CmCredState>,
+    /// Which CBOR dialect the credMgmt command being served arrived in; the
+    /// response encoders read it (the PicoForge and CTAP2 key sets collide,
+    /// so a request must be answered in the shape its sender asked in).
+    cm_dialect: CmDialect,
     /// Volatile largeBlobs (0x0C) write buffer: total length and the
     /// fragments accumulated so far. Committed to the keystore only when the
     /// full payload (with trailing checksum) has arrived and verifies.
@@ -342,6 +419,7 @@ impl<K: Keystore> FidoApp<K> {
             current_channel: [0; 4],
             cm_rp_state: None,
             cm_cred_state: None,
+            cm_dialect: CmDialect::default(),
             lb_pending: None,
             vault_pending: None,
             enterprise_attestation: false,
@@ -1033,6 +1111,14 @@ impl<K: Keystore> FidoApp<K> {
         let state_pt = crypto::hmac_sha256(b"fapico2-credStoreState", &state_data);
         let state_pt = &state_pt[..16];
         let iv = crypto::random_bytes::<16>();
+        // `.clear()` first: `Ctap2Info::default()` already carries the 32
+        // zero placeholder bytes, so extending onto it yields a 64-byte field
+        // (32 zeros || IV || ciphertext) where CTAP2.1 §5.1.2 requires exactly
+        // 32. `device_core.rs::get_info` — the hardware path — has always
+        // *assigned* a freshly built vec and never hit this; only this path,
+        // which the emulation binary and therefore every pytest suite runs,
+        // did. Clearing makes the two encoders agree by construction.
+        info.enc_cred_store_state.clear();
         info.enc_cred_store_state.extend_from_slice(&iv).ok();
         info.enc_cred_store_state
             .extend_from_slice(&crypto::aes_cbc_encrypt(&key, &iv, state_pt))
@@ -1040,6 +1126,7 @@ impl<K: Keystore> FidoApp<K> {
         let id_pt = crypto::hmac_sha256(b"fapico2-encIdentifier", &auth.device_random);
         let id_pt = &id_pt[..16];
         let iv2 = crypto::random_bytes::<16>();
+        info.enc_identifier.clear();
         info.enc_identifier.extend_from_slice(&iv2).ok();
         info.enc_identifier
             .extend_from_slice(&crypto::aes_cbc_encrypt(&key, &iv2, id_pt))
@@ -1561,6 +1648,32 @@ impl<K: Keystore> FidoApp<K> {
                     if cred.rp_id_hash == rp_id_hash {
                         matched.push(cred.clone());
                     }
+                    continue;
+                }
+                // US-714 interop: a U2F key handle is *stateless* — the
+                // private key is re-derived at assertion time and no keystore
+                // entry is ever created (see `u2f::u2f_register`). So a CTAP2
+                // allowList carrying a U2F handle missed the lookup above and
+                // answered NO_CREDENTIALS, which is why
+                // `test_authenticate_ctap1_through_ctap2` — register over U2F,
+                // assert over CTAP2, the interop real authenticators perform —
+                // could never pass.
+                //
+                // `verify_handle` re-derives the key AND authenticates the
+                // handle's appId tag in constant time, so an arbitrary 64-byte
+                // blob cannot become an assertion key: a forged handle fails
+                // the tag check and is skipped, exactly as the U2F AUTHENTICATE
+                // path already treats it (u2f.rs, `stateless_valid`).
+                //
+                // Semantics deliberately inherited from U2F: `resident` is false
+                // (never discoverable — there is no stored record to enumerate),
+                // `user_handle` is empty (U2F carries no user identity), and
+                // the signature counter is the keystore-wide one, which the U2F
+                // path already treats as the global counter.
+                if let Some(cred) =
+                    self.stateless_u2f_credential_for(&desc.id, &rp_id_hash)
+                {
+                    matched.push(cred);
                 }
             }
         } else {
@@ -1675,6 +1788,79 @@ impl<K: Keystore> FidoApp<K> {
             self.ga_state = None;
         }
         assertion
+    }
+
+    /// Re-derive a U2F (stateless) credential for CTAP2 assertion.
+    ///
+    /// US-714 made U2F registration stateless: the key handle encodes the key's
+    /// derivation path plus a tag over the requesting RP, and **no keystore
+    /// entry is created**. A CTAP2 `allowList` therefore cannot find such a
+    /// handle through `keystore::get_credential`, and a credential registered
+    /// over U2F was unassertable over CTAP2 — the interop
+    /// `test_authenticate_ctap1_through_ctap2` performs, and that real
+    /// authenticators perform.
+    ///
+    /// Returns `None` unless the handle is well-formed **and** its tag
+    /// authenticates against `rp_id_hash`, so a caller cannot turn an
+    /// arbitrary blob into an assertion key by naming it in an allowList.
+    ///
+    /// `Ok(None)`-style refusals are deliberate: the caller treats "not a
+    /// credential for this RP" and "not a credential at all" identically,
+    /// which is what `NO_CREDENTIALS` already reports.
+    fn stateless_u2f_credential_for(
+        &mut self,
+        handle: &[u8],
+        rp_id_hash: &[u8; 32],
+    ) -> Option<StoredCredential> {
+        if !crate::stateless::is_stateless(handle) {
+            return None;
+        }
+        let master = crate::stateless::master_from_device_random(
+            &self.keystore.get_auth_state().device_random,
+        );
+        // Constant-time tag check; a handle minted for a different RP fails
+        // here and is skipped rather than signed.
+        if !crate::stateless::verify_handle(master.bytes(), rp_id_hash, handle) {
+            return None;
+        }
+        let scalar = crate::stateless::derive_scalar(master.bytes(), handle)?;
+        let secret = crypto::secret_key_from_bytes(scalar.bytes())?;
+        let pk = crypto::public_key_bytes(&secret.public_key());
+        // Uncompressed SEC1 point: 0x04 || X(32) || Y(32).
+        let (x, y) = pk.get(1..65).and_then(|c| {
+            let (x, y) = c.split_at(32);
+            Some((<[u8; 32]>::try_from(x).ok()?, <[u8; 32]>::try_from(y).ok()?))
+        })?;
+
+        Some(StoredCredential {
+            credential_id: handle.to_vec(),
+            public_key: CosePublicKey::es256(x, y),
+            private_key: scalar.bytes().to_vec(),
+            rp_id_hash: *rp_id_hash,
+            rp_id: None,
+            // U2F carries no user identity: the registration predates CTAP2's
+            // user entity, and asserting one must not invent a handle.
+            user_handle: Vec::new(),
+            user_name: None,
+            user_display_name: None,
+            cred_protect: 0,
+            large_blob_key: None,
+            hmac_secret: None,
+            cred_blob: None,
+            third_party_payment: false,
+            pin_complexity_policy: false,
+            // Stateless handles have no stored record, so they are never
+            // discoverable — they can only be named explicitly in an
+            // allowList, which is the only path that reaches this.
+            resident: false,
+            algorithm: -7,
+            // U2F has no per-credential counter; the U2F AUTHENTICATE path uses
+            // the keystore-wide one, and `build_assertion` reads this field.
+            counter: self.keystore.get_auth_state().cred_counter,
+            revoked: false,
+            // U2F registration cannot express an expiry.
+            expires_at: None,
+        })
     }
 
     /// Build a getAssertion CBOR response for the given credential.
@@ -1835,7 +2021,15 @@ impl<K: Keystore> FidoApp<K> {
             if req.pin_uv_protocol != 1 && req.pin_uv_protocol != 2 {
                 return vec![Ctap2Response::InvalidParameter.code()];
             }
-            if !pin_set {
+            // A PIN is not the only way to be authorised: a factory-fresh key
+            // has none, and CTAP2 expects a pinUvAuthToken minted from built-in
+            // user verification to stand in for it. Gating on "a PIN is set"
+            // alone left such a key unable to use credentialManagement at all,
+            // so the real requirement — a live token — is checked instead.
+            // Nothing is weakened: the token is still verified below, and one
+            // can only exist if a token sub-command succeeded (0x06 only after
+            // a user-presence grant). With neither, this is still PinNotSet.
+            if !pin_set && self.pin_token.is_none() {
                 return vec![Ctap2Response::PinNotSet.code()];
             }
             if self.keystore.get_pin_state().needs_power_cycle {
@@ -1849,62 +2043,100 @@ impl<K: Keystore> FidoApp<K> {
                 .get(..32)
                 .and_then(|s| s.try_into().ok())
                 .unwrap_or([0u8; 32]);
-            // credMgmt authenticates the pinUvAuthParam against the subcommand
-            // byte followed by the CBOR-encoded params map (matching the
-            // python-fido2 CredentialManagement client).
-            let mut auth_data = vec![req.subcommand];
-            let params_cbor = match req.subcommand {
-                0x04 => {
-                    // enumerateCreds: params = {0x01: rpIdHash}
-                    req.rp_id_hash.as_ref().map(|h| {
-                        cbor::encode(&cbor::Value::M(vec![(
-                            cbor::Value::U(0x01),
-                            cbor::Value::B(h.clone()),
-                        )]))
-                    })
-                }
-                0x06 => {
-                    // deleteCred: params = {0x02: credId}
-                    req.cred_id.as_ref().map(|desc| {
-                        let cred_id_map = cbor::Value::M(vec![
-                            (cbor::Value::T("type".to_string()), cbor::Value::T("public-key".to_string())),
-                            (cbor::Value::T("id".to_string()), cbor::Value::B(desc.id.clone())),
-                        ]);
-                        cbor::encode(&cbor::Value::M(vec![(
-                            cbor::Value::U(0x02),
-                            cred_id_map,
-                        )]))
-                    })
-                }
-                0x07 => {
-                    // updateUser: params = {0x02: credId, 0x03: user}
-                    if let (Some(desc), Some(user)) = (&req.cred_id, &req.user) {
-                        let cred_id_map = cbor::Value::M(vec![
-                            (cbor::Value::T("type".to_string()), cbor::Value::T("public-key".to_string())),
-                            (cbor::Value::T("id".to_string()), cbor::Value::B(desc.id.clone())),
-                        ]);
-                        let mut user_entries: Vec<(cbor::Value, cbor::Value)> = vec![
-                            (cbor::Value::T("id".to_string()), cbor::Value::B(user.id.clone())),
-                        ];
-                        if !user.name.is_empty() {
-                            user_entries.push((cbor::Value::T("name".to_string()), cbor::Value::T(user.name.clone())));
+// The signed message is over the *wire* sub-command byte in both dialects,
+            // never the canonical one: PicoForge signs its own numbering.
+            let mut auth_data = vec![req.wire_subcommand];
+            match req.dialect {
+                // PicoForge: `subCommand ‖ CBOR(subCommandParams)`.
+                //
+                // Deliberately rebuilt from the parsed fields rather than
+                // taken from `sub_params_cbor`: for `0x01`/`0x02` this yields
+                // no params, so a client that also sent subCommandParams has
+                // them fall outside the signed scope and is still accepted.
+                // The device twin is stricter — it signs the raw bytes
+                // whenever any were sent — and
+                // `device_full_set.rs::device_twin_credmgmt_mac_scope_differs_from_host_for_0x01_and_0x02`
+                // pins that split. Both halves must survive this change.
+                CmDialect::PicoForge => {
+                    let params_cbor = match req.subcommand {
+                        CM_ENUMERATE_CREDS_BEGIN => {
+                            // params = {0x01: rpIdHash}
+                            req.rp_id_hash.as_ref().map(|h| {
+                                cbor::encode(&cbor::Value::M(vec![(
+                                    cbor::Value::U(0x01),
+                                    cbor::Value::B(h.clone()),
+                                )]))
+                            })
                         }
-                        if !user.display_name.is_empty() {
-                            user_entries.push((cbor::Value::T("displayName".to_string()), cbor::Value::T(user.display_name.clone())));
+                        CM_DELETE_CRED => {
+                            // params = {0x02: credId}
+                            req.cred_id.as_ref().map(|desc| {
+                                let cred_id_map = cbor::Value::M(vec![
+                                    (cbor::Value::T("type".to_string()), cbor::Value::T("public-key".to_string())),
+                                    (cbor::Value::T("id".to_string()), cbor::Value::B(desc.id.clone())),
+                                ]);
+                                cbor::encode(&cbor::Value::M(vec![(
+                                    cbor::Value::U(0x02),
+                                    cred_id_map,
+                                )]))
+                            })
                         }
-                        let user_map = cbor::Value::M(user_entries);
-                        Some(cbor::encode(&cbor::Value::M(vec![
-                            (cbor::Value::U(0x02), cred_id_map),
-                            (cbor::Value::U(0x03), user_map),
-                        ])))
-                    } else {
-                        None
+                        CM_UPDATE_USER => {
+                            // params = {0x02: credId, 0x03: user}
+                            if let (Some(desc), Some(user)) = (&req.cred_id, &req.user) {
+                                let cred_id_map = cbor::Value::M(vec![
+                                    (cbor::Value::T("type".to_string()), cbor::Value::T("public-key".to_string())),
+                                    (cbor::Value::T("id".to_string()), cbor::Value::B(desc.id.clone())),
+                                ]);
+                                let mut user_entries: Vec<(cbor::Value, cbor::Value)> = vec![
+                                    (cbor::Value::T("id".to_string()), cbor::Value::B(user.id.clone())),
+                                ];
+                                if !user.name.is_empty() {
+                                    user_entries.push((cbor::Value::T("name".to_string()), cbor::Value::T(user.name.clone())));
+                                }
+                                if !user.display_name.is_empty() {
+                                    user_entries.push((cbor::Value::T("displayName".to_string()), cbor::Value::T(user.display_name.clone())));
+                                }
+                                let user_map = cbor::Value::M(user_entries);
+                                Some(cbor::encode(&cbor::Value::M(vec![
+                                    (cbor::Value::U(0x02), cred_id_map),
+                                    (cbor::Value::U(0x03), user_map),
+                                ])))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(params) = params_cbor {
+                        auth_data.extend_from_slice(&params);
                     }
                 }
-                _ => None,
-            };
-            if let Some(params) = params_cbor {
-                auth_data.extend_from_slice(&params);
+                // CTAP2 §12.1.6 signs the parameters the sub-command carries,
+                // concatenated in spec order. The credentialID and user bytes
+                // are taken exactly as received — a client signs the encoding
+                // it sent, key order included, so re-encoding could diverge.
+                CmDialect::Ctap2 => match req.subcommand {
+                    CM_ENUMERATE_CREDS_BEGIN => {
+                        if let Some(h) = req.rp_id_hash.as_ref() {
+                            auth_data.extend_from_slice(h);
+                        }
+                    }
+                    CM_DELETE_CRED => {
+                        if let Some(raw) = req.raw_cred_cbor.as_ref() {
+                            auth_data.extend_from_slice(raw);
+                        }
+                    }
+                    CM_UPDATE_USER => {
+                        if let Some(raw) = req.raw_cred_cbor.as_ref() {
+                            auth_data.extend_from_slice(raw);
+                        }
+                        if let Some(raw) = req.raw_user_cbor.as_ref() {
+                            auth_data.extend_from_slice(raw);
+                        }
+                    }
+                    _ => {}
+                },
             }
             if !crypto::pin_verify_auth(req.pin_uv_protocol, &token_arr, &auth_data, &param) {
                 return vec![self.note_pin_auth_failure()];
@@ -1917,11 +2149,15 @@ impl<K: Keystore> FidoApp<K> {
             }
         }
 
+        // The response encoders key off the dialect: the PicoForge and CTAP2
+        // key sets collide, so a request has to be answered in the shape its
+        // sender asked in.
+        self.cm_dialect = req.dialect;
         let result = match req.subcommand {
-            0x01 => self.cm_get_metadata(),
-            0x02 => self.cm_enumerate_rps_begin(),
-            0x03 => self.cm_enumerate_rps_next(),
-            0x04 => {
+            CM_GET_METADATA => self.cm_get_metadata(),
+            CM_ENUMERATE_RPS_BEGIN => self.cm_enumerate_rps_begin(),
+            CM_ENUMERATE_RPS_NEXT => self.cm_enumerate_rps_next(),
+            CM_ENUMERATE_CREDS_BEGIN => {
                 let hash = match req.rp_id_hash.as_deref() {
                     Some(h) if h.len() == 32 => {
                         let mut arr = [0u8; 32];
@@ -1932,9 +2168,9 @@ impl<K: Keystore> FidoApp<K> {
                 };
                 self.cm_enumerate_creds_begin(&hash)
             }
-            0x05 => self.cm_enumerate_creds_next(),
-            0x06 => self.cm_delete_cred(req.cred_id),
-            0x07 => self.cm_update_user(req.cred_id, req.user),
+            CM_ENUMERATE_CREDS_NEXT => self.cm_enumerate_creds_next(),
+            CM_DELETE_CRED => self.cm_delete_cred(req.cred_id),
+            CM_UPDATE_USER => self.cm_update_user(req.cred_id, req.user),
             _ => vec![Ctap2Response::InvalidCommand.code()],
         };
         // Any non-NULL command (except the enumerate next commands) resets
@@ -2498,17 +2734,27 @@ impl<K: Keystore> FidoApp<K> {
         let rp_map = cbor::Value::M(vec![
             (cbor::Value::T("id".to_string()), cbor::Value::T(rp.0.clone())),
         ]);
+        // CTAP2 §12.1.6 numbers these rp(1) ‖ rpID(2) ‖ totalRPs(7);
+        // PicoForge numbers the same three things 3/4/5. The sets collide, so
+        // each sender gets its own shape — a client that cannot find keys
+        // 1/2/7 has nothing to render, which is what left the Slots and
+        // Passkeys screens spinning forever.
+        let (k_rp, k_id, k_total) = match self.cm_dialect {
+            CmDialect::Ctap2 => (0x01u64, 0x02, 0x07),
+            CmDialect::PicoForge => (0x03, 0x04, 0x05),
+        };
         let mut map: Vec<(cbor::Value, cbor::Value)> = vec![
-            (cbor::Value::U(0x03), rp_map),
-            (cbor::Value::U(0x04), cbor::Value::B(rp.1.to_vec())),
+            (cbor::Value::U(k_rp), rp_map),
+            (cbor::Value::U(k_id), cbor::Value::B(rp.1.to_vec())),
         ];
         // Always include TOTAL_RPS so enumerate_rps() can determine the count.
-        map.push((cbor::Value::U(0x05), cbor::Value::U(total as u64)));
+        map.push((cbor::Value::U(k_total), cbor::Value::U(total as u64)));
         // Stash remaining RPs for enumerate_rps_next.
         self.cm_rp_state = Some(CmRpState {
             rps,
             cursor: 1,
             channel: self.current_channel,
+            dialect: self.cm_dialect,
         });
         let response = cbor::Value::M(map);
         let encoded = cbor::encode(&response);
@@ -2519,7 +2765,7 @@ impl<K: Keystore> FidoApp<K> {
 
     fn cm_enumerate_rps_next(&mut self) -> Vec<u8> {
         // Extract data, then drop the borrow before building the response.
-        let (rp_id, rp_id_hash, is_last) = {
+        let (rp_id, rp_id_hash, is_last, dialect) = {
             let state = match self.cm_rp_state.as_mut() {
                 Some(s) => s,
                 None => return vec![Ctap2Response::NotAllowed.code()],
@@ -2535,14 +2781,23 @@ impl<K: Keystore> FidoApp<K> {
             let rp = &state.rps[state.cursor];
             state.cursor += 1;
             let is_last = state.cursor >= state.rps.len();
-            (rp.0.clone(), rp.1, is_last)
+            (rp.0.clone(), rp.1, is_last, state.dialect)
         };
+        // `{1: 0x03}` is byte-identical in both dialects, so the request
+        // cannot be classified; the enumeration it continues decides.
+        self.cm_dialect = dialect;
         let rp_map = cbor::Value::M(vec![
             (cbor::Value::T("id".to_string()), cbor::Value::T(rp_id)),
         ]);
+        // Only the Begin response carries totalRps; the Next response is the
+        // two-key shape in each dialect's own numbering.
+        let (k_rp, k_id) = match self.cm_dialect {
+            CmDialect::Ctap2 => (0x01u64, 0x02),
+            CmDialect::PicoForge => (0x03, 0x04),
+        };
         let map: Vec<(cbor::Value, cbor::Value)> = vec![
-            (cbor::Value::U(0x03), rp_map),
-            (cbor::Value::U(0x04), cbor::Value::B(rp_id_hash.to_vec())),
+            (cbor::Value::U(k_rp), rp_map),
+            (cbor::Value::U(k_id), cbor::Value::B(rp_id_hash.to_vec())),
         ];
         if is_last {
             self.cm_rp_state = None;
@@ -2577,6 +2832,7 @@ impl<K: Keystore> FidoApp<K> {
             creds,
             cursor: 1,
             channel: self.current_channel,
+            dialect: self.cm_dialect,
         });
         response
     }
@@ -2584,7 +2840,7 @@ impl<K: Keystore> FidoApp<K> {
     fn cm_enumerate_creds_next(&mut self) -> Vec<u8> {
         // Extract the data we need, then drop the borrow before calling
         // cm_cred_response (which needs &self).
-        let (cred, total, is_last) = {
+        let (cred, total, is_last, dialect) = {
             let state = match self.cm_cred_state.as_mut() {
                 Some(s) => s,
                 None => return vec![Ctap2Response::NotAllowed.code()],
@@ -2600,8 +2856,11 @@ impl<K: Keystore> FidoApp<K> {
             let cred = state.creds[state.cursor].clone();
             state.cursor += 1;
             let is_last = state.cursor >= state.creds.len();
-            (cred, state.creds.len(), is_last)
+            (cred, state.creds.len(), is_last, state.dialect)
         };
+        // `{1: 0x05}` is byte-identical in both dialects, so the request
+        // cannot be classified; the enumeration it continues decides.
+        self.cm_dialect = dialect;
         let response = self.cm_cred_response(&cred, total);
         if is_last {
             self.cm_cred_state = None;
@@ -2633,28 +2892,40 @@ impl<K: Keystore> FidoApp<K> {
                 .push((cbor::Value::T("displayName".to_string()), cbor::Value::T(display_name.clone())));
         }
         let user = cbor::Value::M(user_entries);
+        // CTAP2 §12.1.6 numbers these 1/2/3/4/5/6/7; PicoForge numbers the
+        // same seven things 6/7/8/9/0x0A/0x0B/0x0C. The sets overlap (key 6
+        // is `user` to PicoForge, `largeBlobKey` to CTAP2), so one response
+        // cannot satisfy both.
+        let (k_user, k_cred, k_pk, k_total, k_protect, k_blob) = match self.cm_dialect {
+            CmDialect::Ctap2 => (0x01u64, 0x02, 0x03, 0x04, 0x05, 0x06),
+            CmDialect::PicoForge => (0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B),
+        };
+        let k_tpp = match self.cm_dialect {
+            CmDialect::Ctap2 => 0x07u64,
+            CmDialect::PicoForge => 0x0C,
+        };
         let mut map: Vec<(cbor::Value, cbor::Value)> = vec![
-            (cbor::Value::U(0x06), user),
-            (cbor::Value::U(0x07), cred_id_map),
-            (cbor::Value::U(0x08), cose_key),
+            (cbor::Value::U(k_user), user),
+            (cbor::Value::U(k_cred), cred_id_map),
+            (cbor::Value::U(k_pk), cose_key),
         ];
-        // Always include TOTAL_CREDENTIALS (key 9) so callers can distinguish
-        // a single-result response from a paginated one.
-        map.push((cbor::Value::U(0x09), cbor::Value::U(total as u64)));
-        // credProtect policy (key 0x0A) when set (FX-411).
+        // Always include TOTAL_CREDENTIALS so callers can distinguish a
+        // single-result response from a paginated one.
+        map.push((cbor::Value::U(k_total), cbor::Value::U(total as u64)));
+        // credProtect policy when set (FX-411).
         if cred.cred_protect > 0 {
             map.push((
-                cbor::Value::U(0x0A),
+                cbor::Value::U(k_protect),
                 cbor::Value::U(cred.cred_protect as u64),
             ));
         }
-        // largeBlobKey (key 0x0B) when the credential carries one (FX-411).
+        // largeBlobKey when the credential carries one (FX-411).
         if let Some(ref k) = cred.large_blob_key {
-            map.push((cbor::Value::U(0x0B), cbor::Value::B(k.to_vec())));
+            map.push((cbor::Value::U(k_blob), cbor::Value::B(k.to_vec())));
         }
         // Include thirdPartyPayment flag (key 0x0C) when set.
         if cred.third_party_payment {
-            map.push((cbor::Value::U(0x0C), cbor::Value::Bool(true)));
+            map.push((cbor::Value::U(k_tpp), cbor::Value::Bool(true)));
         }
         let response = cbor::Value::M(map);
         let encoded = cbor::encode(&response);
@@ -2804,13 +3075,41 @@ fn generate_alg_keypair(alg: i64) -> Result<(Vec<u8>, CosePublicKey), crypto::Ke
             Ok((sk.to_bytes().to_vec(), cose))
         }
         -36 => {
+            // P-521's scalar is 66 bytes = 528 bits, but the prime field is
+            // 521 bits. A uniformly random draw is therefore a valid scalar
+            // only when its top 7 bits are clear — measured at 0.007875 over
+            // 200,000 draws (1 in 127). Against `KEYGEN_MAX_ATTEMPTS` = 8 that
+            // is a 6.1 % success rate, which is the long-standing
+            // `test_algorithms[-36]` flake: `AttemptsExhausted` surfaced as
+            // CTAP 0x7F, indistinguishable from an entropy-starved device.
+            //
+            // Masking the overflow bits makes acceptance ~1 by construction, so
+            // the sampler spends one draw instead of ~127. P-256 (32 B) and
+            // P-384 (48 B) need no mask — their draws are exactly field-sized.
+            //
+            // The mask does not *replace* the validity check: values in
+            // [n, 2^521) are still rejected, and `try_fill_valid` still bounds
+            // that residual (a fraction ~2^-262 of draws) instead of spinning.
             let mut seed = [0u8; 66];
             crypto::try_fill_valid(
                 &mut crate::crypto::TrngRng,
                 &mut seed,
-                |b| p521::ecdsa::SigningKey::from_slice(b).is_ok(),
+                |b| {
+                    if b.len() != 66 {
+                        return false;
+                    }
+                    let mut m = [0u8; 66];
+                    m.copy_from_slice(b);
+                    m[0] &= 0x01; // 528 bits -> 521: keep only bit 520
+                    p521::ecdsa::SigningKey::from_slice(&m).is_ok()
+                },
             )?;
-            let sk = p521::ecdsa::SigningKey::from_slice(&seed)
+            // Re-derive from the masked seed. The predicate above masks a
+            // *copy* (a closure cannot hand the masked value back), so the
+            // masked bytes are what must be used, not the raw draw.
+            let mut masked = seed;
+            masked[0] &= 0x01;
+            let sk = p521::ecdsa::SigningKey::from_slice(&masked)
                 .map_err(|_| crypto::KeygenError::AttemptsExhausted)?;
             let pk = p521::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
             let cose = CosePublicKey {
@@ -3389,13 +3688,39 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
         _ => return Err(FidoError::Cbor),
     };
 
+    let find = |key: u64| map.iter().find(|(k, _)| matches!(k, cbor::Value::U(u) if *u == key));
+    let is_int = |v: &cbor::Value| matches!(v, cbor::Value::U(_) | cbor::Value::N(_));
+    let is_map = |v: &cbor::Value| matches!(v, cbor::Value::M(_));
+
+    // Dialect detection. The two layouts reuse the same key numbers for
+    // different fields, so key *types* are what separate them:
+    //
+    //   key 0x02 -> PicoForge: a map (subCommandParams)
+    //               CTAP2:     an integer (pinUvAuthProtocol)
+    //
+    // PicoForge omits key 0x02 entirely when a sub-command takes no
+    // parameters, so that alone is not enough. Its pinUvAuthProtocol always
+    // sits at key 0x03 as an integer, whereas CTAP2's key 0x03 is
+    // pinUvAuthParam — a byte string. Checking both makes the
+    // classification total: no request is left ambiguous, and no client is
+    // misread as the other dialect.
+    let dialect = match (find(0x02), find(0x03)) {
+        (Some((_, v)), _) if is_map(v) => CmDialect::PicoForge,
+        (_, Some((_, v))) if is_int(v) => CmDialect::PicoForge,
+        (Some((_, v)), _) if is_int(v) => CmDialect::Ctap2,
+        _ => CmDialect::Ctap2,
+    };
+
     let mut expected_key: u64 = 1;
-    let mut subcommand: u8 = 0;
+    let mut wire_subcommand: u8 = 0;
     let mut pin_uv_protocol: u8 = 2;
     let mut pin_uv_auth_param = None;
     let mut rp_id_hash = None;
     let mut cred_id = None;
     let mut user = None;
+    let mut sub_params_cbor = None;
+    let mut raw_cred_cbor = None;
+    let mut raw_user_cbor = None;
 
     for (key, val) in map {
         let key_u = match key {
@@ -3403,70 +3728,123 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
             cbor::Value::N(n) if *n < 0 => return Err(FidoError::InvalidCbor),
             _ => return Err(FidoError::Cbor),
         };
-        if key_u == 1 && subcommand == 0 {
+        if key_u == 1 && wire_subcommand == 0 {
             // OK, subcommand is key 1.
-        } else if key_u < expected_key {
+        } else if dialect == CmDialect::PicoForge && key_u < expected_key {
+            // CTAP2 places no ordering requirement on its map, so this
+            // strictness is kept only where it already applied.
             return Err(FidoError::InvalidCbor);
         }
         expected_key = key_u.saturating_add(1);
 
-        match key_u {
-            0x01 => subcommand = cbor_get_uint(val)? as u8,
-            0x03 => pin_uv_protocol = cbor_get_uint(val)? as u8,
-            0x04 => pin_uv_auth_param = Some(cbor_get_bytes(val)?),
-            0x02 => {
-                // subcommand params map
-                let m = cbor_get_map(val)?;
-                for (k, v) in m {
-                    let sub = match k {
-                        cbor::Value::U(u) => *u,
-                        _ => continue,
-                    };
-                    match sub {
-                        0x01 => {
-                            // rpIdHash
-                            let b = cbor_get_bytes(v)?;
-                            rp_id_hash = Some(b);
+        match dialect {
+            // PicoForge: sub-params nested under key 0x02, protocol at
+            // 0x03, pinUvAuthParam at 0x04.
+            CmDialect::PicoForge => match key_u {
+                0x01 => wire_subcommand = cbor_get_uint(val)? as u8,
+                0x03 => pin_uv_protocol = cbor_get_uint(val)? as u8,
+                0x04 => pin_uv_auth_param = Some(cbor_get_bytes(val)?),
+                0x02 => {
+                    // The signed message is `subCommand ‖ CBOR(this map)`,
+                    // so the map is retained verbatim rather than rebuilt
+                    // from the fields parsed out of it.
+                    let m = cbor_get_map(val)?;
+                    sub_params_cbor = Some(cbor::encode(val));
+                    for (k, v) in m {
+                        let sub = match k {
+                            cbor::Value::U(u) => *u,
+                            _ => continue,
+                        };
+                        match sub {
+                            0x01 => {
+                                // rpIdHash
+                                let b = cbor_get_bytes(v)?;
+                                rp_id_hash = Some(b);
+                            }
+                            0x02 => {
+                                // credentialId { "type": tstr, "id": bstr }
+                                let cm = cbor_get_map(v)?;
+                                let type_ =
+                                    cbor_get_map_text_opt(cm, "type")?.unwrap_or_default();
+                                let id = cbor_get_map_bytes(cm, "id")?;
+                                cred_id = Some(CredDescriptor { type_, id });
+                            }
+                            0x03 => {
+                                // user { "id": bstr, "name": tstr, "displayName": tstr }
+                                let um = cbor_get_map(v)?;
+                                let uid = cbor_get_map_bytes(um, "id")?;
+                                let name = cbor_get_map_text_opt(um, "name")?.unwrap_or_default();
+                                let display_name =
+                                    cbor_get_map_text_opt(um, "displayName")?.unwrap_or_default();
+                                user = Some(CmUser {
+                                    id: uid,
+                                    name,
+                                    display_name,
+                                });
+                            }
+                            _ => {}
                         }
-                        0x02 => {
-                            // credentialId { "type": tstr, "id": bstr }
-                            let cm = cbor_get_map(v)?;
-                            let type_ = cbor_get_map_text_opt(cm, "type")?.unwrap_or_default();
-                            let id = cbor_get_map_bytes(cm, "id")?;
-                            cred_id = Some(CredDescriptor { type_, id });
-                        }
-                        0x03 => {
-                            // user { "id": bstr, "name": tstr, "displayName": tstr }
-                            let um = cbor_get_map(v)?;
-                            let uid = cbor_get_map_bytes(um, "id")?;
-                            let name = cbor_get_map_text_opt(um, "name")?.unwrap_or_default();
-                            let display_name =
-                                cbor_get_map_text_opt(um, "displayName")?.unwrap_or_default();
-                            user = Some(CmUser {
-                                id: uid,
-                                name,
-                                display_name,
-                            });
-                        }
-                        _ => {}
                     }
                 }
-            }
-            _ => {}
+                _ => {}
+            },
+            // CTAP2 §12.1.6: flat keys, no nesting.
+            CmDialect::Ctap2 => match key_u {
+                0x01 => wire_subcommand = cbor_get_uint(val)? as u8,
+                0x02 => pin_uv_protocol = cbor_get_uint(val)? as u8,
+                0x03 => pin_uv_auth_param = Some(cbor_get_bytes(val)?),
+                0x04 => rp_id_hash = Some(cbor_get_bytes(val)?),
+                0x05 => {
+                    raw_cred_cbor = Some(cbor::encode(val));
+                    let cm = cbor_get_map(val)?;
+                    let type_ = cbor_get_map_text_opt(cm, "type")?.unwrap_or_default();
+                    let id = cbor_get_map_bytes(cm, "id")?;
+                    cred_id = Some(CredDescriptor { type_, id });
+                }
+                0x06 => {
+                    raw_user_cbor = Some(cbor::encode(val));
+                    let um = cbor_get_map(val)?;
+                    let uid = cbor_get_map_bytes(um, "id")?;
+                    let name = cbor_get_map_text_opt(um, "name")?.unwrap_or_default();
+                    let display_name =
+                        cbor_get_map_text_opt(um, "displayName")?.unwrap_or_default();
+                    user = Some(CmUser {
+                        id: uid,
+                        name,
+                        display_name,
+                    });
+                }
+                _ => {}
+            },
         }
     }
 
-    if subcommand == 0 {
+    if wire_subcommand == 0 {
         return Err(FidoError::MissingParameter);
     }
 
+    // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
+    // CTAP2 numbers them the other way round. Everything downstream works
+    // in the canonical CTAP2 numbering, so PicoForge's pair is swapped here
+    // and nowhere else.
+    let subcommand = match (dialect, wire_subcommand) {
+        (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
+        (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,
+        (_, w) => w,
+    };
+
     Ok(CmRequest {
         subcommand,
+        wire_subcommand,
+        dialect,
         pin_uv_protocol,
         pin_uv_auth_param,
         rp_id_hash,
         cred_id,
         user,
+        sub_params_cbor,
+        raw_cred_cbor,
+        raw_user_cbor,
     })
 }
 

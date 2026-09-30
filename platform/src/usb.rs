@@ -24,6 +24,7 @@
 //! while device replies go out on the interrupt IN endpoint (usage 0x20).
 
 use crate::hid_control::{CCID_CLASS_DESCRIPTOR, HID_CLASS_DESCRIPTOR};
+use crate::identity::MAX_IDENTITY_STRING;
 use crate::usb_ident::SerialBuf;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
@@ -58,22 +59,25 @@ bind_interrupts!(struct Irqs {
 /// identity should go through [`crate::identity`] rather than duplicating it.
 use crate::identity::usb_ident;
 
-/// Answers the CTAP-HID interface's class protocol on the control endpoint.
+/// Routes the two HID interfaces' class protocols on the control endpoint.
 ///
-/// Without a registered [`Handler`], embassy-usb only serves standard
-/// device-level descriptors and **rejects GET_DESCRIPTOR(Report) 0x2200**
-/// (a standard request *to the interface*), so the descriptor STALLed and
-/// `usbhid` could never bind (hardware cycle E6c, US-391 E7 blocker #1).
-/// The decisions live in [`crate::hid_control`] (host-tested); this glue
-/// maps embassy types onto them.
-struct HidControlHandler {
-    /// HID interface number (the CTAP interface this handler answers).
-    itf: u8,
+/// embassy-usb's `Builder` keeps a single [`Handler`], and this composite
+/// device carries **two** HID interfaces with class behavior — CTAP-HID
+/// (descriptor + idle/protocol requests) and the Yubico OTP interface
+/// (descriptor + idle/protocol + stateful FEATURE reports). One handler,
+/// routing by `wIndex`, is the shape the single-handler constraint forces.
+/// All decisions live in [`crate::hid_control`] and [`crate::otp_hid`]
+/// (host-tested); this glue maps embassy types onto them.
+struct HidInterfacesHandler {
+    /// CTAP-HID interface number.
+    ctap_itf: u8,
+    /// Yubico OTP interface number.
+    otp_itf: u8,
 }
 
-impl Handler for HidControlHandler {
-    fn control_in<'a>(&'a mut self, req: Request, _buf: &'a mut [u8]) -> Option<InResponse<'a>> {
-        if req.index != self.itf as u16 {
+impl HidInterfacesHandler {
+    fn control_in_ctap<'a>(&'a mut self, req: Request) -> Option<InResponse<'a>> {
+        if req.index != self.ctap_itf as u16 {
             return None;
         }
         if !matches!(
@@ -89,8 +93,37 @@ impl Handler for HidControlHandler {
         }
     }
 
-    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
-        if req.index != self.itf as u16 {
+    fn control_in_otp<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.index != self.otp_itf as u16 {
+            return None;
+        }
+        match (req.request_type, req.recipient) {
+            (RequestType::Standard, Recipient::Interface) => {
+                match crate::otp_hid::control_in(req.request, req.value) {
+                    crate::hid_control::InReply::Data(d) => Some(InResponse::Accepted(d)),
+                    crate::hid_control::InReply::Rejected => Some(InResponse::Rejected),
+                    crate::hid_control::InReply::NotHandled => None,
+                }
+            }
+            // GET_REPORT(Feature) — the device→host half of the YK4 transport:
+            // response chunks, then the terminator, then the idle status.
+            (RequestType::Class, Recipient::Interface) if req.request == 0x01 => {
+                if (req.value >> 8) as u8 != 3 || buf.len() < crate::otp_hid::FEATURE_REPORT_SIZE {
+                    return Some(InResponse::Rejected);
+                }
+                let report: &mut [u8; crate::otp_hid::FEATURE_REPORT_SIZE] =
+                    (&mut buf[..crate::otp_hid::FEATURE_REPORT_SIZE])
+                        .try_into()
+                        .expect("slice length checked above");
+                crate::otp_hid::get_report(report);
+                Some(InResponse::Accepted(&buf[..crate::otp_hid::FEATURE_REPORT_SIZE]))
+            }
+            _ => None,
+        }
+    }
+
+    fn control_out_ctap(&mut self, req: Request) -> Option<OutResponse> {
+        if req.index != self.ctap_itf as u16 {
             return None;
         }
         match (req.request_type, req.recipient) {
@@ -104,11 +137,54 @@ impl Handler for HidControlHandler {
             _ => None,
         }
     }
+
+    fn control_out_otp(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        if req.index != self.otp_itf as u16 {
+            return None;
+        }
+        match (req.request_type, req.recipient) {
+            (RequestType::Class, Recipient::Interface) => {
+                // SET_REPORT(Feature) — the host→device half: one 8-byte
+                // report of the 70-byte YK4 frame, or the 0xFF reset.
+                if req.request == 0x09 && (req.value >> 8) as u8 == 3 {
+                    if let Ok(report) = <&[u8; crate::otp_hid::FEATURE_REPORT_SIZE]>::try_from(data)
+                    {
+                        crate::otp_hid::set_report(report);
+                    }
+                    return Some(OutResponse::Accepted);
+                }
+                match crate::otp_hid::control_out(req.request, req.value) {
+                    crate::hid_control::OutReply::Accepted => Some(OutResponse::Accepted),
+                    crate::hid_control::OutReply::Rejected => Some(OutResponse::Rejected),
+                    crate::hid_control::OutReply::NotHandled => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Handler for HidInterfacesHandler {
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        match req.index {
+            i if i == self.ctap_itf as u16 => self.control_in_ctap(req),
+            i if i == self.otp_itf as u16 => self.control_in_otp(req, buf),
+            _ => None,
+        }
+    }
+
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        match req.index {
+            i if i == self.ctap_itf as u16 => self.control_out_ctap(req),
+            i if i == self.otp_itf as u16 => self.control_out_otp(req, data),
+            _ => None,
+        }
+    }
 }
 
 /// Write-once slot for the handler (no heap on device; the handler must live
 /// for the `'d` device lifetime).
-static mut HID_CONTROL_HANDLER: core::mem::MaybeUninit<HidControlHandler> =
+static mut HID_INTERFACES_HANDLER: core::mem::MaybeUninit<HidInterfacesHandler> =
     core::mem::MaybeUninit::uninit();
 
 /// US-103 (PICOForge-COMPAT): the 8-digit `iSerialNumber`, derived once from
@@ -127,6 +203,93 @@ static mut HID_CONTROL_HANDLER: core::mem::MaybeUninit<HidControlHandler> =
 /// [`HID_CONTROL_HANDLER`] above; see `crate::usb_ident` for the full
 /// rationale and the digit/collision rules.
 static mut USB_SERIAL: SerialBuf = SerialBuf::new();
+
+/// The operator-set USB identity a boot may override the build-time one with.
+///
+/// The FIDO keystore persists a `PhyConfig` (VID/PID, product and manufacturer
+/// names) written by a configurator's `CONFIG_WRITE`; until now that record was
+/// stored but never applied — the descriptors read only the compile-time
+/// `identity` constants, which is why a saved identity change "succeeded" yet
+/// never reached the bus. This type is the resolved snapshot `Usb::new` now
+/// applies, field by field: a `Some` field replaces the build-time value, a
+/// `None` leaves it alone — the same per-field precedence the C SDK's
+/// `phy_data` boot override uses. The bytes are owned so the value can be
+/// built from a keystore borrow that ends immediately (see [`StoredName`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredIdentity {
+    /// `(vid << 16) | pid`, as `fapico2_fido::vendorff::pack_vidpid` stores it
+    /// in the keystore; `None` keeps the build-time VID/PID.
+    pub vid_pid: Option<u32>,
+    /// The stored `iProduct`, or `None` to keep the build-time product.
+    pub product: Option<StoredName>,
+    /// The stored `iManufacturer`, or `None` to keep the build-time value.
+    pub manufacturer: Option<StoredName>,
+}
+
+/// A stored identity string — a fixed copy of the keystore's `IdentityName`
+/// bytes, owned so the borrow that produced it can end.
+///
+/// The width is [`MAX_IDENTITY_STRING`] minus the NUL the wire format carries,
+/// the same bound `IdentityName` enforces at construction, so a value that
+/// fits there always fits here and the copy cannot fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredName {
+    bytes: [u8; MAX_IDENTITY_STRING - 1],
+    len: u8,
+}
+
+impl StoredName {
+    /// Copies a stored name out of the keystore's bytes.
+    ///
+    /// Panics if `bytes` exceeds [`MAX_IDENTITY_STRING`] - 1 — impossible for
+    /// anything that came through `IdentityName::new`, and a caller that
+    /// hand-rolls a longer slice has already violated the same wire bound the
+    /// panic restates.
+    pub fn new(bytes: &[u8]) -> Self {
+        assert!(
+            bytes.len() < MAX_IDENTITY_STRING,
+            "stored identity name exceeds the wire bound"
+        );
+        let mut out = [0u8; MAX_IDENTITY_STRING - 1];
+        out[..bytes.len()].copy_from_slice(bytes);
+        Self { bytes: out, len: bytes.len() as u8 }
+    }
+}
+
+/// Reads a stored name back out of its write-once static as a `&'static str`.
+///
+/// The string must not borrow the local [`StoredName`] the bytes were built
+/// from — the local dies at the end of [`Usb::new`], while the config holds
+/// the string for the life of the device — so the read goes through the
+/// static the bytes were copied into, which is why this is `unsafe`.
+///
+/// # SAFETY
+///
+/// The caller must have written `name_buf` and `len` earlier in the same
+/// [`Usb::new`] call (the write-once discipline documented on the statics)
+/// and must never call this again after that one write. `""` if the stored
+/// bytes are not UTF-8 — the same fallback `IdentityName::as_str` uses, and
+/// unreachable in practice because `IdentityName::new` takes a `&str`.
+unsafe fn stored_name_str(
+    name_buf: *const [u8; MAX_IDENTITY_STRING - 1],
+    len_buf: *const u8,
+) -> &'static str {
+    let bytes: &'static [u8; MAX_IDENTITY_STRING - 1] = &*name_buf;
+    let len = *len_buf as usize;
+    core::str::from_utf8(&bytes[..len]).unwrap_or("")
+}
+
+// Write-once copies of the stored identity names. `UsbConfig` holds `&str`s
+// for the life of the built device, and the keystore the names come from is a
+// handle the boot hands on to the HID task afterwards — so the names must
+// outlive that borrow: one `&'static` copy each, written here before the
+// builder runs and never touched again. Same write-once-`MaybeUninit`-static
+// reasoning as [`USB_SERIAL`].
+static mut STORED_PRODUCT_NAME: [u8; MAX_IDENTITY_STRING - 1] = [0; MAX_IDENTITY_STRING - 1];
+static mut STORED_PRODUCT_LEN: u8 = 0;
+static mut STORED_MANUFACTURER_NAME: [u8; MAX_IDENTITY_STRING - 1] =
+    [0; MAX_IDENTITY_STRING - 1];
+static mut STORED_MANUFACTURER_LEN: u8 = 0;
 
 /// The four data endpoints of the composite device. Owned by the serve-loop
 /// tasks (one group per transport); `device` is run in its own task.
@@ -164,6 +327,14 @@ impl<'d> Usb<'d> {
     /// the management applet is given, so the USB serial and `TAG_SERIAL`
     /// agree.
     ///
+    /// `stored` is the operator-set identity persisted in the FIDO keystore
+    /// (`PhyConfig` via a configurator's `CONFIG_WRITE`), or `None` for the
+    /// builds that have no store to consult (`bridge`, `bringup`, `hwtest`).
+    /// Each `Some` field replaces the build-time value; `None` fields keep it.
+    /// VID/PID can only change at enumeration, so an override takes effect on
+    /// the next boot — the same one-reset delay the C SDK's `phy_data`
+    /// override has.
+    ///
     /// **Every caller is on real silicon** and must read the real OTP row:
     /// `fapico2-firmware`, `bridge`, `bringup`, `hwtest`. The bring-up binaries
     /// are hardware diagnostics, not host builds, so they have a genuine OTP
@@ -186,6 +357,7 @@ impl<'d> Usb<'d> {
         msos_descriptor_buf: &'d mut [u8],
         control_buf: &'d mut [u8],
         chipid: u64,
+        stored: Option<StoredIdentity>,
     ) -> Self {
         let driver = Driver::new(usb, Irqs);
 
@@ -205,9 +377,60 @@ impl<'d> Usb<'d> {
         };
 
         let ident = usb_ident();
-        let mut config = UsbConfig::new(ident.vid, ident.pid);
-        config.manufacturer = Some(ident.manufacturer);
-        config.product = Some(ident.product);
+
+        // The operator-set identity overrides the build-time one, field by
+        // field. The stored names are copied into the write-once statics so
+        // the strings the config holds do not borrow the keystore.
+        let mut product = ident.product;
+        let mut manufacturer = ident.manufacturer;
+        if let Some(stored) = stored {
+            // SAFETY: the name statics are written exactly once per process —
+            // this is the only writer and `Usb::new` runs once per boot,
+            // before the device is built and therefore before the host can
+            // read the strings they back — and are never written again, so
+            // the `&'static str`s below are immutable for the life of the
+            // process. Same pattern as `USB_SERIAL`.
+            if let Some(name) = stored.manufacturer {
+                unsafe {
+                    *core::ptr::addr_of_mut!(STORED_MANUFACTURER_NAME) = name.bytes;
+                    *core::ptr::addr_of_mut!(STORED_MANUFACTURER_LEN) = name.len;
+                }
+                manufacturer = unsafe {
+                    stored_name_str(
+                        core::ptr::addr_of!(STORED_MANUFACTURER_NAME),
+                        core::ptr::addr_of!(STORED_MANUFACTURER_LEN),
+                    )
+                };
+            }
+            if let Some(name) = stored.product {
+                unsafe {
+                    *core::ptr::addr_of_mut!(STORED_PRODUCT_NAME) = name.bytes;
+                    *core::ptr::addr_of_mut!(STORED_PRODUCT_LEN) = name.len;
+                }
+                product = unsafe {
+                    stored_name_str(
+                        core::ptr::addr_of!(STORED_PRODUCT_NAME),
+                        core::ptr::addr_of!(STORED_PRODUCT_LEN),
+                    )
+                };
+            }
+        }
+        let (vid, pid) = stored
+            .and_then(|s| s.vid_pid)
+            // A stored all-zero VID/PID is left unapplied: `0x0000:0000` would
+            // make the device unenumerable — unreachable by any client,
+            // including the one that wrote it. Treating zero as "no override"
+            // keeps the record in the keystore while the bus keeps a device,
+            // which is what the old store-without-apply behaviour guaranteed
+            // for free.
+            .filter(|packed| *packed != 0)
+            .map_or((ident.vid, ident.pid), |packed| {
+                ((packed >> 16) as u16, packed as u16)
+            });
+
+        let mut config = UsbConfig::new(vid, pid);
+        config.manufacturer = Some(manufacturer);
+        config.product = Some(product);
         config.serial_number = Some(serial);
         config.max_power = 100;
         config.composite_with_iads = true;
@@ -251,7 +474,7 @@ impl<'d> Usb<'d> {
             // endpoints (E7 — Driver=[none], no hidraw, no CTAP device).
             // The report descriptor itself is NOT embedded in the
             // configuration blob — it is served on GET_DESCRIPTOR(Report) by
-            // [`HidControlHandler`].
+            // [`HidInterfacesHandler`].
             alt.descriptor(0x21, &HID_CLASS_DESCRIPTOR[2..]);
             let in_ep = alt.endpoint_interrupt_in(None, 64, 10);
             // Interrupt OUT: CTAP commands from the host (usage 0x21) — the
@@ -260,9 +483,33 @@ impl<'d> Usb<'d> {
             (in_ep, out_ep, u8::from(hid_itf))
         };
 
-        // Register the HID class-control handler (GET_DESCRIPTOR(Report) etc.).
-        let hid_handler: &'d mut HidControlHandler = unsafe {
-            (&mut *core::ptr::addr_of_mut!(HID_CONTROL_HANDLER)).write(HidControlHandler { itf: hid_itf })
+        // --- HID interface (Yubico OTP, keyboard-usage, feature reports) ---
+        // The transport Yubico Authenticator/ykman uses to detect and drive
+        // the OTP app (`yubikit/core/otp.py`): usage (0x0001, 0x0006) plus an
+        // 8-byte FEATURE report; the frames travel on the control endpoint
+        // ([`OtpHidControlHandler`]), never on this interrupt endpoint — the
+        // IN endpoint exists because the C firmware's keyboard interface has
+        // one (and a HID interface the host's class driver accepts binds
+        // identically here), and is never written.
+        let otp_itf = {
+            let mut func = builder.function(0x03, 0x00, 0x00);
+            let mut iface = func.interface();
+            let otp_itf = iface.interface_number();
+            let mut alt = iface.alt_setting(0x03, 0x00, 0x00, None);
+            // Class descriptor BEFORE the endpoints — the interface-extra
+            // discipline the CCID and CTAP blocks above document (E7).
+            alt.descriptor(0x21, &crate::otp_hid::OTP_HID_CLASS_DESCRIPTOR[2..]);
+            // Interrupt IN: part of the keyboard surface, never armed.
+            let _otp_in = alt.endpoint_interrupt_in(None, 64, 10);
+            u8::from(otp_itf)
+        };
+        // One composite handler answers both HID interfaces (see the struct
+        // docs — embassy-usb keeps a single `Handler`).
+        let hid_handler: &'d mut HidInterfacesHandler = unsafe {
+            (&mut *core::ptr::addr_of_mut!(HID_INTERFACES_HANDLER)).write(HidInterfacesHandler {
+                ctap_itf: hid_itf,
+                otp_itf,
+            })
         };
         builder.handler(hid_handler);
 
