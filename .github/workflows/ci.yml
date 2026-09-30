@@ -598,6 +598,17 @@ jobs:
             fi
           done
           exit $rc
+      # US-1302: the blink-ladder classifier is a pure function over a recorded
+      # LED sequence, so it is host-testable and belongs in the gate job beside
+      # the other no-hardware assertions — NOT in the emulator pytest gate,
+      # which needs a built emulation binary this job does not have.
+      - name: "Gate: the boot-ladder classifier (US-1302)"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          echo "--- classify_ladder over recorded blink sequences ---"
+          python3 -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
+          echo "ok: boot-ladder classifier green"
 
   # ---------------------------------------------------------------------------
   # Supply-chain provenance (US-1060, RS-KEY-ADOPT Phase 7). Two halves, and
