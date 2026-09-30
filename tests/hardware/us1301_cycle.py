@@ -251,6 +251,15 @@ def main(argv: list[str]) -> int:
 
     if args.arm == "flash":
         dest = mount / args.uf2.name
+        # The ROM's MSC can still be settling when it first appears: cycle 2
+        # hit EACCES on a volume that was writable a second later. Wait for it
+        # rather than treating a not-yet-ready mount as a failed cycle.
+        for _ in range(20):
+            try:
+                dest.touch(exist_ok=True)
+                break
+            except OSError:
+                time.sleep(0.5)
         shutil.copyfile(args.uf2, dest)
         print(f"[{args.arm} #{args.index}] copied {args.uf2.name} -> {dest}",
               flush=True)

@@ -38,9 +38,20 @@ One firmware, one binary — a single UF2 serving one USB composite device
 
 ## After a BOOTSEL session or a debugger attach: power-cycle the device
 
-**If the device shows no USB after flashing, changing a setting, or attaching a
-debugger: unplug the USB cable and plug it back in. That is the fix. A reset
-button press or a re-flash will not clear it.**
+**If the device shows no USB after flashing or changing a setting: unplug the
+USB cable, wait 5 seconds, then plug it back in. That is the fix — and the wait
+is part of it. A reset button press or a re-flash will not clear it.**
+
+The 5 seconds is measured, not folklore. Replugging quickly leaves the board
+still frozen; the same board, same firmware and same state recover reliably when
+power was off for 4-5 seconds. This was reproduced on hardware on 2026-10-01
+with no debugger attached, and the cause is in the chip: RP2350 errata E16
+records that the OTP array's supply regulator's power-good is only sampled
+during the initial power-on reset sequence, so a too-short power-off leaves the
+token unable to read its own key material at boot and it refuses to serve.
+
+Practical consequence: **give the cable a real few seconds.** Unplugging and
+immediately replugging is the one way to leave a working token looking broken.
 
 This is a real operator-visible requirement, not a footnote. The firmware's
 hardware key material can be left unreadable by those three actions, and a plain

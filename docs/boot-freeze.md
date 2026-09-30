@@ -9,9 +9,12 @@
 
 ## Read this first if you have a frozen board in front of you
 
-1. **Unplug the USB cable and plug it back in.** That is the fix for the
-   failure below. A reset button press or a re-flash will *not* clear it — see
-   [why](#why-a-power-cycle-and-not-a-reset).
+1. **Unplug the USB cable, WAIT 5 SECONDS, then plug it back in.** That is the
+   fix. The wait is not superstition — it is load-bearing. Replugging quickly
+   leaves the board **still frozen**: the same board, the same firmware and the
+   same state all recover reliably when power was off for 4-5 s and fail to
+   recover when it was off for a moment. A reset-button press or a re-flash
+   will *not* clear it either — see [why](#why-a-power-cycle-and-not-a-reset).
 2. Watch the LED **from the moment you power it**. If it blinks a countable
    number of times and then goes dark and USB never appears, the device reached
    a named boot phase and stopped: [read the ladder](#1-the-boot-phase-ladder).
@@ -162,6 +165,39 @@ A signature cannot be confused with the two other things that blink this pin: no
 signature pulse is 40 ms (the ladder's period) or 500 ms (the heartbeat's), and
 the 1200 ms preamble is three times longer than any other lit pulse the firmware
 drives.
+
+## Why the wait is part of the fix (measured 2026-10-01)
+
+The freeze reproduces **with no debugger attached at all** — measured on
+hardware on 2026-10-01, 2 of 2 flash-and-reboot cycles, each requiring a power
+cycle to recover. So the "attach a probe and have a look" advice is not just
+counterproductive, it manufactures the fault.
+
+What makes it reproducible is a controlled comparison the operator ran during
+that session:
+
+> if I remove power and return it fast, the board stays frozen. If I wait 4-5
+> seconds and replug, then it returns.
+
+Same board, same image, same state; the only variable is how long power was off.
+
+This is **not** a firmware race, a concurrency bug or a boot-ordering problem,
+and nothing is to do with unloading memory — the device is not reading stale
+RAM. The failing read is an OTP read that returns `0xFFFFFFFF`, which the
+firmware maps to "key absent" and then refuses to boot without. That is a
+hardware register result.
+
+The likely mechanism is the supply rail. RP2350 **errata E16** records that the
+OTP array's read voltage comes from an internal regulator whose power-good
+"isn't sampled outside of the initial power-on reset startup sequence". Four or
+five seconds of power-off is what it takes for that rail to discharge and for
+the power-on sequence to sample it correctly. Replug too fast and the OTP array
+comes back in the escalated state, so the board refuses to boot again.
+
+**This is consistent with, and is the strongest evidence yet for, the
+reset-property hypothesis (fact 8).** It also means the recovery procedure is
+deterministic once you know the wait — which is a real improvement over "unplug
+it and hope".
 
 ## Why a power cycle, and not a reset
 
