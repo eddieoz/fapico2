@@ -99,9 +99,21 @@ macro_rules! dlog_throttle {
 // Kept as its own macro rather than a `dbg::phase()` fn so the call site can
 // name a bare `P_*` constant; a fn would need `mod dbg` to exist, which is
 // not true in a production build.
+//
+// US-1304: it also drives the LED ladder, and that is a fix rather than a
+// detail. Until now this macro only wrote the CTAP-HID ring, so
+// `dbg::phase_blinks` had **no call site anywhere in the tree** — the ladder
+// the whole boot-freeze epic is built around was documented and implemented
+// but never emitted. The ring is the precise instrument and it is useless
+// here: it lives in RAM, and a device that never enumerates cannot serve it.
+// So the very failure this epic investigates had no LED output to read, which
+// is why three prior accounts of it had nothing to count. `phase_blinks`
+// no-ops until `mark_led_ready()`, which is what keeps `P_MAIN_ENTERED` safe
+// to call at the top of `main` — before the `LED_OUT` slot exists.
 macro_rules! bphase {
     ($id:expr) => {
-        dlog!(crate::dbg::T_MAIN, crate::dbg::E_PHASE, $id, 0)
+        dlog!(crate::dbg::T_MAIN, crate::dbg::E_PHASE, $id, 0);
+        crate::dbg::phase_blinks($id as u8)
     };
 }
 

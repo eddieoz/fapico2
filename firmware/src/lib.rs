@@ -86,6 +86,9 @@ pub const TASK_ARENA_DEMAND_B_STAMP: &str = "eaea5465b04bd448160d7b6ff893220dab9
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
 pub mod ccid_reasm;
+/// US-1304: the boot-phase blink ladder's level sequence (pure, host-tested;
+/// the device bin drives the pin over it).
+pub mod boot_ladder;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
