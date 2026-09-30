@@ -2,9 +2,13 @@
 
 Rust reimplementation of a YubiKey-class authenticator for the Raspberry Pi
 Pico 2 (RP2350). Not a port of the C `pico-fido2` tree, and it does **not**
-use `pico-keys-sdk` (that SDK is pinned by the C trees — `pico-fido` at
-`7b23b54`, `pico-openpgp` at `8e437f7` — and has no role here). See
-`../AGENTS.md` for the surrounding `pico/` container layout.
+use `pico-keys-sdk` — that C SDK has no role here at all.
+
+Most developers work on this inside a `pico/` workspace that checks out
+`fapico2` alongside the reference trees listed under
+[Reference implementations](#reference-implementations). Paths written as
+`../<repo>` refer to those sibling checkouts; upstream URLs are given so this
+file is also useful when reading the repository on its own.
 
 ---
 
@@ -122,14 +126,17 @@ and `oath` (6.9k) are deep; `openpgp` (887) is a thin wrapper over
 Use these as the specification of correct behaviour — they are the things
 that already work with Yubico software.
 
-- **`../pico-fido`** — the C reference for FIDO2/U2F/OTP. Authoritative for
-  the CTAP2 wire behaviour and the management applet.
-- **`../RS-Key`** — another C firmware; the origin of the `0x41` vendor
-  channel (`apps/fido/src/vendor41.rs`) that fapico2 also answers.
-- **`../picoforge`** (Rust) — the first-party management GUI. **Its wire
-  dialect is the one Yubico's own library also speaks**, so it is the best
-  executable spec for credMgmt. `src/hal/fido/{ops.rs,constants.rs}` name every
-  field; compare against those before inventing a layout.
+- **[pico-fido](https://github.com/polhenarejos/pico-fido)** (C; `../pico-fido`)
+  — the reference for FIDO2/U2F/OTP. Authoritative for the CTAP2 wire
+  behaviour and the management applet.
+- **[RS-Key](https://github.com/TheMaxMur/RS-Key)** (C; `../RS-Key`) — the origin
+  of the `0x41` vendor channel (`apps/fido/src/vendor41.rs`) that fapico2 also
+  answers.
+- **[picoforge](https://github.com/librekeys/picoforge)** (Rust; `../picoforge`)
+  — the first-party management GUI. **Its wire dialect is the one Yubico's own
+  library also speaks**, so it is the best executable spec for credMgmt:
+  `src/hal/fido/{ops.rs,constants.rs}` name every field. Compare against those
+  before inventing a layout.
 
 ---
 
@@ -138,7 +145,8 @@ that already work with Yubico software.
 ```bash
 ./build.sh                     # release UF2 for RP2350 -> firmware/fapico2.uf2
 cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
-./run_tests.sh                 # clippy + gates + pytest (needs ../pico-fido2/.test-venv)
+./run_tests.sh                 # clippy + gates + pytest (needs the ../pico-fido2/.test-venv
+                                 # interpreter; override with PICO_FIDO2_VENV=/path/to/python)
 ```
 
 `build.sh` must produce the UF2 through `firmware/uf2gen.py`. Plain
