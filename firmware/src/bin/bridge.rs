@@ -136,7 +136,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     // Stage 0 marker: LED on for ~2s then blink. If this shows, embassy init
     // and the partition read both worked. (identical to bringup)
-    let mut led = Output::new(p.PIN_25, Level::Low); // ON (active-low)
+    let mut led = Output::new(p.PIN_25, Level::High); // ON (active-high)
     Timer::after_millis(2000).await;
 
     // US-103: the real OTP chipid — the same value the store key above binds

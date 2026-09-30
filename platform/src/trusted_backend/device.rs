@@ -522,7 +522,7 @@ fn mount_ram_fs(
 // UI (activity LED)
 // ---------------------------------------------------------------------------
 
-/// Trussed UI on the activity LED (GPIO25 = [`crate::LED_PIN`], active-low
+/// Trussed UI on the activity LED (GPIO25 = [`crate::LED_PIN`], active-high
 /// on the Pico 2).
 ///
 /// The trussed service already brackets every request with
@@ -578,9 +578,9 @@ impl UserInterface for LedUi {
         // disjoint from the heartbeat task's (see the struct docs).
         let led = unsafe { &mut *self.led };
         match status {
-            // Active-low board LED: set_low = on.
-            trussed::types::ui::Status::Processing => led.set_low(),
-            _ => led.set_high(),
+            // Active-high board LED: set_high = on.
+            trussed::types::ui::Status::Processing => led.set_high(),
+            _ => led.set_low(),
         }
     }
 
@@ -614,7 +614,7 @@ impl UserInterface for LedUi {
         let led = unsafe { &mut *self.led };
         let half_ns = (duration.as_nanos() / 2) as u64;
         for _ in 0..2 {
-            led.set_low(); // on (active-low)
+            led.set_high(); // on (active-high)
             let start = Instant::now();
             while start.elapsed().as_nanos() < half_ns {}
             led.set_high();

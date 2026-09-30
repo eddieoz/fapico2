@@ -1737,7 +1737,7 @@ pub fn init_static_slot_with<T>(
     }
 }
 
-// Board LED (GPIO25, active-low on the Pico 2), owned by the 1 Hz heartbeat
+// Board LED (GPIO25, active-high on the Pico 2), owned by the 1 Hz heartbeat
 // task once it spawns. Initialized on the boot path via the write-once slot
 // discipline shared with the app statics.
 pub static mut LED_OUT: core::mem::MaybeUninit<Output<'static>> =

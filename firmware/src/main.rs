@@ -110,11 +110,24 @@ macro_rules! dlog_throttle {
 // is why three prior accounts of it had nothing to count. `phase_blinks`
 // no-ops until `mark_led_ready()`, which is what keeps `P_MAIN_ENTERED` safe
 // to call at the top of `main` — before the `LED_OUT` slot exists.
+//
+// The cfg split below is `dlog!`'s, deliberately: in a production build
+// neither arm mentions `crate::dbg::`, so `mod dbg` need not exist and the
+// shipping image carries no reference to the ladder at all — not merely an
+// unreached one. That matters more than usual for the ladder than for the
+// ring, because the ladder is not free: it costs 80 ms × Σ(phase ids) on a
+// boot that has it enabled (US-1304's timing correction — 15.2 s to reach
+// phase 19, not 1.5 s).
+#[cfg(any(feature = "dbg-log", feature = "boot-timeline"))]
 macro_rules! bphase {
     ($id:expr) => {
         dlog!(crate::dbg::T_MAIN, crate::dbg::E_PHASE, $id, 0);
         crate::dbg::phase_blinks($id as u8)
     };
+}
+#[cfg(not(any(feature = "dbg-log", feature = "boot-timeline")))]
+macro_rules! bphase {
+    ($id:expr) => {};
 }
 
 mod boot;
@@ -248,7 +261,16 @@ async fn main(spawner: Spawner) -> ! {
     // Board LED (GPIO25) for the heartbeat task + the trussed backend UI
     // (S-721-2, shared pin — see `led_heartbeat_task`): the write-once
     // slot must be initialized before either driver touches it.
-    boot::init_static_slot(core::ptr::addr_of_mut!(boot::LED_OUT), Output::new(p.PIN_25, Level::High));
+    //
+    // US-1305: this is `Level::Low`, where it was `Level::High`. GPIO25 on
+    // the Pico 2 is ACTIVE-HIGH (US-1303), so `High` meant **lit** — and
+    // nothing touched the pin again until the heartbeat task spawned hundreds
+    // of lines below. A healthy boot therefore presented a *solid LED* for its
+    // first several seconds, and so did a frozen one. "Solid LED, no USB" is
+    // the documented appearance of *not yet*, and it was also the appearance
+    // of a board dead in `fatal_boot` before USB was ever constructed.
+    // Initialising to the unlit level is what makes the boot phases legible.
+    boot::init_static_slot(core::ptr::addr_of_mut!(boot::LED_OUT), Output::new(p.PIN_25, Level::Low));
 
     // The board LED is now usable by the boot-phase markers: the write-once
     // slot above is initialized, so the flag that gates them can be set.
@@ -1115,9 +1137,9 @@ async fn led_heartbeat_task() {
     let led: &'static mut Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(boot::LED_OUT)).assume_init_mut() };
     loop {
-        led.set_low(); // ON (active-low)
+        led.set_high(); // ON (active-high)
         Timer::after_millis(500).await;
-        led.set_high(); // OFF
+        led.set_low(); // OFF
         Timer::after_millis(500).await;
     }
 }

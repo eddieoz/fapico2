@@ -276,7 +276,7 @@ pub async fn handle_dbg<'d>(
 // The LED is driven SYNCHRONOUSLY here (direct `Output` writes + a busy-wait
 // on the 1 MHz RP2350 TIMER counter) — at the early stages the async
 // executor/timers are not running yet, so a `Timer::after` would never wake.
-// The single board LED (GPIO25, active-low) is the shared heartbeat /
+// The single board LED (GPIO25, active-high) is the shared heartbeat /
 // trussed-UI pin (`boot::LED_OUT`); during the boot stages the heartbeat task
 // has not been polled yet, so the synchronous blinks own the pin.
 //
@@ -415,9 +415,9 @@ fn stage_blinks(stage: u8) {
         (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut()
     };
     for _ in 0..=stage {
-        led.set_low(); // ON (active-low)
+        led.set_high(); // ON (active-high)
         busy_wait_us(120_000);
-        led.set_high(); // OFF
+        led.set_low(); // OFF
         busy_wait_us(120_000);
     }
     busy_wait_us(500_000);

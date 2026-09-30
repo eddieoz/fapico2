@@ -523,14 +523,18 @@ _B_AGREEMENT = Break(
 
 _B_LED_POLARITY = Break(
     "platform/src/trusted_backend/device.rs",
-    "            trussed::types::ui::Status::Processing => led.set_low(),",
-    "            trussed::types::ui::Status::Processing => led.set_high(),",
-    "the trussed activity LED claims a polarity the Pico 2's GPIO25 does not "
-    "have, so the 'working' indicator shows the LED OFF while the device is "
-    "busy (US-1303/US-1305). This is the inversion that is invisible rather "
-    "than merely wrong: the code compiles, the comment above it stays "
-    "self-consistent with the line, and the only symptom is a device that "
-    "looks idle while it is not",
+    "    fn set_status(&mut self, status: trussed::types::ui::Status) {",
+    "    fn set_status(&mut self, status: trussed::types::ui::Status) {\n"
+    "        let _ = led; // US-1041 nominated break: an active-low LED claim returns\n"
+    "        // GPIO25 is active-low (active-low).",
+    "an LED site re-asserts the polarity the Pico 2's GPIO25 does not have, so "
+    "the 'working' indicator shows the LED OFF while the device is busy "
+    "(US-1303/US-1305). Re-nominated after US-1305: the original break pointed "
+    "at the Processing arm itself, which US-1305 then fixed, so it could only "
+    "ever have been demonstrated against a red baseline. The break now INSERTS "
+    "a wrong claim at a stable anchor, which is both the defect class a reader "
+    "is most likely to reintroduce and a break that stays demonstrable while "
+    "the tree is green — the state a gate has to be trustworthy in",
 )
 
 GATES: tuple[Gate, ...] = (
