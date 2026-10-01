@@ -7,6 +7,41 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # PR #2 (cargo-deps-3f020ecc6e) was reverted: these bumps cross trait
+    # generations that `trussed` 0.2 / `trussed-core` 0.2 have not moved to,
+    # so they cannot be adopted in fapico2 alone. Each entry is pinned to the
+    # exact jump that breaks, not the crate — patch and minor bumps on the
+    # current line still land normally.
+    #
+    # `rand_core` 0.6 -> 0.7+: `trussed` 0.2.0's own manifest pins
+    # `rand_core = "0.6"`, so `Rp2350Rng` (platform/src/trusted_backend/
+    # device.rs) can no longer implement `trussed::service::RngCore` — a
+    # foreign trait, not a source fix. `rand` is listed with it because
+    # rand 0.9+ depends on the same moved `rand_core`, and the openpgp
+    # host fixtures pass their `RngCore` values straight to the device
+    # twin's trait methods.
+    #
+    # The RustCrypto entries: the 0.11/0.13/0.9/0.2 generation moved to
+    # `digest` 0.11, while every crate here (platform, fido, oath, piv,
+    # openpgp) plus trussed is on the `digest` 0.10 line. `Digest` and
+    # `KeyInit` are distinct traits across those lines, so a hasher or
+    # MAC built on one no longer satisfies a bound written against the
+    # other. Unblock all of these together, when trussed does.
+    ignore:
+      - dependency-name: "rand_core"
+        versions: [">=0.7.0"]
+      - dependency-name: "rand"
+        versions: [">=0.9.0"]
+      - dependency-name: "sha2"
+        versions: [">=0.11.0"]
+      - dependency-name: "hmac"
+        versions: [">=0.13.0"]
+      - dependency-name: "hkdf"
+        versions: [">=0.13.0"]
+      - dependency-name: "aes"
+        versions: [">=0.9.0"]
+      - dependency-name: "cbc"
+        versions: [">=0.2.0"]
     groups:
       # A firmware image is a single flash budget; unrelated dependency bumps
       # each cost a slot against the 3.5 MiB ceiling, so land them together.
