@@ -431,6 +431,16 @@ fn the_compiled_pin_follows_the_board_file_end_to_end() {
             .lines()
             .filter_map(|l| l.split("Running `").nth(1))
             .filter_map(|l| l.split('`').next())
+            // Only *this crate's* build script. `find` over the bare
+            // `build-script-build` suffix took the first match, which on a
+            // cold target directory is whichever dependency happened to run
+            // its script first — CI handed back serde_core's, and the test
+            // then asserted against serde's `cargo:` stream. Warm local
+            // target dirs hid it, because the platform's script is usually
+            // the only one re-running. The unit directory is
+            // `<target>/…/build/fapico2-platform-<hash>/build-script-build`,
+            // so the package name is what distinguishes them.
+            .filter(|p| p.ends_with("build-script-build") && p.contains("fapico2-platform-"))
             .find(|p| p.ends_with("build-script-build"))
             .unwrap_or_else(|| {
                 panic!(
