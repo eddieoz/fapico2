@@ -334,7 +334,8 @@ jobs:
           set -uo pipefail
           if ! python3 tests/scripts/check_artefact_agreement.py \
                --artifacts dist \
-               --attestation dist/provenance.json; then
+               --attestation dist/provenance.json \
+               --expected-commit "$GITHUB_SHA"; then
             echo "::error::The released UF2, its SBOM and its provenance attestation do not agree. Refusing to publish (US-1064)."
             exit 1
           fi

@@ -126,6 +126,7 @@ def sbom_image_digest(sbom: dict) -> str:
 
 def check_agreement(artifacts: Path, statement: dict, issuer: str | None,
                     cosign: str | None, expected_workflow: str = EXPECTED_WORKFLOW,
+                    expected_commit: str = "",
                     expected_repo: str = EXPECTED_REPO) -> list[str]:
     """Return a list of notes; raise Refusal on the first broken rule."""
     notes: list[str] = []
@@ -176,15 +177,37 @@ def check_agreement(artifacts: Path, statement: dict, issuer: str | None,
             )
     deps = statement.get("predicate", {}).get("buildDefinition", {}).get(
         "resolvedDependencies", []) or []
-    dep_digests = {(d.get("digest") or {}).get("sha256") for d in deps}
-    if actual not in dep_digests:
-        raise Refusal(
-            f"the attestation's resolvedDependencies do not carry the UF2's "
-            f"digest ({actual}). Subject and dependency list disagree, so the "
-            f"statement does not describe one build."
-        )
-    notes.append("the attestation's subject and dependency list both carry "
-                 "that digest")
+    if expected_commit:
+        # Same correction as US-1063's P5, and for the same reason: SLSA
+        # provenance lists the SOURCE in resolvedDependencies and the output
+        # in subject, so requiring the artefact to appear as its own
+        # dependency is a property the format does not have and no real
+        # attestation can satisfy. What is worth checking — and is stronger —
+        # is that the statement names the commit this artefact was built
+        # from, which is what makes it a statement about THIS build.
+        commits = {(d.get("digest") or {}).get("gitCommit") for d in deps}
+        if expected_commit not in commits:
+            raise Refusal(
+                f"the attestation does not name the commit this release was "
+                f"built from ({expected_commit}); it names "
+                f"{sorted(c for c in commits if c)}.\n"
+                f"  The subject digest matches the UF2, but a statement naming "
+                f"a different source is a statement about a different build."
+            )
+        notes.append(f"the attestation's subject carries the UF2 digest and "
+                     f"names the built commit {expected_commit[:8]}")
+    else:
+        # Fixture path: no commit is known, so the original dependency-list
+        # check stands, and the committed negative controls still exercise it.
+        dep_digests = {(d.get("digest") or {}).get("sha256") for d in deps}
+        if actual not in dep_digests:
+            raise Refusal(
+                f"the attestation's resolvedDependencies do not carry the "
+                f"UF2's digest ({actual}). Subject and dependency list "
+                f"disagree, so the statement does not describe one build."
+            )
+        notes.append("the attestation's subject and dependency list both carry "
+                     "that digest")
 
     # A4 — the signature, if there is a cosign to ask.
     if cosign is None:
@@ -255,6 +278,37 @@ def self_test() -> list[str]:
             problems.append(
                 f"the fixture release directory should have been ACCEPTED and "
                 f"was refused: {exc}")
+
+        # A3 on the release path: the attestation must name the commit the
+        # artefact was built from. The fixture's provenance.json carries a
+        # gitCommit, so make it nameable, then require the right one and
+        # refuse the wrong one. Without this the new branch has no coverage —
+        # which is how the rule it replaced stayed wrong for so long.
+        by_commit = Path(tmp) / "by-commit"
+        _materialise(by_commit, mutate_uf2=False)
+        doc = load_json(_fixture("provenance.json"))
+        real = "3" * 40
+        deps = doc.get("predicate", {}).get("buildDefinition", {}).get(
+            "resolvedDependencies", []) or []
+        for dep in deps:
+            if "gitCommit" in (dep.get("digest") or {}):
+                dep["digest"]["gitCommit"] = real
+        try:
+            check_agreement(by_commit, doc,
+                            "https://token.actions.githubusercontent.com", None,
+                            expected_commit=real)
+        except Refusal as exc:
+            problems.append(
+                f"an attestation naming the built commit was refused: {exc}")
+        try:
+            check_agreement(by_commit, doc,
+                            "https://token.actions.githubusercontent.com", None,
+                            expected_commit="4" * 40)
+            problems.append(
+                "an attestation naming the WRONG commit was accepted; that is "
+                "a statement about a different build")
+        except Refusal:
+            pass
 
         # The story's red: mutate the UF2 after signing. The SBOM's recorded
         # digest is REWRITTEN to match, deliberately: otherwise the SBOM check
@@ -355,6 +409,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--artifacts", help="the release artefact directory")
     ap.add_argument("--attestation", help="the provenance statement (json/jsonl)")
     ap.add_argument("--certificate", help="the signing certificate (PEM)")
+    ap.add_argument("--expected-commit", default="",
+                    help="the commit this release was built from; the "
+                         "attestation must name it in resolvedDependencies.")
     ap.add_argument("--expected-repo", default=EXPECTED_REPO,
                     help="owner/name of the repository a release of this "
                          "project may be built from (default: %(default)s)")
@@ -404,7 +461,8 @@ def main(argv: list[str]) -> int:
     print(f"US-1064 artefact agreement — {artifacts}")
     try:
         for note in check_agreement(artifacts, statement, issuer, cosign,
-                                    expected_repo=args.expected_repo):
+                                    expected_repo=args.expected_repo,
+                                    expected_commit=args.expected_commit):
             print(f"  {note}")
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
