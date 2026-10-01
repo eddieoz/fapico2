@@ -16,7 +16,7 @@ publish = false
 # `fapico2-platform/device` from this crate's `device` feature below, and the
 # host test build gets `host-backend` from the dev-dependency.
 fapico2-platform = { path = "../../platform", default-features = false }
-heapless = "0.9"
+heapless = "0.8"
 heapless09 = { package = "heapless", version = "0.9" }
 iso7816 = "0.2.0"
 # S-721-2: one vendored opcard crate, optional, plain (no_std). The `virt`
@@ -48,12 +48,12 @@ zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
 test-log = "0.2"
-ed25519-dalek = "3"
-x25519-dalek = { version = "3", features = ["static_secrets"] }
-p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 # S-724: secp256k1 verification/agreement fixtures for the device- and
 # virt-path tests (host only — dev-deps never enter the device binary).
-k256 = { version = "0.14.0", features = ["ecdsa", "ecdh"] }
+k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
 # US-946: Brainpool verification/agreement fixtures for the device- and
 # virt-path tests (host only — dev-deps never enter the device binary).
 # Same crates the US-944 `trussed-brainpool` backend rides (elliptic-curve
@@ -69,30 +69,30 @@ elliptic-curve = { version = "0.14", features = ["ecdh", "sec1"] }
 # types (`Signature`/`VerifyingKey` + `PrehashVerifier`) come straight from the
 # same ecdsa 0.17 the bp* crates ride.
 ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "der", "digest"] }
-sha2 = "0.11"
+sha2 = "0.10"
 # US-972: the host-side reference v4 fingerprint in `tests/do_c5_fingerprint.rs`
 # — that test computes what GnuPG would put in DO C5 and compares it against
 # what the card stored. `sha1` 0.10 is already in the workspace lock via
 # apps/fido and apps/oath, so this pulls no new crate into any build.
 # Host only — dev-deps never enter the device binary.
-sha1 = "0.11"
-hex-literal = "1.1"
+sha1 = "0.10"
+hex-literal = "0.4"
 # US-940: deterministic RSA-2048 test-key generation (host-side, seeded rng)
 # and PKCS#1 v1.5 public-key verification of the PSO:SIGN signatures the
 # card returns. Host only — dev-deps never enter the device binary.
 rsa = "0.9"
-rand = "0.10"
+rand = "0.8"
 # US-941: host-side AES-256 block decryption to compute the exact expected
 # plaintext of the AES decipher route (SM routing guard, `0x02` prefix).
 # Host only — dev-deps never enter the device binary.
-aes = "0.9"
+aes = "0.8"
 zeroize = { version = "1", default-features = false }
 # US-1006: `tests/rng_stall.rs` calls `RngCore::try_fill_bytes` on the host
 # backend's RNG twin directly, to pin that a refused entropy draw is really
 # an `Err` and leaves the buffer untouched. Same pin (0.6) the platform
 # declares, so no second `rand_core` enters the lock. Host only — dev-deps
 # never enter the device binary.
-rand_core = "0.10"
+rand_core = "0.6"
 # US-962 (I2): `virt` alone — the advertisement features come from this
 # crate's `rsa-backend` / `secp256k1-backend` / `brainpool-backend`, so a
 # reduced test build really does have no backends to advertise.

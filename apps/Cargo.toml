@@ -43,7 +43,7 @@ device = []
 piv = ["fapico2-mgmt/piv"]
 
 [dev-dependencies]
-heapless = "0.9"
+heapless = "0.8"
 # US-182 (PICOForge-COMPAT): the per-applet status-word sweep covers PIV, the
 # seventh CCID app. `PivApp` is a **normal dependency of the emulation binary
 # only** (`firmware/src/emul_main.rs`), never of the device firmware, so it is
@@ -62,5 +62,5 @@ fapico2-piv = { path = "piv" }
 # the same reason `apps/oath` carries a `pbkdf2` dev-dependency: the test must
 # be able to *mirror the reference client* rather than assert against the
 # applet's own constants. dev-dependencies never enter the firmware binary.
-hmac = { version = "0.13", default-features = false }
-sha1 = { version = "0.11", default-features = false }
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }

@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-heapless = "0.9"
+heapless = "0.8"
 libc = { version = "0.2", optional = true }
 
 # US-181 (PICOForge-COMPAT): the receive-side command-chain accumulator
@@ -59,13 +59,13 @@ trussed-staging = { version = "0.5", features = ["chunked", "wrap-key-to-file"] 
 trussed-wrap-key-to-file = "0.3"
 littlefs2 = { version = "0.8", default-features = false }
 littlefs2-core = "0.1"
-rand_core = "0.10"
+rand_core = "0.6"
 
 # C-firmware migration crypto (US-413 S-413-4). RustCrypto stack, no_std,
 # no-heap: mirrors mbedtls SHA-256 / HKDF / HMAC / AES-CBC / AES-GCM exactly.
-sha2 = { version = "0.11", default-features = false }
-hkdf = { version = "0.13", default-features = false }
-hmac = { version = "0.13", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+hmac = { version = "0.12", default-features = false }
 # US-1070: the `digest` traits behind `platform::sha512`'s rolled compression.
 # Not a new crate in `Cargo.lock` — `sha2 0.10` already resolves to
 # `digest 0.10.7` and every RustCrypto stack here is on that generation. It is
@@ -78,8 +78,8 @@ hmac = { version = "0.13", default-features = false }
 # in through the `block-buffer` half of the default set, so it is named
 # explicitly here rather than relied upon.
 digest = { version = "0.10", default-features = false, features = ["core-api"] }
-aes = { version = "0.9", default-features = false }
-cbc = { version = "0.2", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 subtle = { version = "2", default-features = false }
 zeroize = { version = "1", default-features = false }
@@ -102,7 +102,7 @@ iso7816 = "0.2.0"
 # new crate to `Cargo.lock`. The generic bounds in that test are written
 # against `sha2::digest`'s re-export, which is what keeps the harness
 # implementation-agnostic: it names no particular hasher type of its own.
-sha2 = { version = "0.11", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [features]
 # `host-backend` rides the default so the platform's own seam tests
