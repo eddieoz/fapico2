@@ -47,13 +47,13 @@ device = [
 # TRNG-backed adapter.
 fapico2-platform = { path = "../../platform" }
 rand_core = "0.6"
-heapless = "0.8"
+heapless = "0.9"
 # Always on (no_std-safe): the device shell derives its persistent P-256
 # key-agreement key (hkey) with these. `default-features = false` is
 # load-bearing: p256's defaults enable `std` + `pem`, which break the
 # thumbv8m build (`extern crate std` / getrandom std).
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "ecdh"] }
-elliptic-curve = "0.13"
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "ecdh"] }
+elliptic-curve = "0.14"
 ecdsa = { version = "0.16", features = ["signing", "verifying"] }
 
 # RFC 8439 ChaCha20-Poly1305, for the RS-Key `0x41` backup / soft-lock /
@@ -68,7 +68,7 @@ ecdsa = { version = "0.16", features = ["signing", "verifying"] }
 # security applet is a review liability, not a redundancy win. The wire format
 # is dictated by the client (`picoforge/src/hal/fido/backup.rs:51, 61-78`),
 # so there is no cipher agility to trade against it.
-chacha20poly1305 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false }
 
 # Host-only crypto (optional; enabled by the `host` feature).
 sha2 = { version = "0.10", optional = true, default-features = false }
@@ -76,17 +76,17 @@ hmac = { version = "0.12", optional = true, default-features = false }
 hkdf = { version = "0.12", optional = true, default-features = false }
 aes = { version = "0.8", optional = true, default-features = false }
 cbc = { version = "0.1", optional = true, features = ["block-padding"] }
-cipher = { version = "0.4", optional = true }
+cipher = { version = "0.5", optional = true }
 x448 = { version = "0.6", optional = true, default-features = false }
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "heapless"] }
-sha1 = { version = "0.10", optional = true }
-p384 = { version = "0.13", optional = true }
-p521 = { version = "0.13", optional = true }
-ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+sha1 = { version = "0.11", optional = true }
+p384 = { version = "0.14", optional = true }
+p521 = { version = "0.14", optional = true }
+ed25519-dalek = { version = "3", optional = true, features = ["rand_core"] }
 
 [dev-dependencies]
 serde_cbor = "0.11"
-hex-literal = "0.4"
+hex-literal = "1.1"
 
 # The integration suite drives the full host stack (app/keystore/cbor/hid/
 # ctap2), so it is skipped when the `host` feature is off (e.g. a

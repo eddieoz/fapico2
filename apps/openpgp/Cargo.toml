@@ -16,7 +16,7 @@ publish = false
 # `fapico2-platform/device` from this crate's `device` feature below, and the
 # host test build gets `host-backend` from the dev-dependency.
 fapico2-platform = { path = "../../platform", default-features = false }
-heapless = "0.8"
+heapless = "0.9"
 heapless09 = { package = "heapless", version = "0.9" }
 iso7816 = "0.2.0"
 # S-721-2: one vendored opcard crate, optional, plain (no_std). The `virt`
@@ -48,12 +48,12 @@ zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
 test-log = "0.2"
-ed25519-dalek = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+ed25519-dalek = "3"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
 # S-724: secp256k1 verification/agreement fixtures for the device- and
 # virt-path tests (host only — dev-deps never enter the device binary).
-k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
+k256 = { version = "0.14.0", features = ["ecdsa", "ecdh"] }
 # US-946: Brainpool verification/agreement fixtures for the device- and
 # virt-path tests (host only — dev-deps never enter the device binary).
 # Same crates the US-944 `trussed-brainpool` backend rides (elliptic-curve
@@ -75,8 +75,8 @@ sha2 = "0.10"
 # what the card stored. `sha1` 0.10 is already in the workspace lock via
 # apps/fido and apps/oath, so this pulls no new crate into any build.
 # Host only — dev-deps never enter the device binary.
-sha1 = "0.10"
-hex-literal = "0.4"
+sha1 = "0.11"
+hex-literal = "1.1"
 # US-940: deterministic RSA-2048 test-key generation (host-side, seeded rng)
 # and PKCS#1 v1.5 public-key verification of the PSO:SIGN signatures the
 # card returns. Host only — dev-deps never enter the device binary.

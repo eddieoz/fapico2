@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-heapless = "0.8"
+heapless = "0.9"
 libc = { version = "0.2", optional = true }
 
 # US-181 (PICOForge-COMPAT): the receive-side command-chain accumulator

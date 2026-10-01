@@ -12,12 +12,12 @@ publish = false
 # target. The host build only ever uses the no_std core APIs (Hmac/Digest).
 fapico2-platform = { path = "../../platform" }
 hmac = { version = "0.12", default-features = false }
-sha1 = { version = "0.10", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 # AES-128 single-block ECB for the Yubico AES challenge-response (US-712);
 # no_std core, same pin as the platform/piv crates.
 aes = { version = "0.8", default-features = false }
-heapless = "0.8"
+heapless = "0.9"
 # US-1030: the OATH credential-key unseal scratch is zeroized on both the
 # success and the AEAD-failure path, so a plaintext key does not outlive the
 # record it produced in the boot frame. no_std core, same as the platform's.
@@ -35,7 +35,7 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 # US-1030: the C-migration acceptance tests build a C-format stream with a
 # literal OTP row, the same way `apps/openpgp/tests/migration_restore.rs`
 # does. A dev-dependency only; the device build never sees it.
-hex-literal = "0.4"
+hex-literal = "1.1"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha1"] }
 
 [features]

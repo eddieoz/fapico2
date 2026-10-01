@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 fapico2-platform = { path = "../../platform" }
-heapless = "0.8"
+heapless = "0.9"
 
 # US-711 host tests: the factory-reset fixture drives the real FIDO keystore
 # and OATH app reset primitives against the same store (dev-only — the
