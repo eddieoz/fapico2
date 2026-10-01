@@ -219,8 +219,33 @@ jobs:
           # published, or the release is refused. This is the US-1062 red.
           python3 tests/scripts/check_sbom.py --artifacts dist
 
+      # cosign is PINNED to the last v2 release, deliberately. The installer
+      # defaults to the latest release, which is now v3, and v3 changed the
+      # `sign-blob` output contract: `--output-signature` and
+      # `--output-certificate` are DEPRECATED there and are silently IGNORED
+      # while `--new-bundle-format` is on (the v3 default), so a v3 run accepts
+      # those two flags with a deprecation notice and then fails trying to
+      # write a bundle whose path is empty —
+      #
+      #     Error: signing dist/fapico2.uf2: create bundle file: open :
+      #            no such file or directory
+      #
+      # which is what the third dry run did. v3 also refuses to produce the
+      # split signature/certificate pair at all (`--new-bundle-format=false`
+      # then demands `--bundle`), so adopting v3 is not a flag change: it
+      # replaces the `.sig` + `.pem` contract that BOTH gates
+      # (check_artefact_agreement's A4, and the certificate that
+      # check_release_provenance reads the Fulcio issuer out of) are written
+      # against.
+      #
+      # v2.6.1 is the last v2 and was verified locally to honour both flags.
+      # Lifting this pin means migrating both gates to `verify-blob --bundle`
+      # and extracting the Fulcio certificate from the bundle, which is a
+      # deliberate piece of work — not a version bump.
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.1
       - name: "Sign the UF2 — keyless, via the GitHub Actions OIDC token"
         working-directory: fapico2
         run: |
