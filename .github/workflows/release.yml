@@ -321,6 +321,7 @@ jobs:
                --attestation dist/provenance.json \
                --subject dist/fapico2.uf2 \
                --unsigned \
+               --expected-commit "$GITHUB_SHA" \
                --expected-workflow .github/workflows/release.yml; then
             echo "::error::The build-provenance attestation was refused: it does not name this reusable release workflow, or its subject digest is not this UF2 (US-1063)."
             exit 1

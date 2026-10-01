@@ -128,7 +128,8 @@ def _workflow_parts(builder_id: str) -> tuple[str, str]:
 
 def check_provenance(statement: dict, subject: bytes, issuer: str | None,
                      expected_workflow: str, expected_repo: str = REPO,
-                     unsigned_ok: bool = False, notes: list[str] | None = None) -> None:
+                     unsigned_ok: bool = False, notes: list[str] | None = None,
+                     expected_commit: str = "") -> None:
     """Raise Refusal unless the attestation is acceptable. No return value.
 
     Split out from `main` so the fixtures and a real release go through the
@@ -204,7 +205,16 @@ def check_provenance(statement: dict, subject: bytes, issuer: str | None,
             f"not internally consistent and neither half can be believed."
         )
 
-    # P5 — the attestation is about THIS artefact.
+    # P5 — the attestation is about THIS artefact, built from THIS source.
+    #
+    # Two halves. The subject digest must be the artefact's, and — on the
+    # release path, where the caller knows the commit — the statement must
+    # name that commit. The second half replaced a rule that required the
+    # ARTEFACT to appear in `resolvedDependencies`, which is not a property
+    # SLSA provenance has: it lists the SOURCE there and the output in
+    # `subject`. No real attestation could satisfy it; the fixture could
+    # only because the entry was hand-added to fit the rule. See the branch
+    # below for the property it actually protects.
     actual = hashlib.sha256(subject).hexdigest()
     subjects = statement.get("subject") or []
     if not subjects:
@@ -221,13 +231,43 @@ def check_provenance(statement: dict, subject: bytes, issuer: str | None,
                 f"to something else."
             )
     deps = build.get("resolvedDependencies") or []
-    dep_digests = {(d.get("digest") or {}).get("sha256") for d in deps}
-    if actual not in dep_digests:
-        raise Refusal(
-            f"no resolvedDependency in the attestation carries the artefact's "
-            f"sha256 ({actual}). The subject and the dependency list disagree, "
-            f"so the statement does not describe a single build."
-        )
+    if expected_commit:
+        # P5, release path. The property this rule is FOR is "this statement
+        # describes this one build of this one source". SLSA provenance puts
+        # the source in `resolvedDependencies`, and the subject in
+        # `subject`; requiring the artefact to appear as its own dependency —
+        # which is what this rule used to do — is not a property the format
+        # has, so a real `actions/attest-build-provenance` statement can
+        # never satisfy it. (The committed fixture could, because the entry
+        # was hand-added to satisfy it. That is the trap: a fixture shaped to
+        # the rule rather than to reality tests nothing about reality.)
+        #
+        # So the release path checks the real thing instead, and it is the
+        # stronger of the two: the attestation must name the exact commit
+        # this run built from. That is what binds these bytes to this tag,
+        # which is the claim the whole release rests on and the one
+        # `--verify-tag` alone cannot make.
+        commits = {(d.get("digest") or {}).get("gitCommit") for d in deps}
+        if expected_commit not in commits:
+            raise Refusal(
+                f"the attestation does not name the commit this release was "
+                f"built from ({expected_commit}); its resolvedDependencies name "
+                f"{sorted(c for c in commits if c)}.\n"
+                f"  The subject digest matches the artefact, but a statement "
+                f"that names a different source is a statement about a "
+                f"different build."
+            )
+    else:
+        # P5, fixture path. Kept so the committed negative controls still
+        # exercise something, and so CI does not need a commit to know.
+        dep_digests = {(d.get("digest") or {}).get("sha256") for d in deps}
+        if actual not in dep_digests:
+            raise Refusal(
+                f"no resolvedDependency in the attestation carries the "
+                f"artefact's sha256 ({actual}). The subject and the dependency "
+                f"list disagree, so the statement does not describe a single "
+                f"build."
+            )
 
 
 def self_test(expected_workflow: str, expected_repo: str = REPO) -> list[str]:
@@ -276,6 +316,28 @@ def self_test(expected_workflow: str, expected_repo: str = REPO) -> list[str]:
     if not any("NOT CHECKED" in n for n in notes):
         problems.append("--unsigned passed without reporting that P2 was not "
                         "checked; a dropped signature check has to be visible")
+    # P5 on the release path: the attestation must name the commit this
+    # release was built from. good.json carries a zero gitCommit, so that is
+    # the one it can be made to name; the wrong commit must be refused.
+    good = json.loads((FIXTURES / "good.json").read_text(encoding="utf-8"))
+    deps = good["predicate"]["buildDefinition"]["resolvedDependencies"]
+    real = "1" * 40
+    for dep in deps:
+        if "gitCommit" in (dep.get("digest") or {}):
+            dep["digest"]["gitCommit"] = real
+    try:
+        check_provenance(good, subject, issuer, expected_workflow, expected_repo,
+                         expected_commit=real)
+    except Refusal as exc:
+        problems.append(f"an attestation naming the built commit was refused: {exc}")
+    try:
+        check_provenance(good, subject, issuer, expected_workflow, expected_repo,
+                         expected_commit="2" * 40)
+        problems.append("an attestation naming the WRONG commit was accepted; "
+                        "that is a statement about a different build")
+    except Refusal:
+        pass
+
     # And it must not suppress a real issuer check: a certificate that IS
     # present is still compared against the OIDC issuer, flag or no flag.
     try:
@@ -298,6 +360,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--expected-repo", default=REPO,
                     help="owner/name of the repository a release of this "
                          "project may be built from (default: %(default)s)")
+    ap.add_argument("--expected-commit", default="",
+                    help="the commit this release was built from; the "
+                         "attestation must name it in resolvedDependencies. "
+                         "Omitted on the fixture path, where no commit is known.")
     ap.add_argument("--unsigned", action="store_true",
                     help="this release is not cosign-signed, so P2 (the "
                          "signer's OIDC issuer) cannot be checked. Honoured "
@@ -344,7 +410,8 @@ def main(argv: list[str]) -> int:
     notes: list[str] = []
     try:
         check_provenance(statement, subject, issuer, args.expected_workflow,
-                         args.expected_repo, args.unsigned, notes)
+                         args.expected_repo, args.unsigned, notes,
+                         args.expected_commit)
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
         # P2's "no signing certificate was supplied" is ambiguous on its own:
