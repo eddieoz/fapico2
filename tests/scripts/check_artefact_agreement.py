@@ -408,6 +408,12 @@ def main(argv: list[str]) -> int:
             print(f"  {note}")
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
+        # Same reason as the provenance gate: an "issuer unknown" refusal is
+        # ambiguous between a missing file and an unrecognised rendering, and
+        # the release path cannot afford to be told only that.
+        if issuer is None and args.certificate:
+            print(certinfo.format_explanation(
+                certinfo.explain(Path(args.certificate))))
         print("\nRESULT: FAIL")
         return 1
     print("\nRESULT: PASS")

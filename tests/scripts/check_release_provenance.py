@@ -302,6 +302,13 @@ def main(argv: list[str]) -> int:
                          args.expected_repo)
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
+        # P2's "no signing certificate was supplied" is ambiguous on its own:
+        # it reads the same whether the file is missing, is empty, is not a
+        # PEM, or was rendered in a form this did not recognise. Two dry runs
+        # were spent telling those apart from the outside. Say what was seen.
+        if issuer is None and args.certificate:
+            print(certinfo.format_explanation(
+                certinfo.explain(Path(args.certificate))))
         print("\nRESULT: FAIL")
         return 1
     print("  ACCEPTED")

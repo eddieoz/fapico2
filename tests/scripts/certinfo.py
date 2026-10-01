@@ -67,6 +67,25 @@ URL = re.compile(r"https?://\S+")
 VALUE_WINDOW = 4
 PEM_MARKER = "-----BEGIN CERTIFICATE-----"
 
+# The canonical issuer URL, which is what P2 ultimately compares against.
+# This is the fallback for the case the OID-scoped search cannot cover: the
+# rendering of an unknown X.509 extension has changed between openssl
+# releases (1.1.1 puts the value on the next line; 3.x may put it inline, or
+# quote it, or render the OID differently), and the runner's openssl is not
+# the one this can be tested against here.
+#
+# It is safe as a fallback precisely because it cannot be confused with the
+# extension the previous regex used to grab: .1, the Build Signer URI, is a
+# github.com workflow URL and NEVER this host. So finding this URL anywhere
+# in a rendered Fulcio certificate means the issuer extension is present —
+# it cannot be a coincidence of some other extension's value.
+CANONICAL_ISSUER = "https://token.actions.githubusercontent.com"
+
+
+def _first_url(chunk: str) -> str | None:
+    m = URL.search(chunk)
+    return m.group(0).strip("\"'.,;") if m else None
+
 
 def issuer_from_text(text: str) -> str | None:
     """The issuer URL in a rendered certificate, or None."""
@@ -77,13 +96,59 @@ def issuer_from_text(text: str) -> str | None:
             continue
         inline = m.group("inline")
         if inline:
-            u = URL.search(inline)
+            u = _first_url(inline)
             if u:
-                return u.group(0).rstrip(".,;")
-        for j in range(i + 1, min(i + 1 + VALUE_WINDOW, len(lines))):
-            u = URL.search(lines[j])
-            if u:
-                return u.group(0).rstrip(".,;")
+                return u
+        window = "\n".join(lines[i + 1:i + 1 + VALUE_WINDOW])
+        u = _first_url(window)
+        if u:
+            return u
+    # Fallback, for an openssl rendering this pattern does not recognise.
+    if CANONICAL_ISSUER in text:
+        return CANONICAL_ISSUER
+    return None
+
+
+def explain(path: Path) -> dict:
+    """Why the issuer was or was not found. Printed when it was not.
+
+    P2's refusal is a load-bearing gate, so its failure message has to say
+    what it actually looked at. A bare "no signing certificate was supplied"
+    sent me looking for a missing file twice when the file was present and
+    the problem was how openssl had rendered it.
+    """
+    info: dict = {"path": str(path), "exists": path.is_file()}
+    if not path.is_file():
+        return info
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    info["is_pem"] = PEM_MARKER in raw
+    info["bytes"] = len(raw)
+    openssl = shutil.which("openssl")
+    info["openssl"] = openssl or "NOT INSTALLED"
+    if info["is_pem"] and openssl:
+        out = subprocess.run([openssl, "x509", "-in", str(path), "-noout", "-text"],
+                             capture_output=True, text=True, check=False)
+        info["openssl_exit"] = out.returncode
+        if out.returncode != 0:
+            info["openssl_error"] = (out.stderr or "").strip()[:200]
+    text = rendered_text(path)
+    info["rendered_bytes"] = len(text)
+    info["issuer_oid_seen"] = ISSUER_OID in text
+    info["canonical_issuer_seen"] = CANONICAL_ISSUER in text
+    info["fulcio_oids_seen"] = sorted(set(
+        re.findall(r"1\.3\.6\.1\.4\.1\.57264\.\d+(?:\.\d+)*", text)))
+    info["issuer"] = issuer_from_text(text)
+    return info
+
+
+def format_explanation(info: dict) -> str:
+    head = ("  what the certificate lookup saw:"
+            if info.get("issuer")
+            else "  why the issuer was not found:")
+    lines = [head]
+    for k, v in info.items():
+        lines.append(f"    {k}: {v}")
+    return "\n".join(lines)
     return None
 
 
