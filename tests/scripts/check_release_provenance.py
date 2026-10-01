@@ -127,7 +127,8 @@ def _workflow_parts(builder_id: str) -> tuple[str, str]:
 
 
 def check_provenance(statement: dict, subject: bytes, issuer: str | None,
-                     expected_workflow: str, expected_repo: str = REPO) -> None:
+                     expected_workflow: str, expected_repo: str = REPO,
+                     unsigned_ok: bool = False, notes: list[str] | None = None) -> None:
     """Raise Refusal unless the attestation is acceptable. No return value.
 
     Split out from `main` so the fixtures and a real release go through the
@@ -143,13 +144,26 @@ def check_provenance(statement: dict, subject: bytes, issuer: str | None,
         )
 
     # P2 — signed by GitHub Actions' identity provider.
+    #
+    # `--unsigned` is the escape hatch, and it is an ESCAPE HATCH rather than
+    # a relaxation: it is only honoured when no certificate was supplied at
+    # all, it says so out loud, and a gate invoked WITHOUT it behaves exactly
+    # as before. That asymmetry is the point — a release that silently lost
+    # its signature check would be indistinguishable from one that never had
+    # one, and "P2 was not checked" has to be something a reader can see in
+    # the run log rather than infer from a missing line.
     if issuer is None:
-        raise Refusal(
-            "no signing certificate was supplied, so the OIDC issuer cannot be "
-            "checked. Refusing rather than assuming: an attestation whose "
-            "signer is unknown is not evidence of anything."
-        )
-    if issuer.rstrip("/") != GITHUB_OIDC_ISSUER:
+        if not unsigned_ok:
+            raise Refusal(
+                "no signing certificate was supplied, so the OIDC issuer cannot "
+                "be checked. Refusing rather than assuming: an attestation "
+                "whose signer is unknown is not evidence of anything."
+            )
+        (notes if notes is not None else []).append(
+            "P2 NOT CHECKED (--unsigned): this release is NOT cosign-signed. "
+            "The attestation's signer is unverified here. The trust anchor is "
+            "the GPG-signed tag, not this attestation.")
+    elif issuer.rstrip("/") != GITHUB_OIDC_ISSUER:
         raise Refusal(
             f"the signing certificate's OIDC issuer is {issuer!r}, expected "
             f"{GITHUB_OIDC_ISSUER!r}. The identity that produced this artefact "
@@ -248,6 +262,30 @@ def self_test(expected_workflow: str, expected_repo: str = REPO) -> list[str]:
                         "certificate; an unknown signer is not evidence")
     except Refusal:
         pass
+
+    # The escape hatch must be narrow and loud. It has to permit the release
+    # AND say that P2 was not checked — a gate that quietly stopped checking
+    # the signer is worse than one that refuses, because nobody can see that
+    # the check is gone.
+    notes: list[str] = []
+    try:
+        check_provenance(doc, subject, None, expected_workflow, expected_repo,
+                         unsigned_ok=True, notes=notes)
+    except Refusal as exc:
+        problems.append(f"--unsigned did not permit an unsigned release: {exc}")
+    if not any("NOT CHECKED" in n for n in notes):
+        problems.append("--unsigned passed without reporting that P2 was not "
+                        "checked; a dropped signature check has to be visible")
+    # And it must not suppress a real issuer check: a certificate that IS
+    # present is still compared against the OIDC issuer, flag or no flag.
+    try:
+        check_provenance(doc, subject, "https://example.invalid/",
+                         expected_workflow, expected_repo,
+                         unsigned_ok=True, notes=[])
+        problems.append("--unsigned suppressed the issuer comparison for a "
+                        "certificate that names the wrong OIDC issuer")
+    except Refusal:
+        pass
     return problems
 
 
@@ -260,6 +298,12 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--expected-repo", default=REPO,
                     help="owner/name of the repository a release of this "
                          "project may be built from (default: %(default)s)")
+    ap.add_argument("--unsigned", action="store_true",
+                    help="this release is not cosign-signed, so P2 (the "
+                         "signer's OIDC issuer) cannot be checked. Honoured "
+                         "ONLY when no --certificate is given, and reported "
+                         "loudly. Without this flag a missing certificate is "
+                         "still a refusal.")
     args = ap.parse_args(argv[1:])
 
     if not (args.attestation and args.subject):
@@ -297,9 +341,10 @@ def main(argv: list[str]) -> int:
         # certificate. See tests/scripts/certinfo.py.
         issuer = certinfo.issuer(Path(args.certificate))
     print(f"US-1063 provenance policy — {args.attestation}")
+    notes: list[str] = []
     try:
         check_provenance(statement, subject, issuer, args.expected_workflow,
-                         args.expected_repo)
+                         args.expected_repo, args.unsigned, notes)
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
         # P2's "no signing certificate was supplied" is ambiguous on its own:
@@ -312,6 +357,8 @@ def main(argv: list[str]) -> int:
         print("\nRESULT: FAIL")
         return 1
     print("  ACCEPTED")
+    for note in notes:
+        print(f"  WARNING: {note}")
     print("\nRESULT: PASS")
     return 0
 

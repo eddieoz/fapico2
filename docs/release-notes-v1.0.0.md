@@ -16,14 +16,27 @@ tag builds. The numbers above are the image the release workflow builds and
 publishes; `docs/size-report.md` is the authority and is enforced on every
 push.
 
-**Verifying a download.** The Release carries the UF2, its cosign signature
-and certificate, the SBOM, the build-provenance attestation, and a
-`release-manifest.json` naming the tag, the commit and the digest of every
-one of those files — signed by the same keyless identity. The tag itself is
-GPG-signed, so a release is checked end to end as: the tag signature says a
-maintainer cut this version, the manifest says these assets are that tag's,
-and the per-file signatures say GitHub Actions built them from this
-repository.
+**Verifying a download.** The tag is **GPG-signed** by a maintainer, and
+that is the trust anchor for this release. The Release carries the UF2, the
+SBOM, the build-provenance attestation, and a `release-manifest.json` naming
+the tag, the commit and the digest of each asset. So the check is: confirm
+the tag's signature, read the manifest, and every asset is pinned to that one
+version.
+
+**What this release is not.** The artefacts are **not** cosign-signed. The
+keyless signing path is deferred: cosign reports writing a Fulcio
+certificate and writes something the verification gates cannot read, and a
+keyless signature cannot be reproduced outside GitHub Actions to diagnose
+it. Shipping a signature check that had never passed was the worse option,
+so the signing steps were removed and the omission recorded in the workflow.
+Restoring them is a small, deliberate change, and the gates are unchanged —
+they will enforce the signature again the moment they can.
+
+Note the two are different questions, and only the first is answered here.
+The tag signature says **a person decided this is v1.0.0**. A cosign
+signature would have said **GitHub Actions built these bytes from this
+repository**. The build half is covered for now by CI's reproducibility
+check and the provenance attestation, not by a signature over the artefact.
 
 ## Cutover decision
 

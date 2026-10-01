@@ -42,28 +42,35 @@
 #        -> check_artefact_agreement.py (US-1064), which is the only place
 #           the three are compared.
 #   4. the SET of assets belongs to ONE tag
-#        -> the signed release manifest. cosign signs one file and the
-#           attestation covers one subject, so on their own they leave a gap:
-#           five individually-signed assets with nothing saying they go
-#           together or that they came from this tag. The manifest names the
-#           tag, the commit and every asset's digest, and is signed by the
-#           same identity.
+#        -> the release manifest. The attestation covers one subject, so on
+#           its own it leaves a gap: several assets with nothing saying they
+#           go together or that they came from this tag. The manifest names
+#           the tag, the commit and every asset's digest. It is currently
+#           UNSIGNED — cosign is deferred, see below — so it carries
+#           integrity, not authenticity. What makes it trustworthy is that
+#           the tag it names is GPG-signed: check the tag, read the
+#           manifest, and every asset is pinned to that one version.
 #
 # Signing
 # ------------------------------------------------------------------------
-# cosign in KEYLESS mode. There is no private key in this repository and
-# none should ever be: the only key this project should hold is the future
+# COSIGN IS DEFERRED. The published artefacts are NOT cosign-signed; the
+# GPG-signed tag is the trust anchor. What was tried, and why it was
+# removed rather than shipped, is recorded at the step where it used to
+# be. There is no private key in this repository and none should ever be:
+# the only key this project should hold is the future
 # secure-boot key, which is a different thing for a different subsystem
-# (US-1082, not this epic). Keyless means the signing identity is the
-# GitHub Actions OIDC token, bound to this repository, this workflow and
-# this ref by Fulcio — so a signature says WHO built the artefact, not
-# merely that somebody with a key pressed a button.
+# (US-1082, not this epic). When cosign was in use it signed in KEYLESS
+# mode, where the signing identity is the GitHub Actions OIDC token, bound
+# to this repository, this workflow and this ref by Fulcio — so a signature
+# would have said WHO built the artefact, not merely that somebody with a
+# key pressed a button.
 #
-# The TAG, by contrast, is GPG-signed by a maintainer, deliberately, and
-# that is a different question: cosign proves this workflow built these
-# bytes, while the tag signature proves a person decided this is v1.0.0. A
-# Release is only as trustworthy as the tag it names, which is why
-# publication runs `--verify-tag` and why nothing here creates a tag.
+# The TAG is GPG-signed by a maintainer, and that is the anchor that
+# remains. It answers a different question from the one cosign would have:
+# the tag signature proves a PERSON decided this is v1.0.0, which is the
+# claim a release actually rests on. A Release is only as trustworthy as the
+# tag it names, which is why publication runs `--verify-tag` and why nothing
+# here creates or moves a tag.
 
 name: release
 
@@ -219,51 +226,39 @@ jobs:
           # published, or the release is refused. This is the US-1062 red.
           python3 tests/scripts/check_sbom.py --artifacts dist
 
-      # cosign is PINNED to the last v2 release, deliberately. The installer
-      # defaults to the latest release, which is now v3, and v3 changed the
-      # `sign-blob` output contract: `--output-signature` and
-      # `--output-certificate` are DEPRECATED there and are silently IGNORED
-      # while `--new-bundle-format` is on (the v3 default), so a v3 run accepts
-      # those two flags with a deprecation notice and then fails trying to
-      # write a bundle whose path is empty —
+      # COSIGN IS DEFERRED — THIS RELEASE IS NOT COSIGN-SIGNED.
+      # ------------------------------------------------------------------------
+      # Removed 2026-10-01, and deliberately, not accidentally.
       #
-      #     Error: signing dist/fapico2.uf2: create bundle file: open :
-      #            no such file or directory
+      # cosign v3 changed `sign-blob`'s output contract, so the install is
+      # pinned to the last v2 (2.6.1) to keep the `.sig` + `.pem` pair both
+      # gates are written against. On v2.6.1 keyless signing succeeds and
+      # reports "Wrote certificate to file dist/fapico2.uf2.pem" — and writes
+      # 3312 bytes that are not a PEM: no BEGIN CERTIFICATE, no Fulcio OID,
+      # no issuer anywhere in the file. A keyless signature cannot be
+      # reproduced outside GitHub Actions, so the shape could not be
+      # diagnosed from a developer machine, and cosign was removed rather
+      # than shipped with a signature check that had never passed.
       #
-      # which is what the third dry run did. v3 also refuses to produce the
-      # split signature/certificate pair at all (`--new-bundle-format=false`
-      # then demands `--bundle`), so adopting v3 is not a flag change: it
-      # replaces the `.sig` + `.pem` contract that BOTH gates
-      # (check_artefact_agreement's A4, and the certificate that
-      # check_release_provenance reads the Fulcio issuer out of) are written
-      # against.
+      # WHAT THIS COSTS, stated plainly: a published artefact is no longer
+      # proven by a signature over it. The US-1063 gate is invoked with
+      # --unsigned, which skips P2 (the signer's OIDC issuer) and says so in
+      # its own output; without that flag the gate still refuses an unsigned
+      # release, so the check cannot go missing quietly. The US-1064 gate
+      # skips A4 for its own reasons — cosign is not installed, which it has
+      # always reported as SKIPPED rather than passed.
       #
-      # v2.6.1 is the last v2 and was verified locally to honour both flags.
-      # Lifting this pin means migrating both gates to `verify-blob --bundle`
-      # and extracting the Fulcio certificate from the bundle, which is a
-      # deliberate piece of work — not a version bump.
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
-        with:
-          cosign-release: v2.6.1
-      - name: "Sign the UF2 — keyless, via the GitHub Actions OIDC token"
-        working-directory: fapico2
-        run: |
-          set -euo pipefail
-          cosign sign-blob --yes --output-certificate dist/fapico2.uf2.pem \
-            --output-signature dist/fapico2.uf2.sig dist/fapico2.uf2
-          # What cosign actually wrote, in the open. It reports "Wrote
-          # certificate to file dist/fapico2.uf2.pem" and then the gates
-          # cannot read it, and the two facts sit in different steps with
-          # nothing joining them. This prints the shape of both outputs so
-          # the next failure is diagnosable from the log alone rather than
-          # costing another ten-minute round trip.
-          for f in dist/fapico2.uf2.pem dist/fapico2.uf2.sig; do
-            echo "--- $f: $(stat -c %s "$f") bytes"
-            head -c 100 "$f" | sed 's/^/    /'
-            echo
-          done
-          echo "--- cosign version: $(cosign version 2>/dev/null | head -1)"
+      # WHAT STILL HOLDS: the GPG-signed tag is the trust anchor and is not
+      # affected. CI has already established the image is reproducible from
+      # the source; the SBOM is attached and carries the image digest; the
+      # build-provenance attestation is still minted and still binds the
+      # subject to this workflow; and the release manifest still records the
+      # tag, the commit and every asset's digest.
+      #
+      # TO RESTORE: reinstall cosign (2.6.1 or a migrated bundle-based
+      # contract), drop --unsigned, and re-run. The gates are unchanged and
+      # will enforce P2 and A4 again the moment they can.
+
       - name: Build provenance attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
@@ -316,10 +311,16 @@ jobs:
         working-directory: fapico2
         run: |
           set -uo pipefail
+          # --unsigned: cosign is deferred, so there is no certificate to read
+          # an OIDC issuer out of and P2 cannot be checked. The flag is an
+          # escape hatch, not a relaxation — without it this gate still
+          # refuses an unsigned release, and with it the gate says out loud
+          # that the signer's identity was not verified. See the cosign note
+          # above for what this costs and what still holds.
           if ! python3 tests/scripts/check_release_provenance.py \
                --attestation dist/provenance.json \
-               --certificate dist/fapico2.uf2.pem \
                --subject dist/fapico2.uf2 \
+               --unsigned \
                --expected-workflow .github/workflows/release.yml; then
             echo "::error::The build-provenance attestation was refused: it does not name this reusable release workflow, or its subject digest is not this UF2 (US-1063)."
             exit 1
@@ -332,8 +333,7 @@ jobs:
           set -uo pipefail
           if ! python3 tests/scripts/check_artefact_agreement.py \
                --artifacts dist \
-               --attestation dist/provenance.json \
-               --certificate dist/fapico2.uf2.pem; then
+               --attestation dist/provenance.json; then
             echo "::error::The released UF2, its SBOM and its provenance attestation do not agree. Refusing to publish (US-1064)."
             exit 1
           fi
@@ -341,24 +341,24 @@ jobs:
 
       # THE RELEASE MANIFEST — what binds the SET of artefacts to the tag.
       # ------------------------------------------------------------------------
-      # cosign above signs ONE file, and the attestation covers ONE subject. So
-      # on their own they leave a gap a release could fall into: five assets,
-      # each individually signed, with nothing saying they belong together or
-      # belong to v1.0.0 rather than some other tag. Someone could reassemble
-      # a signed UF2 from one release with an SBOM from another and every
-      # per-file signature would still verify.
+      # The attestation covers ONE subject. So on its own it leaves a gap a
+      # release could fall into: several assets with nothing saying they
+      # belong together or belong to v1.0.0 rather than some other tag.
       #
       # The manifest is the join. It names the tag and the commit, and the
-      # sha256 and byte length of every published asset, and it is signed by
-      # the same keyless OIDC identity as the UF2. A release is now verifiable
-      # as a whole: check the tag signature, check the manifest signature, and
-      # every asset is pinned to that one tag.
+      # sha256 and byte length of every published asset, so a verifier can
+      # confirm the set belongs to that one tag.
       #
-      # The two assertions below are what keep it honest. Without them the
-      # manifest is just a file that says whatever it was built to say: it
-      # re-reads the UF2 and the tag from the environment and refuses to write
-      # a manifest that describes anything other than this run's own output.
-      - name: Build and sign the release manifest
+      # It is NOT signed, because cosign is deferred (see above). What it
+      # carries is integrity, not authenticity: it says what this run
+      # produced, and it is most useful precisely because the tag it names is
+      # GPG-signed. A signature over it is the first thing to restore.
+      #
+      # The assertions inside keep it honest. Without them the manifest is
+      # just a file that says whatever it was built to say: it re-reads the
+      # UF2 and cross-checks it against the digest stamped in the SBOM, and
+      # refuses to write a manifest that omits any published asset.
+      - name: Build the release manifest
         if: ${{ inputs.dry_run != true }}
         working-directory: fapico2
         env:
@@ -393,8 +393,7 @@ jobs:
               sys.exit(f"refusing: the SBOM records {stamped}, the image is {actual}")
 
           files = {}
-          for name in ("fapico2.uf2", "fapico2.uf2.sig", "fapico2.uf2.pem",
-                       "sbom.cdx.json", "provenance.json"):
+          for name in ("fapico2.uf2", "sbom.cdx.json", "provenance.json"):
               p = dist / name
               if not p.is_file():
                   sys.exit(f"refusing: {p} is missing; the manifest must "
@@ -416,17 +415,16 @@ jobs:
           # The tag recorded must be the tag being released. On a dispatch
           # where someone typed a tag that is not this ref, the Release would
           # describe a tag nobody built.
-          if tag not in (os.environ.get("GITHUB_REF", ""),
-                         os.environ.get("GITHUB_REF_NAME", "")):
+          ref = os.environ.get("GITHUB_REF", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          if tag != ref_name and not ref.endswith("/" + tag):
               print(f"note: {tag} is not the ref this run built from "
                     f"({os.environ.get('GITHUB_REF')}); the manifest names the "
                     f"requested release tag and the commit it was built at.")
           PY
-          # Same keyless identity as the UF2, so one verifier checks both.
-          cosign sign-blob --yes \
-            --output-certificate dist/release-manifest.json.pem \
-            --output-signature dist/release-manifest.json.sig \
-            dist/release-manifest.json
+          # NOT signed: cosign is deferred. Say so in the log, so a reader of
+          # this run does not infer a signature that does not exist.
+          echo "manifest: written but UNSIGNED (cosign deferred); the trust anchor is the GPG-signed tag"
 
       # CREATE THE RELEASE. Publication is the ONLY step the dry run skips.
       # Everything above it — the gates, the build, the cosign signatures, the
@@ -451,13 +449,9 @@ jobs:
             --title "fapico2 $RELEASE_TAG" \
             --notes-file docs/release-notes-v1.0.0.md \
             dist/fapico2.uf2 \
-            dist/fapico2.uf2.sig \
-            dist/fapico2.uf2.pem \
             dist/sbom.cdx.json \
             dist/provenance.json \
-            dist/release-manifest.json \
-            dist/release-manifest.json.sig \
-            dist/release-manifest.json.pem
+            dist/release-manifest.json
           echo "published: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
 
       - name: Publish the release artefacts
@@ -467,17 +461,13 @@ jobs:
           name: fapico2-release
           path: |
             fapico2/dist/fapico2.uf2
-            fapico2/dist/fapico2.uf2.sig
-            fapico2/dist/fapico2.uf2.pem
             fapico2/dist/sbom.cdx.json
             fapico2/dist/provenance.json
             fapico2/dist/release-manifest.json
-            fapico2/dist/release-manifest.json.sig
-            fapico2/dist/release-manifest.json.pem
 
       # A dry run that ends in silence is indistinguishable from a broken
       # workflow. Say so explicitly, and name what was exercised.
-      - name: "DRY RUN — signing path exercised, nothing published"
+      - name: "DRY RUN — gates exercised, nothing published"
         if: ${{ inputs.dry_run == true }}
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -490,27 +480,29 @@ jobs:
           echo "" >&2
           echo "- built \`dist/fapico2.uf2\` from this run's source" >&2
           echo "- stamped its digest into the release SBOM" >&2
-          echo "- cosign-signed it keyless via the GitHub Actions OIDC token" >&2
           echo "- minted a build-provenance attestation for it" >&2
+          echo "- passed the provenance gate with --unsigned (P2 NOT CHECKED)" >&2
           echo "- passed check_release_provenance.py and check_artefact_agreement.py" >&2
           echo "" >&2
-          echo "**Not exercised by a dry run:** the release manifest, its" >&2
-          echo "signature, and \`gh release create\`. Both are gated on" >&2
+          echo "**This release is NOT cosign-signed** — cosign is deferred." >&2
+          echo "" >&2
+          echo "**Not exercised by a dry run:** the release manifest and" >&2
+          echo "\`gh release create\`. Both are gated on" >&2
           echo "\`dry_run != true\` because the manifest is only meaningful for" >&2
           echo "a Release that exists. To exercise them, push the tag — that is" >&2
           echo "the publish." >&2
           {
-            echo "### Dry run — signing path exercised, no Release created"
+            echo "### Dry run — gates exercised, no Release created"
             echo ""
             echo "| step | result |"
             echo "|---|---|"
             echo "| build + UF2 | ok |"
             echo "| SBOM image digest stamped | ok |"
-            echo "| cosign keyless signature | ok |"
+            echo "| cosign signature | **not applied (deferred)** |"
             echo "| build-provenance attestation | ok |"
-            echo "| provenance policy (US-1063) | ok |"
+            echo "| provenance policy (US-1063) | ok, P2 skipped (--unsigned) |"
             echo "| artefact agreement (US-1064) | ok |"
-            echo "| release manifest + signature | **skipped (publish-only)** |"
+            echo "| release manifest | **skipped (publish-only)** |"
             echo "| GitHub Release | **skipped (publish-only)** |"
             echo ""
             echo "Tag under test: \`${RELEASE_TAG}\`"
