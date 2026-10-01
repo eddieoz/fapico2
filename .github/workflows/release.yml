@@ -148,6 +148,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi
 
+      # cargo-vet, for US-1061. This step was MISSING the first time the
+      # workflow was dispatched: `check_supply_chain.py` runs `cargo vet` and
+      # treats the tool being absent as a RED rather than a skip, so the very
+      # first dry run died here with "no such command: `vet`" before building
+      # anything. It is installed from source with `--locked` rather than
+      # through a third-party installer action, for the same reason the Rust
+      # toolchain is not: this job holds `id-token: write`, and every action
+      # named in it is a supply-chain path. Same command as ci.yml.
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked
+
       # UNEXERCISED until the first tag. Kept honest by the fact that every
       # gate it calls is exercised on every push.
       - name: "Gate: the crate graph and the supply chain (US-1060/US-1061)"
