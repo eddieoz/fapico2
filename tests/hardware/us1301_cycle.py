@@ -152,57 +152,70 @@ def rescue_reboot(to_bootsel: bool) -> tuple[int, int]:
             pass
 
 
-def rescue_write_phy_config() -> tuple[int, int, str]:
-    """Change one device setting through the rescue applet's `WRITE`.
+def rescue_save_and_reboot() -> tuple[int, int, str, str]:
+    """Change one setting and reboot, on a SINGLE card connection.
 
-    **Not** the Management applet's `WRITE_CONFIG`. That is unconditionally
-    refused on a device build: `apps/mgmt/src/lib.rs`:212 makes
-    `default_user_present()` return `false` under `#[cfg(feature = "device")]`,
+    Returns `(write_sw1, write_sw2, detail, reboot_state)` where
+    `reboot_state` is `"sent"` or an error string.
+
+    **One connection on purpose.** The host's PC/SC reader degrades across
+    separate sessions — a WRITE in one connection leaves the reader unable to
+    accept the next `SCardConnect`, so a REBOOT sent afterwards silently fails
+    to go out and the "cycle" never reboots. That is exactly what save cycle 2
+    did, and it is why the write and the reboot share a handle here.
+
+    **The rescue applet, not the Management applet.** `WRITE_CONFIG` is
+    unconditionally refused on a device build: `apps/mgmt/src/lib.rs`:212 makes
+    `default_user_present()` return `false` under `#[cfg(feature = "device")]`
     and the Management applet — unlike FIDO, OATH, OTP and OpenPGP — is given
-    no presence hook at all, so it answers `6985` instantly on every attempt.
-    The rescue applet's `WRITE` needs no presence grant and is what PicoForge's
-    configuration screen actually uses.
+    no presence hook, so it answers `6985` instantly on every attempt.
 
-    The target TLV is chosen **by tag**, never by position, and the lock and
-    serial tags are excluded by name: the config's last entry is
-    `0a 01 00` = TAG_CONFIG_LOCK, value 0x00 (unlocked), and flipping that byte
-    would lock out every later write until a factory reset.
+    The TLV to change is picked **by tag** (Options), never by position: the
+    config's last entry is `0a 01 00` = TAG_CONFIG_LOCK, value 0x00, and
+    flipping that byte locks out every later write until a factory reset.
     """
     from smartcard.System import readers
 
     conn = list(readers())[0].createConnection()
     conn.connect()
     try:
-        sel, sw1, sw2 = conn.transmit([0x00, 0xA4, 0x04, 0x00, 0x08,
-                                       0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21])
+        _s, sw1, sw2 = conn.transmit([0x00, 0xA4, 0x04, 0x00, 0x08,
+                                      0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21])
         if (sw1, sw2) != (0x90, 0x00):
-            return sw1, sw2, f"rescue SELECT failed ({sw1:02x}{sw2:02x})"
+            return sw1, sw2, f"rescue SELECT failed ({sw1:02x}{sw2:02x})", "not-attempted"
 
         # READ P1 = 0x01 (full PHY configuration).
         blob, r1, r2 = conn.transmit([0x80, 0x1E, 0x01, 0x00, 0x00])
         if (r1, r2) != (0x90, 0x00):
-            return r1, r2, f"READ PhyConfig failed ({r1:02x}{r2:02x})"
+            return r1, r2, f"READ PhyConfig failed ({r1:02x}{r2:02x})", "not-attempted"
         body = bytearray(blob)
 
-        TAG_OPTIONS, TAG_LOCK, TAG_SERIAL = 0x06, 0x0A, 0x02
+        TAG_OPTIONS = 0x06
         i, chosen = 0, None
         while i + 2 <= len(body):
             tag, ln = body[i], body[i + 1]
             if tag == TAG_OPTIONS and ln >= 1:
                 chosen = i + 2 + ln - 1
                 break
-            if tag in (TAG_LOCK, TAG_SERIAL) or ln == 0 or i + 2 + ln > len(body):
-                i += 2 + ln if ln else 1
-                continue
-            i += 2 + ln
+            i += 2 + ln if ln else 1
         if chosen is None:
-            return 0x6F, 0x00, "no Options TLV to change"
+            return 0x6F, 0x00, "no Options TLV to change", "not-attempted"
         before = body[chosen]
         body[chosen] ^= 0x01
 
         # WRITE P1 = 0x01 (PhyConfig).
         _r, w1, w2 = conn.transmit([0x80, 0x1C, 0x01, 0x00, len(body)] + list(body))
-        return w1, w2, f"Options 0x{before:02x} -> 0x{body[chosen]:02x}"
+        detail = f"Options 0x{before:02x} -> 0x{body[chosen]:02x}"
+        if (w1, w2) != (0x90, 0x00):
+            return w1, w2, detail, "not-attempted"
+
+        # REBOOT, mode 0x00 (normal) — on the SAME handle. This kills the card
+        # mid-transmit by design, so a transport error here is the success case.
+        try:
+            conn.transmit([0x80, 0x1F, 0x00, 0x00, 0x00])
+            return w1, w2, detail, "sent"
+        except Exception:
+            return w1, w2, detail, "sent"
     finally:
         try:
             conn.disconnect()
@@ -242,29 +255,23 @@ def main(argv: list[str]) -> int:
         # with nothing to talk to.)
         print(f"[{args.arm} #{args.index}] device up. Changing one setting…",
               flush=True)
-        w1, w2, note = rescue_write_phy_config()
+        w1, w2, note, reboot_state = rescue_save_and_reboot()
         result["detail"] = f"save -> {w1:02x}{w2:02x} ({note})"
         print(f"[{args.arm} #{args.index}] {note}: {w1:02x}{w2:02x}", flush=True)
         if (w1, w2) != (0x90, 0x00):
             result["verdict"] = "SAVE-REJECTED"
             return _emit(result, args.out)
-        # Now reboot, which is the step whose aftermath is being measured.
-        # Do NOT swallow a failure here. The write leaves the reader in a
-        # degraded state often enough that the reboot APDU fails to send, and
-        # a silent `except: pass` turns that into a "cycle" that saved a
-        # setting and then sat there, rebooting nothing — which is exactly
-        # what happened to save cycle 2. A cycle that did not reboot did not
-        # run.
-        try:
-            rescue_reboot(False)
-            result["detail"] += "; reboot sent (normal)"
-        except Exception as exc:
+        # The reboot already went out on the same handle as the write, inside
+        # rescue_save_and_reboot. Do not open a second connection to send it:
+        # the reader is degraded by the write, which is what made cycle 2 save
+        # a setting and reboot nothing.
+        if reboot_state != "sent":
             result["verdict"] = "REBOOT-NOT-SENT"
-            result["detail"] += f"; REBOOT FAILED: {type(exc).__name__}"
+            result["detail"] += f"; REBOOT {reboot_state}"
             print(f"[{args.arm} #{args.index}] the save landed but the reboot "
-                  f"APDU did not send ({type(exc).__name__}). This is NOT a "
-                  f"cycle — the board never rebooted.", flush=True)
+                  f"did not go out. This is NOT a cycle.", flush=True)
             return _emit(result, args.out)
+        result["detail"] += "; reboot sent (normal)"
     else:
         print(f"[{args.arm} #{args.index}] device up. Rebooting to BOOTSEL…",
               flush=True)
@@ -289,9 +296,19 @@ def main(argv: list[str]) -> int:
     # `fa20:0002` immediately, which succeeded against the *pre-reboot* instance
     # and reported "came back in 2s" for a board that had not rebooted at all.
     # Only a device that was observed gone and came back has rebooted.
-    wait_for(lambda: not target_up(), 30.0, "device to leave the bus")
+    left = wait_for(lambda: not target_up(), 30.0, "device to leave the bus")
     back = wait_for(target_up, ENUM_TIMEOUT_S, "enumeration")
     elapsed = time.time() - started
+    if not left:
+        # "Never left the bus" means the reboot did not happen, whatever the
+        # APDU call reported. Two cycles were scored CAME-BACK on the strength
+        # of a send that never reached the card, so the verdict now keys off
+        # the observed re-enumeration and nothing else. A cycle that did not
+        # reboot measures nothing about a boot path.
+        result["verdict"] = "NO-REBOOT-OBSERVED"
+        print(f"[{args.arm} #{args.index}] the device NEVER LEFT THE BUS — the "
+              f"reboot did not happen. Not a cycle.", flush=True)
+        return _emit(result, args.out)
     if back:
         result["verdict"] = "CAME-BACK"
         print(f"[{args.arm} #{args.index}] OK — enumerated after {elapsed:.1f}s",
