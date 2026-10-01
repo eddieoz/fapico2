@@ -180,6 +180,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --target thumbv8m.main-none-eabi
+          # `dist/` did not exist on the second dry run either:
+          # `uf2gen.py` opens its output with `open(path, "wb")`, which does
+          # not create the parent, so the build succeeded and the UF2 step
+          # died with FileNotFoundError on a directory nobody had made. Every
+          # later step writes here too, so it is created once, here.
+          mkdir -p dist
           python3 firmware/uf2gen.py \
             target/thumbv8m.main-none-eabi/release/fapico2-firmware \
             dist/fapico2.uf2 >/dev/null
@@ -227,6 +233,11 @@ jobs:
           subject-path: fapico2/dist/fapico2.uf2
       - name: Fetch the attestation for the policy check
         working-directory: fapico2
+        env:
+          # `gh` is not authenticated by default in Actions; without this it
+          # can only read a PUBLIC attestation store, and this one belongs to
+          # this repository's own store.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # One canonical path. `gh attestation download` writes jsonl natively
@@ -235,9 +246,18 @@ jobs:
           # first attempt to write a different name meant the jsonl path left
           # `dist/provenance.json` absent, which the US-1064 gate turned into
           # a bare FileNotFoundError rather than a Refusal.
-          if ! gh attestation download fapico2/dist/fapico2.uf2 \
+          #
+          # The SUBJECT path is relative to this step's working-directory,
+          # which is the repository root — so it is `dist/…`, not
+          # `fapico2/dist/…`. The latter was what this step said, which is a
+          # path that does not exist, so the download could never have
+          # succeeded. `--repo` is named rather than left to gh's git-remote
+          # discovery, which has no reason to be right.
+          if ! gh attestation download dist/fapico2.uf2 \
+               --repo "${{ github.repository }}" \
                --format jsonl --output dist/provenance.json; then
-            gh attestation download fapico2/dist/fapico2.uf2 \
+            gh attestation download dist/fapico2.uf2 \
+              --repo "${{ github.repository }}" \
               --format json --output dist/provenance.json
           fi
           test -s dist/provenance.json
