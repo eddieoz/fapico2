@@ -151,18 +151,13 @@ struct GaOptions {
 /// CTAP2 `0x04` is userID; PicoForge `0x07` is credentialID, CTAP2 `0x07`
 /// is totalRPs), so a merged map is impossible — each dialect must be
 /// answered in its own shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CmDialect {
     PicoForge,
+    // Spec is the safe default: an unrecognised request is far more
+    // likely to come from a third-party client than from PicoForge.
+    #[default]
     Ctap2,
-}
-
-impl Default for CmDialect {
-    fn default() -> Self {
-        // Spec is the safe default: an unrecognised request is far more
-        // likely to come from a third-party client than from PicoForge.
-        CmDialect::Ctap2
-    }
 }
 
 /// Canonical sub-command identity, independent of the wire dialect.
@@ -191,9 +186,12 @@ struct CmRequest {
     rp_id_hash: Option<Vec<u8>>,
     cred_id: Option<CredDescriptor>,
     user: Option<CmUser>,
-    /// PicoForge only: the sub-command parameter map exactly as received,
-    /// re-encoded.
-    sub_params_cbor: Option<Vec<u8>>,
+    // The PicoForge sub-command parameter map is NOT retained here. This twin
+    // rebuilds the signed params from the fields parsed out of that map (see
+    // the auth_data arm), so storing a verbatim copy would be write-only. The
+    // device twin, which signs the raw bytes, keeps its own copy — the split
+    // is deliberate and pinned by
+    // `device_full_set.rs::device_twin_credmgmt_mac_scope_differs_from_host_for_0x01_and_0x02`.
     /// CTAP2 only: the credentialID and user maps exactly as received.
     /// CTAP2 signs those maps verbatim, so a re-encode could diverge from
     /// what the client actually signed (key order included).
@@ -2050,9 +2048,10 @@ impl<K: Keystore> FidoApp<K> {
                 // PicoForge: `subCommand ‖ CBOR(subCommandParams)`.
                 //
                 // Deliberately rebuilt from the parsed fields rather than
-                // taken from `sub_params_cbor`: for `0x01`/`0x02` this yields
-                // no params, so a client that also sent subCommandParams has
-                // them fall outside the signed scope and is still accepted.
+                // taken verbatim from the received map: for `0x01`/`0x02` this
+                // yields no params, so a client that also sent
+                // subCommandParams has them fall outside the signed scope and
+                // is still accepted.
                 // The device twin is stricter — it signs the raw bytes
                 // whenever any were sent — and
                 // `device_full_set.rs::device_twin_credmgmt_mac_scope_differs_from_host_for_0x01_and_0x02`
@@ -3718,7 +3717,6 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
     let mut rp_id_hash = None;
     let mut cred_id = None;
     let mut user = None;
-    let mut sub_params_cbor = None;
     let mut raw_cred_cbor = None;
     let mut raw_user_cbor = None;
 
@@ -3745,11 +3743,10 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
                 0x03 => pin_uv_protocol = cbor_get_uint(val)? as u8,
                 0x04 => pin_uv_auth_param = Some(cbor_get_bytes(val)?),
                 0x02 => {
-                    // The signed message is `subCommand ‖ CBOR(this map)`,
-                    // so the map is retained verbatim rather than rebuilt
-                    // from the fields parsed out of it.
+                    // The map is walked into the typed fields below; this
+                    // twin does not retain a verbatim copy, because it
+                    // rebuilds the signed params from those fields instead.
                     let m = cbor_get_map(val)?;
-                    sub_params_cbor = Some(cbor::encode(val));
                     for (k, v) in m {
                         let sub = match k {
                             cbor::Value::U(u) => *u,
@@ -3842,7 +3839,6 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
         rp_id_hash,
         cred_id,
         user,
-        sub_params_cbor,
         raw_cred_cbor,
         raw_user_cbor,
     })

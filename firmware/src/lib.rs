@@ -31,16 +31,24 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 168 |
-/// | `hid_task` | 8,144 |
+/// | `hid_task` | 12,224 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **17,760** |
+/// | **total** | **21,840** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
-/// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.85x** this demand. The
-/// feature was `task-arena-size-65536` until US-956, at 3.7x — 46 KiB of a
-/// 532,480 B part spent on a reservoir that is 84 % empty, out of a boot
-/// path whose statics already claimed 527,420 B.
+/// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.50x** this demand (floor
+/// 1.25x). The feature was `task-arena-size-65536` until US-956, at 3.7x —
+/// 46 KiB of a 532,480 B part spent on a reservoir that is 84 % empty, out of
+/// a boot path whose statics already claimed 527,420 B.
+///
+/// The demand was 17,760 B until 2026-10-01, when the re-measurement forced
+/// by the `cargo-deps` revert (PR #2) found `hid_task` at 12,224 B rather
+/// than the recorded 8,144 B. The 2026-09-30 size-report entry attributed an
+/// unchanged arena to the OTP-HID handlers being "synchronous, inside the USB
+/// control transfer" — true of the handlers, but not of the future that
+/// carries their state, which is where the 4,080 B lives. The earlier stamp
+/// was simply never re-run after that change landed.
 ///
 /// The arena is bumped, not paged, and overflow panics "task arena is full"
 /// at the first spawn that does not fit — a dark boot, and one nothing
@@ -75,13 +83,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 17_760;
+pub const TASK_ARENA_DEMAND_B: usize = 21_840;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "eaea5465b04bd448160d7b6ff893220dab92a94992e06d55526fb217c06677d6";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "26d25236d5f2065b8ca480a07f51730db25d53bf922a3d80eb5f85ef7a9a38e5";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
