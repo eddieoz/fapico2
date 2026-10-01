@@ -81,7 +81,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "provenance"
 SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
 GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 GITHUB_BUILDER_PREFIX = "https://github.com/"
-REPO = "eddieoz/pico-fido2"
+REPO = "eddieoz/fapico2"
 
 # name -> (must be accepted?, one line saying what it is)
 CONTROLS = {
@@ -213,7 +213,7 @@ def check_provenance(statement: dict, subject: bytes, issuer: str | None,
         )
 
 
-def self_test(expected_workflow: str) -> list[str]:
+def self_test(expected_workflow: str, expected_repo: str = REPO) -> list[str]:
     """Exercise the policy against the committed fixtures."""
     subject = (FIXTURES / "subject.bin").read_bytes()
     issuer = (FIXTURES / "issuer.txt").read_text().strip()
@@ -226,7 +226,7 @@ def self_test(expected_workflow: str) -> list[str]:
             continue
         doc = json.loads(path.read_text(encoding="utf-8"))
         try:
-            check_provenance(doc, subject, issuer, expected_workflow)
+            check_provenance(doc, subject, issuer, expected_workflow, expected_repo)
             accepted, why = True, ""
         except Refusal as exc:
             accepted, why = False, str(exc).splitlines()[0]
@@ -240,7 +240,7 @@ def self_test(expected_workflow: str) -> list[str]:
     # attestation whose signer it cannot identify.
     doc = json.loads((FIXTURES / "good.json").read_text(encoding="utf-8"))
     try:
-        check_provenance(doc, subject, None, expected_workflow)
+        check_provenance(doc, subject, None, expected_workflow, expected_repo)
         problems.append("the policy ACCEPTED an attestation with no signing "
                         "certificate; an unknown signer is not evidence")
     except Refusal:
@@ -254,12 +254,15 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--certificate", help="the signing certificate (PEM)")
     ap.add_argument("--subject", help="the artefact being published")
     ap.add_argument("--expected-workflow", default=".github/workflows/release.yml")
+    ap.add_argument("--expected-repo", default=REPO,
+                    help="owner/name of the repository a release of this "
+                         "project may be built from (default: %(default)s)")
     args = ap.parse_args(argv[1:])
 
     if not (args.attestation and args.subject):
         print("US-1063 provenance policy (self-test against committed fixtures; "
               "a real attestation is only checkable at release time)")
-        problems = self_test(args.expected_workflow)
+        problems = self_test(args.expected_workflow, args.expected_repo)
         for name, (ok, what) in sorted(CONTROLS.items()):
             print(f"  {'ACCEPT' if ok else 'REFUSE':6s}  {name:26s} — {what}")
         print("  REFUSE  <no certificate>       — an unknown signer is not evidence")
@@ -287,7 +290,8 @@ def main(argv: list[str]) -> int:
             issuer = m.group(1)
     print(f"US-1063 provenance policy — {args.attestation}")
     try:
-        check_provenance(statement, subject, issuer, args.expected_workflow)
+        check_provenance(statement, subject, issuer, args.expected_workflow,
+                         args.expected_repo)
     except Refusal as exc:
         print(f"  REFUSED: {exc}")
         print("\nRESULT: FAIL")

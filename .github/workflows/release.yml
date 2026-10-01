@@ -2,22 +2,30 @@
 #
 # WHAT IS EXERCISED AND WHAT IS NOT — read this before trusting a green run
 # ------------------------------------------------------------------------
-# This workflow has NEVER RUN. It was written in a session with no GitHub
-# Actions runner, no OIDC issuer, no Fulcio, no Rekor, and no RP2350. The
-# cosign step and the attestation step below are therefore *unexercised
-# code*, and nothing in this repository should be read as claiming
-# otherwise. What HAS been exercised, on every push, is the policy those
-# steps feed: `check_release_provenance.py` and `check_artefact_agreement.py`
-# run against committed fixtures with negative controls, through the same
-# functions a release calls.
+# The first RELEASE of this project. The two gates below, and the SBOM
+# stamper, were written in a session with no GitHub Actions runner, no OIDC
+# issuer, no Fulcio, no Rekor, and no RP2350, so the cosign and attestation
+# steps were *unexercised code*. `workflow_dispatch` takes a `dry_run` input,
+# defaulting to TRUE, which runs the entire build -> sign -> attest -> verify
+# chain and publishes nothing; run that first. Expect the first real run to
+# need fixing — that is what the dry run is for, and it is why the default is
+# a dry run rather than a publish.
 #
-# That gap is now closable on demand: `workflow_dispatch` takes a `dry_run`
-# input, defaulting to TRUE, which runs the entire build -> sign -> attest ->
-# verify chain and publishes nothing. Dispatch it once and this header becomes
-# false; until you have, it is still true. Expect the first run to need fixing.
+# Two defects were found by reading rather than running, and are fixed here:
+# the provenance and agreement gates both hardcoded the *previous* repository
+# name (`eddieoz/pico-fido2`), so a genuine attestation from this repository
+# would have been refused as built-elsewhere; and the SBOM carried no digest
+# of the image, so the US-1064 gate had nothing to compare the UF2 against.
+# Both are policy, not plumbing, and both are now exercised by the committed
+# fixtures on every push.
 #
 # The chain of custody, and why there is only ONE mechanism per property
 # ------------------------------------------------------------------------
+#   0. the tag is the authority on WHICH commit this is
+#        -> the annotated, GPG-signed `v*` tag a maintainer pushes. This
+#           workflow never creates or moves a tag; `gh release create` runs
+#           with `--verify-tag` so a Release can only ever describe a tag
+#           that exists on the remote.
 #   1. the image is a function of the source
 #        -> ci.yml, device-build, US-1043: two independent builds from two
 #           source directories, compared with `cmp`, plus the flash-budget
@@ -33,6 +41,13 @@
 #      bytes
 #        -> check_artefact_agreement.py (US-1064), which is the only place
 #           the three are compared.
+#   4. the SET of assets belongs to ONE tag
+#        -> the signed release manifest. cosign signs one file and the
+#           attestation covers one subject, so on their own they leave a gap:
+#           five individually-signed assets with nothing saying they go
+#           together or that they came from this tag. The manifest names the
+#           tag, the commit and every asset's digest, and is signed by the
+#           same identity.
 #
 # Signing
 # ------------------------------------------------------------------------
@@ -43,6 +58,12 @@
 # GitHub Actions OIDC token, bound to this repository, this workflow and
 # this ref by Fulcio — so a signature says WHO built the artefact, not
 # merely that somebody with a key pressed a button.
+#
+# The TAG, by contrast, is GPG-signed by a maintainer, deliberately, and
+# that is a different question: cosign proves this workflow built these
+# bytes, while the tag signature proves a person decided this is v1.0.0. A
+# Release is only as trustworthy as the tag it names, which is why
+# publication runs `--verify-tag` and why nothing here creates a tag.
 
 name: release
 
@@ -170,6 +191,13 @@ jobs:
         run: |
           set -euo pipefail
           cp supply-chain/sbom.cdx.json dist/sbom.cdx.json
+          # The SBOM says what the image is BUILT FROM; the digest of the image
+          # itself is a separate fact and a per-build one, so it is stamped
+          # into the COPY rather than committed. Without it the US-1064 gate
+          # has nothing to compare the UF2 against. The committed file is not
+          # touched — see tests/scripts/stamp_sbom_image.py for why.
+          python3 tests/scripts/stamp_sbom_image.py \
+            --image dist/fapico2.uf2 --sbom dist/sbom.cdx.json
           # Release mode: the SBOM must be present NEXT TO the artefact being
           # published, or the release is refused. This is the US-1062 red.
           python3 tests/scripts/check_sbom.py --artifacts dist
@@ -190,10 +218,18 @@ jobs:
         working-directory: fapico2
         run: |
           set -euo pipefail
-          gh attestation download fapico2/dist/fapico2.uf2 \
-            --format jsonl --output dist/provenance.jsonl || \
+          # One canonical path. `gh attestation download` writes jsonl natively
+          # and the json form is the fallback, and the two gates below (plus
+          # the manifest, plus publication) all name ONE file. Leaving the
+          # first attempt to write a different name meant the jsonl path left
+          # `dist/provenance.json` absent, which the US-1064 gate turned into
+          # a bare FileNotFoundError rather than a Refusal.
+          if ! gh attestation download fapico2/dist/fapico2.uf2 \
+               --format jsonl --output dist/provenance.json; then
             gh attestation download fapico2/dist/fapico2.uf2 \
-            --format json --output dist/provenance.json
+              --format json --output dist/provenance.json
+          fi
+          test -s dist/provenance.json
       # US-1063's refusal half: the attestation has to name THIS reusable
       # workflow (`job_workflow_ref`), not merely come from something that
       # passed CI. cosign has already checked the signature by this point;
@@ -203,10 +239,8 @@ jobs:
         working-directory: fapico2
         run: |
           set -uo pipefail
-          ATT=dist/provenance.json
-          [ -f "$ATT" ] || ATT=dist/provenance.jsonl
           if ! python3 tests/scripts/check_release_provenance.py \
-               --attestation "$ATT" \
+               --attestation dist/provenance.json \
                --certificate dist/fapico2.uf2.pem \
                --subject dist/fapico2.uf2 \
                --expected-workflow .github/workflows/release.yml; then
@@ -228,10 +262,127 @@ jobs:
           fi
           echo "ok: UF2, SBOM and attestation agree"
 
-      # Publication is the ONLY step the dry run skips. Everything above it —
-      # the gates, the build, the cosign signature, the attestation, and both
-      # verification gates — runs identically either way, so a dry run is a
-      # real exercise of the signing path and not a rehearsal of it.
+      # THE RELEASE MANIFEST — what binds the SET of artefacts to the tag.
+      # ------------------------------------------------------------------------
+      # cosign above signs ONE file, and the attestation covers ONE subject. So
+      # on their own they leave a gap a release could fall into: five assets,
+      # each individually signed, with nothing saying they belong together or
+      # belong to v1.0.0 rather than some other tag. Someone could reassemble
+      # a signed UF2 from one release with an SBOM from another and every
+      # per-file signature would still verify.
+      #
+      # The manifest is the join. It names the tag and the commit, and the
+      # sha256 and byte length of every published asset, and it is signed by
+      # the same keyless OIDC identity as the UF2. A release is now verifiable
+      # as a whole: check the tag signature, check the manifest signature, and
+      # every asset is pinned to that one tag.
+      #
+      # The two assertions below are what keep it honest. Without them the
+      # manifest is just a file that says whatever it was built to say: it
+      # re-reads the UF2 and the tag from the environment and refuses to write
+      # a manifest that describes anything other than this run's own output.
+      - name: Build and sign the release manifest
+        if: ${{ inputs.dry_run != true }}
+        working-directory: fapico2
+        env:
+          # `inputs.tag` is set by workflow_call and workflow_dispatch. On a
+          # tag push it is empty, and github.ref_name IS the tag — so this
+          # covers all three triggers without a per-trigger branch.
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys
+
+          dist = pathlib.Path("dist")
+          tag = os.environ["RELEASE_TAG"]
+          # The provenance gate above already proved the attestation's subject
+          # is this UF2; here we only re-derive the digest from the bytes.
+          def digest(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          uf2 = dist / "fapico2.uf2"
+          if not uf2.is_file():
+              sys.exit(f"refusing: {uf2} is not there to describe")
+          actual = digest(uf2)
+
+          # The SBOM was stamped with this same digest a step ago. If the two
+          # disagree, one of them is describing a different image.
+          sbom = json.loads((dist / "sbom.cdx.json").read_text())
+          props = {p.get("name"): p.get("value")
+                   for p in sbom.get("metadata", {}).get("properties", [])}
+          stamped = props.get("cdx:fapico2:uf2:sha256")
+          if stamped != actual:
+              sys.exit(f"refusing: the SBOM records {stamped}, the image is {actual}")
+
+          files = {}
+          for name in ("fapico2.uf2", "fapico2.uf2.sig", "fapico2.uf2.pem",
+                       "sbom.cdx.json", "provenance.json"):
+              p = dist / name
+              if not p.is_file():
+                  sys.exit(f"refusing: {p} is missing; the manifest must "
+                           f"describe every published asset")
+              files[name] = {"sha256": digest(p), "bytes": p.stat().st_size}
+
+          manifest = {
+              "schema": "https://fapico2.dev/release-manifest/v1",
+              "project": "fapico2",
+              "tag": tag,
+              "commit": os.environ.get("GITHUB_SHA", ""),
+              "image": {"name": "fapico2.uf2", "sha256": actual},
+              "files": files,
+          }
+          (dist / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          print(f"manifest: {tag} @ {manifest['commit'][:8]}, "
+                f"{len(files)} assets, image {actual[:12]}…")
+          # The tag recorded must be the tag being released. On a dispatch
+          # where someone typed a tag that is not this ref, the Release would
+          # describe a tag nobody built.
+          if tag not in (os.environ.get("GITHUB_REF", ""),
+                         os.environ.get("GITHUB_REF_NAME", "")):
+              print(f"note: {tag} is not the ref this run built from "
+                    f"({os.environ.get('GITHUB_REF')}); the manifest names the "
+                    f"requested release tag and the commit it was built at.")
+          PY
+          # Same keyless identity as the UF2, so one verifier checks both.
+          cosign sign-blob --yes \
+            --output-certificate dist/release-manifest.json.pem \
+            --output-signature dist/release-manifest.json.sig \
+            dist/release-manifest.json
+
+      # CREATE THE RELEASE. Publication is the ONLY step the dry run skips.
+      # Everything above it — the gates, the build, the cosign signatures, the
+      # attestation, both verification gates, and the manifest — runs
+      # identically either way, so a dry run is a real exercise of the signing
+      # path and not a rehearsal of it.
+      #
+      # `--verify-tag` is load-bearing: a Release must describe a tag that
+      # exists on the remote, which is what stops a release describing a commit
+      # that was never tagged, and what keeps the GPG-signed tag the user made
+      # the authority on which commit this is.
+      - name: Create the GitHub Release
+        if: ${{ inputs.dry_run != true }}
+        working-directory: fapico2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "fapico2 $RELEASE_TAG" \
+            --notes-file docs/release-notes-v1.0.0.md \
+            dist/fapico2.uf2 \
+            dist/fapico2.uf2.sig \
+            dist/fapico2.uf2.pem \
+            dist/sbom.cdx.json \
+            dist/provenance.json \
+            dist/release-manifest.json \
+            dist/release-manifest.json.sig \
+            dist/release-manifest.json.pem
+          echo "published: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
+
       - name: Publish the release artefacts
         if: ${{ inputs.dry_run != true }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -243,29 +394,47 @@ jobs:
             fapico2/dist/fapico2.uf2.pem
             fapico2/dist/sbom.cdx.json
             fapico2/dist/provenance.json
+            fapico2/dist/release-manifest.json
+            fapico2/dist/release-manifest.json.sig
+            fapico2/dist/release-manifest.json.pem
 
       # A dry run that ends in silence is indistinguishable from a broken
       # workflow. Say so explicitly, and name what was exercised.
       - name: "DRY RUN — signing path exercised, nothing published"
         if: ${{ inputs.dry_run == true }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          echo "### Dry run — no artefact was published" >&2
+          echo "### Dry run — no Release was created" >&2
+          echo "" >&2
+          echo "Everything below ran for real. The only thing skipped is" >&2
+          echo "publication, so this is an exercise of the signing path and" >&2
+          echo "not a rehearsal of it." >&2
           echo "" >&2
           echo "- built \`dist/fapico2.uf2\` from this run's source" >&2
+          echo "- stamped its digest into the release SBOM" >&2
           echo "- cosign-signed it keyless via the GitHub Actions OIDC token" >&2
           echo "- minted a build-provenance attestation for it" >&2
           echo "- passed check_release_provenance.py and check_artefact_agreement.py" >&2
           echo "" >&2
-          echo "Re-run with dry_run=false to publish." >&2
+          echo "**Not exercised by a dry run:** the release manifest, its" >&2
+          echo "signature, and \`gh release create\`. Both are gated on" >&2
+          echo "\`dry_run != true\` because the manifest is only meaningful for" >&2
+          echo "a Release that exists. To exercise them, push the tag — that is" >&2
+          echo "the publish." >&2
           {
-            echo "### Dry run — signing path exercised, nothing published"
+            echo "### Dry run — signing path exercised, no Release created"
             echo ""
             echo "| step | result |"
             echo "|---|---|"
             echo "| build + UF2 | ok |"
+            echo "| SBOM image digest stamped | ok |"
             echo "| cosign keyless signature | ok |"
             echo "| build-provenance attestation | ok |"
             echo "| provenance policy (US-1063) | ok |"
             echo "| artefact agreement (US-1064) | ok |"
-            echo "| publish | **skipped (dry run)** |"
+            echo "| release manifest + signature | **skipped (publish-only)** |"
+            echo "| GitHub Release | **skipped (publish-only)** |"
+            echo ""
+            echo "Tag under test: \`${RELEASE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"

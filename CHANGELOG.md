@@ -11,12 +11,19 @@ and the project uses [semantic versioning](https://semver.org/).
 
 Nothing yet.
 
-## [1.0.0] — 2026-09-11
+## [1.0.0] — 2026-10-01
 
-First release of the Rust firmware, and the cutover point from the C
-`pico-fido2` tree. Full notes, including the per-app scope table and the
+First **published** release of the Rust firmware, and the cutover point from
+the C `pico-fido2` tree. Full notes, including the per-app scope table and the
 migration contract, are in
 [`docs/release-notes-v1.0.0.md`](docs/release-notes-v1.0.0.md).
+
+The date is the day the release was cut and published, not the day the scope
+was first written down: this version sat unannounced from 2026-09-11 through
+2026-09-30 while the OpenPGP applet, the Yubico OTP HID transport and the
+FIDO2 credential-management work landed. The shipping image is recorded in
+[`docs/size-report.md`](docs/size-report.md), which re-measures it and fails
+CI on any disagreement — the number in the release notes is not the authority.
 
 ### Added
 

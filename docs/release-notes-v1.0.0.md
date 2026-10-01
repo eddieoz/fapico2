@@ -1,16 +1,29 @@
 # fapico2 v1.0.0 — Release Notes
 
-**Date:** 2026-09-11 · **Target:** Raspberry Pi Pico 2 (RP2350), USB-connected
-**Shipping image:** `firmware/fapico2.uf2`, sha256
-`b9bc12f8987bdd195ab06581e3590673ed617bbfdfe01e0ba743b8b3bf7eeea1`
-(198 blocks = 1 E10 preamble + 197 ARM_S payload; byte-reproducible from the
-tag via `firmware/uf2gen.py` — see [docs/size-report.md](size-report.md)).
-**Phase-7 update (S-731-1, 2026-09-20):** the final Phase-7 acceptance image
-is `firmware/fapico2.uf2` sha256
-`53ba915e1ad405f32abfb7c2b062d2ef13d86795b557a8bab1d4aaa2eaf256f8`
-(HEAD `dcf8397`) — the full hardware matrix was re-pinned on it, including a
-fresh on-card OpenPGP identity regeneration (P7-D2,
-`docs/hardware-matrix.md`).
+**Date:** 2026-10-01 · **Target:** Raspberry Pi Pico 2 (RP2350), USB-connected
+**Shipping image:** `fapico2.uf2`, sha256
+`0f4e6189e4ea0c744ec556b4cf0b74c849b776ac1a25a085d5461175a898142c`
+(3061 blocks = 1 absolute preamble + 3060 ARM_S payload; 1,567,232 bytes;
+byte-reproducible from the tag via `firmware/uf2gen.py` — see
+[docs/size-report.md](size-report.md), which re-measures every figure here
+and fails CI on any disagreement).
+
+**This is the first published release.** Earlier drafts of this file recorded
+`b9bc12f8…` and `53ba915e…` (198 and 2,046-block images from 2026-09-11 and
+2026-09-20). Both predate the OpenPGP applet, the Yubico OTP HID transport,
+and the FIDO2 credential-management work, and neither is what a clone of the
+tag builds. The numbers above are the image the release workflow builds and
+publishes; `docs/size-report.md` is the authority and is enforced on every
+push.
+
+**Verifying a download.** The Release carries the UF2, its cosign signature
+and certificate, the SBOM, the build-provenance attestation, and a
+`release-manifest.json` naming the tag, the commit and the digest of every
+one of those files — signed by the same keyless identity. The tag itself is
+GPG-signed, so a release is checked end to end as: the tag signature says a
+maintainer cut this version, the manifest says these assets are that tag's,
+and the per-file signatures say GitHub Actions built them from this
+repository.
 
 ## Cutover decision
 

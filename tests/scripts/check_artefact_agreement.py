@@ -66,7 +66,7 @@ IMAGE_DIGEST_KEY = "cdx:fapico2:uf2:sha256"
 
 
 EXPECTED_WORKFLOW = ".github/workflows/release.yml"
-EXPECTED_REPO = "eddieoz/pico-fido2"
+EXPECTED_REPO = "eddieoz/fapico2"
 GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 
 
@@ -352,6 +352,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--artifacts", help="the release artefact directory")
     ap.add_argument("--attestation", help="the provenance statement (json/jsonl)")
     ap.add_argument("--certificate", help="the signing certificate (PEM)")
+    ap.add_argument("--expected-repo", default=EXPECTED_REPO,
+                    help="owner/name of the repository a release of this "
+                         "project may be built from (default: %(default)s)")
     args = ap.parse_args(argv[1:])
 
     if not args.artifacts:
@@ -395,7 +398,8 @@ def main(argv: list[str]) -> int:
     cosign = shutil.which("cosign")
     print(f"US-1064 artefact agreement — {artifacts}")
     try:
-        for note in check_agreement(artifacts, statement, issuer, cosign):
+        for note in check_agreement(artifacts, statement, issuer, cosign,
+                                    expected_repo=args.expected_repo):
             print(f"  {note}")
     except Refusal as exc:
         print(f"  REFUSED: {exc}")

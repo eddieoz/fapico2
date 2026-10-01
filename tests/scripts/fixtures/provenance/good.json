@@ -15,7 +15,7 @@
       "externalParameters": {
         "workflow": {
           "ref": "refs/tags/v1.0.0",
-          "repository": "https://github.com/eddieoz/pico-fido2",
+          "repository": "https://github.com/eddieoz/fapico2",
           "path": ".github/workflows/release.yml"
         },
         "inputs": {}
@@ -27,7 +27,7 @@
       },
       "resolvedDependencies": [
         {
-          "uri": "git+https://github.com/eddieoz/pico-fido2@refs/tags/v1.0.0",
+          "uri": "git+https://github.com/eddieoz/fapico2@refs/tags/v1.0.0",
           "digest": {
             "gitCommit": "0000000000000000000000000000000000000000"
           }
@@ -42,10 +42,10 @@
     },
     "runDetails": {
       "builder": {
-        "id": "https://github.com/eddieoz/pico-fido2/.github/workflows/release.yml@refs/tags/v1.0.0"
+        "id": "https://github.com/eddieoz/fapico2/.github/workflows/release.yml@refs/tags/v1.0.0"
       },
       "metadata": {
-        "invocationId": "https://github.com/eddieoz/pico-fido2/actions/runs/1/attempts/1"
+        "invocationId": "https://github.com/eddieoz/fapico2/actions/runs/1/attempts/1"
       }
     }
   }
