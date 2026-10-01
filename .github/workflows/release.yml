@@ -252,6 +252,18 @@ jobs:
           set -euo pipefail
           cosign sign-blob --yes --output-certificate dist/fapico2.uf2.pem \
             --output-signature dist/fapico2.uf2.sig dist/fapico2.uf2
+          # What cosign actually wrote, in the open. It reports "Wrote
+          # certificate to file dist/fapico2.uf2.pem" and then the gates
+          # cannot read it, and the two facts sit in different steps with
+          # nothing joining them. This prints the shape of both outputs so
+          # the next failure is diagnosable from the log alone rather than
+          # costing another ten-minute round trip.
+          for f in dist/fapico2.uf2.pem dist/fapico2.uf2.sig; do
+            echo "--- $f: $(stat -c %s "$f") bytes"
+            head -c 100 "$f" | sed 's/^/    /'
+            echo
+          done
+          echo "--- cosign version: $(cosign version 2>/dev/null | head -1)"
       - name: Build provenance attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:

@@ -123,6 +123,19 @@ def explain(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8", errors="replace")
     info["is_pem"] = PEM_MARKER in raw
     info["bytes"] = len(raw)
+    # Classify what actually arrived. A cosign release that wrote something
+    # other than an armoured certificate — a bundle, bare base64 DER, a JSON
+    # envelope — looks identical to the gate ("no certificate") until you
+    # look at the bytes, so look at them and print what they are.
+    if raw.lstrip().startswith("{"):
+        info["looks_like"] = "JSON (a Sigstore bundle, not an armoured cert)"
+    elif raw.lstrip().startswith("-----BEGIN"):
+        info["looks_like"] = "PEM"
+    elif re.fullmatch(r"[A-Za-z0-9+/=\s]+", raw.strip() or "x"):
+        info["looks_like"] = "bare base64 (DER without PEM armour?)"
+    else:
+        info["looks_like"] = "unrecognised"
+    info["first_bytes"] = repr(raw[:120])
     openssl = shutil.which("openssl")
     info["openssl"] = openssl or "NOT INSTALLED"
     if info["is_pem"] and openssl:
