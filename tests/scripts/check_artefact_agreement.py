@@ -58,6 +58,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import certinfo  # noqa: E402  — sibling script, imported by path
+
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "agreement"
 UF2_NAME = "fapico2.uf2"
@@ -390,11 +393,13 @@ def main(argv: list[str]) -> int:
     statement = load_json(Path(args.attestation))
     issuer = None
     if args.certificate:
-        pem = Path(args.certificate).read_text(encoding="utf-8")
-        m = re.search(
-            r"1\.3\.6\.1\.4\.1\.57264\.1\.[1-9]\s*=\s*ASN1:UTF8String:(\S+)", pem)
-        if m:
-            issuer = m.group(1)
+        # The issuer lives in an X.509 extension, and the only text form in
+        # which that extension is legible is openssl's rendering of it — a
+        # raw PEM is base64 and never contains the OID. Searching the PEM
+        # directly (as this did) meant `issuer` was always None on a real
+        # keyless certificate, and A2/A4 refused every genuine release. See
+        # tests/scripts/certinfo.py.
+        issuer = certinfo.issuer(Path(args.certificate))
     cosign = shutil.which("cosign")
     print(f"US-1064 artefact agreement — {artifacts}")
     try:

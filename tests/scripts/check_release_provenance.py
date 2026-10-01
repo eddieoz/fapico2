@@ -75,6 +75,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import certinfo  # noqa: E402  — sibling script, imported by path
+
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "provenance"
 
@@ -284,10 +287,15 @@ def main(argv: list[str]) -> int:
     subject = Path(args.subject).read_bytes()
     issuer = None
     if args.certificate:
-        pem = Path(args.certificate).read_text(encoding="utf-8")
-        m = re.search(r"1\.3\.6\.1\.4\.1\.57264\.1\.[1-9]\s*=\s*ASN1:UTF8String:(\S+)", pem)
-        if m:
-            issuer = m.group(1)
+        # The issuer lives in an X.509 extension, and the only text form in
+        # which that extension is legible is openssl's rendering of it — a
+        # raw PEM is base64 and never contains the OID. Searching the PEM
+        # directly (as this did) meant `issuer` was always None on a real
+        # keyless certificate, so P2 refused every genuine release with "no
+        # signing certificate was supplied". The committed fixtures could not
+        # catch it: they pass the issuer in as a bare string and never read a
+        # certificate. See tests/scripts/certinfo.py.
+        issuer = certinfo.issuer(Path(args.certificate))
     print(f"US-1063 provenance policy — {args.attestation}")
     try:
         check_provenance(statement, subject, issuer, args.expected_workflow,
