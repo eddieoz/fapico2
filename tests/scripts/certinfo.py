@@ -34,10 +34,57 @@ import shutil
 import subprocess
 from pathlib import Path
 
-# The Fulcio certificate extensions, and the one that names the issuer.
-ISSUER_OID_PREFIX = r"1\.3\.6\.1\.4\.1\.57264\.1\.[1-9]"
-ISSUER_PATTERN = re.compile(ISSUER_OID_PREFIX + r"\s*=\s*ASN1:UTF8String:(\S+)")
+# The Fulcio extension that names the ISSUER, and only that one.
+#
+# Fulcio's extension family is `1.3.6.1.4.1.57264.1.N`:
+#   .1 Build Signer URI      https://github.com/OWNER/REPO/.github/workflows/wf@REF
+#   .5 Source Repository URI
+#   .7 Source Repository Ref
+#   .8 Issuer               https://token.actions.githubusercontent.com
+# Only .8 is the issuer. Matching `.[1-9]` and taking the first hit would
+# return the build-signer URI, which is a *workflow* URL — P2 would then
+# refuse a perfectly good certificate while claiming the signer "is not
+# GitHub Actions", which is a different and wrong accusation.
+ISSUER_OID = "1.3.6.1.4.1.57264.1.8"
+
+# How openssl actually renders an unknown extension. Verified against
+# `openssl x509 -text`, which prints the OID, a colon, and the value on
+# the FOLLOWING indented line:
+#
+#             1.3.6.1.4.1.57264.1.8:
+#                 https://token.actions.githubusercontent.com
+#
+# The older form `OID = ASN1:UTF8String:value` is NOT openssl's output at
+# all — it is what `asn1parse` and some tooling print — but a pre-rendered
+# fixture may carry it, so both spellings are accepted.
+ISSUER_LINE = re.compile(
+    re.escape(ISSUER_OID) + r"[^\S\n]*[=:]"           # OID then = or :
+    r"(?:[^\S\n]*ASN1:UTF8String:)?"                    # optional, not openssl's form
+    r"[^\S\n]*(?P<inline>\S+)?",                        # value on the same line
+    re.MULTILINE)
+URL = re.compile(r"https?://\S+")
+# The value may sit on the next indented line; a few is generous, not tight.
+VALUE_WINDOW = 4
 PEM_MARKER = "-----BEGIN CERTIFICATE-----"
+
+
+def issuer_from_text(text: str) -> str | None:
+    """The issuer URL in a rendered certificate, or None."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = ISSUER_LINE.search(line)
+        if not m:
+            continue
+        inline = m.group("inline")
+        if inline:
+            u = URL.search(inline)
+            if u:
+                return u.group(0).rstrip(".,;")
+        for j in range(i + 1, min(i + 1 + VALUE_WINDOW, len(lines))):
+            u = URL.search(lines[j])
+            if u:
+                return u.group(0).rstrip(".,;")
+    return None
 
 
 def rendered_text(path: Path) -> str:
@@ -58,10 +105,9 @@ def rendered_text(path: Path) -> str:
 def issuer(path: Path) -> str | None:
     """The OIDC issuer, or None if this certificate does not name one."""
     try:
-        m = ISSUER_PATTERN.search(rendered_text(path))
+        return issuer_from_text(rendered_text(path))
     except OSError:
         return None
-    return m.group(1) if m else None
 
 
 def self_test() -> list[str]:
@@ -101,6 +147,37 @@ def self_test() -> list[str]:
         got = issuer(rendered)
         if got != "https://token.actions.githubusercontent.com":
             problems.append(f"a pre-rendered issuer was not read back ({got!r})")
+
+        # A REAL Fulcio-shaped certificate, carrying both the build-signer URI
+        # (.1) and the issuer (.8). This is the case the previous regex got
+        # wrong twice over: it never matched openssl's rendering, and had it
+        # matched, `.[1-9]` would have returned the build-signer URI — a
+        # workflow URL — as "the issuer", and P2 would then refuse a good
+        # certificate while accusing it of not being GitHub Actions.
+        fulcio = root / "fulcio.pem"
+        made = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(root / "k2.pem"), "-out", str(fulcio),
+             "-days", "1", "-subj", "/CN=fapico2-fulcio-shape",
+             "-addext", ISSUER_OID.replace("1.3.6.1.4.1.57264.1.8",
+                                            "1.3.6.1.4.1.57264.1.1")
+             + "=ASN1:UTF8String:https://github.com/eddieoz/fapico2/"
+               ".github/workflows/release.yml@refs/tags/v1.0.0",
+             "-addext", ISSUER_OID
+             + "=ASN1:UTF8String:https://token.actions.githubusercontent.com"],
+            capture_output=True, check=False,
+        )
+        if made.returncode != 0 or not fulcio.is_file():
+            # Older/newer openssl may not accept an unknown OID in -addext.
+            # Skip rather than fail: the two checks above already ran.
+            return problems
+        got = issuer(fulcio)
+        if got != "https://token.actions.githubusercontent.com":
+            problems.append(
+                f"a Fulcio-shaped certificate returned {got!r}. The issuer is "
+                f"extension {ISSUER_OID}; the build-signer URI (.1) is a "
+                f"different extension and must never be returned as the "
+                f"issuer.")
     return problems
 
 
