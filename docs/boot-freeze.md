@@ -70,6 +70,34 @@ UF2, no probe connected)"* and *"Use the probe to READ, never to RUN."*
 > The watchdog refusal below belongs in that file's hardware-validation section
 > and is not yet there.
 
+## There are TWO different failures that look the same
+
+Both end the same way — no USB, only a power cycle recovers — but they are
+**not the same fault**, and an operator can tell them apart by watching the LED
+from power-on. Measured on 2026-10-01 with a ladder-capable image.
+
+**Failure A — dies early. The LED never blinks.**
+The board powers up, never drives the LED, never enumerates. Nothing at all on
+the LED: no blinks, no signature. It died before the first boot phase that can
+drive the pin.
+
+**Failure B — boots, serves, then drops. The LED blinks, then goes solid.**
+The board runs its boot ladder (a run of quick 40 ms blinks), then the 1 Hz
+heartbeat starts (steady on/off about once a second), and **then the LED goes
+solid and the device leaves the USB bus entirely.** It was working. It got
+further than you thought, and then it fell over.
+
+This matters because the obvious reading — "it froze at boot" — is only true of
+Failure A. Failure B is a device that came all the way up, began serving, and
+then died. A tool that only watches for the device to *appear* will miss B
+entirely; `tests/hardware/boot_time_probe.py` is built to report exactly that
+attach-then-drop shape.
+
+What this rules out: the freeze is **not** the OTP key-row refusal the epic
+predicted. An OTP refusal happens well after the LED becomes usable and would
+have produced three ladder blinks and then a distinct signature. Neither failure
+showed that. The prediction has been withdrawn — see the epic.
+
 ## 1. The boot phase ladder
 
 Under the release-allowed `boot-timeline` feature (`./build-timeline.sh`), the
