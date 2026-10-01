@@ -159,7 +159,11 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let salt = data.get(2).copied().unwrap_or(1).max(1);
 
     let mut trng = HostTrng::new();
-    let mut ks = DeviceKeystore::fresh(&mut trng);
+    // `fresh` draws the keystore's device random through the `Trng` seam and
+    // is fallible for that reason. `HostTrng` is a seeded host generator that
+    // cannot refuse a draw, so a refusal here is a broken harness rather than
+    // an uninteresting input — it is panicked on, not skipped.
+    let mut ks = DeviceKeystore::fresh(&mut trng).expect("HostTrng must supply entropy");
     let mut session = VendorSession::default();
     let mut random = |buf: &mut [u8]| buf.fill(0x5Au8);
 

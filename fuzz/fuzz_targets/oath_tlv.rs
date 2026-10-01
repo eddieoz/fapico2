@@ -222,7 +222,8 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         &mut trng,
         &mut store,
         device_id_from_chipid(EMULATION_CHIPID),
-    , OathSeal::emul()) {
+        OathSeal::emul(),
+    ) {
         Err(_) => {
             // Fail closed, and the refused store is untouched.
             assert_eq!(
@@ -242,7 +243,8 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                 &mut trng,
                 &mut store,
                 device_id_from_chipid(EMULATION_CHIPID),
-            , OathSeal::emul())
+                OathSeal::emul(),
+            )
             .expect("the store the applet itself just wrote must boot");
             app2.persist_state(&mut store);
             assert_eq!(

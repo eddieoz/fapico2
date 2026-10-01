@@ -402,6 +402,14 @@ fn the_compiled_pin_follows_the_board_file_end_to_end() {
         let mut cmd = std::process::Command::new("cargo");
         cmd.args(["build", "-v", "--lib", "-p", "fapico2-platform", "--target"])
             .arg(fapico2_platform::identity::HOST_BUILD_TARGET)
+            // The `-v` output is parsed below for a literal ``Running ` ``, and
+            // cargo colours that line when CARGO_TERM_COLOR is `always` — which
+            // `.github/workflows/ci.yml` sets on the whole job. The escapes land
+            // between `Running` and the backtick, the split misses, and the
+            // test fails claiming the build script never re-ran. That is a
+            // false negative about the thing this test exists to check, so the
+            // nested cargo is pinned to plain output. Nothing here reads colour.
+            .env("CARGO_TERM_COLOR", "never")
             .current_dir(&root);
         match env {
             // `FAPICO2_BOARD_PATH` is *removed* rather than set-empty for the
@@ -510,6 +518,12 @@ fn the_compiled_pin_follows_the_board_file_end_to_end() {
             "--exact",
             "selected_board_file_parity",
         ])
+        // Same reason as the `published` closure above: the nested run's own
+        // output is scanned for `1 passed`, and colour would not break that
+        // particular substring — but this pair of nested cargo invocations
+        // should agree about being plain-text, so the setting travels with the
+        // test rather than being rediscovered if a second parse is added.
+        .env("CARGO_TERM_COLOR", "never")
         .current_dir(&root);
         match env {
             None => {
