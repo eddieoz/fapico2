@@ -265,26 +265,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # One canonical path. `gh attestation download` writes jsonl natively
-          # and the json form is the fallback, and the two gates below (plus
-          # the manifest, plus publication) all name ONE file. Leaving the
-          # first attempt to write a different name meant the jsonl path left
-          # `dist/provenance.json` absent, which the US-1064 gate turned into
-          # a bare FileNotFoundError rather than a Refusal.
+          # `gh attestation download` has NO --format and NO --output. It
+          # writes ONE file into the current directory, named after the
+          # artefact's digest — `sha256-<hex>.jsonl`. Everything this step
+          # used to say about formats and output paths was invented: the
+          # fourth dry run died on `unknown flag: --format`.
           #
-          # The SUBJECT path is relative to this step's working-directory,
-          # which is the repository root — so it is `dist/…`, not
-          # `fapico2/dist/…`. The latter was what this step said, which is a
-          # path that does not exist, so the download could never have
-          # succeeded. `--repo` is named rather than left to gh's git-remote
-          # discovery, which has no reason to be right.
-          if ! gh attestation download dist/fapico2.uf2 \
-               --repo "${{ github.repository }}" \
-               --format jsonl --output dist/provenance.json; then
-            gh attestation download dist/fapico2.uf2 \
-              --repo "${{ github.repository }}" \
-              --format json --output dist/provenance.json
+          # So: run it, find the file it named after OUR digest (computed
+          # here rather than globbed blindly, so a stale file from an earlier
+          # step cannot be mistaken for this one), and hand it to the
+          # extractor. The digest is quoted in both spellings because gh uses
+          # a colon on POSIX and a dash on Windows.
+          DIGEST=$(sha256sum dist/fapico2.uf2 | cut -d' ' -f1)
+          rm -f "sha256:${DIGEST}.jsonl" "sha256-${DIGEST}.jsonl"
+          gh attestation download dist/fapico2.uf2 \
+            --repo "${{ github.repository }}"
+          FOUND=""
+          for name in "sha256:${DIGEST}.jsonl" "sha256-${DIGEST}.jsonl"; do
+            [ -f "$name" ] && { FOUND="$name"; break; }
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::gh attestation download produced no file for sha256:${DIGEST} (looked for sha256:….jsonl and sha256-….jsonl). What it did write: $(ls -1 *.jsonl 2>/dev/null || echo nothing)"
+            exit 1
           fi
+          # What gh returns is a Sigstore bundle, not the in-toto statement
+          # the gates read. extract_provenance.py reduces it and says which
+          # shape it found, so this run's log records it.
+          python3 tests/scripts/extract_provenance.py \
+            --input "$FOUND" --output dist/provenance.json
+          rm -f "$FOUND"
           test -s dist/provenance.json
       # US-1063's refusal half: the attestation has to name THIS reusable
       # workflow (`job_workflow_ref`), not merely come from something that
