@@ -152,85 +152,57 @@ def rescue_reboot(to_bootsel: bool) -> tuple[int, int]:
             pass
 
 
-def mgmt_write_config() -> tuple[int, int, str]:
-    """Change one setting through the Management applet: read the config
-    record, toggle a bit, write it back.
+def rescue_write_phy_config() -> tuple[int, int, str]:
+    """Change one device setting through the rescue applet's `WRITE`.
 
-    US-1301 asks for "change one setting and save". This is the save the
-    PicoForge client performs — a Management `WRITE_CONFIG` that persists
-    through the secure partition and takes the persist gate. The exact bit
-    toggled does not matter to the measurement; that it *saves durably* does.
+    **Not** the Management applet's `WRITE_CONFIG`. That is unconditionally
+    refused on a device build: `apps/mgmt/src/lib.rs`:212 makes
+    `default_user_present()` return `false` under `#[cfg(feature = "device")]`,
+    and the Management applet — unlike FIDO, OATH, OTP and OpenPGP — is given
+    no presence hook at all, so it answers `6985` instantly on every attempt.
+    The rescue applet's `WRITE` needs no presence grant and is what PicoForge's
+    configuration screen actually uses.
 
-    AID, CLA and INS are taken from `apps/mgmt/src/lib.rs` rather than guessed:
-    AID `A0 00 00 05 27 47 11 17`, CLA `0x00`, `READ_CONFIG` INS `0x1D`,
-    `WRITE_CONFIG` INS `0x1C`. (`0x1E` is `RESET`, not the write.)
-
-    `WRITE_CONFIG` calls `user_present()` first (`apps/mgmt/src/lib.rs`:561),
-    so the card asks for a touch. Per the 2026-09-30 hardware session the
-    presence window **self-serves after ~8-9 s**, so this waits rather than
-    pressing — no finger, and no debugger.
+    The target TLV is chosen **by tag**, never by position, and the lock and
+    serial tags are excluded by name: the config's last entry is
+    `0a 01 00` = TAG_CONFIG_LOCK, value 0x00 (unlocked), and flipping that byte
+    would lock out every later write until a factory reset.
     """
     from smartcard.System import readers
 
     conn = list(readers())[0].createConnection()
     conn.connect()
     try:
-        sel, sw1, sw2 = conn.transmit([0x00, 0xA4, 0x04, 0x04, 0x08,
-                                       0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17])
+        sel, sw1, sw2 = conn.transmit([0x00, 0xA4, 0x04, 0x00, 0x08,
+                                       0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21])
         if (sw1, sw2) != (0x90, 0x00):
-            return sw1, sw2, f"management SELECT failed ({sw1:02x}{sw2:02x})"
+            return sw1, sw2, f"rescue SELECT failed ({sw1:02x}{sw2:02x})"
 
-        cfg, r1, r2 = conn.transmit([0x00, 0x1D, 0x00, 0x00, 0x00])
+        # READ P1 = 0x01 (full PHY configuration).
+        blob, r1, r2 = conn.transmit([0x80, 0x1E, 0x01, 0x00, 0x00])
         if (r1, r2) != (0x90, 0x00):
-            return r1, r2, f"READ_CONFIG failed ({r1:02x}{r2:02x})"
+            return r1, r2, f"READ PhyConfig failed ({r1:02x}{r2:02x})"
+        body = bytearray(blob)
 
-        body = bytearray(cfg)
-        if not body:
-            return 0x6F, 0x00, "empty config record, nothing to change"
-
-        # Pick the TLV to change BY TAG, never by position. The config is a
-        # TLV list whose last entry is `0a 01 00` = TAG_CONFIG_LOCK, value 0x00
-        # (unlocked) — toggling that byte's low bit sets the lock, which then
-        # refuses every further WRITE_CONFIG until a factory RESET. A "change
-        # one setting" that flips the lock reports success and quietly bricks
-        # configuration for the rest of the run.
-        TAG_CONFIG_LOCK, TAG_SERIAL = 0x0A, 0x02
-        blob = body[1:]          # data[0] is the overall length prefix
+        TAG_OPTIONS, TAG_LOCK, TAG_SERIAL = 0x06, 0x0A, 0x02
         i, chosen = 0, None
-        while i + 2 <= len(blob):
-            tag, ln = blob[i], blob[i + 1]
-            if tag in (TAG_CONFIG_LOCK, TAG_SERIAL) or ln == 0 or i + 2 + ln > len(blob):
+        while i + 2 <= len(body):
+            tag, ln = body[i], body[i + 1]
+            if tag == TAG_OPTIONS and ln >= 1:
+                chosen = i + 2 + ln - 1
+                break
+            if tag in (TAG_LOCK, TAG_SERIAL) or ln == 0 or i + 2 + ln > len(body):
                 i += 2 + ln if ln else 1
                 continue
-            chosen = (i + 2 + ln - 1, tag)   # last value byte of that TLV
-            break
+            i += 2 + ln
         if chosen is None:
-            return 0x6F, 0x00, "no safe TLV to change (only lock/serial present)"
-        body[chosen[0]] ^= 0x01
-        note = f"read {len(body)} B, toggled TLV tag 0x{chosen[1]:02x}"
+            return 0x6F, 0x00, "no Options TLV to change"
+        before = body[chosen]
+        body[chosen] ^= 0x01
 
-        # The write blocks on presence; give the self-serving window room.
-        t0 = time.monotonic()
-        while True:
-            _r, w1, w2 = conn.transmit([0x00, 0x1C, 0x00, 0x00, len(body)] + list(body))
-            if (w1, w2) == (0x90, 0x00):
-                return w1, w2, f"{note}, saved"
-            # 6982 (security status not satisfied) and 6985 (conditions of use
-            # not satisfied) are both the presence gate refusing, not a real
-            # rejection. Per the 2026-09-30 hardware session the window
-            # self-serves after ~8-9 s, so wait and retry rather than pressing
-            # anything — a finger on the pad is a variable this measurement
-            # does not want.
-            presence_refusal = (w1, w2) in ((0x69, 0x82), (0x69, 0x85))
-            if presence_refusal and time.monotonic() - t0 < 45.0:
-                # Only worth waiting for if the card is actually waiting. An
-                # INSTANT refusal is not a presence window: it means a request
-                # is left pending (by an aborted attempt), which makes
-                # begin_request refuse until the device reboots. Waiting only
-                # delays that discovery.
-                time.sleep(1.5)
-                continue
-            return w1, w2, f"{note}, WRITE_CONFIG -> {w1:02x}{w2:02x}"
+        # WRITE P1 = 0x01 (PhyConfig).
+        _r, w1, w2 = conn.transmit([0x80, 0x1C, 0x01, 0x00, len(body)] + list(body))
+        return w1, w2, f"Options 0x{before:02x} -> 0x{body[chosen]:02x}"
     finally:
         try:
             conn.disconnect()
@@ -270,18 +242,29 @@ def main(argv: list[str]) -> int:
         # with nothing to talk to.)
         print(f"[{args.arm} #{args.index}] device up. Changing one setting…",
               flush=True)
-        w1, w2, note = mgmt_write_config()
+        w1, w2, note = rescue_write_phy_config()
         result["detail"] = f"save -> {w1:02x}{w2:02x} ({note})"
         print(f"[{args.arm} #{args.index}] {note}: {w1:02x}{w2:02x}", flush=True)
         if (w1, w2) != (0x90, 0x00):
             result["verdict"] = "SAVE-REJECTED"
             return _emit(result, args.out)
         # Now reboot, which is the step whose aftermath is being measured.
+        # Do NOT swallow a failure here. The write leaves the reader in a
+        # degraded state often enough that the reboot APDU fails to send, and
+        # a silent `except: pass` turns that into a "cycle" that saved a
+        # setting and then sat there, rebooting nothing — which is exactly
+        # what happened to save cycle 2. A cycle that did not reboot did not
+        # run.
         try:
             rescue_reboot(False)
-        except Exception:
-            pass
-        result["detail"] += "; rebooted (normal)"
+            result["detail"] += "; reboot sent (normal)"
+        except Exception as exc:
+            result["verdict"] = "REBOOT-NOT-SENT"
+            result["detail"] += f"; REBOOT FAILED: {type(exc).__name__}"
+            print(f"[{args.arm} #{args.index}] the save landed but the reboot "
+                  f"APDU did not send ({type(exc).__name__}). This is NOT a "
+                  f"cycle — the board never rebooted.", flush=True)
+            return _emit(result, args.out)
     else:
         print(f"[{args.arm} #{args.index}] device up. Rebooting to BOOTSEL…",
               flush=True)
@@ -302,6 +285,11 @@ def main(argv: list[str]) -> int:
 
     print(f"[{args.arm} #{args.index}] waiting for the device to enumerate…",
           flush=True)
+    # It must be seen to LEAVE first. An earlier revision started polling for
+    # `fa20:0002` immediately, which succeeded against the *pre-reboot* instance
+    # and reported "came back in 2s" for a board that had not rebooted at all.
+    # Only a device that was observed gone and came back has rebooted.
+    wait_for(lambda: not target_up(), 30.0, "device to leave the bus")
     back = wait_for(target_up, ENUM_TIMEOUT_S, "enumeration")
     elapsed = time.time() - started
     if back:
