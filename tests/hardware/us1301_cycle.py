@@ -187,8 +187,27 @@ def mgmt_write_config() -> tuple[int, int, str]:
         body = bytearray(cfg)
         if not body:
             return 0x6F, 0x00, "empty config record, nothing to change"
-        body[-1] ^= 0x01
-        note = f"read {len(body)} B, toggled last byte"
+
+        # Pick the TLV to change BY TAG, never by position. The config is a
+        # TLV list whose last entry is `0a 01 00` = TAG_CONFIG_LOCK, value 0x00
+        # (unlocked) — toggling that byte's low bit sets the lock, which then
+        # refuses every further WRITE_CONFIG until a factory RESET. A "change
+        # one setting" that flips the lock reports success and quietly bricks
+        # configuration for the rest of the run.
+        TAG_CONFIG_LOCK, TAG_SERIAL = 0x0A, 0x02
+        blob = body[1:]          # data[0] is the overall length prefix
+        i, chosen = 0, None
+        while i + 2 <= len(blob):
+            tag, ln = blob[i], blob[i + 1]
+            if tag in (TAG_CONFIG_LOCK, TAG_SERIAL) or ln == 0 or i + 2 + ln > len(blob):
+                i += 2 + ln if ln else 1
+                continue
+            chosen = (i + 2 + ln - 1, tag)   # last value byte of that TLV
+            break
+        if chosen is None:
+            return 0x6F, 0x00, "no safe TLV to change (only lock/serial present)"
+        body[chosen[0]] ^= 0x01
+        note = f"read {len(body)} B, toggled TLV tag 0x{chosen[1]:02x}"
 
         # The write blocks on presence; give the self-serving window room.
         t0 = time.monotonic()
@@ -204,6 +223,11 @@ def mgmt_write_config() -> tuple[int, int, str]:
             # does not want.
             presence_refusal = (w1, w2) in ((0x69, 0x82), (0x69, 0x85))
             if presence_refusal and time.monotonic() - t0 < 45.0:
+                # Only worth waiting for if the card is actually waiting. An
+                # INSTANT refusal is not a presence window: it means a request
+                # is left pending (by an aborted attempt), which makes
+                # begin_request refuse until the device reboots. Waiting only
+                # delays that discovery.
                 time.sleep(1.5)
                 continue
             return w1, w2, f"{note}, WRITE_CONFIG -> {w1:02x}{w2:02x}"
