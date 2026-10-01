@@ -2140,18 +2140,13 @@ const LB_CHECKSUM_LEN: usize = 16;
 /// CTAP2 `0x04` is userID; PicoForge `0x07` is credentialID, CTAP2 `0x07`
 /// is totalRPs), so a merged map is impossible — each dialect has to be
 /// answered in its own shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CmDialect {
     PicoForge,
+    // Spec is the safe default: an unrecognised request is far more
+    // likely to come from a third-party client than from PicoForge.
+    #[default]
     Ctap2,
-}
-
-impl Default for CmDialect {
-    fn default() -> Self {
-        // Spec is the safe default: an unrecognised request is far more
-        // likely to come from a third-party client than from PicoForge.
-        CmDialect::Ctap2
-    }
 }
 
 /// Canonical credMgmt sub-command identity, independent of the wire dialect.

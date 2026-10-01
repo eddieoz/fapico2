@@ -1,3 +1,51 @@
+**Date:** 2026-10-01 (**Re-measurement after the revert of the `cargo-deps` group
+PR #2.** No feature changed; the *resolved dependency closure* did, so every
+number below is re-taken rather than carried.)
+
+**Measured: `text` 813,568 → 815,576 B (**+2,008 B**); Berkeley `.bss` 420,692 →
+420,704 B (**+12 B**); task-arena demand 17,760 → **21,840 B** (re-measured, not
+carried — see below); UF2 **3061 blocks** (1 absolute preamble + 3060 ARM_S
+payload), 1,567,232 bytes. Shipping sha256 **`0f4e6189e4ea…`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3061 blocks (1 absolute preamble + 3060 ARM_S payload), 1567232 bytes
+```
+
+**Why every figure moved when no code did.** The `cargo-deps` group PR
+(`3f020ecc6e`, merged then reverted as `904b646`) had rewritten `Cargo.lock`
+across three major-version generations — `rand_core` 0.6 → 0.10 and RustCrypto
+0.10/0.12/0.8/0.1 → 0.11/0.13/0.9/0.2. Those were unbuildable against
+`trussed` 0.2 / `trussed-core` 0.2, which pin `rand_core = "0.6"` and the
+`digest` 0.10 line, so the revert put the whole lockfile back. The restored
+closure compiles to a different image than either the pre-PR or post-PR tree
+did: +2,008 B of `text` and +12 B of `.bss`. Neither delta is a feature and
+neither is a regression to chase — they are what this dependency set weighs.
+
+**The task arena was re-measured, not assumed.** `check_boot_chain.py` failed
+closed on the arena stamp: `TASK_ARENA_DEMAND_B_STAMP` is byte-exact over
+`firmware/src` plus the resolved version of every package in the firmware's
+closure, and the lockfile move invalidated it. The stamp is the guard, not the
+measurement — `measure_task_arena.py` under nightly is the authority — so it was
+re-run and the demand re-stamped at `d4a732983b0db5eb…`. The new figure,
+**21,840 B against a 32,772 B arena (1.50×, floor 1.25×)**, is the measured
+one; the previous 17,760 B was stale and its larger apparent headroom was not
+real. Both the arena and the worst call chain (91,972 B against the 98,304 B
+ceiling) pass.
+
+**The only source change in this commit is clippy, and it is byte-neutral in
+intent**: `CmDialect`'s hand-written `Default` impl became `#[derive(Default)]`
+with `#[default]` on `Ctap2` in **both** the host twin (`app.rs`) and the device
+twin (`device_core.rs`), and the host twin's write-only `sub_params_cbor` field
+was dropped. That field was parsed and stored but never read — the host twin
+deliberately rebuilds the signed params from typed fields while the device twin
+signs the raw bytes, a split pinned by
+`device_full_set.rs::device_twin_credmgmt_mac_scope_differs_from_host_for_0x01_and_0x02`,
+which still passes.
+
+---
+
 **Date:** 2026-09-30 (**US-OTP-HID: the Yubico OTP HID transport** — a second
 HID interface, the YK4 feature-report state machine, and the composite
 `HidInterfacesHandler` that routes both — plus the `encCredStoreState` and
@@ -763,27 +811,27 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 761,600 | `0x10000200` | no (flash) |
-| `.rodata` | 18,708 | `0x100ba100` | no (flash) |
+| `.text` | 763,608 | `0x10000200` | no (flash) |
+| `.rodata` | 18,708 | `0x100ba8d8` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100beae0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 419,668 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x2006681c` | yes |
+| `.gnu.sgstubs` | 0 | `0x100bf2c0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 419,680 | `0x200000c8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20066828` | yes |
 | `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 759,724 (`.text`) + 18,628 (`.rodata`) + 276
+Berkeley `text` = 763,608 (`.text`) + 18,708 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **811,612**. That identity is stated so a reader can check
+the `X` flag) = **815,576**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 813,568 B** · **`.data` = 196 B** · **`.bss` = 420,692 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 815,576 B** · **`.data` = 196 B** · **`.bss` = 420,704 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 420,888 B** (420,892 B address-to-address: `__sheap` `0x20066c1c` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c1c` → **main stack zone = 111,588 B** of 532,480 B of SRAM.
+**RAM statics = 420,900 B** (420,904 B address-to-address: `__sheap` `0x20066c28` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c28` → **main stack zone = 111,576 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
