@@ -177,10 +177,22 @@ drivers re-enable their own IRQs).
 
 ## Identity verification after boot
 
-`lsusb` must show `fa20:0002` "fapico2" — with either "EddieOz" or "The
-BLOCO Community" as the manufacturer, since units predate the 2026-09-28
-rename and only `iManufacturer` differs. If 20a0/42b2 still shows, the Rust
-image is not what booted — the run stops and is reported.
+`lsusb` must show `fa20:0002` "fapico2`.
+
+The manufacturer is **"The BLOCO Community"** for any image built from the
+current `firmware/boards/pico2.toml`; that is what
+`check_release_notes.py` now holds the release notes to, so the two cannot
+drift apart silently again.
+
+"EddieOz" was the manufacturer before the 2026-09-28 rename, and it still
+appears in the rows above because those runs predate it. **A run that flashes
+a current image and records "EddieOz" is a defect, not a legacy exception** —
+it means the image on the board is older than the tree it was flashed from.
+Recording which string was actually seen is the point of this check; do not
+normalise the old one away.
+
+If 20a0/42b2 still shows, the Rust image is not what booted — the run stops
+and is reported.
 
 ## Cross-check against the C secure-store / TRNG review (sess_510abb89)
 

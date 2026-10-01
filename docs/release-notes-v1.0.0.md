@@ -98,12 +98,20 @@ boot bring-up section.
 
 ## USB identity (provisional VID)
 
-The device enumerates as **`fa20:0002` "EddieOz" "fapico2"**. **Note:**
-`0xFA20` is **not** a USB-IF-registered vendor ID — this identity is
+The device enumerates as **`fa20:0002` "The BLOCO Community" "fapico2"`**.
+**Note:** `0xFA20` is **not** a USB-IF-registered vendor ID — this identity is
 provisional. Production requires a registered VID or a picoforge re-brand.
 Host implications and the libccid `Info.plist` allowlist workaround
 (macOS/OpenSC; Linux pcscd matches by CCID class) are documented in the
 [README](../README.md#usb-identity-provisional).
+
+The manufacturer was `"EddieOz"` until 2026-09-28. **v1.0.0 ships
+`"The BLOCO Community"`** — this section said otherwise for a while after
+that rename, which is why `check_release_notes.py` now compares the identity
+in these notes against `firmware/boards/pico2.toml` rather than trusting
+either to be remembered in step with the other. A board flashed with an
+image older than the rename still enumerates as "EddieOz"; that is the only
+case where the old string is correct.
 
 
 ---
