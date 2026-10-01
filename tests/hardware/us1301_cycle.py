@@ -105,6 +105,76 @@ def target_up() -> bool:
     return any((v, p) == (TARGET_VID, TARGET_PID) for v, p, _ in _lsusb())
 
 
+def target_device_number() -> str:
+    """The target's USB **device number**, or `"GONE"` when it is absent.
+
+    Why a number and not a boolean: a boolean cannot distinguish "never
+    rebooted" from "rebooted so fast the poll missed it", and it cannot show
+    that the device came back as a *different* device. Both distinctions have
+    already been got wrong here:
+
+      * an earlier `dn()` helper ran `lsusb | grep -o 'Device [0-9]*' | head -1`,
+        which returns the **root hub's** number rather than the target's, and
+        so watched the wrong device for 24 s while a perfectly good reboot went
+        unobserved;
+      * a polling loop whose break condition fired while the device was *still
+        present* recorded "came back in 3s" for a board that had not rebooted
+        at all.
+
+    Parsing is done from the full `lsusb` text and matched on VID:PID, so
+    nothing here depends on line order or on a device being first.
+
+    A rising device number across an absence is the **proof** that a reboot
+    happened: the kernel allocates a fresh number when a device re-enumerates.
+    """
+    for vid, pid, _name in _lsusb():
+        if (vid, pid) == (TARGET_VID, TARGET_PID):
+            out = subprocess.run(
+                ["bash", "-c",
+                 f"lsusb | grep -i '{TARGET_VID}:{TARGET_PID}' "
+                 r"| sed 's/.*Device \([0-9]*\).*/\1/'"],
+                capture_output=True, text=True, timeout=20).stdout.strip()
+            return out or "?"
+    return "GONE"
+
+
+def watch_reboot(timeout_s: float, sample_s: float = 0.5):
+    """Watch for a reboot and return `(left_bus, sequence)`.
+
+    `sequence` is the run-length-collapsed history of the target's device
+    number, e.g. `[["050", 3], ["GONE", 1], ["052", 4]]` — what was seen and for
+    how many samples. It is recorded in the JSON result so a verdict can be
+    re-checked by a reader rather than taken on trust.
+
+    `left_bus` is True only if the device was **observed absent**. A cycle that
+    never went absent did not reboot, whatever any APDU reported.
+    """
+    prev, count = target_device_number(), 0
+    sequence: list[list] = []
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(sample_s)
+        cur = target_device_number()
+        if cur == prev:
+            count += 1
+            continue
+        sequence.append([prev, count])
+        prev, count = cur, 0
+        if cur == "GONE":
+            sequence.append([cur, 1])
+            # Wait for the return, then record what came back.
+            while time.monotonic() < deadline:
+                time.sleep(sample_s)
+                back = target_device_number()
+                if back != "GONE":
+                    sequence.append([back, 1])
+                    return True, sequence
+                sequence[-1][1] += 1
+            return True, sequence
+    sequence.append([prev, count])
+    return False, sequence
+
+
 def in_bootsel() -> tuple[bool, Path | None]:
     """`(in BOOTSEL, mount point)`, finding the volume up to two levels deep."""
     for one in _listdir(Path("/media")):
@@ -296,27 +366,36 @@ def main(argv: list[str]) -> int:
     # `fa20:0002` immediately, which succeeded against the *pre-reboot* instance
     # and reported "came back in 2s" for a board that had not rebooted at all.
     # Only a device that was observed gone and came back has rebooted.
-    left = wait_for(lambda: not target_up(), 30.0, "device to leave the bus")
-    back = wait_for(target_up, ENUM_TIMEOUT_S, "enumeration")
+    # The verdict is derived from what the DEVICE did, never from what an APDU
+    # returned. A reboot that reports `9000` and does not reboot must not score
+    # as a clean cycle, and a device that returns as a different USB number has
+    # rebooted even if the poll was too coarse to see the gap.
+    before = target_device_number()
+    result["device_before"] = before
+    print(f"[{args.arm} #{args.index}] watching for a reboot (was device "
+          f"{before})…", flush=True)
+    left, sequence = watch_reboot(ENUM_TIMEOUT_S)
+    result["device_sequence"] = sequence
+    result["rebooted"] = left
     elapsed = time.time() - started
+
     if not left:
-        # "Never left the bus" means the reboot did not happen, whatever the
-        # APDU call reported. Two cycles were scored CAME-BACK on the strength
-        # of a send that never reached the card, so the verdict now keys off
-        # the observed re-enumeration and nothing else. A cycle that did not
-        # reboot measures nothing about a boot path.
         result["verdict"] = "NO-REBOOT-OBSERVED"
-        print(f"[{args.arm} #{args.index}] the device NEVER LEFT THE BUS — the "
-              f"reboot did not happen. Not a cycle.", flush=True)
-        return _emit(result, args.out)
-    if back:
-        result["verdict"] = "CAME-BACK"
-        print(f"[{args.arm} #{args.index}] OK — enumerated after {elapsed:.1f}s",
+        print(f"[{args.arm} #{args.index}] the device never left the bus "
+              f"(stayed {before}) — the reboot did not happen. Not a cycle.",
               flush=True)
+        return _emit(result, args.out)
+
+    after = target_device_number()
+    result["device_after"] = after
+    if after != "GONE":
+        result["verdict"] = "CAME-BACK"
+        print(f"[{args.arm} #{args.index}] OK — device {before} → {after} "
+              f"after {elapsed:.1f}s", flush=True)
     else:
         result["verdict"] = "FROZEN"
         result["needs_power_cycle"] = True
-        print(f"[{args.arm} #{args.index}] *** DID NOT ENUMERATE in "
+        print(f"[{args.arm} #{args.index}] *** DID NOT RETURN in "
               f"{ENUM_TIMEOUT_S:.0f}s — freeze reproduction ***", flush=True)
         print("  Per R2-26 only VBUS removal clears this state. Unplug the "
               "cable, WAIT 5 SECONDS, replug, and record that you did.", flush=True)
