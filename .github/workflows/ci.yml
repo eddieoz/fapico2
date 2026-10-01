@@ -44,7 +44,7 @@ env:
   # (firmware/fapico2.uf2), not on the ELF text — the UF2 is what actually
   # occupies flash, and it is the artifact that is flashed.
   #
-  # 1528 KiB against a measured 1563136 B (1526.5 KiB, 3053 blocks): ~1.5 KiB
+  # 1532 KiB against a measured 1567232 B (1530.5 KiB, 3061 blocks): ~1.5 KiB
   # of slack. Tight on purpose. A ratchet with 20 % headroom is a number nobody
   # reads; this one turns ordinary growth into a red that says "raise it
   # deliberately, and say why in docs/size-report.md". The absolute backstop is
@@ -66,7 +66,16 @@ env:
   # dropped, an `int_plus_one` lint rewrite, and an unused import); that they
   # cost nothing is recorded in docs/size-report.md so this raise is not later
   # read as covering them. See the dated entry at the top of that file.
-  FIRMWARE_FLASH_BUDGET_KIB: 1528
+  #
+  # 2026-10-01 raised this from 1528 to 1532. The +8 blocks / +4,096 B is **not
+  # a feature**: it is the cargo-deps group PR #2 having been merged and then
+  # reverted, which moved the whole `Cargo.lock` and so changed what the
+  # restored dependency closure compiles to (text 813,568 -> 815,576 B, .bss
+  # 420,692 -> 420,704 B). The only source edits in the same commit are
+  # clippy — a `Default` derive in both fido twins and one write-only field
+  # dropped — which are byte-neutral in intent and carry none of the growth.
+  # Measured and recorded at the top of docs/size-report.md.
+  FIRMWARE_FLASH_BUDGET_KIB: 1532
 
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
