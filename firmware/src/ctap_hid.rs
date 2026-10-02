@@ -29,6 +29,82 @@ pub const CTAP_HID_KEEPALIVE: u8 = 0x3B;
 pub const CTAP_HID_ERROR: u8 = 0x3F;
 const TYPE_INIT: u8 = 0x80;
 
+/// US-1505: `CTAPHID_CANCEL` (`0x11`) — CTAPHID §11.2.9, the host's "abandon
+/// this request".
+///
+/// The value is not in dispute: `fido2/hid/__init__.py:79` declares
+/// `CANCEL = 0x11` and `fido2/hid/__init__.py:158` puts
+/// `TYPE_INIT | CTAPHID.CANCEL` straight into the report it writes, and
+/// `pico-keys-sdk/src/usb/hid/ctap_hid.h:90` has
+/// `#define CTAPHID_CANCEL (TYPE_INIT | 0x11)`. What §11.2.9 does **not**
+/// require is a reply frame, and this firmware deliberately sends none —
+/// see [`CTAP2_ERR_KEEPALIVE_CANCEL`] and the note on the dispatch arm in
+/// `hid_serve`.
+pub const CTAP_HID_CANCEL: u8 = 0x11;
+
+/// `CTAPHID_KEEPALIVE` payload byte 1: PROCESSING (0x01).
+///
+/// `fido2/ctap.py:37-41` declares `class STATUS(IntEnum): PROCESSING = 1;
+/// UPNEEDED = 2` and `fido2/hid/__init__.py:225` does
+/// `STATUS(struct.unpack_from(">B", recv)[0])` inside a `try` whose
+/// `ValueError` arm raises `ConnectionFailure("Invalid keepalive status")`.
+///
+/// That is the whole reason there are exactly two constants here and no
+/// third: a status byte outside `{0x01, 0x02}` is not "a keepalive the host
+/// ignores", it is a **transport failure** in the host, and the connection
+/// dies rather than the ceremony.
+pub const CTAPHID_KEEPALIVE_PROCESSING: u8 = 0x01;
+
+/// `CTAPHID_KEEPALIVE` payload byte 1: UP_NEEDED (0x02) — the device is
+/// waiting for a touch. See [`CTAPHID_KEEPALIVE_PROCESSING`].
+pub const CTAPHID_KEEPALIVE_UPNEEDED: u8 = 0x02;
+
+/// US-1505/US-1506: the byte a cancelled or expired CTAP2 consent window
+/// answers with — `CTAP2_ERR_KEEPALIVE_CANCEL`, **0x2D**.
+///
+/// ## Why 0x2D and not this crate's own `Ctap2Response::KeepAliveCancel`
+///
+/// `fapico2_fido::ctap2::Ctap2Response::KeepAliveCancel` is declared
+/// `= 0x2C` (`apps/fido/src/ctap2.rs:69`), and that value is the odd one
+/// out. Every implementation and, more to the point, every *client* in
+/// this ecosystem puts the code at `0x2D`:
+///
+/// * `fido2/ctap.py:144-147` (the `fido2` 2.2.1 this repository is built
+///   against — AGENTS.md §2) — `UNSUPPORTED_OPTION = 0x2B`,
+///   `INVALID_OPTION = 0x2C`, **`KEEPALIVE_CANCEL = 0x2D`**,
+///   `NO_CREDENTIALS = 0x2E`;
+/// * `pico-fido/src/fido/ctap.h:176` and `pico-fido2/src/fido/ctap.h:176`
+///   — `#define CTAP2_ERR_KEEPALIVE_CANCEL 0x2D`;
+/// * `RS-Key/crates/rsk-fido/src/error.rs:31` — `KeepAliveCancel = 0x2d`,
+///   and its emulator drives that literal byte
+///   (`RS-Key/tools/emu/src/hid_tests.rs:207` answers `vec![0x2d]`).
+///
+/// Reproduce with the installed client:
+///
+/// ```text
+/// $ python -c "import fido2.ctap as c; print(hex(c.CtapError.ERR.KEEPALIVE_CANCEL))"
+/// 0x2d
+/// ```
+///
+/// The consequence of emitting `0x2C` is not cosmetic. `fido2` decodes a
+/// CTAP2 answer with `status = response[0]; if status != 0x00: raise
+/// CtapError(status)` (`fido2/ctap2/base.py:285-287`), so a `0x2C` arrives
+/// as `ERR.INVALID_OPTION` and `fido2/client/__init__.py:114-135` maps that
+/// to `ClientError.ERR.BAD_REQUEST` — a client-side complaint about the
+/// *request* — instead of `ClientError.ERR.TIMEOUT`, which is what
+/// `KEEPALIVE_CANCEL` is mapped to at `client/__init__.py:105-110`. The
+/// story this byte exists for is "the ceremony was abandoned, not that your
+/// request was malformed", and only one of the two spellings says that.
+///
+/// US-1505/1506 are confined to `firmware/src/`, so the enum is left alone
+/// and the corrected byte is stated here. Renumbering
+/// `Ctap2Response::KeepAliveCancel` to `0x2D` (which would also leave
+/// `0x2D` free of the current `InvalidOption`/`KeepAliveCancel` shift) is
+/// the follow-up, and it is safe: `KeepAliveCancel` had no producer anywhere
+/// in the tree until this story, so the only thing the old value ever did
+/// was mislead a reader.
+pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
+
 /// `capFlags` byte of the CTAPHID_INIT reply — **0x05, both bits, on purpose.
 ///
 /// Two incompatible bit assignments for this one byte are live at once, and

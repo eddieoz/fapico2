@@ -56,9 +56,9 @@ use fapico2_platform::dispatch::MAX_RESPONSE;
 use heapless::Vec as HeaplessVec;
 
 use crate::ctap_hid::{
-    init_reply, CidAllocator, HidAssembler, HidFeed, HID_REPORT_SIZE, CTAP_HID_CBOR,
-    CTAP_HID_ERROR, CTAP_HID_INIT, CTAP_HID_KEEPALIVE, CTAP_HID_MSG, CTAP_HID_PING, CTAP_HID_WINK,
-    HID_ERR_INVALID_CMD,
+    init_reply, CidAllocator, HidAssembler, HidFeed, HID_REPORT_SIZE, CTAP2_ERR_KEEPALIVE_CANCEL,
+    CTAP_HID_CANCEL, CTAP_HID_CBOR, CTAP_HID_ERROR, CTAP_HID_INIT, CTAP_HID_KEEPALIVE,
+    CTAP_HID_MSG, CTAP_HID_PING, CTAP_HID_WINK, HID_ERR_INVALID_CMD,
 };
 use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
 use crate::presence::{self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, TouchWindow};
@@ -777,6 +777,98 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
     } else if cmd == CTAP_HID_WINK {
         // WINK: acknowledge with an empty response frame.
         reply(io, channel, CTAP_HID_WINK, &[]).await;
+    } else if cmd == CTAP_HID_CANCEL {
+        // US-1505, CTAPHID §11.2.9. Before this arm existed the command had
+        // no dispatch at all: any `cmd` in `0x00..=0x7F` is a legal init
+        // packet to the assembler, so a host `CANCEL` was answered
+        // `0x3F` / `0x01 INVALID_CMD` in ~12 ms on the board.
+        //
+        // The window is the whole point. `PendingUp` owns its lifecycle, and
+        // this is the third of its three close conditions alongside grant
+        // and deadline; the teardown goes through [`close_window`] because
+        // that is the only function in the tree pairing `end_window` with
+        // `touch_prompt(false)`, and a second copy of the pair is a way to
+        // leak the single presence slot.
+        //
+        // ## No acknowledgement frame — deliberately
+        //
+        // The reply is the **cancelled command's** answer, on the cancelled
+        // command's channel, and nothing else. A zero-length `0x11` frame
+        // back would be actively harmful on this client, and the chain that
+        // shows it was read, not assumed:
+        //
+        // * `fido2/hid/__init__.py:203-215` — after `_send_cancel()` the
+        //   host keeps reading packets on that same channel;
+        // * `fido2/hid/__init__.py:214-230` — the first packet is matched
+        //   against `TYPE_INIT | cmd` (CBOR), `CTAPHID.KEEPALIVE` and
+        //   `CTAPHID.ERROR`, and the `else` at line 229-230 is
+        //   `raise CtapError(ERR.INVALID_COMMAND)`. A `0x11` reply matches
+        //   none of the three, so the host would raise `INVALID_COMMAND` on
+        //   the cancel it just sent;
+        // * and if the `0x11` were sent *after* the `0x2D`, `_do_call`
+        //   returns on the `0x2D` and the `0x11` stays queued on the
+        //   channel, where the **next** command's read consumes it and
+        //   raises there instead. A delayed corruption is worse than a
+        //   loud one.
+        //
+        // Both references agree. `pico-keys-sdk/src/usb/hid/hid.c:377-395`
+        // handles `CTAPHID_CANCEL` and then `return 0;` — no frame at all.
+        // `RS-Key` had one, removed it, and says why:
+        // "A `CANCEL` is also no longer acknowledged with its own frame (per
+        // the CTAPHID spec)" (`RS-Key/CHANGELOG.md:13380-13388`, and the
+        // arm body at `RS-Key/crates/rsk-usb/src/ctaphid.rs:703-708`:
+        // "A CANCEL is never acknowledged (CTAPHID spec). With no
+        // transaction in flight it is simply ignored").
+        //
+        // ## A CANCEL with no window open
+        //
+        // Silence, for the same reason: the reference ignores it, and the
+        // only thing the host is owed is "not INVALID_CMD". This arm is
+        // therefore the *absence* of an error frame, which is why its test
+        // asserts nothing was sent rather than asserting a frame's bytes.
+        //
+        // No `persist` gate: a cancelled window consumed no grant, mutated
+        // no counter and committed nothing, so there is no durable change
+        // to be durable-before-acked. The app is not called at all, which
+        // is also why this arm can be ordered with the native commands.
+        if slot.is_occupied() {
+            // Copied out before `close_window` takes the slot: `take()`
+            // clears the recorded refusal, and the U2F arm's answer is that
+            // refusal. Reading it afterwards would answer a U2F cancel with a
+            // zero-length APDU response.
+            let mut answer = [0u8; 2];
+            let n = slot.refusal().len().min(answer.len());
+            answer[..n].copy_from_slice(&slot.refusal()[..n]);
+            let ticket = close_window(slot);
+            let len = match ticket.kind {
+                // US-1506: `CTAP2_ERR_KEEPALIVE_CANCEL` rather than the bare
+                // `UpRequired` (0x3B) the window was refusing with — the
+                // request is finished, and a host reading 0x3B retries it
+                // instead of concluding the ceremony is over.
+                PendingKind::Ctap2 => {
+                    answer[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
+                    1
+                }
+                // CTAP1 has no "cancelled" status word, and the two it does
+                // have are both true here: nothing authorised the command.
+                // `6985` / `0700` is what the window was already saying, so
+                // the cancel adds no new claim to the host.
+                //
+                // The `6985` fallback is for a cancel that lands before the
+                // first re-drive has recorded anything: a zero-length APDU
+                // response is not a shape any U2F host can parse, so the
+                // window's own default refusal is the safe answer.
+                PendingKind::U2f => {
+                    if n == 0 {
+                        answer[..2].copy_from_slice(&[0x69, 0x85]);
+                        2
+                    } else {
+                        n
+                    }
+                }
+            };
+            reply(io, &ticket.channel, frame_cmd(ticket.kind), &answer[..len]).await;
+        }
     } else if cmd == 0x41 && !payload.is_empty() && payload[0] == 0x05 {
         // Vendor vault function (pico-fido2 vendor protocol).
         //
@@ -1827,6 +1919,179 @@ mod tests {
             "a mismatched tag must not consume another window's grant"
         );
         crate::presence::end_window(tag_a);
+    }
+
+    /// US-1505: a `CTAPHID_CANCEL` during a live consent window closes it,
+    /// and the parked command is answered `CTAP2_ERR_KEEPALIVE_CANCEL`
+    /// (0x2D) on its own channel.
+    ///
+    /// Before the fix the command had no dispatch arm at all: it fell
+    /// through the `else` to `0x3F` / `0x01 INVALID_CMD`, which is what the
+    /// board measured in ~12 ms with **no window open**. With a window open
+    /// it was worse — the 30 s hold meant the host's `CANCEL` was not even
+    /// read until the window had already answered.
+    #[test]
+    fn us1505_a_cancel_during_a_window_closes_it_and_answers_keepalive_cancel() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), cbor(chan_a, &[0x01, 0xA0])),
+                (StdDuration::from_millis(250), frame(chan_a, CTAP_HID_CANCEL, &[])),
+            ],
+        );
+        // No "press": only the cancel can end this window.
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "US-1505: cancel during a consent window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(1_200)),
+        );
+        injector.join().unwrap();
+
+        // The window is gone and the slot is empty.
+        assert!(!slot.is_occupied(), "a CANCEL is a close condition, like a grant");
+        assert!(
+            !io.sent().iter().any(|s| s.cmd == CTAP_HID_ERROR),
+            "US-1505: a CTAPHID_CANCEL must never be answered 0x3F/INVALID_CMD. \
+             Before this arm existed it always was."
+        );
+
+        // The parked command's final answer, byte for byte.
+        let finals: Vec<Vec<u8>> = io
+            .sent()
+            .into_iter()
+            .filter(|s| s.cmd == CTAP_HID_CBOR)
+            .map(|s| s.payload)
+            .collect();
+        assert_eq!(
+            finals,
+            vec![vec![CTAP2_ERR_KEEPALIVE_CANCEL]],
+            "the exact frames the client sees on the cancelled channel must be \
+             one CBOR answer of 0x2D (CTAP2_ERR_KEEPALIVE_CANCEL) and nothing else — \
+             not a bare 0x3B UpRequired, and not a 0x3F ERROR"
+        );
+        assert!(
+            io.sent().iter().all(|s| s.channel == chan_a),
+            "the answer belongs to the cancelled command's channel"
+        );
+
+        // The teardown, which is the half that leaks: the single presence
+        // slot has to be free again, or every other applet is dead for the
+        // life of the process.
+        let tag = fapico2_fido::presence_tag_from_channel(chan_a);
+        assert!(
+            crate::presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS),
+            "US-1505: the cancel path must run through `close_window`, which is the \
+             only place `end_window` and `touch_prompt(false)` are paired. A cancel \
+             that closed the slot without releasing the presence window would hold it \
+             for the life of the process."
+        );
+        crate::presence::end_window(tag);
+    }
+
+    /// US-1505's other half, and the one that was *measured*: a `CANCEL`
+    /// with **no window open**. Per §11.2.9 there is nothing to cancel, and
+    /// the correct answer to nothing is silence — never `ERROR`, never
+    /// `INVALID_CMD`.
+    ///
+    /// The reference agrees: `pico-keys-sdk/src/usb/hid/hid.c:377-395`
+    /// handles `CTAPHID_CANCEL` and then `return 0;` without sending a frame,
+    /// and `RS-Key/crates/rsk-usb/src/ctaphid.rs:703-708` says "A CANCEL is
+    /// never acknowledged (CTAPHID spec). With no transaction in flight it is
+    /// simply ignored".
+    #[test]
+    fn us1505_a_cancel_with_no_window_open_is_never_an_error() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        // The measured board behaviour: 0x3F / 0x01 INVALID_CMD in ~12 ms.
+        let injector = script(
+            &bus,
+            &[(StdDuration::from_millis(0), frame(chan_a, CTAP_HID_CANCEL, &[]))],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "US-1505: cancel with no window open",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
+        );
+        injector.join().unwrap();
+
+        assert!(
+            io.sent().is_empty(),
+            "US-1505: a CTAPHID_CANCEL with nothing in flight must put no frame on \
+             the wire at all. The board answered 0x3F/0x01 INVALID_CMD here; the \
+             frames actually sent were {:?}.",
+            io.sent()
+        );
+        assert!(!slot.is_occupied(), "nothing to close, and nothing left behind");
+    }
+
+    /// The U2F twin, because the slot is shared and the two arms are
+    /// structurally different: the answer goes out on `CTAP_HID_MSG` with a
+    /// two-byte status word, and CTAP1 has no cancel code at all. It is
+    /// answered with the refusal the window was already sending — `6985` —
+    /// because that is the one U2F shape that is both true ("nothing
+    /// authorised this") and parseable by every U2F host.
+    #[test]
+    fn us1505_a_cancel_during_a_u2f_window_answers_the_u2f_refusal() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let register = [0x00u8, 0x01, 0x03, 0x00, 0x00];
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), frame(chan_a, CTAP_HID_MSG, &register)),
+                (StdDuration::from_millis(250), frame(chan_a, CTAP_HID_CANCEL, &[])),
+            ],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "US-1505: cancel during a U2F consent window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(1_200)),
+        );
+        injector.join().unwrap();
+
+        assert!(!slot.is_occupied());
+        let finals: Vec<Vec<u8>> = io
+            .sent()
+            .into_iter()
+            .filter(|s| s.cmd == CTAP_HID_MSG)
+            .map(|s| s.payload)
+            .collect();
+        assert_eq!(
+            finals,
+            vec![vec![0x69, 0x85]],
+            "a cancelled U2F window answers the U2F refusal on CTAP_HID_MSG — a \
+             one-byte 0x2D on the wrong frame command would be unparseable to a U2F host"
+        );
+        assert!(
+            !io.sent().iter().any(|s| s.cmd == CTAP_HID_ERROR),
+            "a U2F cancel must not be answered 0x3F/INVALID_CMD either"
+        );
     }
 
     /// The U2F twin of the whole story. `CTAP_HID_MSG` had a **structurally

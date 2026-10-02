@@ -1,6 +1,6 @@
 //! Emulation entry point for the fapico2 firmware (US-304).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use fapico2_fido::app::FidoApp;
 use fapico2_mgmt::{FactoryResetHandler, ManagementApp};
 use fapico2_firmware::{oath_device_id, EMULATION_CHIPID};
@@ -250,6 +250,84 @@ const CTAP_HID_WINK: u8 = 0x08;
 const CTAP_HID_KEEPALIVE: u8 = 0x3B;
 const CTAP_HID_ERROR: u8 = 0x3F;
 const TYPE_INIT: u8 = 0x80;
+
+/// US-1505: `CTAPHID_CANCEL` (`0x11`). Kept as a local constant beside the
+/// six above because this file keeps its own copy of the command table —
+/// US-1524 moves the whole emulator onto `hid_serve`'s dispatcher and
+/// deletes the duplication. The *value* has one definition of record
+/// elsewhere, [`fapico2_firmware::ctap_hid::CTAP_HID_CANCEL`], and
+/// `hid_cancel_wins_over_the_unknown_command_arm` below asserts this copy
+/// still agrees with it, so the two cannot drift apart in the meantime.
+const CTAP_HID_CANCEL: u8 = fapico2_firmware::ctap_hid::CTAP_HID_CANCEL;
+
+/// US-1505: the byte a cancelled consent window answers with, from the one
+/// definition of record (`ctap_hid::CTAP2_ERR_KEEPALIVE_CANCEL`) rather than
+/// a fourth local constant.
+const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = fapico2_firmware::ctap_hid::CTAP2_ERR_KEEPALIVE_CANCEL;
+
+/// US-1505: "a `CTAPHID_CANCEL` arrived while a consent window was open".
+///
+/// The emulator's consent loop is still the pre-US-1509 nested `loop` — a
+/// `CTAPHID_CANCEL` dispatched on the next turn of the outer loop could not
+/// reach it, which is the blackout `PendingUp` exists to end and US-1524
+/// exists to finish here. The minimum that makes the command *do* something
+/// on this path without pre-empting that migration is a latch the loop
+/// polls, which is the same cross-task signal the device gets from the
+/// serve loop simply observing the frame.
+///
+/// `swap`-and-clear rather than `load`: "observed at most once" is a property
+/// of one function instead of a convention at three call sites.
+static EMUL_CANCEL_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Is a `CTAPHID_CANCEL` waiting to be acted on? Consumes the latch.
+fn take_pending_cancel() -> bool {
+    EMUL_CANCEL_PENDING.swap(false, Ordering::SeqCst)
+}
+
+/// US-1505: what one turn of an emulator consent window decided.
+///
+/// [`ConsentTick::Expired`] and [`ConsentTick::Cancelled`] both mean the
+/// window is over, and both have already released the presence slot and the
+/// prompt on the way out — so the two call sites cannot forget half the
+/// teardown, which is the US-921 leak this pairing exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentTick {
+    /// Still waiting for a touch: re-assert the prompt and re-drive.
+    KeepWaiting,
+    /// The window ran out on its own deadline.
+    Expired,
+    /// The host sent `CTAPHID_CANCEL`.
+    Cancelled,
+}
+
+/// One turn of an emulator consent window: the whole stop-condition, in one
+/// place, for both the CBOR and the U2F loop.
+///
+/// Cancel is checked **before** expiry. When both are true — the deadline
+/// passed on the same turn the host gave up — `Cancelled` is the honest
+/// report: the host is not waiting for a timeout any more, and answering it
+/// as though a touch window simply ran out describes a ceremony the host has
+/// already abandoned.
+fn emul_consent_tick(win: &TouchWindow) -> ConsentTick {
+    let tick = if take_pending_cancel() {
+        ConsentTick::Cancelled
+    } else if win.expired(emul_now_ms()) {
+        ConsentTick::Expired
+    } else {
+        return ConsentTick::KeepWaiting;
+    };
+    fapico2_firmware::presence::end_window(win.tag);
+    fapico2_firmware::presence::touch_prompt(false);
+    tick
+}
+
+/// US-1505: the emulator's own copy of the CTAPHID CANCEL rule — the one
+/// sentence `hid_serve` and `pico-keys-sdk` both have to say the same way.
+/// Named as a function so the dispatcher's arm and the test below are two
+/// callers of one definition.
+fn hid_is_cancel(cmd: u8) -> bool {
+    cmd == CTAP_HID_CANCEL
+}
 
 // CTAPHID error codes (CTAP spec §11.2.4).
 const HID_ERR_INVALID_CMD: u8 = 0x01;
@@ -988,10 +1066,21 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                             let win = TouchWindow::open(tag, emul_now_ms());
                             fapico2_firmware::presence::touch_prompt(true);
                             loop {
-                                if win.expired(emul_now_ms()) {
-                                    fapico2_firmware::presence::end_window(tag);
-                                    fapico2_firmware::presence::touch_prompt(false);
-                                    break;
+                                match emul_consent_tick(&win) {
+                                    ConsentTick::KeepWaiting => {}
+                                    ConsentTick::Expired => break,
+                                    // US-1505: the host cancelled. Answer the
+                                    // command as cancelled rather than let
+                                    // the window run out to its 30 s
+                                    // deadline and say something the host
+                                    // has already given up on. The window is
+                                    // released by `emul_consent_tick` itself,
+                                    // so the CBOR and U2F loops cannot
+                                    // disagree about that half.
+                                    ConsentTick::Cancelled => {
+                                        ctap_response = vec![CTAP2_ERR_KEEPALIVE_CANCEL];
+                                        break;
+                                    }
                                 }
                                 // Device parity: the keepalive yield lets
                                 // the button task arm the grant; here the
@@ -1044,6 +1133,17 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                 } else if cmd == CTAP_HID_WINK {
                     // WINK: acknowledge with an empty response frame.
                     send_hid_response(&mut transport, &channel, CTAP_HID_WINK, &[]);
+                } else if hid_is_cancel(cmd) {
+                    // US-1505 (CTAPHID §11.2.9). No reply frame of its own —
+                    // the reasoning, and the client code that makes an
+                    // acknowledgement harmful, are on the arm in
+                    // `firmware/src/hid_serve.rs`, which is the shipped one.
+                    // This binary's own consent loop observes the latch and
+                    // answers `CTAP2_ERR_KEEPALIVE_CANCEL` for the command
+                    // it was holding; with nothing in flight the latch is
+                    // simply dropped, exactly as the reference drops it
+                    // (`pico-keys-sdk/src/usb/hid/hid.c:395` — `return 0;`).
+                    EMUL_CANCEL_PENDING.store(true, Ordering::SeqCst);
                 } else if cmd == 0x41 && !payload.is_empty() && payload[0] == 0x05 {
                     // Vendor vault function (test_080 / pico-fido2 vendor protocol).
                     let resp = fido_app.process_vendor_vault(&payload[1..]);
@@ -1089,10 +1189,14 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                         let win = TouchWindow::open(tag, emul_now_ms());
                         fapico2_firmware::presence::touch_prompt(true);
                         loop {
-                            if win.expired(emul_now_ms()) {
-                                fapico2_firmware::presence::end_window(tag);
-                                fapico2_firmware::presence::touch_prompt(false);
-                                break;
+                            match emul_consent_tick(&win) {
+                                ConsentTick::KeepWaiting => {}
+                                // US-1505: CTAP1 has no cancel status word, so
+                                // a cancelled window answers exactly what an
+                                // expired one does — the refusal it was
+                                // already sending. The window is released
+                                // either way, inside `emul_consent_tick`.
+                                ConsentTick::Expired | ConsentTick::Cancelled => break,
                             }
                             fapico2_firmware::presence::touch_prompt(true);
                             u2f_response = fido_app.process_u2f(&payload);
@@ -1133,5 +1237,116 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod us1505_tests {
+    //! US-1505, asserted **in the emulator's own dispatcher**.
+    //!
+    //! `hid_serve` is the shipped dispatcher; this binary keeps a second one
+    //! until US-1524. A cancel arm that exists in only one of the two is half
+    //! a fix, and the half that is missing is the half the e2e suites drive,
+    //! so the emulator's copy gets its own assertions rather than an
+    //! assumption that it "is the same code".
+    //!
+    //! Run with:
+    //! `cargo test -p fapico2-firmware --no-default-features --features emulation --bins --target x86_64-unknown-linux-gnu`
+
+    use super::*;
+
+    /// The command constant this file keeps its own copy of must still be
+    /// the one in `ctap_hid` — and, more to the point, `0x11` must be
+    /// classified as a cancel and *not* fall through to the unknown-command
+    /// arm, which is the whole defect (`0x3F` / `0x01 INVALID_CMD`).
+    #[test]
+    fn hid_cancel_wins_over_the_unknown_command_arm() {
+        assert_eq!(CTAP_HID_CANCEL, 0x11, "§11.2.9's CANCEL is 0x11");
+        assert_eq!(
+            CTAP_HID_CANCEL,
+            fapico2_firmware::ctap_hid::CTAP_HID_CANCEL,
+            "the emulator's local copy has drifted from ctap_hid's"
+        );
+        assert!(hid_is_cancel(CTAP_HID_CANCEL));
+        // None of the arms CANCEL must not be mistaken for may claim it —
+        // in particular the ERROR byte, which is what a fall-through emits.
+        for other in [
+            CTAP_HID_INIT,
+            CTAP_HID_PING,
+            CTAP_HID_MSG,
+            CTAP_HID_WINK,
+            CTAP_HID_CBOR,
+            CTAP_HID_ERROR,
+            CTAP_HID_KEEPALIVE,
+            0x41,
+            0x42,
+        ] {
+            assert!(
+                !hid_is_cancel(other),
+                "{other:#04x} is not CTAPHID_CANCEL and must not be routed to the cancel arm"
+            );
+        }
+    }
+
+    /// The latch the emulator's consent loops poll: set by the dispatch arm,
+    /// consumed by the loop, and consumed **once** — a latch that stayed
+    /// raised would cancel whatever window opened next, which is exactly
+    /// the shape of a cross-request defect.
+    #[test]
+    fn a_pending_cancel_is_observed_exactly_once() {
+        EMUL_CANCEL_PENDING.store(false, Ordering::SeqCst);
+        assert!(!take_pending_cancel(), "nothing was sent; nothing to observe");
+
+        EMUL_CANCEL_PENDING.store(true, Ordering::SeqCst);
+        assert!(take_pending_cancel(), "the loop must see the cancel");
+        assert!(
+            !take_pending_cancel(),
+            "the latch must be consumed by the observation, not left set for the \
+             next window"
+        );
+    }
+
+    /// The stop condition itself, against the real presence runtime: a
+    /// cancel ends the window, and the window's presence slot and prompt are
+    /// both released — the pairing whose absence is a permanently held slot
+    /// and a permanently lit LED.
+    ///
+    /// The slot is opened and released here, in the same order the CBOR arm
+    /// opens one, because the presence runtime is a process-wide singleton.
+    #[test]
+    fn a_cancel_ends_the_emulator_consent_window() {
+        // Write-once, exactly as `main()` does at boot; a second call returns
+        // `false`, which is fine — only the first one installs the slot.
+        fapico2_firmware::presence::init(emul_now_ms);
+        let tag = 0x8000_00E5;
+        EMUL_CANCEL_PENDING.store(false, Ordering::SeqCst);
+        assert!(
+            fapico2_firmware::presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS),
+            "the presence slot must be free before the test opens its window"
+        );
+        let win = TouchWindow::open(tag, emul_now_ms());
+
+        assert_eq!(
+            emul_consent_tick(&win),
+            ConsentTick::KeepWaiting,
+            "a live window with nothing sent keeps waiting"
+        );
+
+        EMUL_CANCEL_PENDING.store(true, Ordering::SeqCst);
+        assert_eq!(
+            emul_consent_tick(&win),
+            ConsentTick::Cancelled,
+            "a CTAPHID_CANCEL ends the window — and answers as cancelled, not \
+             as the refusal the window was sending"
+        );
+
+        // The teardown is the part that is easy to get wrong: the slot is
+        // free again, so the next `begin_window` (a CCID consent window, or
+        // the next FIDO one) can have it.
+        assert!(
+            fapico2_firmware::presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS),
+            "a cancelled window must release the single presence slot"
+        );
+        fapico2_firmware::presence::end_window(tag);
     }
 }
