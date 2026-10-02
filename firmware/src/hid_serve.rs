@@ -80,26 +80,39 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 /// arrives on any channel waits for its answer while a consent window is
 /// open.
 ///
-/// It is three CTAPHID reply writes, and that is the whole argument:
+/// It is four CTAPHID reply writes plus the one keepalive period the
+/// outbound read is bounded by, and that is the whole argument — every term
+/// is a deadline the loop actually holds itself to:
 ///
-/// * a serve-loop pass makes at most three replies — the window's keepalive,
-///   the assembler's transaction-timeout error (only if a fragmented
-///   transaction really is stale), and the answer itself;
+/// * while a window is live, a frame that arrives on the OUT endpoint is
+///   picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (100 ms), because
+///   [`read_one`] is bounded by it;
+/// * then, worst case, the rest of *that* pass still has to run: the live
+///   window's keepalive, a `check_timeout` error (only if a fragmented
+///   transaction really is stale), and the dispatched answer. That is three
+///   further replies, and
 /// * every reply is bounded by [`HID_REPLY_WRITE_TIMEOUT_MS`] (500 ms), so a
 ///   host that has stopped reading the IN endpoint costs a bounded 500 ms per
-///   frame rather than parking the loop forever (US-1504);
-/// * the outbound read is bounded by [`CTAP_KEEPALIVE_PERIOD_MS`] (100 ms)
-///   while a window is open — long enough to keep the keepalive cadence,
-///   short enough that a report is picked up within one cadence;
-/// * the re-drive is one synchronous app call and the persist gate is one
-///   flash program; neither is in the reply arithmetic.
+///   frame rather than parking the loop forever (US-1504).
 ///
-/// So **1500 ms worst case**, and **200 ms (2 x the keepalive period)
+/// So **2100 ms worst case**, and **200 ms (2 x the keepalive period)
 /// against a host that is actually reading the IN endpoint** — the case the
-/// blackout is about. If US-1506 moves the keepalive cadence, the second
-/// number moves with it; the first does not, because it is the reply
-/// deadline and not the cadence.
-pub const SERVE_BOUND_MS: u64 = 3 * HID_REPLY_WRITE_TIMEOUT_MS;
+/// blackout is about.
+///
+/// The re-drive is one synchronous app call and the persist gate is one flash
+/// program; neither is in the arithmetic.
+///
+/// If US-1506 moves the keepalive cadence, the second number moves with it
+/// and the `+ CTAP_KEEPALIVE_PERIOD_MS` term with the first. The reply
+/// deadline still dominates both.
+///
+/// The earlier figure of `3 x HID_REPLY_WRITE_TIMEOUT_MS` (1500 ms) was
+/// published by the first cut of this story and **under-counted**: it dropped
+/// the read's own bound and counted three replies for a pass that can make
+/// four — the live window's keepalive, the assembler's timeout error, the
+/// dispatched command's pre-command keepalive, and its answer. A bound that is
+/// 600 ms optimistic is not a bound.
+pub const SERVE_BOUND_MS: u64 = 4 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
 
 /// Something the serve loop wants the transport to say in its log. The loop
 /// itself has no logger: `defmt` is a device concern, and US-1504 moved the
@@ -219,6 +232,10 @@ pub struct HidServe<'a> {
     /// keeps calling `hid_out.read()`") an assertion rather than a claim.
     #[cfg(test)]
     reads: u32,
+    /// Serve passes the harness had to cut short while a consent window was
+    /// still live. See [`HidServe::note_blocked_live_pass`].
+    #[cfg(test)]
+    blocked_live_passes: u32,
 }
 
 impl<'a> HidServe<'a> {
@@ -231,6 +248,8 @@ impl<'a> HidServe<'a> {
             now_ms,
             #[cfg(test)]
             reads: 0,
+            #[cfg(test)]
+            blocked_live_passes: 0,
         }
     }
 
@@ -238,6 +257,38 @@ impl<'a> HidServe<'a> {
     #[cfg(test)]
     pub fn reads(&self) -> u32 {
         self.reads
+    }
+
+    /// Record a pass the test harness had to abandon while a consent window
+    /// was still open.
+    ///
+    /// This is the instrument that makes the blackout **detectable at all**,
+    /// and it exists because of a hole the first version of this suite had.
+    /// The harness models an idle OUT endpoint as a future that never
+    /// completes (correctly — that is what the real endpoint does), so a drive
+    /// has to abandon a parked pass for its own budget to elapse. Reintroduce
+    /// the pre-fix consent `loop` and that same 150 ms abandonment silently
+    /// **rescues** the test: the pass is cut in half every 150 ms, the loop
+    /// starts another, and the cross-channel requests the tests assert about
+    /// get answered anyway. US-1502 and US-1508 stayed green under exactly
+    /// that revert while the loop they exist to forbid was back.
+    ///
+    /// Counting is conditioned on the slot *still being occupied after* the
+    /// pass: a pass that closed the window and then parked on an idle bus is
+    /// correct behaviour and is not counted. What is counted is a pass that
+    /// could not return while a window was open — which is the blackout,
+    /// measured.
+    #[cfg(test)]
+    fn note_blocked_live_pass(&mut self) {
+        self.blocked_live_passes += 1;
+    }
+
+    /// Passes abandoned by the harness while a consent window was live.
+    /// Every test that drives the loop with a window open asserts this is
+    /// zero.
+    #[cfg(test)]
+    pub fn blocked_live_passes(&self) -> u32 {
+        self.blocked_live_passes
     }
 }
 
@@ -1243,12 +1294,79 @@ mod tests {
         // than the bounded read a live window imposes, so it never cuts a pass
         // that had real work.
         while start.elapsed() < budget {
-            let _ = embassy_time::with_timeout(
-                DRIVE_IDLE_PARK,
-                serve_once(srv, io, app, slot),
-            )
-            .await;
+            drive_one_pass(srv, io, app, slot).await;
         }
+    }
+
+    /// One harness pass: run `serve_once`, abandoning it if it parks, and
+    /// record it if it parked **with a consent window still open**.
+    ///
+    /// The conditioning is what keeps the instrument honest. A pass that
+    /// closes the window and then parks on an idle OUT endpoint is the loop
+    /// doing exactly what it should, so it is not counted; a pass that could
+    /// not return while a window was open is the blackout, so it is. See
+    /// [`HidServe::note_blocked_live_pass`].
+    async fn drive_one_pass<S: HidIo, A: FidoDispatch>(
+        srv: &mut HidServe<'_>,
+        io: &mut S,
+        app: &mut A,
+        slot: &mut PendingUp,
+    ) {
+        let abandoned = embassy_time::with_timeout(DRIVE_IDLE_PARK, serve_once(srv, io, app, slot))
+            .await
+            .is_err();
+        if abandoned && slot.is_occupied() {
+            srv.note_blocked_live_pass();
+        }
+    }
+
+    /// [`drive`] with a *condition* instead of a wall-clock budget.
+    ///
+    /// Same loop, same stop shape — the only difference is what ends it. A
+    /// fixed budget makes an assertion about the firmware depend on how many
+    /// 100 ms keepalive-bounded reads happen to fit on a loaded host, which
+    /// is not a property of the firmware at all; a condition asserts the
+    /// behaviour directly and lets [`DRIVE_CEILING`] be the only time bound.
+    async fn drive_until<S: HidIo, A: FidoDispatch>(
+        srv: &mut HidServe<'_>,
+        io: &mut S,
+        app: &mut A,
+        slot: &mut PendingUp,
+        done: impl Fn(&HidServe<'_>, &A) -> bool,
+    ) {
+        while !done(srv, app) {
+            drive_one_pass(srv, io, app, slot).await;
+        }
+    }
+
+    /// The blackout assertion, shared by every test that drives the loop with
+    /// a consent window open.
+    ///
+    /// Two halves, and the order matters. `slot.is_occupied()` is the
+    /// *premise*: US-1509's change is that the request is parked in the slot,
+    /// so a suite that asserts cross-channel answers without first asserting
+    /// the window is parked will happily go green against firmware that has
+    /// the slot but refuses to use it. The pass count is the *measurement*:
+    /// it catches a blocking await reintroduced anywhere on the live path,
+    /// including inside `redrive_window`, where the slot **is** occupied and
+    /// so the cross-channel assertions alone would not notice for one pass.
+    #[track_caller]
+    fn assert_the_window_is_live_and_unblocked(srv: &HidServe<'_>, slot: &PendingUp) {
+        assert!(
+            slot.is_occupied(),
+            "the consent window must be PARKED in `PendingUp`. US-1509 replaced the \
+             serve loop's nested consent `loop` with this slot; without it the \
+             `MakeCredential` is being answered on some other path, and every \
+             cross-channel assertion below is measuring that other path instead."
+        );
+        assert_eq!(
+            srv.blocked_live_passes(),
+            0,
+            "US-1502/US-1509: {} serve pass(es) could not return while a consent \
+             window was open. The window is re-asserted and the command re-driven \
+             per pass; it is never awaited. A pass that blocks is the blackout.",
+            srv.blocked_live_passes()
+        );
     }
 
     // ── the tests ──────────────────────────────────────────────────────────
@@ -1296,6 +1414,7 @@ mod tests {
         injector.join().unwrap();
 
         assert!(app.window_open, "the harness must actually be inside a window");
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
         let echoed = io
             .sent()
             .into_iter()
@@ -1357,6 +1476,7 @@ mod tests {
         );
         injector.join().unwrap();
 
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
         let answered = io
             .sent()
             .into_iter()
@@ -1406,15 +1526,34 @@ mod tests {
         injector.join().unwrap();
 
         assert!(app.window_open, "the window must still be open at the end");
-        assert!(
-            srv.reads() >= 2,
-            "US-1509: the loop made {} read(s) in 600 ms; it must keep returning \
-             to hid_out.read() while a window is open (and re-driving it each \
-             pass, not awaiting it).",
-            srv.reads()
-        );
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
+
         // Re-driven, not merely retried once: a parked MakeCredential that
         // is re-asserted every pass is re-run every pass.
+        //
+        // This waits for the *condition* under [`DRIVE_CEILING`] rather than
+        // counting passes inside a fixed 600 ms budget. The property US-1509
+        // claims is that the loop keeps reading and keeps re-driving — not
+        // how many times it manages to in half a second on a loaded machine.
+        // A fixed budget made this the one intermittently-red assertion in
+        // the file (observed once in ~25 runs, never reproduced in 22
+        // subsequent ones including 8 run concurrently): the count depends
+        // on how many 100 ms keepalive-bounded reads fit, which depends on
+        // the host's scheduling, not on the firmware.
+        block_on(
+            "US-1509: the window is re-driven, repeatedly",
+            drive_until(&mut srv, &mut io, &mut app, &mut slot, |srv, app| {
+                srv.reads() >= 2 && app.up_calls.len() >= 2
+            }),
+        );
+
+        assert!(
+            srv.reads() >= 2,
+            "US-1509: the loop made {} read(s); it must keep returning to \
+             hid_out.read() while a window is open (and re-driving it each pass, \
+             not awaiting it).",
+            srv.reads()
+        );
         assert!(
             app.up_calls.len() >= 2,
             "US-1509: the parked command was driven {} time(s); a re-asserted \
@@ -1489,6 +1628,7 @@ mod tests {
         });
         injector.join().unwrap();
 
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
         let start = StdInstant::now();
         let log = sent.lock().unwrap();
         let answer = log
@@ -1551,6 +1691,7 @@ mod tests {
         );
         injector.join().unwrap();
 
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
         let refused = io
             .sent()
             .into_iter()
@@ -1686,5 +1827,133 @@ mod tests {
             "a mismatched tag must not consume another window's grant"
         );
         crate::presence::end_window(tag_a);
+    }
+
+    /// The U2F twin of the whole story. `CTAP_HID_MSG` had a **structurally
+    /// identical** keepalive loop in the same dispatcher, so a slot that only
+    /// works for `CTAP_HID_CBOR` leaves half the blackout in place — and the
+    /// two arms genuinely differ: the parked payload is the raw APDU rather
+    /// than an opcode plus CBOR, the kind is [`PendingKind::U2f`], the answer
+    /// goes out on `CTAP_HID_MSG` with a two-byte status word, and the
+    /// re-drive has to re-stamp the app's channel (`set_channel`) because
+    /// `process_u2f` derives the presence tag from the app's remembered
+    /// channel instead of taking it as an argument.
+    ///
+    /// So: register (INS `0x01`, P1 `0x03`) parks, the loop keeps reading and
+    /// keeps answering a `PING` on a second channel, and the window's final
+    /// reply is the granted `9000` — not another `6985`.
+    #[test]
+    fn us1509_the_u2f_arm_parks_and_re_drives_like_the_cbor_arm() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let chan_b = [0x00, 0x00, 0x00, 0x02];
+        // CLA=00 INS=01 (REGISTER) P1=03 P2=00 Lc=00 — a presence-gated
+        // U2F request under `presence_gated_u2f` (INS 0x01, P1 != 0x07).
+        let register = [0x00u8, 0x01, 0x03, 0x00, 0x00];
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), frame(chan_a, CTAP_HID_MSG, &register)),
+                (StdDuration::from_millis(200), frame(chan_b, CTAP_HID_PING, b"ping")),
+            ],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "U2F: register parks and the loop keeps reading",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(1_200)),
+        );
+        injector.join().unwrap();
+
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
+        assert_eq!(
+            slot.parked().expect("the U2F request is parked").ticket.kind,
+            PendingKind::U2f,
+            "the U2F arm must park as `PendingKind::U2f`: its final reply goes out on \
+             CTAP_HID_MSG, and a CBOR-kind ticket would answer a U2F register with a \
+             one-byte CBOR status the client cannot parse"
+        );
+        assert!(
+            io.sent()
+                .iter()
+                .any(|s| s.channel == chan_b && s.cmd == CTAP_HID_PING && s.payload == b"ping"),
+            "US-1502 on the U2F path: a PING that arrived on another channel during a U2F \
+             consent window was never answered — the MSG arm's window is still a blackout"
+        );
+
+        grant.store(true, Ordering::SeqCst);
+        block_on(
+            "U2F: release the consent window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
+        );
+        assert!(
+            io.sent()
+                .iter()
+                .any(|s| s.channel == chan_a && s.cmd == CTAP_HID_MSG && s.payload == vec![0x90, 0x00]),
+            "the parked U2F register must be answered with its granted 9000 on close, not \
+             left as a refusal"
+        );
+    }
+
+    /// US-1510 on the U2F arm: a second presence-gated U2F request while the
+    /// slot is live is refused with the shape the app itself would answer —
+    /// `6985` — and is never parked behind the first. The single slot is
+    /// shared across *both* arms, so this is a distinct path from the CBOR
+    /// refusal and needs its own assertion.
+    #[test]
+    fn us1510_a_second_u2f_request_is_refused_while_the_slot_is_live() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let register = [0x00u8, 0x01, 0x03, 0x00, 0x00];
+        let authenticate = [0x00u8, 0x02, 0x03, 0x00, 0x00];
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), frame(chan_a, CTAP_HID_MSG, &register)),
+                (StdDuration::from_millis(250), frame(chan_a, CTAP_HID_MSG, &authenticate)),
+            ],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "US-1510: second U2F request while a window is open",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(1_200)),
+        );
+        injector.join().unwrap();
+
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
+        // Two `6985`s reach the wire — the app's own answer to the first, and
+        // the refusal for the second. Both are refusals, and neither is a
+        // signature.
+        assert!(
+            !io.sent().iter().any(|s| s.payload == vec![0x90, 0x00]),
+            "nothing may be answered while the window is live: the second request must be \
+             refused, not queued behind the first and answered after it"
+        );
+        assert_eq!(
+            slot.parked().expect("the first window survives").payload,
+            register.as_slice(),
+            "a refused second request must not evict or overwrite the parked one"
+        );
+
+        grant.store(true, Ordering::SeqCst);
+        block_on(
+            "US-1510: release the U2F window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
+        );
     }
 }
