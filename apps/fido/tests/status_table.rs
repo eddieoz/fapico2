@@ -341,6 +341,104 @@ fn lock_required_is_not_the_reset_opcode() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. The CTAPHID *command* table, pinned the same way
+// ---------------------------------------------------------------------------
+
+/// `CtapHidCommand` was transposed: `Keepalive = 0x03` and `Msg = 0x10`, where
+/// the reference has `MSG = 0x03` and `CBOR = 0x10`. It is the same
+/// transcription failure this file already documents for the status table, in
+/// the enum sitting ten lines above `CtapHidError` — and `CtapHidError` was
+/// itself wrong until US-1528, so this file pinned the error half of `hid.rs`
+/// and left the command half unasserted.
+///
+/// It survived partly because the enum is dead code (no reference outside
+/// `hid.rs`), and partly because the wrong entry was named `Keepalive`:
+/// **there is no CTAPHID keepalive command**. `0x3B` is a CTAP2 *status* byte
+/// inside a CBOR response, so an enum of "commands" containing it reads as a
+/// complete list of commands, and `0x03` beside it looks plausible.
+///
+/// Values are literals, for the reason in this file's header: nothing on the
+/// left of a comparison calls `as u8`. Source: `fido2.hid.CTAPHID` in fido2
+/// 2.2.1, read by **executing** the class rather than by grepping a header —
+/// the failure mode this file's own header warns about, and one an earlier
+/// review in this epic caught being made.
+#[test]
+fn the_ctaphid_command_table_matches_the_reference() {
+    use fapico2_fido::hid::CtapHidCommand as C;
+    assert_eq!(C::Ping as u8, 0x01, "CTAPHID_PING");
+    assert_eq!(C::Msg as u8, 0x03, "CTAPHID_MSG (CTAP1/U2F over HID)");
+    assert_eq!(C::Init as u8, 0x06, "CTAPHID_INIT");
+    assert_eq!(C::Wink as u8, 0x08, "CTAPHID_WINK");
+    assert_eq!(
+        C::Cbor as u8,
+        0x10,
+        "CTAPHID_CBOR is 0x10 — CTAP2. This enum had it at 0x03, transposed \
+         with MSG."
+    );
+    assert_eq!(C::Cancel as u8, 0x11, "CTAPHID_CANCEL");
+    assert_eq!(C::Error as u8, 0x3F, "CTAPHID_ERROR");
+    assert_eq!(C::VendorFirst as u8, 0x40, "CTAPHID_VENDOR_FIRST");
+
+    assert_ne!(
+        C::Msg as u8,
+        C::Cbor as u8,
+        "MSG and CBOR are distinct commands (0x03 and 0x10); transposing them \
+         made this table describe a protocol that does not exist"
+    );
+    // `0x3B` is the CTAP2 keepalive STATUS, not a command, so no entry may
+    // claim it. `CTAP2_ERR_KEEPALIVE_CANCEL` is also 0x3B, which is why
+    // offering it as a command would look tidy rather than obviously wrong.
+    assert!(
+        [
+            C::Ping as u8,
+            C::Msg as u8,
+            C::Init as u8,
+            C::Wink as u8,
+            C::Cbor as u8,
+            C::Cancel as u8,
+            C::Error as u8,
+            C::VendorFirst as u8
+        ]
+        .iter()
+        .all(|c| *c != 0x3B),
+        "0x3B is the CTAP2 keepalive status; the command enum must not offer \
+         it as a command (it had `Keepalive = 0x03` on that reasoning)"
+    );
+
+    // ...and it must agree with the firmware's own live constants, which are
+    // what reaches the wire. `firmware/src/ctap_hid.rs` is outside this
+    // crate's dependency graph, so the agreement is asserted by reading the
+    // file — the same source-pinning shape
+    // `presence::tests::the_device_cbor_arm_still_has_the_shape_the_model_assumes`
+    // uses, and for the same reason.
+    let firmware_hid = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/ctap_hid.rs"
+    ))
+    .expect("the firmware's ctap_hid.rs must be readable from this test's crate");
+    // Compared case-insensitively, and ONLY for this: Rust's `{:#04x}`
+    // renders `0x3f` where the firmware's source spells it `0x3F`, and a hex
+    // digit-case difference is not the failure this test is looking for.
+    let firmware_hid = firmware_hid.to_lowercase();
+    for (name, value) in [
+        ("CTAP_HID_PING", C::Ping as u8),
+        ("CTAP_HID_MSG", C::Msg as u8),
+        ("CTAP_HID_INIT", C::Init as u8),
+        ("CTAP_HID_WINK", C::Wink as u8),
+        ("CTAP_HID_CBOR", C::Cbor as u8),
+        ("CTAP_HID_CANCEL", C::Cancel as u8),
+        ("CTAP_HID_ERROR", C::Error as u8),
+    ] {
+        let expected = format!("pub const {name}: u8 = {value:#04x};").to_lowercase();
+        assert!(
+            firmware_hid.contains(&expected),
+            "the firmware's own constant must agree with this enum: expected \
+             `pub const {name}: u8 = {value:#04X};` in firmware/src/ctap_hid.rs"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 3. On the wire, both twins
 // ---------------------------------------------------------------------------
 
