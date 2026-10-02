@@ -69,5 +69,14 @@ firmware/*.cdx.json
 
 build-custom.sh
 
+# Working notes: agent session plans and per-task/EPIC design docs. These are
+# scratch for whoever is driving the work, not the record of what the code does
+# — that is docs/adr, docs/*.md and the commit messages. They referenced by name
+# from source comments in the past, so most of those pointers were already
+# dangling; keeping them out of the repo retires the references instead of
+# leaving them aimed at files nobody else can read.
+docs/superpowers/
+docs/tasks/
+
 # ZCode session state (not repo content)
 .zcode/
