@@ -11,6 +11,11 @@
 //!
 //! This module holds the pure, host-testable decisions; `usb.rs` carries the
 //! thin `Handler` glue that maps `embassy-usb` request types onto them.
+//!
+//! US-1515: control-OUT decisions also take the data stage (`wValue` +
+//! payload), so a request that carries bytes cannot be ACKed by a decision
+//! that never saw them. SET_REPORT on the CTAP interface is STALLed, not
+//! ACKed — the long-form argument is on [`control_out`].
 
 /// CTAP-HID report descriptor (FIDO U2F, 64-byte reports).
 /// Matches the C `desc_hid_report` in `pico-keys-sdk/src/usb/usb_descriptors.c`:
@@ -101,7 +106,10 @@ pub enum InReply {
 /// Reply for a control-OUT (host → device) request on the HID interface.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OutReply {
-    /// Accept (data stage, if any, is consumed and ignored).
+    /// Accept. Only ever returned for a request that has **no data stage** to
+    /// discard — US-1515: an `Accepted` on a request that carries a payload
+    /// tells the host the payload was applied, so returning it for one that
+    /// was thrown away is the ACK-and-discard lie this variant now excludes.
     Accepted,
     /// This interface's request, but unsupported — STALL.
     Rejected,
@@ -127,10 +135,65 @@ pub fn control_in(request: u8, value: u16) -> InReply {
     }
 }
 
-/// Decide a control-OUT request addressed to the HID interface.
-pub fn control_out(request: u8) -> OutReply {
+/// Decide a control-OUT request addressed to the CTAP HID interface.
+///
+/// `_value` is the request's `wValue` and `_data` is the data-stage payload.
+/// Both are taken so the payload **arrives at the decision** instead of being
+/// dropped by the caller's match (US-1515: `usb.rs`'s `control_out_ctap`
+/// matched on `bRequest` alone and never forwarded the buffer, so a SET_REPORT
+/// was ACKed while its payload went nowhere). The leading underscore says the
+/// CTAP interface has nothing to *apply* either of them to — see the SET_REPORT
+/// arm. Signing a future servicing path has to rename them, which is the
+/// friction this wants.
+pub fn control_out(request: u8, _value: u16, _data: &[u8]) -> OutReply {
     match request {
-        SET_IDLE | SET_PROTOCOL | SET_REPORT => OutReply::Accepted,
+        // The only two control-OUT requests here with **no data stage**, so
+        // neither can discard anything. SET_IDLE's idle rate and SET_PROTOCOL's
+        // mode have no device-side state on this interface — `control_in`
+        // answers the matching GETs with "idle rate 0" / "report protocol",
+        // i.e. the defaults this device always runs — so accepting them costs
+        // no truth. (usbhid issues SET_IDLE at bind time, so STALLing it
+        // would be a gratuitous behaviour change to the E6c fix, not a
+        // correction.)
+        SET_IDLE | SET_PROTOCOL => OutReply::Accepted,
+        // US-1515 — STALL, do not ACK-and-discard.
+        //
+        // Servicing was the other option and it is not available here:
+        //
+        //  * There is nothing to configure. `CTAP_REPORT_DESCRIPTOR`
+        //    (this file, lines 18-35) declares exactly two reports, Input
+        //    (usage 0x20) and Output (usage 0x21) — no Feature report and no
+        //    Config report. SET_REPORT's `wValue` high byte selects the report
+        //    type (HID 1.11 §7.2.1: 0 Config, 1 Input, 2 Output, 3 Feature),
+        //    and a report type the interface does not declare has no defined
+        //    meaning. Every one of the four is unbacked, so there is no subset
+        //    that could be honoured.
+        //  * No host needs it. CTAPHID carries every message on the interrupt
+        //    IN/OUT endpoints (CTAPHID §2), and `usb.rs:479-482` already
+        //    builds both — `firmware/src/tasks.rs:538` reads commands off
+        //    `hid_out`. The client this firmware deliberately speaks
+        //    (`fido2` 2.2.1, see AGENTS.md §2) has no SET_REPORT or
+        //    feature-report call anywhere in `fido2/hid/*.py`: its CTAP
+        //    transport is `write_packet` plus a read on IN.
+        //  * The C reference services a 64-byte CTAP SET_REPORT by feeding it
+        //    to the CTAPHID packet assembler
+        //    (`pico-keys-sdk/src/usb/hid/hid.c:282-302`,
+        //    `driver_process_usb_packet_hid`). That assembler is
+        //    `firmware/src/ctap_hid.rs` — outside `platform/`, and the file
+        //    the sibling US-1515 change in the `lane-firmware` worktree
+        //    restructures — so adopting it would entangle this fix with that
+        //    one. Deliberately left out; a STALL is a complete, honest answer.
+        //  * The reference has this same defect on the path we are not taking:
+        //    TinyUSB ACKs the control transfer before invoking the callback,
+        //    and `hid.c:288-290` then does `if (bufsize != HID_RPT_SIZE)
+        //    return;` — the C discards a short SET_REPORT silently too. No
+        //    host can be relying on that ACK.
+        //
+        // The YubiOTP interface in the same composite device is the contrast
+        // case and is routed separately, by `wIndex` not by bRequest
+        // (`usb.rs:167-183`): its SET_REPORT *is* serviced
+        // (`otp_hid::set_report`, `otp_hid.rs:215`) and must keep ACKing.
+        SET_REPORT => OutReply::Rejected,
         _ => OutReply::Rejected,
     }
 }
@@ -205,13 +268,14 @@ mod tests {
         assert_eq!(control_in(0x7F, 0), InReply::Rejected);
     }
 
-    /// SET_IDLE / SET_PROTOCOL / SET_REPORT complete without a data reply.
+    /// SET_IDLE / SET_PROTOCOL complete without a data stage; SET_REPORT does
+    /// not, and is therefore STALLed (US-1515).
     #[test]
     fn set_requests_accepted() {
-        assert_eq!(control_out(SET_IDLE), OutReply::Accepted);
-        assert_eq!(control_out(SET_PROTOCOL), OutReply::Accepted);
-        assert_eq!(control_out(SET_REPORT), OutReply::Accepted);
-        assert_eq!(control_out(0x7F), OutReply::Rejected);
+        assert_eq!(control_out(SET_IDLE, 0, &[]), OutReply::Accepted);
+        assert_eq!(control_out(SET_PROTOCOL, 0, &[]), OutReply::Accepted);
+        assert_eq!(control_out(SET_REPORT, 0x0200, &[0u8; 64]), OutReply::Rejected);
+        assert_eq!(control_out(0x7F, 0, &[]), OutReply::Rejected);
     }
 
     /// The CCID class descriptor payload mirrors the C firmware's

@@ -122,13 +122,20 @@ impl HidInterfacesHandler {
         }
     }
 
-    fn control_out_ctap(&mut self, req: Request) -> Option<OutResponse> {
+    fn control_out_ctap(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
         if req.index != self.ctap_itf as u16 {
             return None;
         }
         match (req.request_type, req.recipient) {
             (RequestType::Class, Recipient::Interface) => {
-                match crate::hid_control::control_out(req.request) {
+                // US-1515: `wValue` and the data stage are forwarded. This
+                // arm used to match on `bRequest` alone and never look at
+                // `data`, so a SET_REPORT's payload was dropped here — before
+                // any decision saw it — while the request was still ACKed.
+                // The CTAP decision now STALLs SET_REPORT
+                // (`hid_control::control_out`); this note is the wiring half,
+                // so a future servicing path gets the buffer from here.
+                match crate::hid_control::control_out(req.request, req.value, data) {
                     crate::hid_control::OutReply::Accepted => Some(OutResponse::Accepted),
                     crate::hid_control::OutReply::Rejected => Some(OutResponse::Rejected),
                     crate::hid_control::OutReply::NotHandled => None,
@@ -175,7 +182,7 @@ impl Handler for HidInterfacesHandler {
 
     fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
         match req.index {
-            i if i == self.ctap_itf as u16 => self.control_out_ctap(req),
+            i if i == self.ctap_itf as u16 => self.control_out_ctap(req, data),
             i if i == self.otp_itf as u16 => self.control_out_otp(req, data),
             _ => None,
         }
