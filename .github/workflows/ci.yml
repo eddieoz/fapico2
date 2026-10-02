@@ -75,7 +75,20 @@ env:
   # clippy — a `Default` derive in both fido twins and one write-only field
   # dropped — which are byte-neutral in intent and carry none of the growth.
   # Measured and recorded at the top of docs/size-report.md.
-  FIRMWARE_FLASH_BUDGET_KIB: 1532
+  #
+  # 2026-10-02 raised this from 1532 to 1536. The +10 blocks / +5,120 B is the
+  # US-1519 passkey-discovery epic (capFlags 0x05, the bounded HID read/write
+  # deadlines, the Phase C non-blocking consent window, CTAPHID_CANCEL, the
+  # keepalive protocol, the emulator parity migration and the aligned CTAP2
+  # error table) plus the `PendingUp` consent slot that carries it. It IS a
+  # feature, unlike the 2026-10-01 entry above. Shrinking was attempted first
+  # and did not pay: the two async helpers that hold the loop were outlined and
+  # that cost +428 B of text, `emul_hid.rs` was already `cfg`-gated out of the
+  # device image (0 symbols), and the remaining growth is the reviewed fixes.
+  # The slack this leaves is 512 B (1536 KiB = 1,572,864 B against a measured
+  # 1,572,352 B) — the smallest whole-KiB value that fits, which is what this
+  # ratchet is for. Measured and recorded at the top of docs/size-report.md.
+  FIRMWARE_FLASH_BUDGET_KIB: 1536
 
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is

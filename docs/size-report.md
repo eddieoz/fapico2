@@ -1,3 +1,168 @@
+**Date:** 2026-10-02 (**US-1519 — the passkey-discovery epic, merged.** The
+image grew, the ratchet bit, and the EPIC's acceptance criterion is "shrink the
+implementation rather than raise the number". Shrinking was attempted first and
+did not pay; the ratchet is raised 1532 → **1536 KiB** and the reason is below,
+feature by feature, with the zero-byte edits named so a later reader does not
+misattribute them to this raise.)
+**Measured: `text` 815,576 → 817,984 B (**+2,408 B**); Berkeley `.bss` 420,704 →
+421,768 B (**+1,064 B**); task-arena demand 21,976 → **21,944 B** (**−32 B**,
+re-measured, stamp re-stamped `897931090a328186…`); UF2 **3061 → 3071 blocks**
+(1 absolute preamble + 3070 ARM_S payload), 1,567,232 → **1,572,352 bytes**.
+Shipping sha256 `0f4e6189e4ea…` → **`4349e0ad29c6…`**.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes
+4349e0ad29c68d703e36beb32d2e698107aa999ef102f092d107b494f1f1a6b4  firmware/fapico2.uf2
+```
+
+**The baseline was rebuilt, not assumed.** The epic base `517529f` was checked
+out into a scratch worktree and built from scratch with this toolchain: it
+produces **1,567,232 B / 3061 blocks / sha256 `0f4e6189e4ea…`**, which is the
+2026-10-01 entry below, exactly. So the +2,408 B of `text` and the +10 blocks
+below are this epic's, not accumulated drift. The same worktree build is where
+the per-symbol attribution comes from (`arm-none-eabi-nm -S`, symbol-size delta
+base → head).
+
+**What the +2,408 B of `text` is, symbol by symbol.** Only the entries large
+enough to matter are listed; the remainder is `OUTLINED_FUNCTION_*` churn and
+`num-bigint-dig` monomorph renumbering that nets out under 100 B.
+
+| symbol | base | head | delta |
+|---|---:|---:|---:|
+| `tasks::__hid_task_task0::poll` (the monomorphised serve loop) | 4,888 | 6,548 | **+1,660** |
+| `fido::device_app::FidoApp::process_u2f_with_store` | 1,432 | 0 | **−1,432** |
+| `tasks::DeviceFido<hid_serve::FidoDispatch>::process_u2f` | 0 | 1,412 | **+1,412** |
+| `hid_serve::reply::<tasks::DeviceHid>` | 0 | 672 | +672 |
+| `tasks::reply_hid` | 498 | 0 | **−498** |
+| `fido::device_app::FidoApp::process_ctap2_with_store` | 25,696 | 25,868 | +172 |
+| `hid_serve::close_window` | 0 | 144 | +144 |
+| `tasks::HidInWriter<hid_reply>::sent_or_failed` | 0 | 76 | +76 |
+| `tasks::DeviceHid<hid_serve::HidIo>::read_report` | 0 | 80 | +80 |
+| `tasks::persist_hid` | 72 | 0 | **−72** |
+| `heapless::Vec<u8, 7609>::extend_from_slice` | 36 | 0 | **−36** |
+
+**The two ±1,4xx rows are a move, not a cost, and they are the single largest
+thing in this entry.** US-1524 put the emulator on the shipped serve loop, which
+meant the U2F dispatch had to stop being a method on `FidoApp` (reachable only
+from a `&mut FidoApp` the serve loop does not own) and become a method on the
+new `hid_serve::FidoDispatch` trait, implemented over `&mut FidoApp`. The work
+moved 1,432 B out of `process_u2f_with_store` and 1,412 B into the trait impl —
+**net −20 B** — and the same holds for the reply path: 672 B into
+`hid_serve::reply::<DeviceHid>` against 498 B out of `tasks::reply_hid`,
+**net +174 B** for the one that also grew a `HidNote::ReplyDropped` arm and a
+bounded write. Reading "+1,660 on the poll body" without the two removals beside
+it is how a move gets mistaken for a 2.4 KB feature.
+
+**What the remaining +1,660 B of `hid_task::poll` actually is.** `HidIo` and
+`FidoDispatch` are monomorphised exactly once for the device (`DeviceHid`,
+`DeviceFido`), so this is not duplicated monomorphisation — it is the serve loop
+itself, now carrying: the `redrive_window` pass (US-1509's non-blocking consent
+window), the CTAP2 **and** U2F park arms, `close_window`'s
+`end_window`/`touch_prompt`/release pairing, the keepalive rate limiter
+(US-1506), the `CTAPHID_CANCEL` arm (US-1505), the same-channel contention
+refusal (US-921), and the two deadline-bounded USB transfers (US-1504, whose
+`embassy_time::with_timeout` pulls its machinery into this path for the first
+time). None of it is on a path that existed before the epic.
+
+**What the +1,064 B of `.bss` is, exactly and only.** `boot::PENDING_UP`, and
+nothing else:
+
+```
+200004d0 00000428 b ...fapico2_firmware4boot10PENDING_UP...            # 1,064
+```
+
+1,064 = the pinned **1,024 B** `PENDING_UP_PAYLOAD_MAX` payload buffer + 40 B
+of slot state (`occupied`, the `WindowTicket`, `payload_len`, the two-byte
+refusal + its length, `last_keepalive_ms`, `keepalive_sent`, with the struct's
+alignment). `arm-none-eabi-nm -S` shows **exactly** 1,064 B of new `.bss` and
+the gate's `RAM statics` figure moved 420,904 → 421,968 B, also exactly +1,064:
+the entire RAM delta of this epic is that one static. The 1,024 B bound is
+pinned by `pending_up::tests::the_payload_bound_is_1024_and_is_never_parked_over`
+and is the mechanism that stops a hostile oversize request converting into a
+30 s wait (US-1510) — shrinking it would be removing a reviewed fix, so it was
+left alone. `hid_task`'s arena pool, `HID_RESP`, the app statics and the store
+buffers are all byte-identical to the base build.
+
+**RAM, which is the tighter constraint, absorbed the whole thing.** The **main
+stack zone fell 111,576 → 110,512 B** to make room; `bss + stack zone + .data
+= 532,476 B` against 532,480 B of SRAM either way. There is still **no
+unallocated SRAM**, so the 1,064 B was not free — it was bought out of the
+stack zone. The **worst call chain is 91,988 B against the 98,304 B ceiling
+(6,316 B of margin)**, which the `redrive_window` re-assert pass did not eat;
+it was 91,972 B at the base. `check_boot_chain.py` PASSes.
+
+**The task arena went *down*, by 32 B, and its stamp was re-measured.**
+`measure_task_arena.py` re-run under nightly over the merged tree:
+
+```
+measured 6 task pools, 21,944 B total, stamp 897931090a328186…
+  button_poll_task: 56      ccid_task: 8,600    embassy_main: 168
+  hid_task: 12,328           led_heartbeat_task: 56    usb_task: 736
+```
+
+21,944 B in a **32,772 B** arena = **1.49×** (floor 1.25×), against 21,976 B /
+1.50× at the base: `hid_task`'s future is **32 B smaller** even though its
+compiled poll body is 1,660 B larger. That is not a contradiction — the consent
+`loop` the epic removed was an `async` state machine whose frame was charged to
+the future, and the replacement parks its state in `boot::PENDING_UP` instead.
+**The growth was paid in `.bss` and traded back out of the arena.** The stamp
+is byte-exact over source text, so the 26 commits in the epic invalidated it
+regardless of whether any future grew; `check_boot_chain.py` failed closed on it
+until `measure_task_arena.py` was re-run, which is the guard working.
+
+**Shrinking was tried, and here is what it measured.** Three levers, in order
+of how promising they looked:
+
+1. **`emul_hid.rs` in the device image** — the obvious suspect, a 1,035-line
+   new module that exists for the emulator. **It was already gated out.**
+   `lib.rs:132` carries `#[cfg(feature = "emulation")]`, and
+   `arm-none-eabi-nm … | grep -c emul_hid` on the release ELF returns **0**.
+   Cost in the shipping image: **0 B.** Nothing to recover.
+2. **`#[cfg(test)]` instrumentation** — `HidServe::reads` and
+   `HidServe::blocked_live_passes` (US-1509's blackout detector) are both
+   `#[cfg(test)]` fields. Cost in the release image: **0 B.**
+3. **Outlining the loop's two big async helpers** — `#[inline(never)]` on
+   `hid_serve::redrive_window` and `hid_serve::dispatch`, on the theory that an
+   `async fn` inlined across many `.await`s duplicates its state machine at
+   `opt-level = "z"`. **Measured: 817,984 → 818,412 B, +428 B.** Worse, not
+   better, because both are reached from exactly one call site apiece and there
+   is no duplication to remove — only a prologue and an epilogue. Reverted;
+   the committed figure is the 817,984 B above.
+
+There is no fourth lever that is not "remove a reviewed fix". The capFlags
+change, the bounded HID reads and writes, Phase C's non-blocking consent
+window, `CTAPHID_CANCEL`, the keepalive protocol, the emulator parity
+migration and the error-table alignment were each reviewed and are each the
+subject of a US-number; **the only way to reach 1532 KiB from here is to undo
+one of them**, so the number is raised deliberately instead, which is what the
+EPIC asks for in that case.
+
+**Which edits in this epic cost 0 B, named so this raise is not read as
+covering them.**
+
+* The **emulator parity migration** (US-1524) — `emul_main.rs` dropping its
+  own assembler, reply framer, dispatcher and consent `loop` for
+  `hid_serve`'s — costs **0 B on the device image**. It removes code from a
+  binary that is not flashed.
+* `HidServe::reads` / `blocked_live_pass` / `blocked_live_passes` — the US-1509
+  blackout instrument — are `#[cfg(test)]` and cost **0 B**.
+* The task-arena **re-stamp** and this document re-stamp cost **0 B** of
+  `text`; the stamp is a byte-exact hash, not code.
+* `FidoApp::process_u2f_with_store` → `FidoDispatch::process_u2f` is **net
+  −20 B**, i.e. the largest single item in the epic is a move that came out
+  slightly ahead.
+
+**The raise, and what it buys.** `FIRMWARE_FLASH_BUDGET_KIB` **1532 → 1536**.
+1536 KiB = 1,572,864 B against a measured 1,572,352 B, so the slack this leaves
+is **512 B**. That is tighter than the ~1.5 KiB the previous two raises left,
+and deliberately so: 1536 is the smallest whole-KiB value the shipping image
+fits under, which is the most informative number this ratchet can carry — the
+next ordinary growth is a red again, immediately.
+
+Prior header:
+
 **Date:** 2026-10-01 (**Re-measurement after the revert of the `cargo-deps` group
 PR #2.** No feature changed; the *resolved dependency closure* did, so every
 number below is re-taken rather than carried.)
@@ -811,27 +976,27 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 763,608 | `0x10000200` | no (flash) |
-| `.rodata` | 18,708 | `0x100ba8d8` | no (flash) |
+| `.text` | 766,008 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb238` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bf2c0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 419,680 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20066828` | yes |
-| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfc20` | non-alloc, not in Berkeley `text` |
+| `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20066c50` | yes |
+| `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 763,608 (`.text`) + 18,708 (`.rodata`) + 276
+Berkeley `text` = 766,008 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **815,576**. That identity is stated so a reader can check
+the `X` flag) = **817,984**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 815,576 B** · **`.data` = 196 B** · **`.bss` = 420,704 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 817,984 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 420,900 B** (420,904 B address-to-address: `__sheap` `0x20066c28` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c28` → **main stack zone = 111,576 B** of 532,480 B of SRAM.
+**RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
