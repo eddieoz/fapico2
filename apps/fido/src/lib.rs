@@ -65,8 +65,9 @@ pub mod vault;
 // — the two `FidoApp` types have separate dispatch `match`es, so this module
 // (not either arm) is the single place the sub-command set is defined.
 pub mod vendor41;
-// US-176: the durable state the twelve `vendor41::PENDING` arms need, and the
-// two `vendor41::VendorOps` implementations over the host and device
+// US-176: the durable state the `vendor41` arms needed — twelve of them were
+// stubs then, and none is a stub now (US-1516) — and the two
+// `vendor41::VendorOps` implementations over the host and device
 // keystores. A sibling rather than a part of `vendor41` because `vendor41` is
 // the protocol and must stay keystore-free — see the module docs on why the
 // commit lives with the dispatch arm that owns the snapshot.

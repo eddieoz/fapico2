@@ -636,17 +636,34 @@ impl<K: Keystore> FidoApp<K> {
             // vault below: that one is reached through the CTAPHID frame CMD
             // byte in `firmware/src/tasks.rs`, a different frame and a
             // different field, so the two cannot alias (its sub-command `1` is
-            // STATUS here, whereas `1` is MSE in RS-Key). Every sub-command is
-            // a NOT_ALLOWED stub until Phase I implements it; `vendor41` owns
-            // both the sub-command set and the shrink-to-empty discipline.
+            // STATUS here, whereas `1` is MSE in RS-Key). `vendor41` owns
+            // the sub-command set and the shrink-to-empty discipline.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
-            // rejected MAC against its three-strike counter. Neither is
-            // consulted while every sub-command is still a stub — this arm
-            // still answers `0x30` to every request, and
-            // `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-            // pins that with a real `0x20` token in hand.
+            // rejected MAC against its three-strike counter.
+            //
+            // US-1516 replaces two sentences this comment used to carry. It
+            // said "every sub-command is a NOT_ALLOWED stub until Phase I
+            // implements it" and that the token "is not consulted while every
+            // sub-command is still a stub — this arm still answers `0x30` to
+            // every request". Both were true when written and outlived the
+            // stubs: `PENDING` drained across US-170 … US-175 and **all
+            // fourteen sub-commands now have real arms**. Per arm, gate and
+            // tokenless authority are written down in `vendor41::decision`.
+            //
+            // The gate is **per arm**, not per dispatch: `CONFIG_READ` is
+            // ungated by protocol, `CONFIG_WRITE` consults the token for its
+            // identity tier only, and the twelve token-optional rows call
+            // `authorize` from inside their own gate helpers so a bare request
+            // is answered with a touch rather than refused for want of a
+            // token.
+            //
+            // This twin and `device_app` must keep saying the same thing: the
+            // board runs `device_app`, so a comment or an arm that is honest
+            // here and stale there is a green suite over a broken device.
+            // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
+            // is the check that the device twin agrees.
             crate::vendor41::CMD => {
                 // US-114: the `0x41` response is `status || CBOR`, so this
                 // arm has somewhere to put a body.

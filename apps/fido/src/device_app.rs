@@ -635,25 +635,44 @@ impl FidoApp {
             // first payload byte of a standard 0x90 CBOR frame. NOT the vendor
             // vault: that one dispatches on the CTAPHID frame CMD byte (its
             // arm in `firmware/src/tasks.rs`), so the two read disjoint fields
-            // of disjoint frames and cannot alias. Every sub-command is a
-            // NOT_ALLOWED stub until Phase I implements it; `vendor41` owns
-            // both the sub-command set and the shrink-to-empty discipline. The
-            // store is threaded now so those stories need not re-open this arm.
+            // of disjoint frames and cannot alias. `vendor41` owns the
+            // sub-command set and the shrink-to-empty discipline; the store is
+            // threaded so an arm need not re-open this dispatch.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
-            // rejected MAC against its three-strike counter. Neither is
-            // consulted by the twelve arms still in `vendor41::PENDING` —
-            // those still answer `0x30`, and
-            // `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-            // pins that with a real `0x20` token in hand. `CONFIG_READ` is
-            // ungated *by protocol*, so consulting either would be wrong for it
-            // rather than merely early.
+            // rejected MAC against its three-strike counter.
             //
-            // US-115: `CONFIG_WRITE` consults both, for its identity tier only,
-            // and this arm is where the record it returns gets committed —
-            // `vendor41` has the store but not the snapshot, and only this arm
-            // can make the write durable (see `vendor41::handle`).
+            // US-1516 replaces two sentences this comment used to carry. It
+            // said "every sub-command is a NOT_ALLOWED stub until Phase I
+            // implements it", and that the token "is not consulted by the
+            // twelve arms still in `vendor41::PENDING` — those still answer
+            // `0x30`". Both were true when written and outlived the stubs:
+            // `PENDING` drained across US-170 … US-175 and **all fourteen
+            // sub-commands now have real arms**. A comment claiming a
+            // capability this path does not have is the failure the decision
+            // table exists to prevent, one layer up — and it is worse here
+            // than in `vendor41`, because this is the arm the RP2350 runs.
+            // What replaced it: every arm is listed, with the gate it declares
+            // and what authorises a tokenless request, in `vendor41::decision`.
+            //
+            // The gate is therefore **per arm**, not per dispatch. `CONFIG_READ`
+            // is ungated *by protocol* — the client sends it as its probe for
+            // whether this firmware speaks `0x41` at all — so consulting a
+            // token for it would be wrong rather than early. `CONFIG_WRITE`
+            // consults it for the identity tier only. The twelve
+            // token-optional rows call `authorize` from inside their own gate
+            // helpers, so a bare request reaches them and is answered with a
+            // touch instead of refused for want of a token.
+            //
+            // US-115: `CONFIG_WRITE`'s record is committed here — `vendor41`
+            // has the store but not the snapshot, and only this arm can make
+            // the write durable (see `vendor41::handle`).
+            //
+            // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
+            // is what keeps this arm honest: it drives every sub-command over
+            // *this* path and requires a dispatched answer, so the module's
+            // claim cannot be true for the host twin and false here.
             crate::vendor41::CMD => {
                 let auth = self.pin_token.as_ref().map(|token| crate::vendor41::TokenAuth {
                     token,
