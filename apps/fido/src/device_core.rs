@@ -2165,9 +2165,12 @@ impl FidoApp {
     // * The `UpRequired` → keepalive → retry loop that turns a bare `0x3B`
     //   into a touch prompt lives in the *transport*, not here, and its
     //   predicate does not include `0x0B`:
-    //   `presence_windowed = ctap_cmd == 0x01 || ctap_cmd == 0x02 ||
-    //   ctap_cmd == 0x06 || ctap_cmd == vendor41::CMD` in
-    //   `firmware/src/tasks.rs`, mirrored in `firmware/src/emul_main.rs`.
+    //   `presence_windowed = up_request || ctap_cmd == vendor41::CMD ||
+    //   ctap_cmd == 0x06` (with `up_request = ctap_cmd == 0x01 ||
+    //   ctap_cmd == 0x02`) in `firmware/src/hid_serve.rs`. There is no
+    //   separate emulator copy of the predicate to drift from — US-1524 made
+    //   `emul_hid::serve_pass` call the same `serve_once`, so both paths
+    //   evaluate this one expression.
     //   So gating here would answer a bare 0x3B that never opens a window,
     //   never prompts and never retries — a deadlock, not a prompt.
     // * The reference C firmware gates too (`pico-fido/src/fido/

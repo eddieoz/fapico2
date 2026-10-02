@@ -122,19 +122,41 @@ pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 /// exactly this pair — `resp->capFlags = CAPFLAG_WINK | CAPFLAG_CBOR` at
 /// `pico-keys-sdk/src/usb/hid/hid.c:451`.)
 ///
-/// So `0x04` alone is a trap in both directions: the de-facto readers call it
-/// "CBOR supported", while a spec reader calls it "WINK yes, **CBOR no**" — the
-/// device announces it has no CTAP2 while serving CTAP2 happily. `fido2`
-/// 2.2.1 gates CTAP2 on exactly that bit and raises
-/// `ValueError("Device does not support CTAP2.")` (`fido2/ctap2/base.py`), so
-/// a spec-reading host never offers the key as a passkey authenticator at all
-/// — the US-1507 discovery symptom (works on some sites, never offered on
-/// others).
+/// So `0x04` alone is a trap **under the spec column only**: a spec reader
+/// calls it "WINK yes, **CBOR no**" — the device announces it has no CTAP2
+/// while serving CTAP2 happily. Under the de-facto column it reads as "CBOR
+/// supported", which is the right answer by accident.
 ///
-/// `0x05` reads as **CBOR + WINK under both** conventions, and this device
-/// serves both: CBOR on `CTAP_HID_CBOR`, WINK acknowledged on `CTAP_HID_WINK`
-/// (`firmware/src/tasks.rs`). Do **not** "simplify" this back to a single
-/// `0x04` — that byte is the whole regression this constant exists to prevent.
+/// ## How strong that claim is — measured, and weaker than it reads
+///
+/// An earlier version of this paragraph said flatly that "a spec-reading host
+/// never offers the key as a passkey authenticator at all — the US-1507
+/// discovery symptom". **That was not established**, and the A/B probe in
+/// `docs/webauthn-discovery-ab.md` is what says so:
+///
+/// * the differing bit is **`0x01`**, and `0x01` is **WINK under every
+///   convention verifiable on this machine**. The de-facto column is verified
+///   by *executing* `fido2.hid.CAPABILITY`; the spec column could not be
+///   verified here at all (the reference fetch was rejected). The whole claim
+///   rests on the unverified column;
+/// * the CBOR bit **`0x04` is set on both boards**. Our pre-fix board sent
+///   `0x04`, the C reference sends `0x05`, and both therefore already read as
+///   "CBOR supported" under the de-facto convention — the one every
+///   first-party tool actually uses;
+/// * so `0x05` is **reference parity, not a demonstrated fix**. The probe
+///   proves which bytes differ between two boards. It does not prove which
+///   byte a browser acts on, and it did not observe a browser at all.
+///
+/// The value stays `0x05` because that is what the reference sends and because
+/// it is harmless under the convention that *is* verified — not because it has
+/// been shown to repair discovery. Do **not** "simplify" this back to a single
+/// `0x04` on the strength of the reasoning the earlier draft gave: that byte is
+/// the regression this constant exists to prevent, and the argument that
+/// actually keeps it is parity with the C reference.
+///
+/// The device serves both capabilities, which is what makes `0x05` honest
+/// rather than merely safe: CBOR on `CTAP_HID_CBOR` and WINK acknowledged on
+/// `CTAP_HID_WINK`, both arms in `firmware/src/hid_serve.rs`'s `dispatch`.
 /// `init_reply_advertises_cbor_and_wink_under_both_conventions` decodes the
 /// reply under each assignment and fails if either reader could conclude
 /// "no CTAP2".
@@ -147,13 +169,14 @@ pub const CTAPHID_INIT_REPLY_LEN: usize = 17;
 
 /// Build the 17-byte CTAPHID_INIT reply payload.
 ///
-/// US-1507: extracted verbatim from `dispatch_hid_cmd` in
-/// `firmware/src/tasks.rs`, which is an `async fn` — the construction itself
+/// US-1507: extracted verbatim from the INIT arm of `dispatch` in
+/// `firmware/src/hid_serve.rs` (it was `dispatch_hid_cmd` in
+/// `firmware/src/tasks.rs` before the serve loop moved out). The construction
 /// is pure stack work with no I/O, so the one byte that decides whether a host
-/// discovers this key as a CTAP2 authenticator (see
-/// [`CTAPHID_INIT_CAP_FLAGS`]) is now reachable from this module's unit tests.
-/// The firmware builds its reply through *this* function, so the test covers
-/// the shipped bytes rather than a copy of them.
+/// discovers this key as a CTAP2 authenticator (see [`CTAPHID_INIT_CAP_FLAGS`])
+/// is reachable from this module's unit tests. The firmware builds its reply
+/// through *this* function, so the test covers the shipped bytes rather than a
+/// copy of them.
 ///
 /// `version_major` / `version_minor` / `version_build` are the **YubiKey**
 /// firmware version bytes, not the CTAPHID protocol version: `yubikit` reads

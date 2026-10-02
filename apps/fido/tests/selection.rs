@@ -107,9 +107,11 @@ fn device_twin_does_not_answer_invalid_command() {
 /// to (`device_core::default_user_present` → `false`). A future story that
 /// *does* add the gate has to change this test deliberately, at the same
 /// time as it adds `0x0B` to `presence_windowed` in
-/// `firmware/src/tasks.rs` (the `UpRequired` → keepalive → retry loop) — the
-/// gate is not reachable from `process_ctap2` alone, and the reasoning is in
-/// `device_core::handle_authenticator_selection`.
+/// `firmware/src/hid_serve.rs` (the `UpRequired` → keepalive → retry loop,
+/// which lives in `serve_once` + `dispatch`; the emulator runs the same
+/// `serve_once` via `emul_hid::serve_pass`, so there is no second predicate to
+/// update) — the gate is not reachable from `process_ctap2` alone, and the
+/// reasoning is in `device_core::handle_authenticator_selection`.
 #[test]
 fn selection_answers_without_user_presence() {
     let mut trng = HostTrng::new();

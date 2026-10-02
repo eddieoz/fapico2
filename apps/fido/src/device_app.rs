@@ -621,8 +621,9 @@ impl FidoApp {
             // selection` in `device_core.rs` states the full argument. In
             // short, a gated answer is unreachable from here (the
             // `UpRequired` → keepalive → retry loop that makes a gate into a
-            // prompt is in `firmware/src/tasks.rs` and its predicate does
-            // not name `0x0B`), `fido2`'s `Ctap2.selection()` raises a
+            // prompt is `serve_once` + `dispatch` in `firmware/src/hid_serve.rs`,
+            // and its `presence_windowed` predicate does not name `0x0B`),
+            // `fido2`'s `Ctap2.selection()` raises a
             // `CtapError` on *any* non-zero status so no gated status reads
             // as a selection, and the reference C firmware's gate is
             // disarmed in its default build. Answering here is what makes
@@ -634,10 +635,11 @@ impl FidoApp {
             // US-106: the RS-Key vendor channel (PicoForge framing C) — the
             // first payload byte of a standard 0x90 CBOR frame. NOT the vendor
             // vault: that one dispatches on the CTAPHID frame CMD byte (its
-            // arm in `firmware/src/tasks.rs`), so the two read disjoint fields
-            // of disjoint frames and cannot alias. `vendor41` owns the
-            // sub-command set and the shrink-to-empty discipline; the store is
-            // threaded so an arm need not re-open this dispatch.
+            // arm in `firmware/src/hid_serve.rs`'s `dispatch`), so the two
+            // read disjoint fields of disjoint frames and cannot alias.
+            // `vendor41` owns the sub-command set and the shrink-to-empty
+            // discipline; the store is threaded so an arm need not re-open
+            // this dispatch.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
