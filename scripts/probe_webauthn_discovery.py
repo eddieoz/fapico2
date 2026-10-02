@@ -22,7 +22,13 @@ Usage:
     python3 scripts/probe_webauthn_discovery.py
     python3 scripts/probe_webauthn_discovery.py --unanswered-observe 3.0
 
-Exits 0 only if every part completed and the device was left answering.
+Exit codes:
+    0  every part completed and the device was left answering
+    2  a part could not be run at all (device missing, unanswered INIT, ...)
+    3  the final INIT+PING round-trip failed — the board was not left answerable
+    4  every part ran, but one of the measurements the brief asks for could not
+       be read (currently: every requested getInfo option came back absent).
+       That is a probe defect being reported, not a device finding.
 """
 
 from __future__ import annotations
@@ -191,6 +197,14 @@ class RawHid:
             except BlockingIOError:
                 # Output buffer full — the device is not reading. Wait for
                 # room, bounded, and record that we had to.
+                #
+                # This clause is the whole handler: `BlockingIOError` *is*
+                # `OSError(errno.EAGAIN)`, so a separate `except OSError` arm
+                # keyed on EAGAIN is unreachable behind it. An earlier draft
+                # had one, and it was worse than dead — its `continue` skipped
+                # the deadline check below, turning a bounded wait into an
+                # unbounded spin. There is no other OSError worth special-casing
+                # here, so the rest propagate.
                 self.write_stalls += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -199,11 +213,6 @@ class RawHid:
                         f"({self.write_stalls} stalls) — device is not reading"
                     ) from None
                 select.select([], [self.fd], [], min(remaining, 0.05))
-            except OSError as exc:
-                if exc.errno in (11,):  # EAGAIN
-                    self.write_stalls += 1
-                    continue
-                raise
 
     def _drain_one(self) -> bool:
         """Read one report if one is available. False if nothing was ready."""
@@ -439,7 +448,14 @@ def mc_payload() -> bytes:
     return bytes([CTAP2_MAKE_CREDENTIAL]) + cbor.encode(params)
 
 
-def part_a(hid: RawHid, desc, observe: float) -> Session:
+def part_a(hid: RawHid, desc, observe: float) -> tuple[Session, bool]:
+    """Cold-boot INIT + getInfo. Returns (session, options_anomaly).
+
+    `options_anomaly` is True when every option the brief asked for came back
+    absent, which is this probe having looked in the wrong place rather than
+    the device having said something. It is a nonzero exit, not a device
+    finding — see the ANOMALY block printed at the point it is detected.
+    """
     say("=" * 78)
     say("PART (a) — cold-boot CTAPHID_INIT + authenticatorGetInfo latency")
     say("=" * 78)
@@ -485,7 +501,11 @@ def part_a(hid: RawHid, desc, observe: float) -> Session:
         f"{lib_dev.version} capabilities=0x{lib_dev.capabilities:02X} "
         f"device_version={lib_dev.device_version} cid={lib_dev._channel_id:#010x} "
         f"(agrees with raw framing: {lib_dev.capabilities == capflags})")
-    lib_dev._connection.close()
+    # `close()` is the public API (`CtapHidDevice.close`, fido2/hid/__init__.py
+    # — it just forwards to the connection), so there is no reason to reach
+    # into `_connection`. `_channel_id` above has no public accessor in 2.2.1
+    # and is only printed for the record.
+    lib_dev.close()
     hid.mark_all_consumed()
 
     # Repeat INIT a few times so the number is not a single sample.
@@ -526,23 +546,55 @@ def part_a(hid: RawHid, desc, observe: float) -> Session:
     except Exception as exc:  # pragma: no cover
         say(f"  FATAL: getInfo body is not CBOR after the status byte: {exc}")
         sys.exit(2)
-    # getInfo key 4 is the options map (a map of option-id -> supported). Keys
-    # 1..3 are versions/extensions/aaguid, 5.. are maxMsgSize, protocols, etc.
-    # These are the ids the brief asks about. There is no "up" option id in
-    # CTAP2 — user presence is not optional on this authenticator — so the one
-    # that governs a MakeCredential's UV requirement is 0x0E makeCredUvNotRqd.
+    # getInfo key 4 is the options map, and this device spells it with **text
+    # keys**: `{"rk": True, "clientPin": True, ...}`. The integer option ids
+    # (0x01 rk, 0x03 alwaysUv, 0x06 clientPin, 0x0C pinUvAuthToken, 0x07
+    # largeBlobs, 0x0E makeCredUvNotRqd) are the *other* dialect's spelling —
+    # picoforge/Yubico's own. Indexing this map with them yields `<absent>` for
+    # every key, which is exactly what the first draft of this probe did, and
+    # a row of seven `<absent>` reads like "the device supports none of these"
+    # rather than "the probe looked in the wrong place".
+    #
+    # So: print the keys the device actually sent, look the brief's options up
+    # BY NAME, and treat an all-absent result as an anomaly to shout about
+    # rather than print (it returns nonzero at the end of the run).
     opts = info.get(4, {}) if isinstance(info, dict) else {}
+    key_type = type(next(iter(opts), None)).__name__
     say(f"       getInfo options map (key 0x04) = {opts!r}")
-    for key, name in ((0x06, "clientPin"), (0x0C, "pinUvAuthToken"),
-                      (0x03, "alwaysUv"), (0x0E, "makeCredUvNotRqd"),
-                      (0x01, "rk"), (0x04, "credMgmt"), (0x07, "largeBlobs")):
-        say(f"         options[0x{key:02X}] {name} = {opts.get(key, '<absent>')!r}")
-    say(f"         (no 'up' option id exists in CTAP2; user presence is implied)")
+    say(f"       options map key type as received = {key_type!r} "
+        f"(observed keys are {sorted(opts, key=str)!r})")
+    requested = ("clientPin", "pinUvAuthToken", "alwaysUv", "makeCredUvNotRqd", "rk")
+    say("       the options the brief asks about, looked up BY NAME:")
+    missing = [name for name in requested if name not in opts]
+    for name in requested:
+        if name in opts:
+            say(f"         options[{name!r}] = {opts[name]!r}")
+        else:
+            say(f"         options[{name!r}] = '<absent>'  ** not in the observed key set **")
+    say(f"       (CTAP2's options map has no 'uv' and no 'up' key: alwaysUv "
+        f"and makeCredUvNotRqd are what a MakeCredential's UV requirement is "
+        f"governed by, and user presence is implied rather than optional)")
+    options_anomaly = False
+    if missing and len(missing) == len(requested):
+        options_anomaly = True
+        say("")
+        say("  !!! ANOMALY — EVERY requested option came back absent !!!")
+        say("  !!! This is a probe defect, not a device finding. An all-absent")
+        say("  !!! result is what an integer-option-id lookup produces against a")
+        say("  !!! text-keyed map, and it looks exactly like 'the device")
+        say("  !!! advertises none of these options'. Do not record it as one.")
+        say("  !!! The keys the device DID send are printed above; re-derive the")
+        say("  !!! lookup from those before any of this is written down.")
+        say("  !!! (The run exits 4.)")
+        say("")
+    elif missing:
+        say(f"  NOTE: absent from the observed key set: {missing!r} "
+            f"— reported as observed, not as an id miss.")
     say(f"       full getInfo map keys = {sorted(info.keys()) if isinstance(info, dict) else 'n/a'}")
     say(f"       versions (key 1) = {info.get(1) if isinstance(info, dict) else 'n/a'}")
     say(f"       maxMsgSize (key 5) = {info.get(5) if isinstance(info, dict) else 'n/a'}")
     say("")
-    return sess
+    return sess, options_anomaly
 
 
 def consent_round(hid: RawHid, sess: Session, label: str, observe: float,
@@ -643,12 +695,12 @@ def consent_round(hid: RawHid, sess: Session, label: str, observe: float,
 
     init_ans = hid.find(BROADCAST.hex(), INIT, since=t_init_send)
     ping_ans = hid.find(cid_hex, PING, since=t_ping_send)
-    cancel_ans = (hid.find(cid_hex, 0x11, since=t_cancel_send)
+    cancel_ans = (hid.find(cid_hex, CANCEL, since=t_cancel_send)
                   or hid.find(cid_hex, ERROR, since=t_cancel_send)) if send_cancel else None
     ka_during = hid.count_since(t_mc, cid_hex, KEEPALIVE)
     # Anything else the device volunteered on the open channel during the
     # blackout, beyond the keepalive stream. Reported, never filtered away.
-    others = hid.find_other(cid_hex, t_mc, exclude=(KEEPALIVE, 0x11, ERROR, PING, MATCH_CBOR))
+    others = hid.find_other(cid_hex, t_mc, exclude=(KEEPALIVE, CANCEL, ERROR, PING, MATCH_CBOR))
     for o in others:
         say(f"      (unexpected) extra frame on open channel: cmd=0x{o['cmd']:02X} "
             f"len={o['len']} raw={o['raw']} at +{(o['t']-t_mc)*1000:.1f} ms")
@@ -741,7 +793,7 @@ def consent_round(hid: RawHid, sess: Session, label: str, observe: float,
     late_ping = ping_ans or hid.find(cid_hex, PING, since=t_ping_send)
     late_cancel = None
     if send_cancel:
-        late_cancel = cancel_ans or hid.find(cid_hex, 0x11, since=t_cancel_send) \
+        late_cancel = cancel_ans or hid.find(cid_hex, CANCEL, since=t_cancel_send) \
             or hid.find(cid_hex, ERROR, since=t_cancel_send)
     if late_init is not None and init_ans is None:
         say(f"    (b) broadcast INIT answered LATE, "
@@ -781,7 +833,7 @@ def consent_round(hid: RawHid, sess: Session, label: str, observe: float,
 
 def part_b_and_c(hid: RawHid, sess: Session, observe: float) -> dict:
     say("=" * 78)
-    say("PART (c1) — CTAPHID_CANCEL (0x11) with NO consent window open")
+    say(f"PART (c1) — CTAPHID_CANCEL (0x{CANCEL:02X}) with NO consent window open")
     say("=" * 78)
     hid.settle()
     hid.mark_all_consumed()
@@ -790,10 +842,11 @@ def part_b_and_c(hid: RawHid, sess: Session, observe: float) -> dict:
         say(f"  CTAPHID_CANCEL: NOT ANSWERED after 3000 ms")
         c1 = {"answered": False}
     else:
-        verdict = ("zero-length 0x11 frame — CTAPHID §11.2.9 CORRECT"
-                   if ev["cmd"] == 0x11 and ev["len"] == 0 else
-                   "NOT the zero-length 0x11 frame §11.2.9 requires")
-        say(f"  sent CTAPHID_CANCEL frame cmd 0x11 on channel {sess.cid_hex}, 0-byte payload")
+        verdict = (f"zero-length 0x{CANCEL:02X} frame — CTAPHID §11.2.9 CORRECT"
+                   if ev["cmd"] == CANCEL and ev["len"] == 0 else
+                   f"NOT the zero-length 0x{CANCEL:02X} frame §11.2.9 requires")
+        say(f"  sent CTAPHID_CANCEL frame cmd 0x{CANCEL:02X} on channel "
+            f"{sess.cid_hex}, 0-byte payload")
         say(f"  reply: cmd=0x{ev['cmd']:02X} len={ev['len']} raw={ev['raw']} "
             f"latency={ms:.1f} ms")
         if ev["cmd"] == ERROR and ev["body"]:
@@ -894,7 +947,7 @@ def main() -> int:
 
     rc = 0
     try:
-        sess = part_a(hid, desc, args.unanswered_observe)
+        sess, options_anomaly = part_a(hid, desc, args.unanswered_observe)
         res = part_b_and_c(hid, sess, args.unanswered_observe)
         ok = final_state_check(hid, args.unanswered_observe)
         say("")
@@ -932,6 +985,12 @@ def main() -> int:
                 say(f"  [{e['t']-t0:8.3f}s] {e.get('kind')}: {e.get('raw','')}")
         if not ok:
             rc = 3
+        elif options_anomaly:
+            # The run completed and every frame was measured, but one of the
+            # measurements the brief asked for could not be read (see the
+            # ANOMALY block in part (a)). Nonzero, so a caller scripting this
+            # cannot mistake the run for a clean one.
+            rc = 4
     finally:
         try:
             conn.close()
