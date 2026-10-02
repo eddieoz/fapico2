@@ -145,6 +145,45 @@ jobs:
       - name: Firmware lib unit tests (presence / ctap_hid / ccid_reasm)
         working-directory: fapico2
         run: cargo test -p fapico2-firmware --lib --target x86_64-unknown-linux-gnu -- --test-threads=1
+      # US-1524 parity, gated (2026-10-02). The step above builds
+      # `--lib` under `default = ["device"]`, and `lib.rs` gates the
+      # emulator half of the CTAP-HID seam on `feature = "emulation"`
+      # alone — so `emul_hid`, and with it the whole six-test parity
+      # suite, was COMPILED OUT of the only firmware test invocation in
+      # CI. Measured before this step: 78 tests under `device`, 84 under
+      # `device,emulation`; the delta is exactly the parity suite
+      # (`the_emulator_and_the_shipped_loop_agree_report_for_report`,
+      # `a_cross_channel_request_is_answered_inside_a_window`,
+      # `a_cancel_with_nothing_pending_is_dropped_and_cannot_cancel_the_next_window`,
+      # `a_cancel_inside_a_window_answers_keepalive_cancel`,
+      # `a_long_reply_is_fragmented_the_same_way`,
+      # `us1511_the_window_scenario_is_identical_on_both_paths`).
+      #
+      # This is the only evidence for the epic's DoD item 6 (emulator and
+      # board answer identically), the entire anti-regression value of
+      # US-1524, and the suite every pytest acceptance run and the sibling
+      # `pico-fido2` suites execute against. A gate that nothing runs is
+      # not a gate — the same sentence this file already uses at the
+      # `advertise-serve-gate` job, reproduced one level up.
+      #
+      # A SECOND step, not a widened first one, for two reasons:
+      #   * the step above is the SHIPPING configuration's gate and stays
+      #     that way on its own — `device` alone must stay green, or a
+      #     parity change could mask a device-only break;
+      #   * the count is the evidence. Two steps report 78 and 84
+      #     separately, so a future `cfg` move that re-hides the suite
+      #     shows up as the second step dropping back to 78.
+      # `device,emulation` (not `emulation` alone) so the device path is
+      # compiled in the same build the parity tests compare it against.
+      # `--test-threads=1` for the same reason as above: the flake is in
+      # `ccid_reasm::tests`, which this build also compiles, and it
+      # reproduces here (measured 1 in 4 parallel runs).
+      # `--lib`, because the emulation BIN target cannot build for the
+      # host at all — `rp_pac`/`embassy_rp` are arm-scoped (118 errors at
+      # the pre-epic base `ea298a6`). `run_tests.sh` only BUILDS that bin.
+      - name: Firmware lib unit tests (emulation parity, US-1524)
+        working-directory: fapico2
+        run: cargo test -p fapico2-firmware --lib --features device,emulation --target x86_64-unknown-linux-gnu -- --test-threads=1
 
   # ---------------------------------------------------------------------------
   # 2/4 — cargo clippy -- -D warnings. A strict lint gate: any new warning on a

@@ -73,8 +73,26 @@ python3 tests/scripts/check_rng_path.py
 # if the sink ever loses its compare-then-write, not only if the prose drifts.
 python3 tests/scripts/check_erase_budget.py
 
+# Acceptance exit-code contract gate (US-1518): `run_acceptance.py` needs a
+# board, a browser and a finger, so nothing here can run it end to end — which
+# is how its exit code came to be `1 if machine_fail else 0` while the README
+# told callers to gate on it, and a browser-less run reported success over two
+# machine-gated cases that never executed. This gate imports the pure
+# `classify_cases` the contract now lives in and pins every branch, including
+# that one.
+python3 tests/scripts/check_acceptance_exit_code.py
+
 # Red-team regression suite (US-923, Phase F): passed as a tests/harness/
 # path below, or runs as part of the default pytest discovery.
+
+# US-1524 emulator/board parity, as a TEST rather than only a build. The
+# build below links the emulator; nothing above ever RAN the six parity
+# tests in `emul_hid`, because `lib.rs` gates that module on
+# `feature = "emulation"` and every other firmware `--lib` invocation in
+# this tree (and in CI, until 2026-10-02) used `default = ["device"]`.
+# Mirrors the CI step of the same name so a local run reproduces the gate.
+# `--test-threads=1` for the `ccid_reasm::tests` shared-clock reason.
+cargo test -p fapico2-firmware --lib --features device,emulation --target x86_64-unknown-linux-gnu -- --test-threads=1 2>&1 | tail -3
 
 # Build the emulator
 cargo build -p fapico2-firmware --bin fapico2-emulation --no-default-features --features emulation --target x86_64-unknown-linux-gnu 2>&1 | tail -3

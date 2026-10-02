@@ -126,6 +126,62 @@ def log(msg=""):
     print(msg, flush=True)
 
 
+# ---------------------------------------------------------------------------
+# The exit-code contract, in one pure function
+# ---------------------------------------------------------------------------
+#
+#   0  every MACHINE-gated case in this run reported PASS
+#   1  at least one machine case FAILED, or one was in scope and did not
+#      report at all
+#   2  the harness could not run (no board, ambiguous identity, no browser
+#      when --run-browser asked for one) — decided by the callers, not here
+#
+# "In scope" is the whole distinction, and it is carried on each case as
+# `out_of_scope`. `page:enumerates` and `page:answers_after_abandon` are
+# machine-gated *on the acceptance page*, but they can only report if a browser
+# was launched, so they are machine-gated HERE only when `--run-browser` was
+# passed. Without it they carry `gate: "browser"` and `out_of_scope: true`:
+# visible and named, but not in the machine tally.
+#
+# The bug this replaces. The exit code was the one-liner
+# `1 if machine_fail else 0`, while both page cases were filed under
+# `gate: "machine"` unconditionally. So a browser-less run exited **0** with
+# `page:enumerates` and `page:answers_after_abandon` never executed, while the
+# README promised "exit code 0 = every machine case passed". `88d31cd` fixed
+# the *summary count* for the same defect and left the exit code — the half the
+# README tells callers to gate on — still reporting success over an unexecuted
+# case.
+#
+# The rule, stated so it cannot be re-broken: **an unexecuted case is never a
+# pass.** It is either out of scope and named as such, or in scope and non-zero.
+# Human-gated cases are out of both directions — they need a physical touch by
+# design, so `NOT RUN` on one is the expected state of an unattended run.
+#
+# Pure over a list of case dicts, with no board, browser or clock, so
+# `tests/scripts/check_acceptance_exit_code.py` can pin all four branches
+# without the hardware the harness itself requires.
+def classify_cases(all_cases):
+    machine = [c for c in all_cases if c["gate"] == "machine"]
+    machine_pass = [c for c in machine if c["verdict"] == "PASS"]
+    machine_fail = [c for c in machine if c["verdict"] == "FAIL"]
+    # Anything in the machine tally that is neither PASS nor FAIL: the page
+    # stayed silent, the case raised before recording a verdict, or a future
+    # gate was added and left unhandled. All three mean "we did not measure
+    # it", and all three must be non-zero.
+    machine_notrun = [c for c in machine if c["verdict"] not in ("PASS", "FAIL")]
+    out_of_scope = [c for c in all_cases if c.get("out_of_scope")]
+    complete = not machine_fail and not machine_notrun
+    return {
+        "machine": machine,
+        "machine_pass": machine_pass,
+        "machine_fail": machine_fail,
+        "machine_notrun": machine_notrun,
+        "out_of_scope": out_of_scope,
+        "complete": complete,
+        "exit_code": 0 if complete else 1,
+    }
+
+
 def hdr(title):
     log()
     log("=" * 78)
@@ -894,14 +950,29 @@ def main():
             "verdict": (pr or {}).get("verdict", "NOT RUN"),
             "observed": (pr or {}).get("observed", "no verdict reported"),
             "evidence": {},
+            "out_of_scope": False,
         })
+    # The page's two MACHINE-gated cases. Whether they are machine-gated for
+    # THIS run depends on whether a browser was launched: with no `--run-browser`
+    # there is nothing that could report them, so filing them under
+    # `gate: "machine"` would put two cases that cannot run into the machine
+    # tally and let the run exit 0 over them (the defect fixed above). They
+    # stay listed, named, and flagged `out_of_scope` so a board-only run says
+    # out loud what it did not verify.
     for cid in MACHINE_PAGE_CASES:
         pr = (browser_results or {}).get(cid)
+        in_scope = args.run_browser
         all_cases.append({
-            "case": f"page:{cid}", "title": "page-side check", "gate": "machine",
+            "case": f"page:{cid}", "title": "page-side check",
+            "gate": "machine" if in_scope else "browser",
             "verdict": (pr or {}).get("verdict", "NOT RUN"),
-            "observed": (pr or {}).get("observed", "no verdict reported"),
+            "observed": (pr or {}).get(
+                "observed",
+                "no verdict reported" if in_scope
+                else "out of scope: this run did not pass --run-browser, so "
+                     "no browser was launched and the page could not report it"),
             "evidence": {},
+            "out_of_scope": not in_scope,
         })
 
     log(f"{'case':<44} {'gate':<8} {'verdict'}")
@@ -911,24 +982,39 @@ def main():
                                                      c["verdict"])
         log(f"{c['case']:<44} {c['gate']:<8} {mark}")
     log()
-    # Count ONLY real passes. A machine case that reported nothing is NOT a
-    # pass -- counting it as one would let CI go green on a case that never
-    # ran, which is exactly the failure mode this harness exists to prevent.
-    machine = [c for c in all_cases if c["gate"] == "machine"]
-    machine_pass = [c for c in machine if c["verdict"] == "PASS"]
-    machine_fail = [c for c in machine if c["verdict"] == "FAIL"]
-    machine_notrun = [c for c in machine if c["verdict"] not in ("PASS", "FAIL")]
+    tally = classify_cases(all_cases)
+    machine = tally["machine"]
+    machine_pass = tally["machine_pass"]
+    machine_fail = tally["machine_fail"]
+    machine_notrun = tally["machine_notrun"]
+    out_of_scope = tally["out_of_scope"]
+    complete = tally["complete"]
     log(f"machine-checkable: {len(machine_pass)}/{len(machine)} pass "
         f"({len(machine_fail)} fail, {len(machine_notrun)} not run)")
     if machine_notrun:
-        log("  NOT counted as passes: "
-            + ", ".join(c["case"] for c in machine_notrun)
-            + "  (the page-side cases only run with --run-browser)")
+        log("  IN SCOPE AND DID NOT REPORT, counted as NOT passing: "
+            + ", ".join(c["case"] for c in machine_notrun))
+        log("  (these were machine-gated for this run, so something that "
+            "should have reported them did not; that is a harness failure, "
+            "not a pass)")
+    if out_of_scope:
+        log()
+        log("*** NOT CERTIFIED BY THIS RUN ***")
+        log("  These are machine-gated cases the acceptance page owns, and "
+            "this run did not exercise them:")
+        for c in out_of_scope:
+            log(f"    - {c['case']}  ({c['observed']})")
+        log("  Exit code 0 therefore means the cases this run COULD execute "
+            "all passed.")
+        log("  It does NOT mean the browser-discovery DoD was verified. "
+            "Re-run with --run-browser for that.")
     if any(c["gate"] == "human" for c in all_cases):
+        log()
         log("human-gated: the ceremonies above need a physical touch; a "
             "'NOT RUN' there means the operator did not run them, which is "
-            "not a pass.")
+            "not a pass. Human-gated cases never affect the exit code.")
 
+    exit_code = tally["exit_code"]
     report = {
         "harness": "US-1518 acceptance",
         "board_selected": ctap.describe(device),
@@ -937,6 +1023,14 @@ def main():
                   "baseline_ms": ctx["baseline_ms"],
                   "derived_ms": ctx["bound_ms"]},
         "recoveries_between_cases": recoveries,
+        "complete": complete,
+        "out_of_scope": [c["case"] for c in out_of_scope],
+        "exit_code": exit_code,
+        "exit_code_contract": {
+            "0": "every machine-gated case in this run reported PASS",
+            "1": "a machine case failed, or one was in scope and did not report",
+            "2": "the harness could not run",
+        },
         "cases": all_cases,
     }
     if args.json_out:
@@ -947,7 +1041,12 @@ def main():
     hdr("MACHINE-READABLE RESULTS")
     log(json.dumps(report, indent=2, default=str))
 
-    return 1 if machine_fail else 0
+    log()
+    log(f"EXIT CODE {exit_code} — " + (
+        "every machine-gated case in this run passed"
+        if complete else
+        "NOT a clean run: see the summary above"))
+    return exit_code
 
 
 if __name__ == "__main__":

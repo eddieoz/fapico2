@@ -25,9 +25,45 @@ python3 scripts/acceptance/run_acceptance.py --run-browser --browser-autorun
 python3 scripts/acceptance/run_acceptance.py --json-out /tmp/us1518.json
 ```
 
-Exit code `0` = every machine case passed, `1` = at least one machine case
-failed, `2` = the harness could not run (no board, ambiguous identity, no
-browser).
+## Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | every **machine-gated case in this run** reported `PASS` |
+| `1` | at least one machine case `FAIL`ed, **or** one was in scope and never reported a verdict |
+| `2` | the harness could not run — no board, ambiguous identity, or `--run-browser` with no Chrome |
+
+Two clauses of the `0` row are load-bearing:
+
+- **"in this run"** — `page:enumerates` and `page:answers_after_abandon` are
+  machine-gated *on the acceptance page*, but they can only report if a browser
+  was launched. A run without `--run-browser` reports them under a separate
+  `browser` gate with `out_of_scope: true`, so they stay visible and named while
+  staying out of the machine tally. Such a run prints a
+  `*** NOT CERTIFIED BY THIS RUN ***` banner listing exactly what it did not
+  exercise.
+- **"reported `PASS`"** — a case that was in scope and produced no verdict is a
+  **failure**, not an absence. That is the whole point: the runner cannot
+  distinguish "nothing was wrong" from "we never looked", so it must not report
+  the first when it only measured the second. `--run-browser` without
+  `--browser-autorun` lands here too, if the operator never clicks the two
+  machine buttons — which is why the unattended invocation passes both flags.
+
+So a green exit code has two distinct meanings, and the summary says which:
+
+| invocation | `exit 0` means |
+|---|---|
+| `run_acceptance.py` | the 8 board-side machine cases passed; **the browser-discovery DoD was NOT verified** |
+| `run_acceptance.py --run-browser --browser-autorun` | the 8 board-side cases **and** both page-side machine cases passed |
+
+Only the second row certifies the DoD. The JSON report carries `complete`,
+`out_of_scope` and `exit_code`, so a consumer gating on the report file rather
+than the process status sees the same distinction.
+
+Human-gated ceremonies (`uv_required`, `attestation_direct`, …) never affect
+the exit code in either direction: they need a physical touch by design, so a
+`NOT RUN` there is the expected state of an unattended run, not a defect. They
+print under their own `human` gate and are never counted as passes.
 
 ## Requirements
 
@@ -203,7 +239,14 @@ host's writes blocked to `ETIMEDOUT`.
 python3 scripts/acceptance/run_acceptance.py --json-out acceptance.json
 ```
 
-Gate on the exit code. For a job with no board attached the harness exits `2`,
-which is distinguishable from a real failure. The browser half needs a board and
-a human, so it belongs on a self-hosted runner or a hardware bench, not in
-GitHub-hosted CI.
+Gate on the exit code. A job with no board attached exits `2`, which is
+distinguishable from a real failure (`1`).
+
+Note what the invocation above does and does not buy you: it runs the 8
+board-side machine cases only. Exit `0` from **that** command means those 8
+passed — it is a board regression gate, not the browser-discovery DoD, and the
+run says so in its `*** NOT CERTIFIED BY THIS RUN ***` banner. Anything gating
+on the DoD itself needs
+`--run-browser --browser-autorun`, which needs a board, Chrome and a machine
+(never a human — the two page-side cases are machine-gated), so it belongs on a
+self-hosted runner or a hardware bench rather than GitHub-hosted CI.
