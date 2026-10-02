@@ -31,10 +31,10 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 168 |
-/// | `hid_task` | 12,224 |
+/// | `hid_task` | 12,304 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **21,840** |
+/// | **total** | **21,920** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
 /// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.50x** this demand (floor
@@ -83,13 +83,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 21_840;
+pub const TASK_ARENA_DEMAND_B: usize = 21_920;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "26d25236d5f2065b8ca480a07f51730db25d53bf922a3d80eb5f85ef7a9a38e5";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "79ed3ee6bb539f2bc4386c969682237e6aaa49a82eda3d6382dc7f372ced32c2";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -98,6 +98,10 @@ pub mod ccid_reasm;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
 pub mod ctap_hid;
+/// US-1504: the CTAPHID reply-write park guard — the deadline-bounded reply
+/// framing, with the "write one report" step behind a trait so the deadline
+/// is testable on the host against a writer that never ACKs.
+pub mod hid_reply;
 /// US-921: the presence-latch anti-harvest wiring (shared presence runtime).
 pub mod presence;
 

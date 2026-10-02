@@ -440,49 +440,68 @@ fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
 
+/// US-1504 reply-write park guard: a host that has stopped polling the
+/// interrupt IN endpoint never ACKs, and `EndpointIn::write` awaits that ACK
+/// for **every** report — the INIT report and each of the continuation
+/// reports — so a 7609-byte `largeBlob` reply was 129 sequential unbounded
+/// awaits. One of them never returning parked the HID serve loop forever: the
+/// device was dead until unplug, and stayed dead for the next host. This is
+/// the CTAPHID twin of [`CCID_REPLY_WRITE_TIMEOUT_MS`], with the same value,
+/// the same whole-message scope (not per report) and the same
+/// cancellation-safety argument: embassy-rp 0.10's `EndpointIn::write` only
+/// awaits BEFORE arming the endpoint (arming happens in the synchronous tail
+/// after the wait), so a dropped future leaves nothing armed.
+///
+/// The framing + deadline live in [`fapico2_firmware::hid_reply`] (the lib,
+/// not this module) precisely so they are testable on the host: this adapter
+/// is the only device-specific part, and it is the only thing a host test
+/// cannot have.
+struct HidInWriter<'a>(&'a mut Endpoint<'static, USB, In>);
+
+impl fapico2_firmware::hid_reply::ReportWriter for HidInWriter<'_> {
+    type Error = EndpointError;
+    fn write_report(
+        &mut self,
+        report: &[u8; HID_REPORT_SIZE],
+    ) -> impl core::future::Future<Output = Result<(), EndpointError>> {
+        self.0.write(report)
+    }
+}
+
 /// Send `payload` to the host as one or more 64-byte CTAP HID reports on the
-/// interrupt IN endpoint (INIT report + continuation reports as needed).
-/// Moved here from the (now pure, US-705.1) `ctap_hid` module — endpoint I/O
-/// has no host-testable core.
+/// interrupt IN endpoint (INIT report + continuation reports as needed),
+/// under the US-1504 reply-write deadline.
+///
+/// Returns `true` iff every report of the reply was written. `false` covers
+/// both failures — a refused write and a host that never ACKed — and in both
+/// the frame is abandoned: the caller logs, drops the reply and returns to
+/// its serve loop. It never retries, never re-enumerates and never disables
+/// the endpoint; a partially framed message on a CTAPHID channel is garbage
+/// to the host anyway.
+///
+/// The endpoint lifetime is `'static` (the task's own `hid_in`) rather than
+/// the anonymous `'_` this used to take, because the borrow now lives inside
+/// the writer adapter for the whole reply. Both callers already own a
+/// `'static` endpoint.
 pub async fn send_hid_report(
-    hid_in: &mut Endpoint<'_, USB, In>,
+    hid_in: &mut Endpoint<'static, USB, In>,
     channel: &[u8; 4],
     cmd: u8,
     payload: &[u8],
-) -> Result<(), EndpointError> {
-    let total = payload.len();
-    let mut report = [0u8; HID_REPORT_SIZE];
-
-    if total <= HID_FIRST_PAYLOAD {
-        report[..4].copy_from_slice(channel);
-        report[4] = cmd | 0x80;
-        report[5..7].copy_from_slice(&(total as u16).to_be_bytes());
-        report[7..7 + total].copy_from_slice(payload);
-        hid_in.write(&report).await?;
-        return Ok(());
+) -> bool {
+    use fapico2_firmware::hid_reply::{write_reply, ReplyOutcome};
+    let mut writer = HidInWriter(hid_in);
+    match write_reply(&mut writer, channel, cmd, payload).await {
+        ReplyOutcome::Sent => true,
+        ReplyOutcome::WriteFailed => {
+            defmt::warn!("hid reply write failed; frame dropped (serve loop continues)");
+            false
+        }
+        ReplyOutcome::TimedOut => {
+            defmt::warn!("hid reply write timed out; frame dropped (serve loop continues)");
+            false
+        }
     }
-
-    // INIT report
-    report[..4].copy_from_slice(channel);
-    report[4] = cmd | 0x80;
-    report[5..7].copy_from_slice(&(total as u16).to_be_bytes());
-    report[7..7 + HID_FIRST_PAYLOAD].copy_from_slice(&payload[..HID_FIRST_PAYLOAD]);
-    hid_in.write(&report).await?;
-
-    // Continuation reports
-    let mut offset = HID_FIRST_PAYLOAD;
-    let mut seq: u8 = 0;
-    while offset < total {
-        let end = (offset + HID_CONT_PAYLOAD).min(total);
-        report = [0u8; HID_REPORT_SIZE];
-        report[..4].copy_from_slice(channel);
-        report[4] = seq;
-        report[5..5 + (end - offset)].copy_from_slice(&payload[offset..end]);
-        hid_in.write(&report).await?;
-        offset = end;
-        seq = seq.wrapping_add(1);
-    }
-    Ok(())
 }
 
 /// HID serve loop: CTAP-HID framing (see `ctap_hid`) + FIDO command dispatch.
@@ -984,15 +1003,22 @@ async fn dispatch_hid_cmd(
     }
 }
 
-/// Send one CTAP-HID reply report (logs and drops on USB error; the host
-/// re-sends or re-enumerates).
+/// Send one CTAP-HID reply report (logs and drops on USB error or on a host
+/// that never ACKed; the host re-sends or re-enumerates).
+///
+/// US-1504: every reply on this path — the keepalives of the CTAP2 and U2F
+/// `UpRequired` loops, the final CBOR/MSG answers, PING, WINK, the assembler
+/// error frames and the `0x41`/`0x42` vendor answers — is bounded by
+/// [`fapico2_firmware::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS`] inside
+/// [`send_hid_report`], so no HID reply can park the serve loop. The two
+/// `UpRequired` keepalive loops therefore keep their cadence with a live
+/// host, and with a host that has gone away they fall out of the wait within
+/// one deadline instead of hanging the task forever.
 async fn reply_hid(
     hid_in: &mut Endpoint<'static, USB, In>,
     channel: &[u8; 4],
     cmd: u8,
     payload: &[u8],
 ) {
-    if send_hid_report(hid_in, channel, cmd, payload).await.is_err() {
-        defmt::warn!("hid reply failed");
-    }
+    let _ = send_hid_report(hid_in, channel, cmd, payload).await;
 }
