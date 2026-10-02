@@ -1131,6 +1131,29 @@ pub fn perform_rescue_reboot(mode: u8) -> ! {
 /// assembler framing up to CTAPHID_MAX_MSG and getInfo advertising 7609.
 pub static mut HID_RESP: HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }> = HeaplessVec::new();
 
+/// US-1509: the parked user-presence consent window — the single-occupancy
+/// slot the HID serve loop parks a `MakeCredential` / `GetAssertion` /
+/// U2F register-authenticate in while it waits for a touch.
+///
+/// It is a static here, next to the other serve-loop statics, for the same
+/// reason `HID_RESP` is: the slot carries a **1024-byte payload buffer**, and
+/// inside `hid_task` that would land in the task's async frame, where
+/// `TASK_ARENA_DEMAND_B` (`lib.rs`) accounts for every byte. `.bss` is the
+/// budget the linker's `__sheap` ceiling already governs.
+///
+/// **Who crosses the boundary: nobody.** The `boot.rs` rule at
+/// [`RESCUE_PHY_GENERATION`] — *what crosses the transport boundary is a
+/// counter, never a `&mut` to either app* — does not apply here, because this
+/// slot is touched by exactly one owner: `hid_task`. The emulator that US-1524
+/// will migrate is a **separate binary** with its own copy of this static, not
+/// a second task in this image. So the write-once `static mut` +
+/// `addr_of_mut!` borrow that [`HID_RESP`] uses is the right discipline here,
+/// and the `Atomic*` counter shape would be the wrong one: a counter cannot
+/// carry a payload, and a lock-free payload behind atomics would be a second
+/// source of truth for a slot that has exactly one writer.
+pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
+    fapico2_firmware::pending_up::PendingUp::new();
+
 /// US-413 S-413-4: the C key row (`OTP_MKEK_ROW 0xE90`, 32 bytes = 16 ECC
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
 /// firmware does (readable from any code — no read-protect; the boot-path

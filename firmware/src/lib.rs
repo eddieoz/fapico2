@@ -31,10 +31,10 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 168 |
-/// | `hid_task` | 12,304 |
+/// | `hid_task` | 12,360 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **21,920** |
+/// | **total** | **21,976** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
 /// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.50x** this demand (floor
@@ -83,13 +83,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 21_920;
+pub const TASK_ARENA_DEMAND_B: usize = 21_976;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "79ed3ee6bb539f2bc4386c969682237e6aaa49a82eda3d6382dc7f372ced32c2";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "a47d30d23b6f3894b42ec97a62dc2f4f4514ed7c779a83e912ea0eda222fe432";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -100,10 +100,27 @@ pub mod dbg_cid;
 pub mod ctap_hid;
 /// US-1504: the CTAPHID reply-write park guard — the deadline-bounded reply
 /// framing, with the "write one report" step behind a trait so the deadline
-/// is testable on the host against a writer that never ACKs.
+/// is testable on the host against a writer that never ACKS.
 pub mod hid_reply;
 /// US-921: the presence-latch anti-harvest wiring (shared presence runtime).
 pub mod presence;
+/// US-1509: the parked user-presence consent window — the single-occupancy
+/// slot that replaces the serve loop's nested consent `loop`.
+///
+/// **Ungated and dependency-free on purpose.** US-1524 has to migrate
+/// `emul_main.rs` onto this policy, and that binary builds with `emulation`
+/// and without `device`, so anything this module needed from the app crates
+/// (or from `embassy_time`) would have pushed the emulator's parity work
+/// behind a device-only feature. Pure methods, injected clock, no USB — see
+/// the module docs.
+pub mod pending_up;
+/// US-1509: the CTAP-HID serve loop and FIDO dispatch, extracted from
+/// `tasks.rs` behind [`hid_serve::HidIo`] / [`hid_serve::FidoDispatch`] so
+/// the consent-window behaviour is host-testable. Gated because the app
+/// dispatch reaches `fapico2-fido` / `fapico2-mgmt`, which only the device and
+/// emulation builds pull in.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod hid_serve;
 
 /// US-130 (PICOForge-COMPAT): the OATH applet's SELECT `TAG_NAME` device-id —
 /// the per-unit PBKDF2 salt for the OATH access key.

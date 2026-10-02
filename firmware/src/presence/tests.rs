@@ -1251,27 +1251,41 @@ fn a_press_between_two_button_samples_is_invisible_to_every_path() {
     );
 }
 
-/// The host model above assumes a *shape* for the device's keepalive loop:
+/// The host model above assumes a *shape* for the device's consent path:
 /// that it is entered on a bare one-byte `UpRequired` answer, that it opens
-/// the cross-call window under the channel-derived tag, that it parks for
-/// `CTAP_KEEPALIVE_PERIOD_MS` (the only place the serve task yields), and
-/// that it re-drives the same command inside the window. Model that shape
-/// wrongly and every assertion above is about the model.
+/// the cross-call window under the channel-derived tag, that it yields for
+/// about `CTAP_KEEPALIVE_PERIOD_MS` at a time, and that it re-drives the
+/// same command inside the window. Model that shape wrongly and every
+/// assertion above is about the model.
 ///
 /// So the shape is pinned against the source. This is a source scan, and
 /// it is a weak one — it cannot see a behavioural change, only a removed
 /// or renamed step — but it is what stops the model and the device from
 /// drifting apart silently, which is the failure mode a hand-written model
 /// has and a shared function does not.
+///
+/// **US-1509 moved the subject.** The consent path is no longer inline in
+/// `tasks.rs`'s CBOR arm; it is the parked slot in `firmware/src/hid_serve.rs`,
+/// so this scan reads that file. The pin is also now *stronger* in the one
+/// place it matters: the pre-fix arm contained
+/// `Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await` inside a `loop`, and
+/// that is precisely the inline await US-1509 removed — so its ABSENCE is
+/// asserted, not just the steps around it. A test that only pins what is
+/// present would pass just as happily against a reintroduced blackout.
 #[test]
 fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tasks.rs"))
-        .expect("tasks.rs must be readable from the test's own crate");
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hid_serve.rs"))
+        .expect("hid_serve.rs must be readable from the test's own crate");
+    // The slice opens at the *arm*, not at `presence_windowed`: the CBOR
+    // arm's pre-command keepalive (the one FX-402 parity requires, emitted
+    // before the app runs) sits above the `presence_windowed` binding, and
+    // pinning from the narrower start would have quietly stopped checking
+    // it.
     let start = src
-        .find("let presence_windowed")
-        .expect("the CBOR arm must compute `presence_windowed`");
+        .find("} else if cmd == CTAP_HID_CBOR {")
+        .expect("the dispatch must have a CBOR arm");
     let end = src[start..]
-        .find("if persist_hid(")
+        .find("if app.persist() {")
         .map(|i| start + i)
         .expect("the CBOR arm must persist before its reply");
     let arm = &src[start..end];
@@ -1280,9 +1294,12 @@ fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
         "let presence_windowed",
         "Ctap2Response::UpRequired.code()",
         "presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS)",
-        "reply_hid(hid_in, channel, CTAP_HID_KEEPALIVE, &[0x02])",
-        "Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await",
-        "fapico2_firmware::presence::end_window(tag)",
+        "reply(io, channel, CTAP_HID_KEEPALIVE, &[0x02])",
+        // US-1509: the command is PARKED, not looped on. The slot carries
+        // the channel-derived tag and the deadline the model derives from
+        // `TouchWindow`, so the model's window budget is the device's.
+        "slot.park(ticket, payload)",
+        "TouchWindow::open(tag, now_ms()).deadline_ms",
     ] {
         assert!(
             arm.contains(step),
@@ -1290,17 +1307,61 @@ fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
              assumes it, and a model that outlives its subject tests nothing"
         );
     }
-    // The park must be followed by a re-drive of the SAME command, or the
-    // loop is a keepalive generator rather than a retry loop.
-    let park = arm
-        .find("Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await")
-        .expect("park present");
-    let redrive = arm[park..]
-        .find("fido_app.process_ctap2_with_store(")
-        .map(|i| park + i)
-        .expect("a re-drive after the park");
+
+    // US-1509's regression pin: the consent arm must not wait. The blackout
+    // was exactly `Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await`
+    // inline in the arm that had just consumed the inbound read — the whole
+    // OUT endpoint went undrained for the length of the window, so a
+    // `CTAPHID_CANCEL` could not reach the device at all. Re-asserting this
+    // string in the arm means the serve loop has gone back to sleeping here.
     assert!(
-        redrive > park,
-        "the re-drive must come after the park, not before it"
+        !arm.contains("Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await"),
+        "US-1509: the CBOR arm awaits a keepalive period again. The consent path must \
+         park the command in `PendingUp` and return to the top of the serve loop, or \
+         the loop stops reading the OUT endpoint for the whole window and a \
+         CTAPHID_CANCEL cannot reach the device."
     );
+
+    // US-1509's structural claim: the re-drive is the *serve loop's* per-pass
+    // work, not a nested one. `redrive_window` holds it, and `serve_once`
+    // calls it as its first step — which is what "re-asserted each pass,
+    // then back to `hid_out.read()`" means in source. Before US-1509 both
+    // lived inside the dispatch arm, one nested `loop` deep.
+    let redrive = src
+        .find("async fn redrive_window")
+        .and_then(|at| src.get(at..).map(|s| at + s.find("app.process_ctap2(").unwrap_or(usize::MAX)))
+        .filter(|at| *at != usize::MAX)
+        .expect("a re-drive in redrive_window");
+    let serve_once = src
+        .find("pub async fn serve_once")
+        .expect("serve_once must exist");
+    let drive_call = src
+        .get(serve_once..)
+        .and_then(|s| s.find("redrive_window(now_ms,"))
+        .map(|i| serve_once + i)
+        .expect("serve_once must re-drive the window");
+    assert!(
+        redrive > serve_once && drive_call < redrive,
+        "US-1509: the window's re-drive must be reached from `serve_once` (before it \
+         reads the OUT endpoint again), not from inside the dispatch that opened it. \
+         A re-drive owned by the dispatch is the old nested loop with a new name."
+    );
+
+    // US-921's leak analysis turns on this pairing. `close_window` is the
+    // single exit from a window, so `end_window` and the prompt clear cannot
+    // be separated by an edit to one caller — but only while both live in
+    // that one function. Split them and the pin below is what notices.
+    let close = src
+        .find("fn close_window")
+        .expect("the window must be closed in one place");
+    let close_body = &src[close..close + 600];
+    for step in ["presence::end_window(ticket.tag)", "presence::touch_prompt(false)"] {
+        assert!(
+            close_body.contains(step),
+            "`close_window` no longer contains `{step}` — every window exit must pair \
+             the presence-slot release with the prompt clear. A leaked window holds \
+             the single presence slot for the life of the process and no applet can \
+             ever grant again."
+        );
+    }
 }

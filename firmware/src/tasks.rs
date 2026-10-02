@@ -27,21 +27,13 @@ use heapless::Vec as HeaplessVec;
 /// not borrow) the management applet, which the CCID task holds mutably.
 pub static DEVICE_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// `CTAP_READ_CONFIG` (`0x42`) — yubikit's `CTAP_VENDOR_FIRST + 2`.
-///
-/// When a host enumerates this key through its **FIDO** interface rather than
-/// CCID, `yubikit.support._read_info_ctap` asks for device info this way. If
-/// it fails, ykman falls back to a synthesised "YubiKey 3.0, U2F only, no
-/// serial" record — and since that record reports no FIDO2 capability, the
-/// FIDO2 application is declared unsupported. `ykman fido info` printed
-/// `CTAP2: Not supported` on every run, which is what left the desktop
-/// app's Slots and Passkeys screens loading forever.
-const CTAP_READ_CONFIG: u8 = 0x42;
-
-use crate::boot::{DevFlash, HID_RESP, SECURE_PRIMARY_OFFSET, SECURE_SHADOW_OFFSET, SECURE_SLOT_BYTES};
+use crate::boot::{
+    DevFlash, HID_RESP, PENDING_UP, SECURE_PRIMARY_OFFSET, SECURE_SHADOW_OFFSET,
+    SECURE_SLOT_BYTES,
+};
 use fapico2_firmware::ccid_reasm::{CcidReassembler, Reasm, MAX_WIRE};
 use fapico2_firmware::ctap_hid::*;
-use fapico2_firmware::presence::{TouchWindow, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS};
+use fapico2_firmware::hid_serve::{FidoDispatch, HidIo, HidNote, HidServe};
 use fapico2_platform::usb::EndpointError;
 
 /// Fixed ATR answered to the CCID ATR-reset command (1-byte body `0x04`).
@@ -504,19 +496,184 @@ pub async fn send_hid_report(
     }
 }
 
-/// HID serve loop: CTAP-HID framing (see `ctap_hid`) + FIDO command dispatch.
+/// The device's two HID endpoints, behind [`HidIo`].
 ///
-/// US-425: after every state-mutating FIDO command, the platform persist
-/// gate runs BEFORE the CTAP-HID reply (durable-before-ack, CCID-arm parity)
-/// — PINs and credentials reach the flash secure partition before the host
-/// is told the command succeeded. The store/flash handles are the same
-/// single-core write-once statics the `ccid_task` was spawned with; the
-/// aliasing rationale lives at the spawn in `main`.
+/// US-1509: this adapter and [`DeviceFido`] below are the *only* device part
+/// of the serve loop. The framing, the dispatch, the consent-window policy
+/// and the published bound all live in [`fapico2_firmware::hid_serve`], which
+/// is where the host can drive them — which is the only reason the blackout
+/// had a chance to ship behind a green suite.
+struct DeviceHid {
+    hid_in: Endpoint<'static, USB, In>,
+    hid_out: Endpoint<'static, USB, Out>,
+}
+
+impl HidIo for DeviceHid {
+    // `async fn`, not a hand-rolled `-> impl Future`: the trait declares the
+    // return type so that a `#[cfg]`-gated method can sit beside it, but the
+    // body is a plain await and clippy's `manual_async_fn` is right that the
+    // explicit `async move` block here says nothing the body does not.
+    async fn read_report(
+        &mut self,
+        report: &mut [u8; HID_REPORT_SIZE],
+    ) -> Result<usize, ()> {
+        self.hid_out.read(report).await.map_err(|_| ())
+    }
+
+    fn send_frame(
+        &mut self,
+        channel: &[u8; 4],
+        cmd: u8,
+        payload: &[u8],
+    ) -> impl core::future::Future<Output = bool> {
+        send_hid_report(&mut self.hid_in, channel, cmd, payload)
+    }
+
+    fn note(&mut self, note: HidNote) {
+        match note {
+            HidNote::ReadFailed => defmt::warn!("hid out read failed"),
+            HidNote::ReplyDropped => {
+                // US-1504: the deadline fired inside `send_hid_report`, which
+                // already warned; this is the caller's half of the same fact.
+                defmt::warn!("hid reply dropped (write failed or host never acked)");
+            }
+            HidNote::PersistFailed => defmt::error!("hid persist failed; CTAPHID ERROR/INVALID_COMMAND (durable-before-ack)"),
+        }
+    }
+
+    fn note_command(&mut self, cmd: u8, payload_len: u16, channel: u32) {
+        // `dlog!` vanishes in a build with neither diagnostic feature, and
+        // the arguments are now function parameters rather than locals of the
+        // serve loop — so the drop has to be stated here.
+        let _ = (cmd, payload_len, channel);
+        dlog!(
+            crate::dbg::T_HID,
+            crate::dbg::E_HIDCMD,
+            (u32::from(cmd) << 8) | u32::from(payload_len),
+            channel
+        );
+    }
+
+    #[cfg(any(feature = "dbg-log", feature = "apdu-trace", feature = "boot-timeline"))]
+    async fn debug_drain(&mut self, cmd: u8, channel: &[u8; 4], payload: &[u8]) -> bool {
+        // US-922: a vendor command on the drain channel (per-boot random,
+        // printed to RTT under `dbg-log`) answers from `dbg::handle_dbg` and
+        // never reaches the FIDO dispatch. This task and its endpoints are
+        // independent of `ccid_task`, so the ring stays retrievable after a
+        // CCID wedge. The rationale for the feature list is on the call site
+        // in `hid_serve`, where it has to be named.
+        if cmd == crate::dbg::DBG_CMD && *channel == crate::dbg::channel() {
+            crate::dbg::handle_dbg(&mut self.hid_in, channel, payload).await;
+            return true;
+        }
+        false
+    }
+}
+
+/// The FIDO app, the store and the flash handle, behind [`FidoDispatch`].
+///
+/// The `store`/`flash` handles are the same single-core write-once statics
+/// the `ccid_task` was spawned with; the aliasing rationale lives at the
+/// spawn in `main`.
+///
+/// US-425: after every state-mutating FIDO command the platform persist gate
+/// runs BEFORE the CTAP-HID reply (durable-before-ack, CCID-arm parity) —
+/// PINs and credentials reach the flash secure partition before the host is
+/// told the command succeeded.
 ///
 /// US-939: the FIDO app rides the same write-once static discipline
 /// ([`boot::FIDO_APP`]) — the spawn receives the sole `&'static mut` instead
 /// of the app by value, which had bloated the Embassy async-main frame to
 /// 95,232 B against a ~20.8 KiB main stack.
+struct DeviceFido<'a> {
+    app: &'a mut FidoApp,
+    store: &'a mut DeviceStore,
+    flash: &'a mut DevFlash,
+    /// US-711 review fix: observe the management factory-reset generation
+    /// (bumped after the durable FIDO slot wipe) and re-initialize the app in
+    /// RAM before the next command — a later mutating command then persists
+    /// only the FRESH snapshot and can never re-persist the pre-reset one
+    /// the wipe deleted (C `cbor_reset` → `init_fido()` parity). Synchronous
+    /// check → wipe window (no `.await` inside), the same cooperative
+    /// discipline as the persist gate.
+    reset_gen: u32,
+    /// US-162: the Rescue applet's durable `phy` generation, seeded from the
+    /// same counter the commit side bumps. Checked in the same window as
+    /// `reset_gen` for the same reason.
+    phy_gen_seen: u32,
+}
+
+impl FidoDispatch for DeviceFido<'_> {
+    fn sync_generations(&mut self) {
+        let gen = crate::boot::RESET_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+        if gen != self.reset_gen {
+            self.reset_gen = gen;
+            self.app.factory_reset();
+        }
+        // US-162 (PICOForge-COMPAT Phase H): a Rescue `WRITE PhyConfig`
+        // committed durably on the CCID task since the last HID command —
+        // adopt the new `phy` into this task's in-RAM keystore copy, so the
+        // next `0x41 CONFIG_WRITE` cannot re-persist a stale snapshot over
+        // it. Same generation-then-act discipline, checked in the same
+        // synchronous window (no `.await` between check and act).
+        let phy_gen = crate::boot::RESCUE_PHY_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+        if phy_gen != self.phy_gen_seen {
+            self.phy_gen_seen = phy_gen;
+            if !self.app.sync_phy(self.store) {
+                defmt::warn!("rescue: phy adopt failed; keeping RAM copy");
+            }
+        }
+    }
+
+    fn device_info_page(&self, _page: u8, out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+        let serial = DEVICE_SERIAL.load(core::sync::atomic::Ordering::Relaxed).to_be_bytes();
+        fapico2_mgmt::default_config_tlv(serial, out);
+    }
+
+    fn process_ctap2(
+        &mut self,
+        ctap_cmd: u8,
+        payload: &[u8],
+        channel: [u8; 4],
+        out: &mut HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }>,
+    ) -> usize {
+        self.app
+            .process_ctap2_with_store(ctap_cmd, payload, channel, out, Some(&mut *self.store))
+    }
+
+    fn process_vendor_vault(
+        &mut self,
+        payload: &[u8],
+        out: &mut HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }>,
+    ) -> usize {
+        self.app
+            .process_vendor_vault_with_store(payload, out, Some(&mut *self.store))
+    }
+
+    fn set_channel(&mut self, channel: [u8; 4]) {
+        self.app.set_channel(channel);
+    }
+
+    fn process_u2f(
+        &mut self,
+        apdu: &[u8],
+        out: &mut HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }>,
+    ) -> usize {
+        self.app
+            .process_u2f_with_store(apdu, out, Some(&mut *self.store))
+    }
+
+    fn persist(&mut self) -> bool {
+        persist_hid(self.app, self.store, self.flash)
+    }
+}
+
+/// HID serve loop task: the two endpoints, the app, and the serve loop itself.
+///
+/// The body is three adapters and a call into
+/// [`fapico2_firmware::hid_serve::serve_loop`]. Everything that used to be
+/// here — CTAP-HID framing, the FIDO dispatch, and the user-presence consent
+/// path — moved into that module so the host can drive it; see its docs.
 #[task]
 pub async fn hid_task(
     hid_in: Endpoint<'static, USB, In>,
@@ -525,133 +682,31 @@ pub async fn hid_task(
     mut store: DeviceStore,
     flash: &'static mut DevFlash,
 ) {
-    let mut hid_in = hid_in;
-    let mut hid_out = hid_out;
-    // US-711 review fix: observe the management factory reset generation
-    // (bumped after the durable FIDO slot wipe) and re-initialize this
-    // task's FIDO app in RAM before the next command — a later mutating
-    // command then persists only the FRESH snapshot and can never
-    // re-persist the pre-reset one the wipe deleted (C `cbor_reset` →
-    // `init_fido()` parity). Synchronous check → wipe window (no `.await`
-    // inside), the same cooperative discipline as the persist gate.
-    let mut reset_gen = crate::boot::RESET_GENERATION.load(core::sync::atomic::Ordering::Acquire);
-    // US-162: the Rescue applet's durable `phy` generation, seeded from the
-    // same counter the commit side bumps. Checked in the same window as
-    // `reset_gen` for the same reason.
-    let mut phy_gen_seen =
-        crate::boot::RESCUE_PHY_GENERATION.load(core::sync::atomic::Ordering::Acquire);
-    let mut assembler = HidAssembler::new(now_ms);
-    // US-705.1: per-INIT channel allocation (nonce-derived, counter-backed).
-    let mut cid_alloc = fapico2_firmware::ctap_hid::CidAllocator::new();
-    let mut report = [0u8; HID_REPORT_SIZE];
-    // SAFETY: S-701-1 — static CTAPHID_MAX_MSG-sized response buffer (never the stack).
+    let mut io = DeviceHid { hid_in, hid_out };
+    let mut app = DeviceFido {
+        app: fido_app,
+        store: &mut store,
+        flash,
+        reset_gen: crate::boot::RESET_GENERATION.load(core::sync::atomic::Ordering::Acquire),
+        phy_gen_seen: crate::boot::RESCUE_PHY_GENERATION.load(core::sync::atomic::Ordering::Acquire),
+    };
+    // SAFETY: S-701-1 — static CTAP2_MAX_MSG-sized response buffer, never the
+    // stack. Write-once, single owner (this task), reached by an
+    // `addr_of_mut!` borrow: the HID task is the only reader of the CTAP-HID
+    // reply path, so there is no second owner to alias.
     let ctap_out: &'static mut HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }> =
         unsafe { &mut *core::ptr::addr_of_mut!(HID_RESP) };
-
-    loop {
-        // 500 ms transaction timeout (CTAP-HID §11.2.3).
-        if let Some((channel, code)) = assembler.check_timeout() {
-            reply_hid(&mut hid_in, &channel, CTAP_HID_ERROR, &[code]).await;
-        }
-
-        let n = match hid_out.read(&mut report).await {
-            Ok(n) => n,
-            Err(_) => {
-                defmt::warn!("hid out read failed");
-                dlog_throttle!(crate::dbg::T_HID, crate::dbg::E_ERR, 1, 0, 1_000_000);
-                Timer::after_millis(10).await;
-                continue;
-            }
-        };
-        if n == 0 {
-            continue;
-        }
-
-        match assembler.feed(&report[..n]) {
-            HidFeed::NeedMore => {}
-            HidFeed::Err(channel, code) => {
-                reply_hid(&mut hid_in, &channel, CTAP_HID_ERROR, &[code]).await;
-            }
-            HidFeed::Ready(cmd) => {
-                // The reply goes to the transaction's channel, which `feed`
-                // recorded. It must be read AFTER feed: copying the
-                // assembler's channel before feeding sent every reply after
-                // the first to the *previous* transaction's channel (E7c —
-                // the CBOR reply carried the INIT's broadcast CID and
-                // python-fido2 rejected it, "Wrong channel").
-                let channel = assembler.channel();
-                dlog!(
-                    crate::dbg::T_HID,
-                    crate::dbg::E_HIDCMD,
-                    (u32::from(cmd) << 8) | assembler.payload().len() as u32,
-                    u32::from_be_bytes(channel)
-                );
-                // Diagnostic ring drain (`dbg-log` feature only; US-933:
-                // also the `apdu-trace` and `boot-timeline` capture
-                // builds): a vendor command on the drain channel (US-922 —
-                // per-boot random and printed to RTT under `dbg-log`;
-                // pinned by the two capture builds so a drain needs no
-                // probe) answers from `dbg::handle_dbg` and never reaches
-                // the FIDO dispatch. This task + endpoints are independent
-                // of `ccid_task`, so the ring is retrievable after a CCID
-                // wedge.
-                //
-                // `boot-timeline` has to be named HERE, and separately from
-                // the `dlog!` arms in `main.rs`. Getting it wrong is silent
-                // and total: the build compiles, the ring fills with exactly
-                // the phase records the capture exists for, and the drain
-                // command falls through to the FIDO dispatcher, which
-                // answers a 1-byte unknown-command error on every channel.
-                // The symptom is "the pull script says wrong cid" for a
-                // device whose cid is right — which is what happened the
-                // first time this image was flashed.
-                #[cfg(any(feature = "dbg-log", feature = "apdu-trace", feature = "boot-timeline"))]
-                if cmd == crate::dbg::DBG_CMD && channel == crate::dbg::channel() {
-                    crate::dbg::handle_dbg(&mut hid_in, &channel, assembler.payload()).await;
-                    continue;
-                }
-                // US-711 review fix: a management factory reset signalled
-                // since the last command — re-initialize the FIDO app in
-                // RAM (CTAP2 Reset) so this command runs against
-                // factory-fresh state.
-                let gen =
-                    crate::boot::RESET_GENERATION.load(core::sync::atomic::Ordering::Acquire);
-                if gen != reset_gen {
-                    reset_gen = gen;
-                    fido_app.factory_reset();
-                }
-                // US-162 (PICOForge-COMPAT Phase H): a Rescue `WRITE PhyConfig`
-                // committed durably on the CCID task since the last HID
-                // command — adopt the new `phy` into this task's in-RAM
-                // keystore copy, so the next `0x41 CONFIG_WRITE` cannot
-                // re-persist a stale snapshot over it. Same
-                // generation-then-act discipline, checked in the same
-                // synchronous window (no `.await` between check and act).
-                let phy_gen =
-                    crate::boot::RESCUE_PHY_GENERATION.load(core::sync::atomic::Ordering::Acquire);
-                if phy_gen != phy_gen_seen {
-                    phy_gen_seen = phy_gen;
-                    if !fido_app.sync_phy(&mut store) {
-                        defmt::warn!("rescue: phy adopt failed; keeping RAM copy");
-                    }
-                }
-                // `assembler.payload()` borrows the reassembled message for
-                // the dispatch; the next `feed` call resets it.
-                dispatch_hid_cmd(
-                    &mut hid_in,
-                    &mut cid_alloc,
-                    fido_app,
-                    ctap_out,
-                    &channel,
-                    cmd,
-                    assembler.payload(),
-                    &mut store,
-                    flash,
-                )
-                .await;
-            }
-        }
-    }
+    // SAFETY: the parked consent window, US-1509. Same write-once, single-
+    // owner discipline as `HID_RESP` above, and for the same reason it is a
+    // static rather than a task local: the 1024-byte payload buffer would
+    // otherwise sit in this task's async frame, which `TASK_ARENA_DEMAND_B`
+    // accounts for byte by byte. `hid_task` is the only writer — the boot.rs
+    // `RESCUE_PHY_GENERATION` rule about counters is for state that crosses
+    // between two *tasks*, and nothing here does.
+    let slot: &'static mut fapico2_firmware::pending_up::PendingUp =
+        unsafe { &mut *core::ptr::addr_of_mut!(PENDING_UP) };
+    let mut srv = HidServe::new(now_ms, ctap_out);
+    fapico2_firmware::hid_serve::serve_loop(&mut srv, &mut io, &mut app, slot).await
 }
 
 /// The secure-partition image sink (US-422/US-391): the primary/shadow slot
@@ -667,6 +722,7 @@ pub fn secure_slot_sink(flash: &mut DevFlash) -> FlashSlotSink<crate::boot::DevS
 }
 
 /// US-425/US-427: durable-before-ack persist for the FIDO HID path.
+///
 /// Synchronous (no `.await` inside) so the cooperative executor makes the
 /// window atomic — mirrors the CCID arm's gate call. Returns `true` iff the
 /// command's durable state stands — programmed now, or no durable change was
@@ -703,322 +759,3 @@ fn persist_hid(fido_app: &mut FidoApp, store: &mut DeviceStore, flash: &mut DevF
     }
 }
 
-/// Dispatch one complete CTAP-HID message to the FIDO app and send the reply.
-///
-/// The store/flash handles feed the US-425 persist gate: every
-/// state-mutating branch runs [`persist_hid`] after `process_*` and before
-/// the reply, so the reply only goes out once the change is durable.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_hid_cmd(
-    hid_in: &mut Endpoint<'static, USB, In>,
-    cid_alloc: &mut fapico2_firmware::ctap_hid::CidAllocator,
-    fido_app: &mut FidoApp,
-    ctap_out: &mut HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }>,
-    channel: &[u8; 4],
-    cmd: u8,
-    payload: &[u8],
-    store: &mut DeviceStore,
-    flash: &mut DevFlash,
-) {
-    if cmd == CTAP_HID_INIT {
-        // INIT response: nonce(8) + cid(4) + ver_iface(1) + ver_major(1) +
-        // ver_minor(1) + version_build(1) + cap_flags(1) = 17 bytes.
-        let nonce = if payload.len() >= 8 {
-            &payload[..8]
-        } else {
-            payload
-        };
-        // US-705.1: derive the channel from the INIT handshake (nonce +
-        // counter) instead of the constant [0, 0, 0, 1]; the reply frame
-        // itself goes out on the requesting (broadcast) channel per spec.
-        let new_channel = cid_alloc.allocate(nonce);
-        // US-1507: bytes 12..16 of the reply — versionInterface, the YubiKey
-        // firmware version, and capFlags — are built by `ctap_hid::init_reply`.
-        // The rationale for all of them (why the version bytes are the YubiKey
-        // version and not the CTAPHID one, and why capFlags is 0x05 rather than
-        // 0x04) lives on that function and on `CTAPHID_INIT_CAP_FLAGS`, so it
-        // is not restated here.
-        let inner = init_reply(
-            nonce,
-            &new_channel,
-            fapico2_mgmt::VERSION_MAJOR,
-            fapico2_mgmt::VERSION_MINOR,
-            0x00, // versionBuild
-        );
-        reply_hid(hid_in, channel, 0x06, &inner).await;
-    } else if cmd == CTAP_READ_CONFIG {
-        // DeviceInfo page 0 over the FIDO interface. The payload is the
-        // page number (yubikit sends `int2bytes(page)`, i.e. a single zero
-        // byte for page 0); anything past page 0 is a page this device does
-        // not paginate, and the blob below is complete in one page, so those
-        // get the empty page the client expects at the end of a sequence.
-        if payload.len() > 1 || (payload.len() == 1 && payload[0] != 0) {
-            reply_hid(hid_in, channel, cmd, &[0x00]).await;
-            return;
-        }
-        let serial = DEVICE_SERIAL.load(core::sync::atomic::Ordering::Relaxed).to_be_bytes();
-        let mut tlv: HeaplessVec<u8, MAX_RESPONSE> = HeaplessVec::new();
-        fapico2_mgmt::default_config_tlv(serial, &mut tlv);
-        reply_hid(hid_in, channel, cmd, tlv.as_slice()).await;
-    } else if cmd == CTAP_HID_CBOR {
-        if !payload.is_empty() {
-            let ctap_cmd = payload[0];
-            // User-presence requests emit a CTAPHID keepalive (UP NEEDED)
-            // before completing (FX-402 parity).
-            //
-            // US-115 adds the `0x41` vendor channel to `presence_windowed`
-            // below, and *not* to this one. The pre-command keepalive is
-            // unconditional for 0x01/0x02, which always need a touch; `0x41`
-            // only needs one for the *benign tier* of `CONFIG_WRITE`, and
-            // emitting a keepalive for the identity tier — which answers `0x00`
-            // on the first pass — would put a frame on the wire that the client
-            // has no reason to expect and that says nothing true about progress.
-            let up_request = ctap_cmd == 0x01 || ctap_cmd == 0x02;
-            if up_request {
-                reply_hid(hid_in, channel, CTAP_HID_KEEPALIVE, &[0x02]).await;
-            }
-            // US-115: the commands whose arm may answer `UpRequired`, and so
-            // may need the cross-call consent window below.
-            //
-            // `vendor41::config_write` answers `UpRequired` for a benign PHY
-            // blob with no presence grant, and this loop is the only thing that
-            // turns that into a prompt, a keepalive and a retry. The window is
-            // entered on the *answer* — the conditions below still require a
-            // one-byte `UpRequired` reply — so the identity tier, gated on a
-            // pinUvAuth token and answering `0x00` first time, never opens a
-            // window and never waits for a button. That is also the
-            // compatibility point: PicoForge sends no touch for `CONFIG_WRITE`
-            // (`picoforge/src/hal/fido/ops.rs:1514-1554`), so a touch
-            // requirement on the token-authorised path would hang the Config
-            // screen until its 30 s timeout (`ops.rs:1550`).
-            // authenticatorClientPIN (0x06) joins them because its
-            // `getPinUvAuthTokenUsingUvWithPermissions` (sub-command 0x06)
-            // answers `UpRequired` when no press has been observed — that is
-            // the only way a client on a PIN-less key can obtain a
-            // pinUvAuthToken at all. The window is entered on the *answer*,
-            // so the PIN-based sub-commands (0x05/0x09), which never answer
-            // `UpRequired`, are unaffected and send no keepalive.
-            let presence_windowed =
-                up_request
-                    || ctap_cmd == fapico2_fido::vendor41::CMD
-                    || ctap_cmd == 0x06;
-            // SOAK-FINDING-1: the store is bound for the command so growth
-            // mutations commit transactionally (durable or rejected) — the
-            // gate below then finds either a persistable dirty state or a
-            // clean app, never an un-persistable latch.
-            let mut len = fido_app.process_ctap2_with_store(
-                ctap_cmd,
-                &payload[1..],
-                *channel,
-                ctap_out,
-                Some(store),
-            );
-            // US-921: an UpRequired answer no longer dead-ends the
-            // request — the app's gate can never grant (one synchronous
-            // poll inside a non-preemptive serve section), so open the
-            // cross-call consent window and re-drive the command inside
-            // it: each keepalive + yield lets the button task's tick arm
-            // the grant, and the app's own gate consumes it (its injected
-            // closure is the join-only `request_grant_in_window`).
-            // US-921 review (P0-1): the tag is domain-separated into the HID
-            // space (bit 31 set) — a raw CID would eventually equal a CCID
-            // presence tag and the same-tag join would let a CCID command
-            // consume a press consented to a FIDO touch.
-            let tag = fapico2_fido::presence_tag_from_channel(*channel);
-            if presence_windowed
-                && len == 1
-                && ctap_out[0] == fapico2_fido::ctap2::Ctap2Response::UpRequired.code()
-                && fapico2_firmware::presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS)
-            {
-                let win = TouchWindow::open(tag, now_ms());
-                fapico2_firmware::presence::touch_prompt(true);
-                loop {
-                    if win.expired(now_ms()) {
-                        // The window ran out on an unanswered touch: the
-                        // UpRequired below goes out as the final reply.
-                        fapico2_firmware::presence::end_window(tag);
-                        fapico2_firmware::presence::touch_prompt(false);
-                        break;
-                    }
-                    // Progress frame, then a yield — the button task's
-                    // tick runs here and drains the press latch.
-                    reply_hid(hid_in, channel, CTAP_HID_KEEPALIVE, &[0x02]).await;
-                    Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await;
-                    // Re-assert the prompt: the heartbeat flickers it off
-                    // between iterations (shared-pin contract).
-                    fapico2_firmware::presence::touch_prompt(true);
-                    len = fido_app.process_ctap2_with_store(
-                        ctap_cmd,
-                        &payload[1..],
-                        *channel,
-                        ctap_out,
-                        Some(store),
-                    );
-                    if len == 1
-                        && ctap_out[0] == fapico2_fido::ctap2::Ctap2Response::UpRequired.code()
-                    {
-                        continue;
-                    }
-                    // Final response (the retry consumed the grant, or a
-                    // non-UP error): close the window, clear the prompt.
-                    fapico2_firmware::presence::end_window(tag);
-                    fapico2_firmware::presence::touch_prompt(false);
-                    break;
-                }
-            }
-            // US-425/US-427: durable-before-ack — persist before the success
-            // reply (the keepalives above are progress notifications, not the
-            // ack); the final reply (success, non-UP error, or the expired
-            // UpRequired) goes out only if the gate is `true`, else the
-            // closest existing CTAPHID error — 0xBF ERROR /
-            // INVALID_COMMAND (the CTAPHID set has no "authenticator
-            // internal/persistence failure" code; INVALID_COMMAND is the
-            // generic reject this module already uses for unprocessable
-            // commands, so the host sees an error frame, never a false ack).
-            if persist_hid(fido_app, store, flash) {
-                reply_hid(hid_in, channel, CTAP_HID_CBOR, &ctap_out[..len]).await;
-            } else {
-                defmt::error!("hid persist failed; CTAPHID ERROR/INVALID_COMMAND (durable-before-ack)");
-                reply_hid(hid_in, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
-            }
-        } else {
-            reply_hid(hid_in, channel, CTAP_HID_CBOR, &[HID_ERR_INVALID_CMD]).await;
-        }
-    } else if cmd == CTAP_HID_PING {
-        reply_hid(hid_in, channel, CTAP_HID_PING, payload).await;
-    } else if cmd == CTAP_HID_WINK {
-        // WINK: acknowledge with an empty response frame.
-        reply_hid(hid_in, channel, CTAP_HID_WINK, &[]).await;
-    } else if cmd == 0x41 && !payload.is_empty() && payload[0] == 0x05 {
-        // Vendor vault function (pico-fido2 vendor protocol).
-        //
-        // R-7 / US-106: this is the *frame-CMD* `0x41`, and it is NOT the same
-        // thing as the CTAP2 *opcode* `0x41` that the `CTAP_HID_CBOR` arm
-        // above now routes to `vendor41` (the RS-Key channel, PicoForge vendor
-        // framing C). They cannot alias, on two independent grounds — plus one
-        // coincidence that is a trap:
-        //
-        // 1. They are disjoint fields of disjoint frames. This arm reads the
-        //    CTAPHID frame's CMD byte; the other reads the first byte of the
-        //    payload *inside* a standard `CTAPHID_CBOR` frame. A given frame
-        //    has one CMD byte, so at most one of the two `else if` chains can
-        //    ever match it. There is no `0xC1` handler anywhere in the tree.
-        // 2. Their sub-command numbering overlaps with different meanings, so
-        //    they must not share a decoder. Sub-command `1` is vault STATUS
-        //    (return the enrolled vault id) and RS-Key MSE (ephemeral ECDH
-        //    setup). Their pinUvAuth messages differ for the same reason: the
-        //    vault MACs `0xff*32 || 0x0D || sub || params` (the
-        //    authenticatorConfig domain) where RS-Key MACs
-        //    `0xff*32 || 0x41 || sub || params`.
-        //
-        //    The coincidence, which is NOT a difference and so is not a third
-        //    ground: the two channels share the *same* response framing — a
-        //    status byte followed by a CBOR map, with the map present only on
-        //    success (`device_core.rs:3148-3157`, `vault::ok_response`, and
-        //    `vendor41::handle`). Identical framing on two protocols with
-        //    colliding sub-command numbers is exactly the combination that
-        //    tempts someone into sharing a decoder later. Don't.
-        //
-        //    `apps/fido/tests/vendor41.rs::vault_framing_does_not_alias_ctap2_vendor_0x41`
-        //    asserts this rather than trusting the comment.
-        //
-        // SOAK-FINDING-1: store bound for the transactional enroll commit
-        // (as in the CBOR arm above).
-        let len = fido_app.process_vendor_vault_with_store(&payload[1..], ctap_out, Some(store));
-        // US-425/US-427: durable-before-ack — success reply only on a `true`
-        // gate, else 0xBF / INVALID_COMMAND (as in the CBOR arm above).
-        if persist_hid(fido_app, store, flash) {
-            reply_hid(hid_in, channel, 0x41, &ctap_out[..len]).await;
-        } else {
-            defmt::error!("hid persist failed; CTAPHID ERROR/INVALID_COMMAND (durable-before-ack)");
-            reply_hid(hid_in, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
-        }
-    } else if cmd == CTAP_HID_MSG {
-        // U2F (CTAP1) APDU over HID. The payload is the raw APDU.
-        // US-921: the app derives its presence tag from the transaction
-        // channel — the U2F entry predates the channel plumbing, so set it
-        // explicitly (process_ctap2 re-derives it per call).
-        fido_app.set_channel(*channel);
-        // SOAK-FINDING-1: store bound for the transactional register (as in
-        // the CBOR arm above) — an overflow registers as a clean U2F
-        // WrongData, not an un-persistable dirty state.
-        let mut len = fido_app.process_u2f_with_store(payload, ctap_out, Some(store));
-        // US-921: a bare UP refusal (6985 / the US-908 NOT_PRESENT shape)
-        // opens the cross-call consent window — same discipline as the
-        // CBOR arm: keepalive + yield arms the grant, the app's gate
-        // consumes it on the retry.
-        // US-921 review (P1-2): decode the APDU head BEFORE consulting the
-        // refusal shape — only REGISTER (INS 0x01) and AUTHENTICATE in
-        // enforce mode (INS 0x02, any P1 but check-only 0x07) consult
-        // presence in the app. Check-only (P1=0x07) answers 6985 by spec
-        // WITHOUT a touch, so it never opens the 30 s window: a flood of
-        // check-only requests cannot keep the prompt lit / the slot hogged
-        // for 30 s, and a press during it is never latched for a command
-        // that needed no presence. (The finding's "INS 0x04 / P1=0x03" is
-        // adjusted to this codebase's dispatch: INS 0x02 is AUTHENTICATE —
-        // 0x04 would be VERSION, never presence-gated — and P1=0x08
-        // don't-enforce runs the same presence-gated enforce path as 0x03,
-        // so excluding only 0x07 keeps both signing modes windowed.)
-        let tag = fapico2_fido::presence_tag_from_channel(*channel);
-        let presence_gated_u2f = payload.len() >= 3
-            && matches!(payload[1], 0x01 | 0x02)
-            && payload[2] != 0x07;
-        if presence_gated_u2f
-            && fapico2_firmware::presence::u2f_up_refusal(&ctap_out[..len])
-            && fapico2_firmware::presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS)
-        {
-            let win = TouchWindow::open(tag, now_ms());
-            fapico2_firmware::presence::touch_prompt(true);
-            loop {
-                if win.expired(now_ms()) {
-                    // Window expired on an unanswered touch: the captured
-                    // refusal below goes out verbatim as the final reply.
-                    fapico2_firmware::presence::end_window(tag);
-                    fapico2_firmware::presence::touch_prompt(false);
-                    break;
-                }
-                reply_hid(hid_in, channel, CTAP_HID_KEEPALIVE, &[0x02]).await;
-                Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await;
-                fapico2_firmware::presence::touch_prompt(true);
-                len = fido_app.process_u2f_with_store(payload, ctap_out, Some(store));
-                if fapico2_firmware::presence::u2f_up_refusal(&ctap_out[..len]) {
-                    continue;
-                }
-                fapico2_firmware::presence::end_window(tag);
-                fapico2_firmware::presence::touch_prompt(false);
-                break;
-            }
-        }
-        // US-425/US-427: durable-before-ack — success reply only on a `true`
-        // gate, else 0xBF / INVALID_COMMAND (as in the CBOR arm above).
-        if persist_hid(fido_app, store, flash) {
-            reply_hid(hid_in, channel, CTAP_HID_MSG, &ctap_out[..len]).await;
-        } else {
-            defmt::error!("hid persist failed; CTAPHID ERROR/INVALID_COMMAND (durable-before-ack)");
-            reply_hid(hid_in, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
-        }
-    } else {
-        // Unknown init command — CTAPHID ERROR frame, INVALID_COMMAND.
-        reply_hid(hid_in, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
-    }
-}
-
-/// Send one CTAP-HID reply report (logs and drops on USB error or on a host
-/// that never ACKed; the host re-sends or re-enumerates).
-///
-/// US-1504: every reply on this path — the keepalives of the CTAP2 and U2F
-/// `UpRequired` loops, the final CBOR/MSG answers, PING, WINK, the assembler
-/// error frames and the `0x41`/`0x42` vendor answers — is bounded by
-/// [`fapico2_firmware::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS`] inside
-/// [`send_hid_report`], so no HID reply can park the serve loop. The two
-/// `UpRequired` keepalive loops therefore keep their cadence with a live
-/// host, and with a host that has gone away they fall out of the wait within
-/// one deadline instead of hanging the task forever.
-async fn reply_hid(
-    hid_in: &mut Endpoint<'static, USB, In>,
-    channel: &[u8; 4],
-    cmd: u8,
-    payload: &[u8],
-) {
-    let _ = send_hid_report(hid_in, channel, cmd, payload).await;
-}
