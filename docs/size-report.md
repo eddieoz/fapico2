@@ -1,3 +1,99 @@
+**Date:** 2026-10-02 (**US-1529 — `makeCredUvNotRqd` was a hard-coded lie;
+derive it from PIN state.** The option was seeded `true` in
+`Ctap2Info::default`, so a PIN-set device advertised support for a
+non-discoverable-credential `makeCredential` with no UV — which the MC 8.1 gate
+refuses with `0x36`. It is now computed from the same two facts that gate
+reads. This is a **re-stamp only**: the ratchet is not touched, because the
+shipping UF2 did not grow.)
+**Measured: `text` 817,984 → 818,148 B (**+164 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); task-arena demand 21,944 B (**0**, stamp
+`014837326a490937…` still verifies against the current sources, so nothing was
+re-measured); UF2 **3071 blocks** (**unchanged**, 1 absolute preamble + 3070
+ARM_S payload), 1,572,352 bytes (**unchanged**). Shipping sha256
+`4349e0ad29c6…` → **`3f46f624cc14…`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes
+3f46f624cc1431222cdfb22afc95f80562cb9ca70b465d3cca46c30d9c026fde  firmware/fapico2.uf2
+```
+
+**The +164 B is all `.text`, and it is all in one place.** `.rodata` did not
+move, which is the useful fact: `"makeCredUvNotRqd"` was already a string
+literal in `Ctap2Info::default` and only its *value* changed (`true` → `false`),
+so no new key is emitted and the option map's footprint is unchanged. The
+whole delta is therefore the one device-image call site —
+`device_core.rs::handle_get_info` now does
+
+```rust
+info.set_option(
+    "makeCredUvNotRqd",
+    crate::ctap2::make_cred_uv_not_rqd(
+        self.keystore.pin_state.pin_hash.is_some(),
+        self.keystore.pin_state.always_uv,
+    ),
+);
+```
+
+`make_cred_uv_not_rqd(pin_set, always_uv) = !pin_set && !always_uv` has **no
+standalone symbol in the release ELF** — `arm-none-eabi-nm … | grep
+make_cred_uv_not_rqd` returns nothing — so it inlines at its call sites rather
+than adding a called function and a prologue/epilogue pair. What costs 164 B is
+the inlined body (two flag loads off `pin_state`, a second load to keep them
+live across the CBOR insert, the `!a && !b` reduction, and `Ctap2Info::set_option`
+— a 106 B out-of-line symbol — called one more time). That is the honest
+shape of it: **164 B to stop the wire claiming a capability the device refuses**,
+and to make the two twins unable to drift by construction.
+
+**164 B, and the UF2 block count did not move: 3,071 before, 3,071 after.**
+The UF2 grows in whole 512 B blocks, so a sub-block change cannot move the
+block count; this one landed inside the last already-allocated block and the
+image is byte-identical in length. The **sha256 did change**
+(`4349e0ad29c6…` → `3f46f624cc14…`) because the payload bytes changed even
+though the length did not — which is why this doc records the hash and not
+just the size. A reader diffing only the block count would wrongly conclude
+nothing was flashed.
+
+**The ratchet is untouched, and so is its slack.**
+`FIRMWARE_FLASH_BUDGET_KIB` stays at **1536**; this story does not raise it and
+does not need to. Against the budget the slack is unchanged at **512 B** — the
+same single 512-byte block of headroom US-1519's entry describes, since
+1,572,352 B measured against 1,572,864 B is exactly one block.
+
+**Which edits in this story cost 0 B, named so this re-stamp is not read as
+covering them.**
+
+* **`apps/fido/src/app.rs`** — the host twin's identical copy of the fix — is
+  `#[cfg(feature = "host")]`. Cost in the shipping image: **0 B.** Only
+  `device_core.rs` is compiled for the device.
+* The 8 tests in `apps/fido/tests/make_cred_uv_not_rqd.rs` are an integration
+  test binary; **0 B.**
+* The `docs/webauthn-discovery-ab.md` / `-baseline.md` updates are prose;
+  **0 B.**
+* **This document's re-stamp is 0 B**, including the ELF section table and the
+  ELF summary above: both are regenerated from the ELF by
+  `check_size_report.py`, so re-recording them is not an edit to the image.
+* The comment blocks added next to the unchanged 8.1 gate in
+  `device_core.rs` and `app.rs` cost **0 B**; the gate itself is byte-for-byte
+  the same branch, which is the point — the advertisement was fixed to match
+  the gate, not the reverse.
+
+**The US-1519 headroom paragraph is still accurate, and was checked rather than
+assumed.** It reads: *"The headroom is one 512-byte block, not zero… one more
+block lands the image on exactly 1,572,864 — which is not greater than the
+1,572,864 B ceiling, so it passes. Two blocks (1,573,376 B) is the first size
+that trips it."* Re-derived against this build: 3071 × 512 = 1,572,352 B
+measured; 1536 KiB = 1,572,864 B; the ratchet fires on `SHIPPING -gt
+BUDGET_BYTES` (`ci.yml`), so 1,572,864 B is **not** greater than 1,572,864 B and
+passes, while 1,573,376 B is. Every term in that paragraph is unchanged by
+US-1529, because US-1529 did not move the block count. The earlier,
+overstated phrasing ("the next ordinary growth is a red again, immediately")
+remains corrected in place and is **not** restored by this entry.
+
+Prior header:
+
 **Date:** 2026-10-02 (**US-1519 — the passkey-discovery epic, merged.** The
 image grew, the ratchet bit, and the EPIC's acceptance criterion is "shrink the
 implementation rather than raise the number". Shrinking was attempted first and
@@ -984,10 +1080,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,008 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb238` | no (flash) |
+| `.text` | 766,172 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb2e0` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfc20` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfcc0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -995,14 +1091,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,008 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 766,172 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **817,984**. That identity is stated so a reader can check
+the `X` flag) = **818,148**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 817,984 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,148 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
