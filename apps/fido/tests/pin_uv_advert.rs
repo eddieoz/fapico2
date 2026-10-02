@@ -69,8 +69,12 @@ fn uv_is_never_advertised_on_the_host_twin() {
 }
 
 /// The options vector is a 16-slot heapless vec and `set_option` swallows a
-/// failed push with `.ok()`. A tenth key would truncate silently, so the
-/// advertised set is pinned by length as well as by value.
+/// failed push with `.ok()`, so a seventeenth key would vanish with no
+/// diagnostic. Pinning the advertised set by length as well as by value
+/// makes an addition show up as a test failure instead. Ten is the current
+/// count: `Ctap2Info::default` seeds seven and `handle_get_info` adds
+/// `authnrCfg`, `enterpriseAttestation` and `alwaysUv` — `clientPin` and
+/// `pinUvAuthToken` overwrite in place via `set_option`'s `find`.
 const ADVERTISED_OPTIONS: usize = 10;
 
 fn assert_pin_pair(opts: &[(String, bool)], want_pin: bool, want_token: bool) {

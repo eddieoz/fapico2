@@ -404,22 +404,28 @@ impl Ctap2Info {
 /// right now" (`handle_get_info` sets that from `pin_hash.is_some()`).
 ///
 /// The tempting rule — `pin_hash.is_some()`, mirroring `clientPin` — is
-/// wrong in the fail-safe direction. Sub-command `0x06`
-/// (getPinUvAuthTokenUsingUvWithPermissions) needs no PIN: it asserts a
-/// user-presence grant and nothing else, because this build has no
-/// user-verification secret to check, and credentialManagement honours the
-/// token it returns even with `pin_hash == None`
-/// (`device_core.rs:2520`, and `pin.rs:2029` in the host twin). A
-/// factory-fresh key therefore *does* have the capability, and reporting
-/// `false` would tell a client to stop using a path that answers.
+/// wrong. Sub-command `0x06` (getPinUvAuthTokenUsingUvWithPermissions)
+/// needs no PIN: it asserts a user-presence grant and nothing else,
+/// because this build has no user-verification secret to check, and
+/// credentialManagement honours the token it returns even with
+/// `pin_hash == None` (`device_core.rs:2564`, and `app.rs:2029` in the
+/// host twin). A factory-fresh key therefore *does* have the capability,
+/// so reporting `false` would withdraw a route that answers.
 ///
-/// Nor can the client library be used to argue the other way. In fido2
-/// 2.2.1 the option's only reader is `ClientPin.is_token_supported()`
-/// (`fido2/ctap2/pin.py:263`), whose single call site sits inside
-/// `if allow_uv and info.options.get("uv")`
-/// (`fido2/client/__init__.py:681-683`). This authenticator deliberately
-/// never advertises `uv` (see the `Default` note below), so that reader is
-/// unreachable here and the bit's value is wire-inert for that library.
+/// The option is also load-bearing off the uv-gated branch. In fido2
+/// 2.2.1 `ClientPin.is_token_supported()` (`ctap2/pin.py:262-264`) has
+/// three call sites, and only the third is gated on `uv`:
+///
+///   - `get_uv_token` (`pin.py:347-348`) raises
+///     `ValueError("Authenticator does not support get_uv_token")` in the
+///     client when the bit is false, so a PIN-less key loses sub-command
+///     `0x06` entirely — the resident-credential case this story exists
+///     to avoid.
+///   - `get_pin_token` (`pin.py:307`) selects
+///     `GET_TOKEN_USING_PIN` (permissions honoured) over
+///     `GET_TOKEN_USING_PIN_LEGACY` (permissions dropped). Not uv-gated.
+///   - `Client._get_token` (`client/__init__.py:683`), the only
+///     uv-gated one, inside `if allow_uv and info.options.get("uv")`.
 ///
 /// What the value *must* track is lockout. Once the durable flag latches,
 /// every PIN leg refuses (`verify_token`, credentialManagement and Config
@@ -427,7 +433,11 @@ impl Ctap2Info {
 /// honour is exactly the incoherence this story is about: a client reads
 /// `true`, mints a token, and is then refused at the first command. The
 /// token sub-command gates on the same flags, so the advertisement is true
-/// whenever it is made rather than merely fail-closed.
+/// whenever it is made rather than merely fail-closed. Withdrawing the bit
+/// also downgrades `get_pin_token` to the legacy opcode, but both share one
+/// match arm (`device_core.rs:1764`) whose outcome the PIN decides, not the
+/// opcode, so that costs no behaviour.
+///
 /// It takes the two durable lockout flags rather than a state struct: the
 /// twins keep different ones (`keystore::PinState` and
 /// `device_keystore::DevicePinState`), and this signature is what keeps one
@@ -440,11 +450,19 @@ pub fn pin_uv_auth_token_available(blocked: bool, needs_power_cycle: bool) -> bo
 ///
 /// The constant 3 was never arbitrary — it is the `auth_failures` latch
 /// threshold that `note_pin_auth_failure` uses in both twins
-/// (`device_core.rs:780`, `app.rs:515`). Reporting the *remaining* budget
-/// against the same counter makes the value mean something: a client polling
-/// `uvRetries` sees it fall to 0 exactly when the device stops answering
-/// PIN/UV at all, and recovers when a good `pinUvAuthParam` resets the
-/// counter.
+/// (`device_core.rs:781`, `app.rs:515`). Reporting the *remaining* budget
+/// against the same counter makes the value mean something: it falls as a
+/// bad-`pinUvAuthParam` streak grows, and recovers when a good one resets
+/// the counter.
+///
+/// It does not, however, fall to 0 in step with the lockout, and a reader
+/// must not assume it does. `auth_failures` is volatile — zeroed at boot
+/// (`device_app.rs:417`) and on session teardown (`device_app.rs:558`) —
+/// while `powerCycleState` derives from the **durable** `needs_power_cycle`.
+/// So after a power cycle during a lockout GetInfo reports
+/// `uvRetries: 3, powerCycleState: true`: a full budget on a counter that
+/// every leg refuses anyway. `powerCycleState` is the authoritative
+/// "locked out" signal; `uvRetries` is only the remaining streak budget.
 ///
 /// The semantic mismatch, stated rather than hidden: `auth_failures` counts
 /// **pinUvAuthParam MAC** verification failures, not UV-gesture failures.
@@ -475,10 +493,6 @@ impl Default for Ctap2Info {
         // get_info sets the value from the actual PIN state. pinUvAuthToken
         // is seeded here so the key is on the wire, but get_info overrides it
         // with `pin_uv_auth_token_available` in every reachable state.
-        let mut options: HeaplessVec<(&'static str, bool), 16> = HeaplessVec::new();
-        options.push(("rk", true)).ok();
-        options.push(("clientPin", false)).ok();
-        options.push(("pinUvAuthToken", true)).ok();
         let mut options: HeaplessVec<(&'static str, bool), 16> = HeaplessVec::new();
         options.push(("rk", true)).ok();
         options.push(("clientPin", false)).ok();
