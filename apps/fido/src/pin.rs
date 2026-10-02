@@ -161,16 +161,20 @@ impl<'a> PinProtocol<'a> {
         })
     }
 
-    /// getUVRetries (0x07). UV is not implemented in this build, so a
-    /// constant retry budget is reported (the counter never decrements).
+    /// getUVRetries (0x07). US-1513: the budget was a hard-coded 3 that no test
+    /// could observe. It now tracks the same `auth_failures` counter the
+    /// latch in `note_pin_auth_failure` uses, and reports the durable
+    /// lockout as `powerCycleState` — the same pair of keys CTAP2.1 §6.5.5.4
+    /// defines and the device twin writes at `device_core.rs:1558`.
     fn get_uv_retries(&self) -> Result<PinProtocolOutput, FidoError> {
+        let state = self.keystore.get_pin_state();
         Ok(PinProtocolOutput {
             response: ClientPinResponse {
                 key_agreement: None,
                 pin_token: None,
                 retries: None,
-                power_cycle_state: false,
-                uv_retries: Some(3),
+                power_cycle_state: state.blocked || state.needs_power_cycle,
+                uv_retries: Some(crate::ctap2::uv_retries(state.auth_failures)),
             },
             raw_pin_token: None,
         })
@@ -572,6 +576,14 @@ impl<'a> PinProtocol<'a> {
     /// presence probe and auto-acks, matching the rest of the host stack
     /// (US-908).
     fn get_pin_token_uv(&mut self, params: ClientPinParams) -> Result<PinProtocolOutput, FidoError> {
+        // US-1512: mirror of the lockout gate the device twin puts in front
+        // of the same sub-command. A durable lockout refuses every PIN leg,
+        // so the one route that needs no PIN must refuse too — otherwise this
+        // twin mints a token the board would not.
+        let state = self.keystore.get_pin_state();
+        if state.blocked || state.needs_power_cycle {
+            return Err(FidoError::PinAuthBlocked);
+        }
         let permissions = params.permissions.ok_or(FidoError::MissingParameter)?;
         if permissions & 0x08 != 0 && params.pin_uv_auth_protocol != 2 {
             return Err(FidoError::PinAuthInvalid);

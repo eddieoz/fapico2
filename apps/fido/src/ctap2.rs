@@ -37,7 +37,51 @@ pub enum Ctap2Command {
     Config = 0x0D,
 }
 
-/// CTAP2 response codes.
+/// CTAP2 status codes (the *response* table — see [`Ctap2Command`] for the
+/// separate, deliberately-non-spec command table).
+///
+/// US-1528. Every byte below is a **wire value** a client decodes, so this enum
+/// is transcribed, not designed. The two authorities, which agree with each
+/// other, are:
+///
+///   * `fido2` 2.2.1, `fido2/ctap.py` `CtapError.ERR` — what `ykman`, Yubico
+///     Authenticator and every first-party tool actually decode. Executed, not
+///     grepped: the enum is read at runtime in the test that pins this table.
+///   * the C reference, `pico-fido2/src/fido/ctap.h` `CTAP2_ERR_*`.
+///
+/// Where they differ the **library wins**, because it is the decoder. That is
+/// the whole reason `PinTokenExpired` is `0x38` here and absent from
+/// `ctap.h`: `CtapError.ERR` defines it, so a client reading our `0x38` gets
+/// `PIN_TOKEN_EXPIRED` and a client reading the C firmware's silence gets
+/// nothing to read.
+///
+/// The previous table was off by one across `0x2B`..`0x2D` and wrong again at
+/// `0x07`/`0x08`, which meant **every** `InvalidOption` this firmware returned
+/// was read by every client as `UNSUPPORTED_OPTION` — a different sentence
+/// ("you named a value we do not support" vs "you named a value that is
+/// malformed for a parameter we do support"). `tests/status_table.rs` pins
+/// every value below against the executed library so this cannot drift again;
+/// do not "tidy" a value here without running that test.
+///
+/// ## `NoOperationPending` was removed, deliberately
+///
+/// US-1528 listed it as one of the four non-reference codes to resolve. It is
+/// gone rather than aligned or re-valued, for three reasons that all point the
+/// same way:
+///
+///   1. The spec **withdrew** the code. `fido2` keeps it as a comment —
+///      `# NO_OPERATION_PENDING = 0x2A  # No longer in spec` — so no client
+///      can decode it whatever byte it carries.
+///   2. Even the withdrawn code was `0x2A`, not the `0x29` we had. `0x29` was
+///      `NOT_BUSY`, a *different* withdrawn code. The variant was wrong at
+///      both the semantic and the numeric level, which is the signature of a
+///      name copied down a column without the value ever being checked.
+///   3. It had **zero producers and zero assertions** anywhere in the tree
+///      (`grep -rn NoOperationPending` returns this paragraph and nothing
+///      else), so removing it breaks no caller.
+///
+/// Keeping a wrong-valued, unreachable variant in the one table whose entire
+/// job is to be transcribed correctly is a drift vector, not documentation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum Ctap2Response {
@@ -48,8 +92,20 @@ pub enum Ctap2Response {
     InvalidSeq = 0x04,
     Timeout = 0x05,
     ChannelBusy = 0x06,
-    LockRequired = 0x07,
-    InvalidChannel = 0x08,
+    /// `CTAP2_ERR_LOCK_REQUIRED`.
+    ///
+    /// Was `0x07`, which is wrong twice over: the reference value is `0x0A`
+    /// (`CtapError.ERR.LOCK_REQUIRED`; the C SDK agrees at
+    /// `pico-fido2/pico-keys-sdk/src/usb/hid/ctap_hid.h:157`,
+    /// `CTAP1_ERR_LOCK_REQUIRED 0x0a`), and `0x07` collided with
+    /// [`Ctap2Command::Reset`] — a status byte and a command opcode that are
+    /// never on the same layer but must never share a value, because a reader
+    /// that has lost track of which table it is in then has no way to tell.
+    LockRequired = 0x0A,
+    /// `CTAP2_ERR_INVALID_CHANNEL`. Was `0x08`; the reference value is `0x0B`
+    /// (`CtapError.ERR.INVALID_CHANNEL`; `ctap_hid.h:158`,
+    /// `CTAP1_ERR_INVALID_CHANNEL 0x0b`).
+    InvalidChannel = 0x0B,
     CborUnexpectedType = 0x11,
     InvalidCbor = 0x12,
     MissingParameter = 0x14,
@@ -63,10 +119,33 @@ pub enum Ctap2Response {
     UnsupportedAlgorithm = 0x26,
     OperationDenied = 0x27,
     KeyStoreFull = 0x28,
-    NoOperationPending = 0x29,
-    UnsupportedOption = 0x2A,
-    InvalidOption = 0x2B,
-    KeepAliveCancel = 0x2C,
+    /// `CTAP2_ERR_UNSUPPORTED_OPTION` — the request named an option this
+    /// authenticator does not advertise.
+    ///
+    /// Was `0x2A`, which is not a live code at all. The reference skips
+    /// straight from `KEY_STORE_FULL` (`0x28`) to `UNSUPPORTED_OPTION`
+    /// (`0x2B`); `fido2` keeps the commented-out
+    /// `# NOT_BUSY = 0x29  # No longer in spec` and
+    /// `# NO_OPERATION_PENDING = 0x2A  # No longer in spec` as the reason the
+    /// gap exists, so `0x2A` is a **withdrawn** code. Emitting it put a value
+    /// on the wire that no client can name.
+    UnsupportedOption = 0x2B,
+    /// `CTAP2_ERR_INVALID_OPTION` — the option is advertised, but the value
+    /// carried is not one it accepts.
+    ///
+    /// Was `0x2B`, which every client decodes as `UNSUPPORTED_OPTION`. This is
+    /// the bug US-1528 was filed for: a conformance-visible difference in what
+    /// the firmware says, at roughly ten producer sites, and the `up: false`
+    /// rejection US-1526 deliberately decided and pinned is one of them.
+    InvalidOption = 0x2C,
+    /// `CTAP2_ERR_KEEPALIVE_CANCEL` — user cancelled a keepalive.
+    ///
+    /// Was `0x2C`. `firmware/src/ctap_hid.rs` (a separate worktree) is the
+    /// first thing in this project to *produce* a keepalive-cancel answer and
+    /// emits `0x2D` on the strength of the same two sources. Aligning here is
+    /// what makes the two halves agree by value; do not "fix" one from the
+    /// other, re-derive both from the table above.
+    KeepAliveCancel = 0x2D,
     NoCredentials = 0x2E,
     UserActionTimeout = 0x2F,
     NotAllowed = 0x30,
@@ -77,6 +156,19 @@ pub enum Ctap2Response {
     PinNotSet = 0x35,
     PuatRequired = 0x36,
     PinPolicyViolation = 0x37,
+    /// `CTAP2_ERR_PIN_TOKEN_EXPIRED`.
+    ///
+    /// **Not in the C reference** — `ctap.h` runs `PIN_POLICY_VIOLATION`
+    /// (`0x37`) straight to `REQUEST_TOO_LARGE` (`0x39`) — but **in the client
+    /// library**, which is the authority that matters: `CtapError.ERR` defines
+    /// `PIN_TOKEN_EXPIRED = 0x38`. So this value is *correct* and the C
+    /// firmware's silence is the omission, not this. Verified by executing the
+    /// enum rather than grepping the literal, and re-verified on every run of
+    /// `tests/status_table.rs`.
+    ///
+    /// Fate, per US-1528's "align or write down": **kept as-is.** Aligning it
+    /// to a C-header-only reading would mean emitting a byte every client
+    /// decodes as `REQUEST_TOO_LARGE`.
     PinTokenExpired = 0x38,
     RequestTooLarge = 0x39,
     ActionTimeout = 0x3A,
@@ -396,13 +488,103 @@ impl Ctap2Info {
     }
 }
 
+/// US-1512: the rule behind GetInfo's `pinUvAuthToken` option.
+///
+/// The option is a **capability**, not a configuration flag. CTAP 2.1
+/// §5.4.6 asks "can this authenticator return a pinUvAuthToken?", and
+/// `clientPin` already answers the separate question "is a PIN configured
+/// right now" (`handle_get_info` sets that from `pin_hash.is_some()`).
+///
+/// The tempting rule — `pin_hash.is_some()`, mirroring `clientPin` — is
+/// wrong. Sub-command `0x06` (getPinUvAuthTokenUsingUvWithPermissions)
+/// needs no PIN: it asserts a user-presence grant and nothing else,
+/// because this build has no user-verification secret to check, and
+/// credentialManagement honours the token it returns even with
+/// `pin_hash == None` (`device_core.rs:2564`, and `app.rs:2029` in the
+/// host twin). A factory-fresh key therefore *does* have the capability,
+/// so reporting `false` would withdraw a route that answers.
+///
+/// The option is also load-bearing off the uv-gated branch. In fido2
+/// 2.2.1 `ClientPin.is_token_supported()` (`ctap2/pin.py:262-264`) has
+/// three call sites, and only the third is gated on `uv`:
+///
+///   - `get_uv_token` (`pin.py:347-348`) raises
+///     `ValueError("Authenticator does not support get_uv_token")` in the
+///     client when the bit is false, so a PIN-less key loses sub-command
+///     `0x06` entirely — the resident-credential case this story exists
+///     to avoid.
+///   - `get_pin_token` (`pin.py:307`) selects
+///     `GET_TOKEN_USING_PIN` (permissions honoured) over
+///     `GET_TOKEN_USING_PIN_LEGACY` (permissions dropped). Not uv-gated.
+///   - `Client._get_token` (`client/__init__.py:683`), the only
+///     uv-gated one, inside `if allow_uv and info.options.get("uv")`.
+///
+/// What the value *must* track is lockout. Once the durable flag latches,
+/// every PIN leg refuses (`verify_token`, credentialManagement and Config
+/// all return PIN_AUTH_BLOCKED), so advertising a token the device will not
+/// honour is exactly the incoherence this story is about: a client reads
+/// `true`, mints a token, and is then refused at the first command. The
+/// token sub-command gates on the same flags, so the advertisement is true
+/// whenever it is made rather than merely fail-closed. Withdrawing the bit
+/// also downgrades `get_pin_token` to the legacy opcode, but both share one
+/// match arm (`device_core.rs:1764`) whose outcome the PIN decides, not the
+/// opcode, so that costs no behaviour.
+///
+/// It takes the two durable lockout flags rather than a state struct: the
+/// twins keep different ones (`keystore::PinState` and
+/// `device_keystore::DevicePinState`), and this signature is what keeps one
+/// rule behind both.
+pub fn pin_uv_auth_token_available(blocked: bool, needs_power_cycle: bool) -> bool {
+    !(blocked || needs_power_cycle)
+}
+
+/// US-1513: the budget `getUVRetries` (clientPIN sub-command `0x07`) reports.
+///
+/// The constant 3 was never arbitrary — it is the `auth_failures` latch
+/// threshold that `note_pin_auth_failure` uses in both twins
+/// (`device_core.rs:781`, `app.rs:515`). Reporting the *remaining* budget
+/// against the same counter makes the value mean something: it falls as a
+/// bad-`pinUvAuthParam` streak grows, and recovers when a good one resets
+/// the counter.
+///
+/// It does not, however, fall to 0 in step with the lockout, and a reader
+/// must not assume it does. `auth_failures` is volatile — zeroed at boot
+/// (`device_app.rs:417`) and on session teardown (`device_app.rs:558`) —
+/// while `powerCycleState` derives from the **durable** `needs_power_cycle`.
+/// So after a power cycle during a lockout GetInfo reports
+/// `uvRetries: 3, powerCycleState: true`: a full budget on a counter that
+/// every leg refuses anyway. `powerCycleState` is the authoritative
+/// "locked out" signal; `uvRetries` is only the remaining streak budget.
+///
+/// The semantic mismatch, stated rather than hidden: `auth_failures` counts
+/// **pinUvAuthParam MAC** verification failures, not UV-gesture failures.
+/// The UV leg (sub-command `0x06`) proves user presence, not a secret, so a
+/// refused presence check answers `UpRequired` and deliberately does not
+/// charge this counter — charging it would let anyone who declines to touch
+/// the key drive the authenticator into a lockout.
+///
+/// So `uvRetries` reads as "PIN/UV authorization attempts remaining before
+/// the latch", which is the budget this build actually enforces.
+pub fn uv_retries(auth_failures: u8) -> u8 {
+    UV_RETRY_BUDGET.saturating_sub(auth_failures)
+}
+
+/// The latch threshold both twins use for `auth_failures`, and therefore the
+/// ceiling on the value [`uv_retries`] can report.
+pub const UV_RETRY_BUDGET: u8 = 3;
+
 impl Default for Ctap2Info {
     fn default() -> Self {
         // NOTE: "up" is deliberately NOT advertised, matching the reference
         // C firmware: the suite's test_option_up can only run when the option
         // is absent (its conftest Device.doGA has no options kwarg).
+        // The same goes for "uv": there is no built-in user-verification
+        // secret in this build to check (US-1525), so advertising it would
+        // promise a mechanism that does not exist.
         // clientPin key is always present (it advertises PIN capability);
-        // get_info sets the value from the actual PIN state.
+        // get_info sets the value from the actual PIN state. pinUvAuthToken
+        // is seeded here so the key is on the wire, but get_info overrides it
+        // with `pin_uv_auth_token_available` in every reachable state.
         let mut options: HeaplessVec<(&'static str, bool), 16> = HeaplessVec::new();
         options.push(("rk", true)).ok();
         options.push(("clientPin", false)).ok();

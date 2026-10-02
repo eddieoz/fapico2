@@ -44,11 +44,18 @@ const AAGUID_HEX: &str = "A0A1A2A3A4A5A6A7A8A9AAABACADAEAF";
 
 /// Every identity variable, so the "default" build below can guarantee none of
 /// them leaked in from the ambient environment.
-const ALL_VARS: [&str; 4] = [
+///
+/// US-1517 added the fifth. An identity override has since also required
+/// `FAPICO2_IDENTITY_OVERRIDE_ACK=1`, so a probe that set only the four would
+/// not build at all — and an acknowledgement inherited from the developer's own
+/// shell would decide whether the "default" half of this file really is a
+/// default build. Both reasons put it on this list.
+const ALL_VARS: [&str; 5] = [
     "FAPICO2_AAGUID_HEX",
     "FAPICO2_MANUFACTURER",
     "FAPICO2_PRODUCT",
     "FAPICO2_VID_PID",
+    "FAPICO2_IDENTITY_OVERRIDE_ACK",
 ];
 
 /// A dedicated target directory for ONE variant, separate from the enclosing
@@ -76,9 +83,9 @@ fn probe_target_dir(overridden: bool) -> PathBuf {
         .join(if overridden { "override" } else { "default" })
 }
 
-/// Run a real `cargo build -p fapico2-platform` with all four identity
-/// variables either set to the probe values or removed, and return the bytes
-/// of the rlib produced.
+/// Run a real `cargo build -p fapico2-platform` with the whole identity block
+/// either set to the probe values (plus the US-1517 acknowledgement) or
+/// removed, and return the bytes of the rlib produced.
 fn build_with(overridden: bool) -> Vec<u8> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(&cargo);
@@ -102,7 +109,8 @@ fn build_with(overridden: bool) -> Vec<u8> {
         cmd.env_remove(var);
     }
     if overridden {
-        cmd.env("FAPICO2_AAGUID_HEX", AAGUID_HEX)
+        cmd.env("FAPICO2_IDENTITY_OVERRIDE_ACK", "1")
+            .env("FAPICO2_AAGUID_HEX", AAGUID_HEX)
             .env("FAPICO2_MANUFACTURER", MANUFACTURER)
             .env("FAPICO2_PRODUCT", PRODUCT)
             .env("FAPICO2_VID_PID", VID_PID);

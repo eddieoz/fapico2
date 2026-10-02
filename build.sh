@@ -14,6 +14,43 @@ cd "$(dirname "$0")"
 
 OUT_NAME="fapico2"
 
+# US-1517: this script sets **no** identity variable, and that is the point.
+# The single source of truth for the AAGUID, USB manufacturer/product and
+# VID:PID is the set of DEFAULT_* constants in `platform/src/identity.rs`;
+# `build-signed.sh` and `build-timeline.sh` agree, and
+# `apps/fido/tests/aaguid_build.rs::no_tracked_build_script_overrides_the_identity`
+# fails if any of the three ever grows an assignment.
+#
+# Why it is a rule and not a preference: the AAGUID is the leading 16 bytes of
+# every attested credential blob, so two images built from this repository
+# under two different identities are two authenticators sharing no passkeys —
+# and the only record of which was which is somebody's flash log. The drift
+# that prompted the rule was a git-ignored `build-custom.sh` that set
+# FAPICO2_AAGUID_HEX to pico-fido2's own value; see the module docs on
+# `platform::identity`.
+#
+# An override is still available for development, and now needs two deliberate
+# variables (the build fails with one):
+#
+#   FAPICO2_IDENTITY_OVERRIDE_ACK=1 FAPICO2_AAGUID_HEX=89FB94B7... ./build.sh
+#
+# Say which identity this build will serve, before it spends a minute
+# compiling one. The acknowledgement warning from `platform/build.rs` repeats
+# it during the build; this line is here because it is the thing an operator
+# reads when they are about to flash the result.
+if [ -n "${FAPICO2_AAGUID_HEX:-}${FAPICO2_MANUFACTURER:-}${FAPICO2_PRODUCT:-}${FAPICO2_VID_PID:-}" ]; then
+    echo "build.sh: IDENTITY OVERRIDE in effect — this image will NOT serve fapico2's published AAGUID." >&2
+    if [ -z "${FAPICO2_IDENTITY_OVERRIDE_ACK:-}" ]; then
+        echo "build.sh: ... and there is no FAPICO2_IDENTITY_OVERRIDE_ACK=1, so the build below will FAIL. That is deliberate (US-1517)." >&2
+    else
+        echo "build.sh:   FAPICO2_AAGUID_HEX=${FAPICO2_AAGUID_HEX:-<unset>}" >&2
+        echo "build.sh:   FAPICO2_MANUFACTURER=${FAPICO2_MANUFACTURER:-<unset>} FAPICO2_PRODUCT=${FAPICO2_PRODUCT:-<unset>}" >&2
+        echo "build.sh:   FAPICO2_VID_PID=${FAPICO2_VID_PID:-<unset>}" >&2
+    fi
+else
+    echo "build.sh: identity: the published defaults in platform/src/identity.rs (fapico2's own AAGUID, board-file USB strings)"
+fi
+
 # US-919 foreign-image wipe: OFF by default for a device build, and named
 # here so the artefact's provenance is in the build line rather than implied
 # by an omission. Set FAPICO2_FOREIGN_IMAGE_WIPE=1 in the environment to get

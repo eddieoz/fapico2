@@ -379,16 +379,21 @@ fn config_read_is_ungated() {
 /// That is correct about the *authorisation layer and nothing else*. The
 /// client's reason for sending them bare is that the firmware is supposed to
 /// gate them on a physical touch instead
-/// (`picoforge/src/hal/fido/ops.rs:1573-1575`), and **no such gate exists** —
-/// every row is a `0x30` stub that consults nothing, so nothing is unguarded
-/// in the deployed sense, and the token present/absent question is the only
-/// one being answered here.
+/// (`picoforge/src/hal/fido/ops.rs:1573-1575`).
 ///
-/// What must not happen is an implementer reading this green test as the whole
-/// story. The obligation is therefore named and asserted below, and
-/// [`todo_us1xx_presence_gate_covers_every_tokenless_row`] is `#[ignore]`d
-/// with the twelve sub-commands listed, so the debt is discoverable by name
-/// and by a test that fails the moment anyone runs it.
+/// **That other half now exists** (US-170 … US-175; US-1516 recorded it): eight
+/// of the twelve rows take a presence grant on the tokenless path, each proved
+/// behaviourally by its own module's tests. The four that do not — `Mse`,
+/// `State`, `Unlock`, `AttState` — each answer with something the touch was
+/// standing in for; that is recorded per sub-command in `vendor41::decision`
+/// and pinned by name in
+/// `vendor41::the_token_optional_rows_without_a_touch_are_the_four_named_ones`.
+///
+/// This paragraph used to say "no such gate exists — every row is a `0x30`
+/// stub", and kept saying it long after the stubs drained. That is the failure
+/// US-1516 was raised about: a green test is not a specification, and prose
+/// about the state of the world decays silently while the test beside it goes
+/// on passing.
 #[test]
 fn token_optional_rows_admit_a_tokenless_request() {
     use fapico2_fido::vendor41::requires_presence_when_tokenless;
@@ -449,57 +454,76 @@ fn token_optional_rows_admit_a_tokenless_request() {
     }
 }
 
-/// The unimplemented half of [`token_optional_rows_admit_a_tokenless_request`],
-/// as a test that fails the moment anyone runs it.
+/// The other half of [`token_optional_rows_admit_a_tokenless_request`]: what
+/// each of the twelve token-optional rows actually does when the token is
+/// absent.
 ///
-/// Named `todo_us1xx_…` rather than `TODO_us1xx_…`: the all-caps form trips
-/// `non_snake_case`, and this series fixes a newly-introduced lint rather than
-/// silencing it. The shout is carried by the `#[ignore]` reason string
-/// instead, and the name is still greppable.
+/// **This test used to be `todo_us1xx_presence_gate_covers_every_tokenless_row`,
+/// `#[ignore]`d, ending in an unconditional `panic!`.** It claimed that "no
+/// presence gate exists on the 0x41 channel" — which was true when it was
+/// written and stayed in the file long after it stopped being true. Eight of
+/// the twelve rows take a presence grant today, and the other four are not
+/// debt: each answers with something the touch was standing in for, recorded
+/// in `vendor41::decision`.
 ///
-/// `#[ignore]`d on purpose: this is a **statement of debt**, not a passing
-/// check, and enabling it today would fail for the honest reason that no
-/// presence gate exists on the `0x41` channel. It is written out anyway
-/// because the alternative — the obligation living only in a module doc — is
-/// what let a green test read as a complete specification for an unguarded
-/// master-seed read.
+/// Deleting it is not what closes that: an obligation that lives only in prose
+/// is what let the stale sentence survive in the first place. So the check is
+/// back, as a test that passes and says what it says — one row per
+/// sub-command, the mechanism each actually uses, and a pointer to the
+/// behavioural test that proves it. A sixth row without a touch, or a
+/// mechanism that stops existing, fails here rather than in a review nobody
+/// performs.
 ///
-/// Renaming it to the real US number is the first thing the Phase I story that
-/// implements the gate should do, and running it is the last.
+/// The per-row *behaviour* is proved elsewhere, not restated here:
+/// `tests/vendor_backup.rs::export_falls_back_to_a_touch_when_there_is_no_pin`,
+/// `tests/vendor_audit.rs::all_three_audit_subcommands_use_the_same_union_gate`,
+/// and the `presence(false)` legs of `tests/vendor_att.rs`.
 #[test]
-#[ignore = "Phase I debt: no presence gate exists on the 0x41 channel yet"]
-fn todo_us1xx_presence_gate_covers_every_tokenless_row() {
-    use fapico2_fido::vendor41::requires_presence_when_tokenless;
-    // The twelve sub-commands the client sends bare or PIN-or-touch, and
-    // which therefore owe a presence check on the tokenless path.
-    for sub in [
-        Subcommand::Mse,
-        Subcommand::Export,
-        Subcommand::Load,
-        Subcommand::Finalize,
-        Subcommand::State,
-        Subcommand::Unlock,
-        Subcommand::AuditRead,
-        Subcommand::AuditCheckpoint,
-        Subcommand::AuditConfig,
-        Subcommand::AttImport,
-        Subcommand::AttClear,
-        Subcommand::AttState,
-    ] {
-        assert!(
-            requires_presence_when_tokenless(sub),
-            "{:?} must be declared as owing a presence check",
+fn every_token_optional_row_is_either_touch_gated_or_named_as_an_exception() {
+    use fapico2_fido::vendor41::{decision, Tokenless};
+
+    // The twelve, each with the mechanism the device uses on the tokenless
+    // path. A row appearing here for the first time is the moment to say
+    // *why* a tokenless request is safe, in this table, where the next reader
+    // is already looking.
+    let rows: [(Subcommand, Tokenless); 12] = [
+        // vendor_backup's backup_auth falls through to the presence window.
+        (Subcommand::Mse, Tokenless::Ungated),
+        (Subcommand::Export, Tokenless::Touch),
+        (Subcommand::Load, Tokenless::Touch),
+        (Subcommand::Finalize, Tokenless::Touch),
+        (Subcommand::State, Tokenless::StatusOnly),
+        (Subcommand::Unlock, Tokenless::Possession),
+        (Subcommand::AuditRead, Tokenless::Touch),
+        (Subcommand::AuditCheckpoint, Tokenless::Touch),
+        (Subcommand::AuditConfig, Tokenless::Touch),
+        (Subcommand::AttImport, Tokenless::Touch),
+        (Subcommand::AttClear, Tokenless::Touch),
+        (Subcommand::AttState, Tokenless::StatusOnly),
+    ];
+
+    for (sub, tokenless) in rows {
+        let d = decision(sub);
+        assert_eq!(
+            d.tokenless, tokenless,
+            "{:?}: this file says the tokenless path is {tokenless:?}, \
+             vendor41::decision says {:?}. One of the two is out of date — \
+             find out which before changing either.",
             sub.byte(),
+            d.tokenless
         );
-        // THE MISSING HALF. There is nothing to assert per-row yet, because
-        // the gate does not exist. When it does, this is where the assertion
-        // goes: drive the sub-command with no token and no MAC through
-        // `process_ctap2` and require a status that is *not* a bare success —
-        // `Ctap2Response::UpRequired` (0x2E) or `UserActionTimeout` (0x3A)
-        // with no button pressed.
     }
-    panic!(
-        "TODO(US-1xx): none of the twelve token-optional rows has a presence \
-         gate. Implement one, or correct this table if the client has changed."
+
+    // And the count, so a fourteenth token-optional row cannot appear without
+    // this array growing: the array is the enumeration, and a sub-command
+    // missing from it would otherwise be silently unaccounted for.
+    let declared = rows.len();
+    let token_optional = Subcommand::ALL
+        .iter()
+        .filter(|s| required_permission(**s) == Requirement::TokenOptional(ACFG))
+        .count();
+    assert_eq!(
+        declared, token_optional,
+        "this list must cover every TokenOptional row ({token_optional} of them)"
     );
 }

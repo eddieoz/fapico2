@@ -636,17 +636,34 @@ impl<K: Keystore> FidoApp<K> {
             // vault below: that one is reached through the CTAPHID frame CMD
             // byte in `firmware/src/tasks.rs`, a different frame and a
             // different field, so the two cannot alias (its sub-command `1` is
-            // STATUS here, whereas `1` is MSE in RS-Key). Every sub-command is
-            // a NOT_ALLOWED stub until Phase I implements it; `vendor41` owns
-            // both the sub-command set and the shrink-to-empty discipline.
+            // STATUS here, whereas `1` is MSE in RS-Key). `vendor41` owns
+            // the sub-command set and the shrink-to-empty discipline.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
-            // rejected MAC against its three-strike counter. Neither is
-            // consulted while every sub-command is still a stub — this arm
-            // still answers `0x30` to every request, and
-            // `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-            // pins that with a real `0x20` token in hand.
+            // rejected MAC against its three-strike counter.
+            //
+            // US-1516 replaces two sentences this comment used to carry. It
+            // said "every sub-command is a NOT_ALLOWED stub until Phase I
+            // implements it" and that the token "is not consulted while every
+            // sub-command is still a stub — this arm still answers `0x30` to
+            // every request". Both were true when written and outlived the
+            // stubs: `PENDING` drained across US-170 … US-175 and **all
+            // fourteen sub-commands now have real arms**. Per arm, gate and
+            // tokenless authority are written down in `vendor41::decision`.
+            //
+            // The gate is **per arm**, not per dispatch: `CONFIG_READ` is
+            // ungated by protocol, `CONFIG_WRITE` consults the token for its
+            // identity tier only, and the twelve token-optional rows call
+            // `authorize` from inside their own gate helpers so a bare request
+            // is answered with a touch rather than refused for want of a
+            // token.
+            //
+            // This twin and `device_app` must keep saying the same thing: the
+            // board runs `device_app`, so a comment or an arm that is honest
+            // here and stale there is a green suite over a broken device.
+            // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
+            // is the check that the device twin agrees.
             crate::vendor41::CMD => {
                 // US-114: the `0x41` response is `status || CBOR`, so this
                 // arm has somewhere to put a body.
@@ -925,10 +942,31 @@ impl<K: Keystore> FidoApp<K> {
         }
     }
 
-    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). The reference C
-    /// firmware auto-accepts selection in emulation, so the command returns
-    /// CTAP2_OK immediately here; a hardware build gates this on the board
-    /// button (30 s timeout → ACTION_TIMEOUT) behind US-324.
+    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). Returns CTAP2_OK
+    /// immediately, with no touch.
+    ///
+    /// US-1514 corrected the comment that used to sit here, which was wrong
+    /// in both halves. It said "the reference C firmware auto-accepts
+    /// selection **in emulation**" — the reference's gate is disarmed in its
+    /// *default build*, not only under emulation: `cbor_selection.c` does call
+    /// `wait_button_pressed()`, but the `force_button_wait = true` that
+    /// disarms `button_wait_start()`'s auto-complete branch
+    /// (`pico-keys-sdk/src/button.c:113`) sits inside
+    /// `#ifdef FORCE_BUTTON_WAIT`, a CMake option that is off unless
+    /// requested. And it said a hardware build would time out to
+    /// `ACTION_TIMEOUT` (0x3A) — the reference returns
+    /// `CTAP2_ERR_USER_ACTION_TIMEOUT` = **0x2F** on timeout and
+    /// `CTAP2_ERR_OPERATION_DENIED` = 0x27 on cancel. 0x3A is not what a
+    /// gated selection answers anywhere, and `Ctap2Response::ActionTimeout`
+    /// is accordingly still produced nowhere in this tree.
+    ///
+    /// The gate is still worth having and is still not implemented; see
+    /// `device_core::handle_authenticator_selection` for why it cannot be
+    /// added to this twin alone, and note that adding it would need the
+    /// transport (`firmware/src/tasks.rs`) to put `0x0B` in
+    /// `presence_windowed` — otherwise the `UpRequired` this returns would
+    /// never open a window and would go out as a bare error to a client
+    /// that turns every non-zero status into a `CtapError`.
     fn authenticator_selection(&mut self) -> Vec<u8> {
         vec![Ctap2Response::Ok.code()]
     }
@@ -1136,6 +1174,13 @@ impl<K: Keystore> FidoApp<K> {
         let pin_state = self.keystore.get_pin_state();
         let pin_set = pin_state.pin_hash.is_some();
         info.set_option("clientPin", pin_set);
+        // US-1512: the capability half of the PIN/UV pair, set from the same
+        // shared helper the device twin uses so the two cannot drift — the
+        // rule is at `ctap2::pin_uv_auth_token_available`.
+        info.set_option(
+            "pinUvAuthToken",
+            crate::ctap2::pin_uv_auth_token_available(pin_state.blocked, pin_state.needs_power_cycle),
+        );
         // authnrCfg is advertised by the reference firmware.
         info.set_option("authnrCfg", true);
         // Enterprise attestation is implemented (FX-408): Config 0x01 enables
@@ -1294,7 +1339,16 @@ impl<K: Keystore> FidoApp<K> {
         }
 
         // 4) User presence. In emulation we always succeed; set UP flag.
-        // options.up handling: if up==false → INVALID_OPTION (per spec 5.6).
+        // US-1526: MC `up:false` → INVALID_OPTION. The decision, the
+        // argument and what would have to change to relax it are written out
+        // in full on the device twin's copy of this check
+        // (`device_core.rs`, `make_credential_inner`, "THE `up` POLICY,
+        // decided" — reference C parity at
+        // `pico-fido/src/fido/cbor_make_credential.c:387`). This is the
+        // second copy of one policy in two files; the full text lives on the
+        // twin that actually ships, and this line says where. The pair must
+        // not be relaxed independently — that is the defect US-1514 was
+        // filed for.
         if req.options.present
             && req.options.up == Some(false) {
                 return vec![Ctap2Response::InvalidOption.code()];
@@ -1615,6 +1669,14 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // hmac-secret with silent authentication is not allowed (C parity).
+        // US-1526: the device twin has this same check
+        // (`device_core.rs`, `handle_get_assertion`, under "US-1526:
+        // getAssertion `up:false` is SERVED"), and the reasoning — the
+        // reference's one rejected combination, at
+        // `pico-fido/src/fido/cbor_get_assertion.c:324` — is written out
+        // there. The brief for this story suggested only the host twin had
+        // it; it does not, and `tests/up_policy.rs` pins the agreement so the
+        // question does not reopen.
         if req.options.up == Some(false) && req.extensions.hmac_secret_input.is_some() {
             return vec![Ctap2Response::InvalidOption.code()];
         }

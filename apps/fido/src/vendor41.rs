@@ -1,5 +1,6 @@
 //! US-106 (EPIC `PICOForge-COMPAT`) — the RS-Key `0x41` vendor channel
-//! (PicoForge vendor framing **(C)**) and its clean `NOT_ALLOWED` stub set.
+//! (PicoForge vendor framing **(C)**), and the written decision for every one
+//! of its fourteen sub-commands: [`decision`].
 //!
 //! # The protocol
 //!
@@ -19,25 +20,42 @@
 //! Attestation screens, all five of which became reachable when US-101..US-104
 //! made the token advertise the RS-Key profile.
 //!
-//! # Why twelve of the fourteen sub-commands are still stubs
+//! # Why `NOT_ALLOWED` was the right answer while this channel was stubs
 //!
 //! `CONFIG_READ` (`0x0D`) became real in US-114 and `CONFIG_WRITE` (`0x0C`) in
-//! US-115; the other twelve are not. Before this module a `0x41`
-//! opcode fell into each `FidoApp`'s dispatch catch-all and answered
-//! `CTAP2_ERR_INVALID_COMMAND` (`0x01`) — "I do not recognise this command" —
-//! which is false. These sub-commands *are* part of the profile we advertise;
-//! this firmware just does not permit them yet. That is
-//! `CTAP2_ERR_NOT_ALLOWED` (`0x30`), and it is what the sibling vendor-vault
-//! path already answers for its own recognised-but-unimplemented
+//! US-115. Before this module a `0x41` opcode fell into each `FidoApp`'s
+//! dispatch catch-all and answered `CTAP2_ERR_INVALID_COMMAND` (`0x01`) — "I do
+//! not recognise this command" — which is false. These sub-commands *are* part
+//! of the profile we advertise; this firmware just did not permit them yet.
+//! That is `CTAP2_ERR_NOT_ALLOWED` (`0x30`), and it is what the sibling
+//! vendor-vault path already answered for its own recognised-but-unimplemented
 //! sub-commands (see `crate::device_core` and
 //! `app::FidoApp::process_vendor_vault`). A desktop app renders `0x30` as "not
-//! supported"; it renders `0x01` as "broken token".
+//! supported"; it renders `0x01` as "broken token". This was the mitigation for
+//! EPIC risk R-1.
 //!
-//! This is the mitigation for EPIC risk R-1, and it is a **temporary** state.
-//! (As of US-115, twelve stubs — the two that left are `CONFIG_READ` and
-//! `CONFIG_WRITE`.)
-//! [`config_read`] and [`config_write`] are the two arms that have left it, and
-//! they left the way the module requires: a real arm in [`handle_subcommand`]
+//! ## The stub set has since drained — all fourteen are implemented (US-1516)
+//!
+//! US-170 … US-175 wrote the remaining twelve. **[`PENDING`] is now empty**
+//! and there is no `stub()` arm left in [`handle_subcommand`] to reach for.
+//!
+//! The status quo this module used to describe is worth keeping as a record
+//! because it is the shape of the mistake: a `NOT_ALLOWED` is honest only while
+//! it is paired with a statement of *which* sub-command is unimplemented and
+//! what it would take. When the pair was dropped — the sentences below, in
+//! [`handle`], in [`Outcome`], in [`requires_presence_when_tokenless`] — what
+//! remained was documentation asserting "twelve stubs" about a channel with
+//! twelve implementations, which is the same failure mode as the one this
+//! module exists to prevent, one layer up.
+//!
+//! So the decision is now **per sub-command and written down**, in
+//! [`decision`]: which story implemented it, which arm serves it, what gate
+//! it declares, and — for the token-optional rows — what authorises a request
+//! that arrives with no token at all. [`SubcommandDecision::tokenless`] is the
+//! column that matters most, because "the client sends this bare" is exactly
+//! the fact that makes a missing gate invisible.
+//!
+//! They left the way the module requires: a real arm in [`handle_subcommand`]
 //! and no entry in [`PENDING`].
 //!
 //! # Shrink-to-empty — the discipline, and what actually enforces it
@@ -111,16 +129,13 @@
 //!
 //! # Phase I's state seam — [`VendorOps`]
 //!
-//! US-106..US-117 built the protocol: which sub-commands exist, which gate
-//! each owes its caller, and two of the fourteen arms. US-176 added the thing
-//! the remaining twelve need and cannot have without — durable state — as
-//! [`VendorOps`], a trait [`handle`] takes and the two command paths
-//! implement over their own keystores. Nothing consults it yet, and
-//! [`PENDING`] still names all twelve: the Phase I stories (US-170 … US-175)
-//! write the arms and delete their `PENDING` entry, and
-//! `tests/vendor41.rs::vendor41_stub_never_touches_the_state` is what says
-//! none of them has done so early. The reasoning for a trait rather than a
-//! `&mut` state bundle, and for why the payloads could not ride on [`Outcome`]
+//! US-106..US-117 built the protocol: which sub-commands exist and which gate
+//! each owes its caller. US-176 added the thing those arms needed and could not
+//! have without — durable state — as [`VendorOps`], a trait [`handle`] takes
+//! and the two command paths implement over their own keystores. **Every arm
+//! consults it now**: US-170 … US-175 wrote the twelve remaining sub-commands
+//! against it, and [`PENDING`] is empty. The reasoning for a trait rather than
+//! a `&mut` state bundle, and for why the payloads could not ride on [`Outcome`]
 //! instead, is on [`VendorOps`] itself.
 //!
 //! # Not the vendor vault
@@ -220,17 +235,22 @@
 //!
 //! ## Which arms consult the MAC, and which do not
 //!
-//! [`verify_mac`] is public so a sub-command arm can call it, and as of US-115
-//! exactly one does: [`config_write`], and only for the *identity* tier of its
-//! field classifier. That is a narrower statement than "the gate is on", and
-//! the difference is the story:
+//! [`verify_mac`] is public so a sub-command arm can call it. Since
+//! US-170 … US-175 most of them do — but **only when a token is actually
+//! attached**, which is the whole design of this channel: the client sends
+//! these sub-commands bare (`picoforge/src/hal/fido/mod.rs:1709`, `:1741`,
+//! `:1757`, `:1826`, `:1895`) and expects the firmware to gate them another
+//! way. So "does this arm verify the MAC?" is a different question from "is
+//! this arm gated?", and the second is what [`SubcommandDecision::tokenless`]
+//! records per sub-command.
 //!
-//! * The **twelve stubs** must stay ungated, or they would answer `0x36`/`0x40`
-//!   instead of the `0x30` the client needs to see. `CONFIG_WRITE` was one of
-//!   them until US-115; the two "not yet wired" tests
-//!   (`vendor41_mac_is_not_yet_wired_into_the_stubs` and
-//!   `vendor41_permission_gate_is_not_yet_wired_into_the_stubs`) now iterate
-//!   the twelve and say so in their names.
+//! The arms that call [`verify_mac`]: `config_write` (identity tier only),
+//! `vendor_backup`'s `export`/`load` through `backup_auth`, `vendor_lock`'s
+//! `unlock`, `vendor_audit`'s three arms through `token_or_touch_gate`, and
+//! `vendor_att`'s `att_import`/`att_clear`.
+//!
+//! The arms that do not, each for a stated reason:
+//!
 //! * **`CONFIG_READ`** is sent with no token and no MAC at all
 //!   (`picoforge/src/hal/fido/ops.rs:1461-1479`), so a token demand reached
 //!   from dispatch would reject a request the protocol deliberately sends
@@ -241,40 +261,43 @@
 //! * **`CONFIG_WRITE`'s benign tier** is gated on a *presence grant*, not a
 //!   token — see [`FieldTier`] — so a benign blob is not authenticated and a
 //!   `pinUvAuthParam` riding along on one is not verified and therefore not
-//!   charged. Two assertions make that a check rather than a comment:
-//!   the last leg of
-//!   `tests/vendor41.rs::vendor41_mac_is_not_yet_wired_into_the_stubs` (a
-//!   *bogus* MAC on a benign blob, asserted to answer `0x3B` and to leave
-//!   `pin_auth_failure` clear), and the `!refused.pin_auth_failure` leg of
-//!   `tests/vendor41.rs::config_write_rejected_without_presence`.
+//!   charged.
 //!
-//! So the arrangement is still a test and not a promise; there are now three
-//! of them instead of two, and each names the arm it is about.
+//!   US-1516 removed the first of the two assertions this used to claim. It
+//!   cited "the last leg of
+//!   `tests/vendor41.rs::vendor41_mac_is_not_yet_wired_into_the_stubs` (a
+//!   *bogus* MAC on a benign blob, asserted to answer `0x3B` …)". That test
+//!   iterates [`PENDING`], which is empty, so that leg stopped running when
+//!   the last stub drained and the sentence outlived it — a check described as
+//!   a check that had quietly become a comment. The surviving assertion is
+//!   the `!refused.pin_auth_failure` leg of
+//!   `tests/vendor41.rs::config_write_rejected_without_presence`, which names
+//!   `CONFIG_WRITE` directly and does not go through [`PENDING`].
+//! * **`MSE`, `FINALIZE`, `STATE` and `ATT_STATE`** carry no token at all — see
+//!   [`SubcommandDecision::tokenless`] for what authorises each instead. Three
+//!   of the four are the client's own choice; `FINALIZE` is the exception, and
+//!   the reason is on its dispatch arm in [`handle_subcommand`].
 //!
 //! # US-112: the per-sub-command permission gate
 //!
 //! [`required_permission`] says what each sub-command demands of the caller,
 //! and [`authorize`] turns a sub-command plus the caller's token permissions
 //! into a decision, refusing with [`Ctap2Response::UnauthorizedPermission`]
-//! (`0x40`). As of US-115 exactly one dispatch path consults them: `CONFIG_WRITE`,
-//! and only once its field classifier has decided the blob is
-//! [`FieldTier::Identity`]. The rest do not, for two different reasons that
-//! are worth keeping apart:
+//! (`0x40`).
 //!
-//! * For the **twelve stubs** it is because they owe the client `0x30`, and a
-//!   gate reached from dispatch would answer `0x40` instead.
-//! * For **`CONFIG_READ`** it is a property of the protocol rather than a
-//!   placeholder: the row is [`Requirement::Ungated`], so consulting the table
-//!   for it could only ever admit the request.
+//! Dispatch itself does not consult them: every token-optional arm that cares
+//! calls [`authorize`] from inside its own gate, so a *bare* request never
+//! reaches it and is not refused for want of a token. `CONFIG_WRITE` is the one
+//! row that can be refused at the authorisation layer, and only after its field
+//! classifier has decided the blob is [`FieldTier::Identity`].
+//! `CONFIG_READ`'s row is [`Requirement::Ungated`], so consulting the table for
+//! it could only ever admit the request.
 //!
-//! `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-//! enforces the first in the *permissive* direction too — a real `0x20` token
-//! is presented and the twelve still answer `0x30`, so the test cannot be
-//! passed by a gate that is switched on for the right tokens and off for the
-//! rest. It no longer makes the `CONFIG_WRITE` leg, because `CONFIG_WRITE` is
-//! no longer a stub; `config_write_identity_field_requires_pin_token` replaces
-//! it, and the *permissive* direction it lost is now covered by
-//! `config_write_identity_field_is_written_by_a_0x20_token`.
+//! `tests/vendor41.rs::vendor41_permission_table_matches_the_picoforge_call_sites`
+//! pins the table against the client's own call sites, row by row, and
+//! `tests/pin_perms.rs::token_optional_rows_admit_a_tokenless_request` pins the
+//! consequence: twelve rows admit a tokenless request, and a token that *is*
+//! presented must still carry the `0x20` bit.
 //!
 //! ## Three requirements, not two
 //!
@@ -492,12 +515,18 @@
 //!
 //! ## How a `TokenOptional` row is actually enforced
 //!
-//! When Phase I implements one, `authorize` admitting a tokenless request is
+//! When Phase I implemented one, `authorize` admitting a tokenless request was
 //! only half the story: the other half is whatever the device does instead —
-//! a presence check, per the client's own comment at `ops.rs:1573-1575`. That
-//! is a Phase I decision and it is **not** implemented here. Today every row,
-//! optional or not, is a `0x30` stub reached without consulting this table at
-//! all, so nothing here grants anything.
+//! a presence check, per the client's own comment at `ops.rs:1573-1575`.
+//!
+//! **That half is built.** Eight of the twelve rows take the touch branch
+//! (`vendor_backup::backup_auth`, `vendor_audit::token_or_touch_gate` and
+//! `vendor_att`'s shared gate all implement it). The four that do not —
+//! `MSE`, `STATE`, `UNLOCK`, `ATT_STATE` — each answer a different question,
+//! and [`SubcommandDecision::tokenless`] records what authorises them
+//! instead. What is *not* built is the single predicate that would make the
+//! two sets mechanical: [`requires_presence_when_tokenless`] reports the
+//! obligation and nothing calls it.
 
 use crate::cbor::no_heap::{self, Item, Parser};
 use crate::ctap2::Ctap2Response;
@@ -558,8 +587,8 @@ pub enum Subcommand {
     /// Sent by PicoForge with **no MAC and no token**
     /// (`picoforge/src/hal/fido/ops.rs:1461-1479`), which makes it the most
     /// likely sub-command to be probed and therefore the most important one not
-    /// to have left on `0x01`. It is stubbed with the rest, and the stub
-    /// demands no token — a token-gated stub would reject a request the
+    /// to have left on `0x01`. Implemented by [`config_read`], and it demands
+    /// no token — a token-gated implementation would reject a request the
     /// protocol sends ungated.
     ConfigRead,
     /// `RSKEY_VENDOR_AUDIT_CONFIG` (14) — turn the audit journal on/off.
@@ -638,22 +667,267 @@ impl Subcommand {
 /// The **stub set**: the sub-commands that currently answer
 /// [`Ctap2Response::NotAllowed`] because Phase I has not implemented them.
 ///
-/// This is a strict subset of [`Subcommand::ALL`], and it is the list that
-/// shrinks to empty. It is deliberately a *separate* list from the protocol
-/// enumeration: the protocol table must stay complete forever, because
-/// [`Subcommand::from_byte`] needs every real sub-command to tell "pending"
-/// apart from "malformed". Keeping them apart is what makes retiring a stub a
-/// one-line move here rather than an edit to a permanent table — and it is
-/// what makes "is this still a stub?" a question a test can answer, which the
-/// `match` in [`handle_subcommand`] on its own cannot.
+/// **It is empty** (US-1516): US-114, US-115 and then US-170 … US-175
+/// implemented all fourteen between them. The list is kept because it is what
+/// makes "is this still a stub?" answerable, and because an empty list that
+/// fails loudly the moment something is added back is a better guard than a
+/// deleted one.
 ///
-/// Since US-114 it is the protocol minus `CONFIG_READ`, and since US-115 minus
-/// that one too. To retire another, write the real arm in
-/// [`handle_subcommand`] and delete the entry here.
+/// It is deliberately a *separate* list from the protocol enumeration: the
+/// protocol table must stay complete forever, because [`Subcommand::from_byte`]
+/// needs every real sub-command to tell "pending" apart from "malformed".
+/// Keeping them apart is what made retiring a stub a one-line move here rather
+/// than an edit to a permanent table — and it is what makes "is this still a
+/// stub?" a question a test can answer, which the `match` in
+/// [`handle_subcommand`] on its own cannot.
+///
+/// To retire another: write the real arm in [`handle_subcommand`], delete the
+/// entry here, and add the row to [`decision`] (whose exhaustive `match` is
+/// what forces the third edit).
 /// `tests/vendor41.rs::vendor41_pending_set_is_exactly_the_stub_set` checks
-/// the two against each other in both directions, so neither half of that
-/// edit can be forgotten.
+/// the two against each other in both directions.
 pub const PENDING: &[Subcommand] = &[];
+
+// ---------------------------------------------------------------------------
+// US-1516: the decision, per sub-command
+// ---------------------------------------------------------------------------
+
+/// What authorises a request that arrives with **no** pinUvAuth token.
+///
+/// This is the column that matters. [`required_permission`] says what a
+/// *token* must carry; the client sends twelve of the fourteen sub-commands
+/// **bare** (`picoforge/src/hal/fido/mod.rs:1709`, `:1741`, `:1757`, `:1826`,
+/// `:1895`) because it expects the firmware to gate them some other way
+/// (`ops.rs:1573-1575`). "Some other way" is a decision, and an unstated one
+/// is how a token-optional row becomes an unguarded read of the master seed
+/// with a green suite behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tokenless {
+    /// A physical touch ([`PresenceGate`]). The standard token-optional path:
+    /// the token is an alternative authority, not a prerequisite.
+    Touch,
+    /// The response is a read of **booleans and a hash** — no key material, no
+    /// capability to change anything — and the client documents the call as
+    /// ungated (`mod.rs:1738`, `:1892`). A touch would gate nothing.
+    StatusOnly,
+    /// The request carries its own authority: a blob sealed to the device's
+    /// MSE channel whose plaintext must equal stored key material.
+    Possession,
+    /// Nothing gates it and nothing gates it *should*. The sub-command's whole
+    /// effect is to set up a session or read a status, and the protocol sends
+    /// it with no credentials at all.
+    Ungated,
+}
+
+/// One sub-command's written decision: who implements it, what it does, and
+/// what authorises it.
+///
+/// `requirement` is deliberately *not* a field — it is [`required_permission`],
+/// and `tests/vendor41.rs::decision_agrees_with_the_permission_table` asserts
+/// the two never drift. Copying it here would give the enforced table a second,
+/// unchecked copy, which is the same failure shape as the two-AAGUID drift
+/// US-1517 fixed: two sources that agree until one of them moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubcommandDecision {
+    /// The sub-command this row is about. Asserted equal to the argument
+    /// `decision` was called with, so a row cannot be filed under the wrong
+    /// name.
+    pub sub: Subcommand,
+    /// The story that implemented the arm.
+    pub story: &'static str,
+    /// The function that serves it, so a reader can go straight to the code
+    /// rather than searching `handle_subcommand` for it.
+    pub arm: &'static str,
+    /// What authorises a tokenless request — see [`Tokenless`].
+    pub tokenless: Tokenless,
+    /// Why that, in one or two sentences. Every row has one; a row with an
+    /// empty reason would be the thing this table exists to prevent.
+    pub reason: &'static str,
+}
+
+/// The written decision for every sub-command — US-1516's deliverable.
+///
+/// # Why a table and not a doc comment
+///
+/// A doc comment cannot be wrong *loudly*. This module spent its stub era with
+/// a dozen sentences in its header saying "twelve sub-commands are stubs",
+/// sentences that outlived the stubs by years and were still being quoted by
+/// the next person to read the file. The way to make a written decision
+/// survive is to make it a value a test can walk: [`decision`] is an
+/// exhaustive `match`, so a fifteenth sub-command does not compile until it
+/// has a row, and the tests on it check the row against the enforced
+/// permission table and against the set of sub-commands that really do take a
+/// touch.
+///
+/// # Why `tokenless` is the interesting column
+///
+/// [`PENDING`] answered "is this implemented?" and, once it drained, that
+/// question had no answer left in the source. It had never answered the harder
+/// one: the twelve token-optional rows admit a request with no token, so what
+/// stops them is not the permission table at all. Eight are stopped by a
+/// touch. The other four are stopped by something else entirely, and those
+/// four are now named rather than inferred.
+pub const fn decision(sub: Subcommand) -> SubcommandDecision {
+    match sub {
+        Subcommand::Mse => SubcommandDecision {
+            sub: Subcommand::Mse,
+            story: "US-171",
+            arm: "vendor_backup::mse",
+            tokenless: Tokenless::Ungated,
+            reason: "The client sends it bare (mod.rs:1709) and it only parks an \
+                     ephemeral ECDH channel, handing back a point it generated. It does \
+                     overwrite the stored channel (vendor_state.rs:708), so what that is \
+                     worth is bounded by the consumers: EXPORT/LOAD/FINALIZE demand a \
+                     token or a touch, and UNLOCK's blob must both decrypt under this \
+                     channel and equal the stored soft-lock key (vendor_lock.rs, \
+                     steps 4-6). Replacing the channel therefore cannot produce a blob \
+                     UNLOCK accepts.",
+        },
+        Subcommand::Export => SubcommandDecision {
+            sub: Subcommand::Export,
+            story: "US-171",
+            arm: "vendor_backup::export",
+            tokenless: Tokenless::Touch,
+            reason: "Reads the encrypted master seed out of the device. The client \
+                     passes `pin.as_deref()` (mod.rs:1771), and vendor_backup's \
+                     backup_auth falls through to the presence window when no token \
+                     arrives (vendor_backup.rs:440). Proved by \
+                     tests/vendor_backup.rs::export_falls_back_to_a_touch_when_there_is_no_pin.",
+        },
+        Subcommand::Load => SubcommandDecision {
+            sub: Subcommand::Load,
+            story: "US-172",
+            arm: "vendor_backup::load",
+            tokenless: Tokenless::Touch,
+            reason: "Restores a seed from a backup — the destructive direction of \
+                     EXPORT, and the one that must not be reachable by whoever merely \
+                     holds the token bus. Same backup_auth path: token, else touch \
+                     (vendor_backup.rs:884).",
+        },
+        Subcommand::Finalize => SubcommandDecision {
+            sub: Subcommand::Finalize,
+            story: "US-172",
+            arm: "vendor_backup::finalize",
+            tokenless: Tokenless::Touch,
+            reason: "Seals the one-time export window. The client sends it with neither \
+                     params nor token (mod.rs:1755-1763), so the arm deliberately does \
+                     NOT run backup_auth — a token demand here would answer 0x36 to the \
+                     only FINALIZE the client ever sends, which renders as \"enter your \
+                     PIN\". Recorded divergence: required_permission calls this row \
+                     TokenOptional, and the arm never looks at a token, so the \"a \
+                     token that is presented must carry the bit\" half of that row is \
+                     not enforced here. It is safe because the check only ever refuses.",
+        },
+        Subcommand::State => SubcommandDecision {
+            sub: Subcommand::State,
+            story: "US-170",
+            arm: "vendor_lock::state",
+            tokenless: Tokenless::StatusOnly,
+            reason: "Returns four booleans — sealed, has_seed, locked, unlocked — and \
+                     nothing else (vendor_lock::state). The client documents the call as \
+                     ungated (mod.rs:1738) and passes None. No key material crosses \
+                     this arm, so a touch would gate nothing; the soft-lock *act* it \
+                     reports on is UNLOCK, which has its own row.",
+        },
+        Subcommand::Unlock => SubcommandDecision {
+            sub: Subcommand::Unlock,
+            story: "US-170",
+            arm: "vendor_lock::unlock",
+            tokenless: Tokenless::Possession,
+            reason: "Loads the soft-locked seed for this power cycle, and the client \
+                     calls it ungated over 0x41 (mod.rs:1824). A token is verified when \
+                     present; without one the request carries its own authority — a blob \
+                     that must open under the MSE channel AND whose plaintext compares \
+                     equal, in constant time, to the stored soft-lock key (steps 4-6). The \
+                     second check is what bounds it: the caller needs the device's own \
+                     key material, not merely a channel it chose.",
+        },
+        Subcommand::AuditRead => SubcommandDecision {
+            sub: Subcommand::AuditRead,
+            story: "US-173",
+            arm: "vendor_audit::audit_read",
+            tokenless: Tokenless::Touch,
+            reason: "Exports a window of the tamper-evident journal. Token when the \
+                     client has one (mod.rs:1573), else the union gate's presence \
+                     branch, which answers UpRequired rather than PinRequired so the \
+                     user is asked for a button and not for a PIN the app never obtains \
+                     (vendor_audit.rs, tests/vendor_audit.rs:1105-1113).",
+        },
+        Subcommand::AuditCheckpoint => SubcommandDecision {
+            sub: Subcommand::AuditCheckpoint,
+            story: "US-173",
+            arm: "vendor_audit::audit_checkpoint",
+            tokenless: Tokenless::Touch,
+            reason: "Signs the journal's chain head, extending the audit trail. Same \
+                     union gate as AUDIT_READ; a signature nobody asked for is still a \
+                     signature, and tests/vendor_audit.rs proves all three audit \
+                     sub-commands take it rather than one by accident.",
+        },
+        Subcommand::AuditConfig => SubcommandDecision {
+            sub: Subcommand::AuditConfig,
+            story: "US-174",
+            arm: "vendor_audit::audit_config",
+            tokenless: Tokenless::Touch,
+            reason: "Turns the journal on and off. Targets 0 and 1 (enable/disable) go \
+                     through the same union gate and answer UpRequired with no token; \
+                     target 2 is a status read and is ungated \
+                     (tests/vendor_audit.rs::audit_config_target_2_is_ungated_and_reports_the_state).",
+        },
+        Subcommand::AttImport => SubcommandDecision {
+            sub: Subcommand::AttImport,
+            story: "US-175",
+            arm: "vendor_att::att_import",
+            tokenless: Tokenless::Touch,
+            reason: "Installs an organisation attestation key and chain — the one row \
+                     that changes what this device vouches for, so a token or a touch \
+                     is the floor. Token when present (mod.rs:1987), else \
+                     vendor_att's presence gate (vendor_att.rs:672).",
+        },
+        Subcommand::AttClear => SubcommandDecision {
+            sub: Subcommand::AttClear,
+            story: "US-175",
+            arm: "vendor_att::att_clear",
+            tokenless: Tokenless::Touch,
+            reason: "Removes the organisation attestation. Same gate as ATT_IMPORT: \
+                     it is the other half of the same capability, and a gate that \
+                     covers the install but not the removal guards nothing.",
+        },
+        Subcommand::AttState => SubcommandDecision {
+            sub: Subcommand::AttState,
+            story: "US-175",
+            arm: "vendor_att::att_state",
+            tokenless: Tokenless::StatusOnly,
+            reason: "Returns {installed, chain_hash}. The hash is derived from the \
+                     installed scalar, and the scalar never crosses this arm \
+                     (vendor_att::att_state). Ungated by construction — the signature \
+                     takes neither a request body nor a token, because the client sends \
+                     it as (ATT_STATE, None, None) (mod.rs:1895) and the stock gate \
+                     checks for a pinUvAuthParam before it looks at the sub-command, \
+                     so routing it through backup_auth would answer 0x36 to the client's \
+                     only ATT_STATE.",
+        },
+        Subcommand::ConfigWrite => SubcommandDecision {
+            sub: Subcommand::ConfigWrite,
+            story: "US-115",
+            arm: "vendor41::config_write",
+            tokenless: Tokenless::Ungated,
+            reason: "The one row with no tokenless path at all: a tokenless request is \
+                     refused 0x40 by authorize before any gate runs, so there is nothing \
+                     left to authorise. A token that IS presented is verified and \
+                     charged for the identity tier; the benign tier is a touch.",
+        },
+        Subcommand::ConfigRead => SubcommandDecision {
+            sub: Subcommand::ConfigRead,
+            story: "US-114",
+            arm: "vendor41::config_read",
+            tokenless: Tokenless::Ungated,
+            reason: "Ungated by protocol: sent with no MAC and no token (ops.rs:1461-1479) \
+                     and used as the client's probe for whether this firmware supports \
+                     0x41 at all (mod.rs:1158-1166). A token demand here would reject a \
+                     request the protocol deliberately sends ungated.",
+        },
+    }
+}
 
 /// Handle an RS-Key `0x41` request body (`data` is the CBOR map that followed
 /// the `0x41` opcode byte) and return what the command path should do with it.
@@ -690,23 +964,23 @@ pub const PENDING: &[Subcommand] = &[];
 ///
 /// `ops` is the Phase I state seam — see [`VendorOps`] for why it is a trait
 /// and why it, rather than a proposal on [`Outcome`], is where a durable write
-/// goes. **No arm consults it yet**: the twelve [`PENDING`] sub-commands still
-/// answer [`Ctap2Response::NotAllowed`] and touch nothing, and
-/// `tests/vendor41.rs::vendor41_stub_never_touches_the_state` is what keeps
-/// that a check rather than a claim. It is threaded through
-/// [`handle_subcommand`] on the same argument as `phy` and `auth` — the
-/// parameters an arm has *when its story lands*, not ones it has today, so
-/// adding a seventh is not a seventh edit to this signature.
+/// goes. **Every arm consults it** as of US-170 … US-175, which is why the
+/// `let _ = ops;` that used to sit under this comment is gone: the parameter
+/// has a caller for the first time, and a future arm cannot be the one that
+/// makes it dead again. It is threaded through [`handle_subcommand`] on the
+/// same argument as `phy` and `auth`.
 ///
 /// The returned [`Outcome`] is a status, one flag, and the physical
-/// configuration the command wants committed (US-115). As of US-115 the flag is
-/// **not** always `false`: `identity_gate` sets it when [`verify_mac`]
+/// configuration the command wants committed (US-115). The flag is
+/// **not** always `false`: the identity gate sets it when [`verify_mac`]
 /// refuses a `pinUvAuthParam` for the `CONFIG_WRITE` identity tier, which is
 /// what lets an arm charge a rejected MAC against the app's own three-strike
 /// counter without this module growing a counter of its own. It stays `false`
-/// for the twelve stubs and for the two implemented arms' non-charging
-/// answers — a benign-tier write authenticates nothing, and `CONFIG_READ` is
-/// ungated by protocol. See the module docs on the lockout seam.
+/// for every non-charging answer — a benign-tier write authenticates nothing,
+/// `CONFIG_READ` is ungated by protocol, and the `vendor_lock` / `vendor_audit`
+/// gates make "charge or not" a type (`ChargePinAuth::{Charge, NoCharge}`)
+/// rather than a convention a caller can forget. See the module docs on the
+/// lockout seam.
 /// `phy` is the device's persisted physical-configuration record, read by the
 /// app out of its own keystore and handed down by value ([`crate::vendorff::PhyConfig`] is a
 /// `Copy` struct of four `Option`s). It is a parameter rather than something
@@ -826,9 +1100,10 @@ fn extract_subcommand(data: &[u8]) -> Result<Subcommand, Ctap2Response> {
 /// `data`, `auth`, `phy`, `presence`, `out` and `ops` are passed through so an
 /// arm has the request body, the caller's token, the physical configuration
 /// record, the user-presence probe, somewhere to put a response, and the
-/// durable-state seam, without another round of edits. The twelve stubs ignore
-/// all six; [`config_read`] uses `data`, `phy` and `out`; [`config_write`] uses
-/// `data`, `auth`, `phy` and `presence`.
+/// durable-state seam, without another round of edits. [`config_read`] uses
+/// `data`, `phy` and `out`; [`config_write`] uses `data`, `auth`, `phy` and
+/// `presence`; the twelve Phase I arms in `vendor_backup`, `vendor_lock`,
+/// `vendor_audit` and `vendor_att` use `ops` and most of the rest.
 ///
 /// `ops` is the one parameter with a lifetime-independent reason to be here
 /// before it has a caller: a Phase I arm's state reads and writes all go
@@ -860,14 +1135,9 @@ fn handle_subcommand(
     {
         return Outcome::pin_auth_failure(Ctap2Response::PinAuthInvalid);
     }
-    // US-176: no arm reads `ops` yet, and the twelve stubs must not start
-    // reading it without also leaving `PENDING`. Naming the parameter `ops`
-    // rather than `_ops` is deliberate — a Phase I arm's first line is then
-    // the parameter itself — and this statement is what keeps the unused
-    // warning from being the only thing recording the fact. The check that
-    // actually enforces it is
-    // `tests/vendor41.rs::vendor41_stub_never_touches_the_state`.
-    let _ = ops;
+    // Every arm now reads `ops`, so the `let _ = ops;` that stood here while
+    // the twelve were stubs is gone (US-1516). Leaving it would be a lie in the
+    // code rather than only in the comment.
     match sub {
         // --- seed backup / restore (Offboard, Backup) — US-171, US-172 ---
         // `MSE` is ungated *and* stateful: the channel it parks is the one
@@ -916,8 +1186,16 @@ fn handle_subcommand(
         // not possible. That is deliberate — the client sends
         // `rs_key_vendor(ATT_STATE, None, None)` (`mod.rs:1895`), and the stock
         // gate checks for a `pinUvAuthParam` *before* it looks at the
-        // sub-command (`vendor41.rs:2816-2819`), so an `ATT_STATE` sent the
-        // client's exact way would answer `0x36`.
+        // sub-command — `verify_mac` refuses `!have_mac` before it reaches
+        // `sub.ok_or(..)` (`vendor41.rs:3150-3153`) — so an `ATT_STATE` sent
+        // the client's exact way would answer `0x36`.
+        //
+        // The line range that used to stand here said `2816-2819`. It pointed
+        // at a `params_span` assignment inside `verify_mac`'s key walk, which
+        // is where key 2 is timed — not where a missing MAC is refused. The
+        // claim was true and the pointer was not; US-1516 fixes the pointer
+        // because it is the same class of error this module is here to
+        // prevent, and because this commit moved the lines anyway.
         Subcommand::AttState => crate::vendor_att::att_state(ops, out).into(),
         Subcommand::AttClear => {
             crate::vendor_att::att_clear(data, auth, presence, ops).into()
@@ -1497,10 +1775,10 @@ fn zero_mask_refusal(tag: PhyTag, value: &[u8]) -> Option<Ctap2Response> {
     }
     // The width is checked before the value, and it has to be: this tag's value
     // is one byte, so `value.first() == Some(&0)` alone would also fire on a
-    // three-byte record that merely *starts* with zero — and `0x2B` means "an
+    // three-byte record that merely *starts* with zero — and `0x2C` means "an
     // invalid value for a real option", which is not what a wrong-width record
     // is. Falling through instead lets `apply_phy_record` give its own answer
-    // (`0x2A`, this firmware has no field for the record), so each status keeps
+    // (`0x2B`, this firmware has no field for the record), so each status keeps
     // meaning one thing. The client only ever writes one byte
     // (`tlv.push(RSKEY_PHY_TAG_ENABLED_USB_ITF); tlv.push(0x01)`,
     // `picoforge/src/hal/fido/mod.rs:1127-1128`), so this is defence in depth
@@ -2751,10 +3029,12 @@ pub const MAC_LEN: usize = 16;
 ///   and uses it as the feature probe for whether this firmware supports `0x41`
 ///   at all.
 ///
-/// The twelve stubs must stay ungated, or they would answer `0x36`/`0x40`
-/// instead of the `0x30` the client needs to see;
-/// `tests/vendor41.rs::vendor41_mac_is_not_yet_wired_into_the_stubs` drives all
-/// twelve with a correct and a bogus MAC and pins it.
+/// A stub had to stay ungated, or it would have answered `0x36`/`0x40`
+/// instead of the `0x30` the client needed to see; there are no stubs left
+/// (US-1516), and the arms that do call it each charge the failure explicitly
+/// rather than by omission — `vendor_lock::unlock` for `UNLOCK`,
+/// `vendor_audit`'s gate for the three audit sub-commands, and the test per
+/// module that says so.
 pub fn verify_mac<'a>(
     data: &'a [u8],
     token: Option<&[u8; 32]>,
@@ -3044,33 +3324,36 @@ pub const fn required_permission(sub: Subcommand) -> Requirement {
     }
 }
 
-/// # The unimplemented half: [`requires_presence_when_tokenless`]
+/// # The other half, and what is left of it: [`requires_presence_when_tokenless`]
 ///
-/// A `TokenOptional` row is a *deferral*, not a grant, and the thing it
-/// defers to is not built. The client sends those twelve sub-commands
-/// bare precisely because the firmware is supposed to gate them on a physical
-/// touch instead (`picoforge/src/hal/fido/ops.rs:1573-1575`), and **no presence
-/// check exists on this channel today** — every one of them is a `0x30` stub
-/// that consults nothing, so nothing is unguarded in the deployed sense.
+/// A `TokenOptional` row is a *deferral*, not a grant: the client sends those
+/// twelve sub-commands bare precisely because the firmware is supposed to gate
+/// them on a physical touch instead (`picoforge/src/hal/fido/ops.rs:1573-1575`).
+/// The deferral used to point at nothing, which is why the obligation got a
+/// **name** rather than a paragraph —
+/// [`requires_presence_when_tokenless`] is greppable, it is asserted against
+/// the table, and the twelve sub-commands it returns `true` for are listed.
 ///
-/// The hazard is not today's behaviour; it is what a Phase I implementer can
-/// read out of this commit. `token_optional_rows_admit_a_tokenless_request`
-/// (in `apps/fido/tests/pin_perms.rs`) asserts, as a **passing test**, that a
-/// tokenless request clears [`authorize`] for all twelve of these rows — and
-/// two of them are `Export` ("read the encrypted master seed") and `State`
-/// (`has_seed` / `locked`). An implementer who takes that test as a green
-/// light, implements `Export`, and wires the gate has shipped an unguarded
-/// seed read with no touch requirement either, and the suite is still green.
+/// **Eight of the twelve now discharge it** (US-170 … US-175, and this doc said
+/// otherwise until US-1516): `EXPORT`, `LOAD`, `FINALIZE`, `AUDIT_READ`,
+/// `AUDIT_CHECKPOINT`, `AUDIT_CONFIG`, `ATT_IMPORT` and `ATT_CLEAR` all take a
+/// presence grant on the tokenless path, and each is proved behaviourally —
+/// `tests/vendor_backup.rs::export_falls_back_to_a_touch_when_there_is_no_pin`,
+/// `tests/vendor_audit.rs::all_three_audit_subcommands_use_the_same_union_gate`,
+/// and `tests/vendor_att.rs`'s `presence(false)` legs.
 ///
-/// So the obligation gets a **name** rather than a paragraph:
-/// [`requires_presence_when_tokenless`] is the function a Phase I arm calls to
-/// find out whether admitting a tokenless request commits it to a presence
-/// check, it is asserted against the table, and the twelve sub-commands it
-/// returns `true` for are greppable. It reports the obligation; it does not
-/// discharge it. Nothing calls it yet, and
-/// `pin_perms::todo_us1xx_presence_gate_covers_every_tokenless_row` is
-/// `#[ignore]`d with the twelve sub-commands listed, so the debt is also
-/// discoverable as a failing-if-enabled test rather than only as prose.
+/// The four that do not are `MSE`, `STATE`, `UNLOCK` and `ATT_STATE`, and each
+/// answers with something the touch was standing in for. [`decision`] records
+/// what, per sub-command; `tests/pin_perms.rs` pins the exception set by name so
+/// a fifth one is a deliberate edit rather than an omission.
+///
+/// **This predicate still has no caller**, and that is now the honest state
+/// rather than a gap: it describes an obligation that most arms discharge
+/// through their own gate helpers (`vendor_backup::backup_auth`,
+/// `vendor_audit::token_or_touch_gate`, `vendor_att`'s shared gate) instead of
+/// by asking it. Making those helpers ask it would be the mechanical version of
+/// a decision that [`decision`] already records per sub-command; what is worth
+/// keeping is the record, not the call.
 ///
 /// # Which rows it covers, and why the other two are excluded
 ///
@@ -3124,13 +3407,28 @@ pub const fn requires_presence_when_tokenless(sub: Subcommand) -> bool {
 /// have answered `0x36`; both are refusals and neither is more informative,
 /// but the arm must pick one order and not mix them.
 ///
-/// Reached from dispatch by exactly one path: `identity_gate`, after
-/// [`verify_mac`], for the `CONFIG_WRITE` identity tier. The other thirteen
-/// sub-commands do not reach it — twelve because they owe the client `0x30`,
-/// and `CONFIG_READ` because its row is [`Requirement::Ungated`] and
-/// consulting the table for it could only ever admit the request.
+/// Reached by exactly one path *from dispatch*: `identity_gate`, after
+/// [`verify_mac`], for the `CONFIG_WRITE` identity tier. `CONFIG_READ` never
+/// reaches it, because its row is [`Requirement::Ungated`] and consulting the
+/// table for it could only ever admit the request.
+///
+/// US-1516 corrects the rest of that sentence, which used to read "the other
+/// twelve … do not reach it — twelve because they owe the client `0x30`". It
+/// stopped being true when the last stub drained, and it was the wrong shape of
+/// claim to leave standing: it described the twelve as untouched when they now
+/// **are** the main callers. They reach [`authorize`] from inside their own
+/// gates — `vendor_backup::backup_auth`, `vendor_lock::unlock`,
+/// `vendor_audit::token_or_touch_gate` and `vendor_att`'s shared gate — and they
+/// reach it only on the **token-present** leg. Dispatch reaching it would be
+/// wrong for them, and that is the property worth stating: a bare request must
+/// arrive at an arm and be answered with a touch, not be turned away here for
+/// want of a token. See [`SubcommandDecision::tokenless`] for what each of the
+/// twelve does authorise it with.
+///
 /// `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-/// pins the twelve.
+/// used to be cited here as pinning this. It does not: it iterates
+/// [`PENDING`], which is empty, so it asserts nothing — see the US-1516 section
+/// of `tests/vendor41.rs`'s module docs for the six tests in that state.
 pub fn authorize(
     sub: Subcommand,
     token_permissions: Option<u8>,
@@ -3909,8 +4207,12 @@ impl Drop for EscalationTestGuard {
 /// exactly one increment and substitutes that method's status, so the third
 /// strike still answers `0x34` rather than `0x33`.
 ///
-/// The flag is `false` for every stub. That is asserted, not assumed:
-/// `tests/vendor41.rs::vendor41_stub_never_charges_pin_auth_failure`.
+/// The flag is `false` whenever nothing authenticated, which is every answer
+/// on this channel that is not a rejected MAC. That is asserted rather than
+/// assumed by each gated module: `vendor41_stub_never_charges_pin_auth_failure`
+/// for `CONFIG_WRITE`'s benign tier, and the `ChargePinAuth` assertions in
+/// `tests/vendor_audit.rs::audit_config_targets_0_and_1_are_gated` for the
+/// audit gate's three refusal legs.
 ///
 /// # `phy`, and why the commit is not here
 ///

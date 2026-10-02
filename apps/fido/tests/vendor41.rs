@@ -72,16 +72,46 @@
 //! * US-115 landed `CONFIG_WRITE`, so this file is no longer only about the
 //!   stub set. The two "not yet wired" gates keep their names (the EPIC's
 //!   grep resolves to them) but **not** their `CONFIG_WRITE` legs, because
-//!   there is no such thing any more. Both now iterate [`PENDING`]:
-//!   `vendor41_mac_is_not_yet_wired_into_the_stubs` drives all twelve with a
-//!   correct and a bogus MAC, and
-//!   `vendor41_permission_gate_is_not_yet_wired_into_the_stubs` drives all
-//!   twelve with a real `0x20` token and a MAC over it. Iterating the stub set
-//!   rather than naming a sub-command is what keeps them from becoming
-//!   change-detectors — the original `CONFIG_WRITE` version would have started
-//!   failing the day US-115 landed, for a reason unrelated to what it protects.
-//!   A comment that is quietly wrong is worse than no comment, and a test whose
-//!   *name* is quietly wrong is the same thing.
+//!   there is no such thing any more. Both now iterate [`PENDING`] rather
+//!   than naming a sub-command — which is what keeps them from becoming
+//!   change-detectors, since the original `CONFIG_WRITE` version would have
+//!   started failing the day US-115 landed, for a reason unrelated to what it
+//!   protects. A comment that is quietly wrong is worse than no comment, and a
+//!   test whose *name* is quietly wrong is the same thing.
+//!
+//! # US-1516: six of those tests are now **vacuous**, and that is the finding
+//!
+//! [`PENDING`] is empty. Six tests in this file iterate it —
+//! `vendor41_pending_set_is_exactly_the_stub_set`,
+//! `vendor41_stub_is_ungated_and_synchronous`,
+//! `vendor41_mac_is_not_yet_wired_into_the_stubs`,
+//! `vendor41_stub_never_touches_the_state`,
+//! `vendor41_permission_gate_is_not_yet_wired_into_the_stubs` and
+//! `vendor41_stub_never_charges_pin_auth_failure` — so **each of them asserts
+//! nothing at all today.** They are green because `for sub in PENDING` runs
+//! zero times, and they went on being read as proof that a stub refuses
+//! politely, gates nothing, and charges no PIN failure. Three of their doc
+//!   comments still said "drives all twelve", which stopped being true when
+//!   the last stub drained.
+//!
+//! That is the same failure US-1516 was raised about, in its sharpest form: a
+//! test that reads as a specification and specifies nothing. A *test* decaying
+//! silently is worse than prose decaying, because prose announces itself as
+//! prose and a green test does not.
+//!
+//! They are **kept, not deleted**, and that is a decision rather than
+//! sentiment: [`PENDING`] is retained precisely so that "is this still a stub?"
+//! is answerable and so an empty list is a guard rather than a void (see
+//! `vendor41::PENDING`'s own docs). A test that fires the moment an entry is
+//! added back is exactly the guard that the module wants, and deleting the
+//! bodies would throw it away. What was fixed is the prose, which claimed
+//! enforcement that had silently stopped happening.
+//!
+//! The live statements about behaviour are elsewhere and are not vacuous:
+//! the per-module tests for the arms that exist, and — for the claim "every
+//! sub-command reaches a real arm on the device" —
+//! `every_subcommand_is_dispatched_on_the_device_path`, which is what this
+//! file's `PENDING` walks can no longer say.
 //! * `vendor41_token_auth_reports_the_latch_but_nothing_reads_it_yet` was
 //!   renamed to `..._and_only_the_identity_tier_reads_it`, because
 //!   `CONFIG_WRITE` now reads `TokenAuth::blocked` — and reads it *narrowly*,
@@ -275,12 +305,16 @@ fn device_app() -> (DeviceApp, HostTrng, HostSecureStore) {
 //
 // | byte | CTAP2.1 name | meaning |
 // |---|---|---|
-// | `0x2B` | `CTAP2_ERR_INVALID_OPTION` | the request is *malformed* — a parameter had an unusable value |
+// | `0x2C` | `CTAP2_ERR_INVALID_OPTION` | the request is *malformed* — a parameter had an unusable value |
 // | `0x30` | `CTAP2_ERR_NOT_ALLOWED` | the request was *well-formed and recognised*, but this authenticator does not permit it |
 //
 // A pending sub-command is the second case, not the first: the host sent a
 // valid RS-Key sub-command with valid params, and we declined. Answering
-// `0x2B` would blame the caller's request for a limitation that is ours.
+// `0x2C` would blame the caller's request for a limitation that is ours.
+//
+// (US-1528: the INVALID_OPTION row was `0x2B` until then. The argument above
+// never depended on the number — it is about malformed vs. well-formed — so
+// the move changed which byte travels with the decision, not the decision.)
 //
 // `0x30` is also what this crate already does for the identical meaning. The
 // sibling vendor-vault path returns `Ctap2Response::NotAllowed` for its
@@ -361,6 +395,16 @@ fn vendor41_subcommand_set_matches_picoforge() {
 /// the sub-command silently starts answering `0x3E`.
 ///
 /// One assertion carries both directions, for every variant in the protocol.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_pending_set_is_exactly_the_stub_set() {
     // Every PENDING entry must be a real protocol sub-command, so the stub set
@@ -638,6 +682,16 @@ fn vendor41_extract_subcommand_rejects_malformed_shapes() {
 /// keepalive, on a device with no PIN — so this now iterates
 /// [`PENDING`], for the same reason `unimplemented_vendor_subcommand_returns_2b`
 /// does.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_stub_is_ungated_and_synchronous() {
     for sub in fapico2_fido::vendor41::PENDING {
@@ -1623,6 +1677,16 @@ fn vendor41_mac_statuses_match_the_crate_enum() {
 /// touch and there is no MAC to check. Charging one would let three reads of a
 /// config screen latch the three-strike lockout against a user who failed
 /// nothing.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_mac_is_not_yet_wired_into_the_stubs() {
     // Arm the presence answer before anything can read it, not after. The
@@ -1732,6 +1796,16 @@ fn vendor41_mac_is_not_yet_wired_into_the_stubs() {
 /// arm that reads state before removing the `PENDING` entry — a change the
 /// compiler is silent about and the other test is silent about too, because
 /// from its side the sub-command still answers `NOT_ALLOWED`.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_stub_never_touches_the_state() {
     for sub in fapico2_fido::vendor41::PENDING {
@@ -2384,6 +2458,16 @@ fn vendor41_token_optional_rows_still_require_the_bit() {
 /// `vendor41_stub_never_charges_pin_auth_failure` drives all fourteen through
 /// `handle` with a `0x20` token in hand. Between them, no sub-command and no
 /// token state is left untested at the stub boundary.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_permission_gate_is_not_yet_wired_into_the_stubs() {
     // The EPIC's acceptance bullet for US-112 was that a `CONFIG_WRITE` with
@@ -2490,6 +2574,16 @@ fn vendor41_permission_gate_is_not_yet_wired_into_the_stubs() {
 /// test fail the day the second real arm lands — turning a contract into a
 /// change-detector. `CONFIG_READ` is real as of US-114, and the second leg
 /// below is what says it still does not charge.
+/// # US-1516: this test is **vacuous today**, and that is its finding
+///
+/// [`PENDING`] is empty, so the loop below runs zero times and this asserts
+/// nothing at all. It is not broken and it is not a stub-era leftover to
+/// delete: it is the guard that fires the moment a sub-command is added back
+/// to the stub set, which is the one thing keeping [`PENDING`] honest. What was
+/// wrong was the doc comment above, which claimed active enforcement.
+/// See the US-1516 section of this file's module docs for all six such tests
+/// and for why a green test that has quietly stopped testing is the sharper
+/// version of the problem US-1516 was raised about.
 #[test]
 fn vendor41_stub_never_charges_pin_auth_failure() {
     let auth = Some(TokenAuth {
@@ -4454,12 +4548,16 @@ const TARGET_LED_LITERAL: u8 = 0x02;
 const DEV_CONF_TAG_USB_ENABLED_LITERAL: u8 = 0x03;
 
 /// CTAP2.1 `CTAP2_ERR_UNSUPPORTED_OPTION` — a well-formed request naming
-/// something this authenticator does not do.
-const UNSUPPORTED_OPTION: u8 = 0x2A;
+/// something this authenticator does not do. US-1528: was `0x2A`, a code the
+/// spec withdrew; the reference value is `0x2B`.
+const UNSUPPORTED_OPTION: u8 = 0x2B;
 /// CTAP2.1 `CTAP2_ERR_INVALID_OPTION` — a well-formed option carrying a value
 /// that is never acceptable. Used for exactly one thing: the zero
-/// enabled-USB-interface mask.
-const INVALID_OPTION: u8 = 0x2B;
+/// enabled-USB-interface mask. US-1528: was `0x2B`; the reference value is
+/// `0x2C`, and the old value is what made the two constants below swap
+/// meanings silently — a test that asserted "not UNSUPPORTED_OPTION" would
+/// have been satisfied by the INVALID_OPTION it was meant to rule out.
+const INVALID_OPTION: u8 = 0x2C;
 /// CTAP2.1 `CTAP2_ERR_UP_REQUIRED` — a touch is needed before this proceeds.
 const UP_REQUIRED: u8 = 0x3B;
 /// CTAP2.1 `CTAP2_ERR_PIN_AUTH_BLOCKED` — pinUvAuth is refused outright
@@ -4867,9 +4965,9 @@ fn config_write_mixed_blob_needs_the_token_but_not_a_touch() {
 /// configuration.
 ///
 /// The three *different* statuses in the companion assertions are what make
-/// this one specific. `0x0B` with the value `1` is `0x2A`
+/// this one specific. `0x0B` with the value `1` is `0x2B`
 /// (no field for it in the persisted record) and a VID/PID write with no token
-/// is `0x36`, so `0x2B` can only be the zero-mask rule and not one of those
+/// is `0x36`, so `0x2C` can only be the zero-mask rule and not one of those
 /// two rules leaking into the answer.
 #[test]
 fn config_write_rejects_zero_interface_mask_unconditionally() {
@@ -4904,11 +5002,14 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
     // because 0x0B is simply refused.
     //
     // US-117 changed what the non-zero value answers. It used to be
-    // `0x2A` (`UnsupportedOption`) because the mask had no field in the
+    // `UnsupportedOption` because the mask had no field in the
     // persisted record on the PHY path; `DEV_CONF` (`0x00`) now gives it one,
     // so `0x0B` is writable and reaches the identity gate — and a request with
-    // no token is `0x36` (`PuatRequired`). The status is still *not* `0x2B`,
-    // which is the property the control exists to protect.
+    // no token is `0x36` (`PuatRequired`). The status is still *not*
+    // `INVALID_OPTION` (`0x2C`), which is the property the control exists to
+    // protect. (US-1528: the byte quoted here moved from `0x2A` to `0x2B`
+    // when the status table was corrected; the alternative it is not is now
+    // named rather than numbered, so it cannot be re-pinned to a stale byte.)
     let nonzero = phy_blob(&[(TAG_ENABLED_USB_ITF, &[0x01])]);
     let unsupported = run_config_write(&nonzero, None, false, &phy);
     assert_eq!(
@@ -4916,8 +5017,8 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
         PUAT_REQUIRED,
         "0x0B with a non-zero value is a different fault — the mask is now \
          writable, so what stops it is the identity tier's gate, not the \
-         record. It must answer 0x36 (no token) and not 0x2B. If it answered \
-         0x2B the loop above would be passing for the wrong reason"
+         record. It must answer 0x36 (no token) and not 0x2C. If it answered \
+         0x2C the loop above would be passing for the wrong reason"
     );
     assert_eq!(
         unsupported.phy, None,
@@ -4945,30 +5046,33 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
         vidpid_no_token.status.code(),
         PUAT_REQUIRED,
         "and a VID/PID write with a press but no token is the *identity* rule \
-         at 0x36 — so 0x2B above can only be the zero-mask rule"
+         at 0x36 — so 0x2C above can only be the zero-mask rule"
     );
 
     // The width is checked before the value, so a multi-byte `0x0B` record that
-    // merely *starts* with zero gets the width status, not `0x2B`. The
+    // merely *starts* with zero gets the width status, not `0x2C`. The
     // client's reader would skip such a record (`picoforge/src/hal/fido/
-    // mod.rs:1001-1003`) rather than misread it, and `0x2B` — "an invalid value
-    // for a real option" — is not what a wrong-width record is.
+    // mod.rs:1001-1003`) rather than misread it, and `INVALID_OPTION` — "an
+    // invalid value for a real option" — is not what a wrong-width record is.
     //
-    // US-117 changed the status here from `0x2A` to `0x02`, and the change is
-    // the rule working rather than drifting. `0x2A` was right for the wrong
-    // reason: `0x0B` had no field in the persisted record, so *every* `0x0B`
-    // record was unsupported and the width never had to be looked at. Now that
-    // the tag is writable the width *is* checked, and a three-byte record is a
-    // wrong-width record — `InvalidParameter` (`0x02`), the same status a
-    // wrong-width VID/PID earns. The status is still not `0x2B`, which is the
-    // property this leg exists to protect.
+    // US-117 changed the status here from `UnsupportedOption` to `0x02`, and
+    // the change is the rule working rather than drifting. `UnsupportedOption`
+    // was right for the wrong reason: `0x0B` had no field in the persisted
+    // record, so *every* `0x0B` record was unsupported and the width never had
+    // to be looked at. Now that the tag is writable the width *is* checked, and
+    // a three-byte record is a wrong-width record — `InvalidParameter` (`0x02`),
+    // the same status a wrong-width VID/PID earns. The status is still not
+    // `INVALID_OPTION`, which is the property this leg exists to protect.
+    // (US-1528 renamed the alternatives rather than numbering them: the two
+    // byte values this paragraph used to quote are both the wrong values under
+    // the corrected table.)
     let wrong_width = phy_blob(&[(TAG_ENABLED_USB_ITF, &[0x00, 0x01, 0x00])]);
     let bad_width = run_config_write(&wrong_width, None, false, &phy);
     assert_eq!(
         bad_width.status.code(),
         INVALID_PARAMETER,
         "a three-byte 0x0B record whose leading byte is zero is a wrong-width \
-         record, not a zero mask: it must answer 0x02, or 0x2B would be \
+         record, not a zero mask: it must answer 0x02, or 0x2C would be \
          reachable by a shape the rule was never about"
     );
     assert_eq!(
@@ -5167,8 +5271,8 @@ fn config_write_refuses_records_with_no_destination_in_the_persisted_record() {
             } else {
                 "it has no field in PhyConfig, and a partial apply is not \
                  available — see vendor41::config_write. Note the status is \
-                 0x2A (unsupported), not 0x2B (invalid): the record is one this \
-                 firmware does not do, not one it does badly"
+                 UNSUPPORTED_OPTION (0x2B), not INVALID_OPTION (0x2C): the record is \
+                 one this firmware does not do, not one it does badly"
             },
         );
     }
@@ -6758,5 +6862,258 @@ fn key6_of(auth_bytes: &[u8]) -> fapico2_fido::cbor::Value {
         .find(|(k, _)| matches!(k, V::U(6)))
         .map(|(_, v)| v.clone())
         .expect("the auth map must carry key 6 (the phy record) when phy is set")
+}
+
+
+// ---------------------------------------------------------------------------
+// US-1516: the written decision, per sub-command
+// ---------------------------------------------------------------------------
+
+/// [`vendor41::decision`] is a row per sub-command, and the row has to agree
+/// with the tables the code actually enforces.
+///
+/// Three checks, and each catches a different way the record goes stale:
+///
+/// * **`requirement` is not a field of the row** — deliberately. The enforced
+///   answer lives in [`vendor41::required_permission`], so a second copy here
+///   would be a second source that agrees until one of them moves. The
+///   consistency that *is* checkable is checked instead: a row may only claim
+///   [`Tokenless::Touch`] when the enforced table would actually admit a
+///   tokenless request, i.e. when the row is `TokenOptional`. Claiming a touch
+///   for `CONFIG_WRITE` would assert a fallback for the one sub-command that is
+///   refused `0x40` before any gate runs.
+/// * **`reason` is never empty** — a row with no reason is the thing this table
+///   exists to prevent, so it is a failure rather than a style.
+/// * **`arm` names a function that exists** — see the next test.
+#[test]
+fn decision_agrees_with_the_permission_table() {
+    use fapico2_fido::vendor41::{
+        decision, required_permission, Requirement, Subcommand, SubcommandDecision, Tokenless,
+    };
+
+    for sub in Subcommand::ALL {
+        let d: SubcommandDecision = decision(sub);
+
+        assert_eq!(
+            d.sub, sub,
+            "the row filed under {sub:?} must say it is about {sub:?} — a row \
+             copied to the wrong variant is a record of the wrong sub-command"
+        );
+        assert!(
+            !d.reason.trim().is_empty(),
+            "{sub:?} has no recorded reason; an unexplained row is exactly the \
+             thing US-1516 was raised about"
+        );
+        assert!(
+            !d.arm.is_empty() && d.story.starts_with("US-"),
+            "{sub:?} must name the arm that serves it and the story that wrote it \
+             (got arm={:?}, story={:?})",
+            d.arm,
+            d.story
+        );
+
+        // The internal consistency: only a token-optional row has a tokenless
+        // path at all.
+        if d.tokenless == Tokenless::Touch {
+            assert!(
+                matches!(required_permission(sub), Requirement::TokenOptional(_)),
+                "{sub:?} claims a touch fallback, so its enforced row must be \
+                 TokenOptional — otherwise a tokenless request is refused \
+                 before any gate runs and there is nothing for the touch to \
+                 authorise (it is {})",
+                match required_permission(sub) {
+                    Requirement::Ungated => "Ungated",
+                    Requirement::Permission(_) => "Permission",
+                    Requirement::TokenOptional(_) => "TokenOptional",
+                }
+            );
+        }
+    }
+}
+
+/// The token-optional rows that admit a request with no token are split into
+/// two groups, and the split is the decision US-1516 exists to write down.
+///
+/// Eight are stopped by a physical touch. **Four are not**, and this pins that
+/// set by name: adding a fifth is then a deliberate edit to this list rather
+/// than an omission nobody notices, which is the failure mode of the epoch this
+/// story found — a `NOT_ALLOWED` stub that reads as a refusal while implying a
+/// capability, and prose claiming a gate that no arm consults.
+#[test]
+fn the_token_optional_rows_without_a_touch_are_the_four_named_ones() {
+    use fapico2_fido::vendor41::{decision, requires_presence_when_tokenless, Subcommand, Tokenless};
+
+    // Recorded with the reason each one gives instead. The names must match
+    // `decision`'s rows; the reasons are what a reader is owed, and they are
+    // asserted to be *different from one another* by construction — two rows
+    // sharing a `Tokenless` variant because they share a mechanism is fine,
+    // two sharing it for different reasons is not.
+    let no_touch = [
+        (Subcommand::Mse, Tokenless::Ungated),
+        (Subcommand::State, Tokenless::StatusOnly),
+        (Subcommand::Unlock, Tokenless::Possession),
+        (Subcommand::AttState, Tokenless::StatusOnly),
+    ];
+
+    for sub in Subcommand::ALL {
+        // Only the token-optional rows are in the split at all: `CONFIG_READ`
+        // and `CONFIG_WRITE` never reach an arm without a token, so "does it
+        // take a touch" is not a question about them.
+        if !requires_presence_when_tokenless(sub) {
+            continue;
+        }
+        let touches = decision(sub).tokenless == Tokenless::Touch;
+        let named = no_touch.iter().any(|(s, _)| *s == sub);
+        assert_eq!(
+            touches,
+            !named,
+            "{sub:?} ({:?}) — if this row changed which side of the split it is \
+             on, this list must change with it. A fifth token-optional row \
+             without a touch fallback is a decision to make, not a default.",
+            decision(sub).tokenless
+        );
+    }
+
+    // Every one of the four really does owe a presence check under the enforced
+    // table, and the eight that do take a touch are the remaining token-optional
+    // rows — twelve in total, so the two sets partition the set exactly.
+    for (sub, _) in no_touch {
+        assert!(
+            requires_presence_when_tokenless(sub),
+            "{sub:?} is in the no-touch list, so it must still be a row the \
+             enforced table admits without a token — otherwise the list is \
+             describing a sub-command that never reaches its arm"
+        );
+    }
+    let tokenless_total = Subcommand::ALL
+        .iter()
+        .filter(|s| requires_presence_when_tokenless(**s))
+        .count();
+    assert_eq!(
+        tokenless_total,
+        no_touch.len() + 8,
+        "eight token-optional rows take a touch and four do not; the enforced \
+         table must therefore name twelve"
+    );
+}
+
+/// Every `arm` in [`vendor41::decision`] names a function that exists.
+///
+/// A decision table is only better than a comment if it cannot quietly become
+/// fiction. This reads the sources the arms live in and requires the function
+/// name to be there — so renaming `vendor_audit::audit_read` turns this red
+/// instead of leaving a table that points at a function nobody can find.
+///
+/// The check is textual rather than a link, because the arms are private
+/// (`pub(crate)`-ish module functions that no public API reaches) and Rust has
+/// no way to name a function as a value. What it catches is the realistic
+/// drift: a rename, or a row written from memory.
+#[test]
+fn every_decision_row_names_an_arm_that_exists() {
+    use fapico2_fido::vendor41::{decision, Subcommand};
+
+    // The modules a row may name, mapped to the file that must contain the
+    // function. Deliberately an allowlist: a row naming some *other* module is
+    // a typo or a lie, and both should fail here rather than fall through to a
+    // source file this test does not read.
+    let sources: [(&str, &str); 5] = [
+        ("vendor_backup", include_str!("../src/vendor_backup.rs")),
+        ("vendor_lock", include_str!("../src/vendor_lock.rs")),
+        ("vendor_audit", include_str!("../src/vendor_audit.rs")),
+        ("vendor_att", include_str!("../src/vendor_att.rs")),
+        ("vendor41", include_str!("../src/vendor41.rs")),
+    ];
+
+    for sub in Subcommand::ALL {
+        let arm = decision(sub).arm;
+        let (module, fn_name) = arm
+            .rsplit_once("::")
+            .unwrap_or_else(|| panic!("{sub:?}: arm {arm:?} is not module::function"));
+        let source = sources
+            .iter()
+            .find(|(m, _)| *m == module)
+            .unwrap_or_else(|| panic!("{sub:?}: arm {arm:?} names module {module:?}, which this test does not read"))
+            .1;
+
+        // `fn name(` or `fn name<T>(` — the generic form is real
+        // (`vendor_lock::state` is `fn state<const N: usize>`), and matching
+        // only the parenthesised spelling would have made this test fail on a
+        // correct row.
+        let needle = format!("fn {fn_name}");
+        let found = source.match_indices(&needle).any(|(at, _)| {
+            matches!(
+                source[at + needle.len()..].trim_start().chars().next(),
+                // the parameter list, or a generic list in front of it
+                Some('(') | Some('<')
+            )
+        });
+        assert!(
+            found,
+            "{sub:?}: the decision row names {arm}, but no `fn {fn_name}` exists in \
+             {module}.rs — either the arm was renamed and the row was not, or the \
+             row was written from memory"
+        );
+    }
+}
+
+/// "Every sub-command has a real arm", proved on the **device** path.
+///
+/// # Why this is not a restatement of [`vendor41::PENDING`]
+///
+/// The whole file so far can pass while the board is broken: `PENDING` is a
+/// list in a module both twins import, so an empty one says the *list* is
+/// empty and nothing about what the RP2350 actually does with a `0x41` frame.
+/// Fixing only `app.rs` — or only a `PENDING` entry — would leave a green suite
+/// and a dead device path, which is exactly the twin trap AGENTS.md §1 names.
+///
+/// So this drives the type the serve loop actually constructs,
+/// [`DeviceApp`] = `device_app::FidoApp`, through `process_ctap2_with_store`,
+/// and requires that every sub-command is *dispatched*: the answer is never
+/// `0x01`, the catch-all's "I do not recognise this command".
+///
+/// # Why the assertion is `!= 0x01` and not `!= NOT_ALLOWED`
+///
+/// Measured, not assumed. Driving every sub-command bare (empty params, no
+/// token, no touch) on this device app gives:
+///
+/// | sub-command | status | meaning |
+/// |---|---|---|
+/// | 11 of 14 | `0x14` `MissingParameter`, `0x02` or `0x00` | the arm decoded the request and had nothing to work with |
+/// | `Export` | **`0x30` `NotAllowed`** | the export window is sealed on a fresh device, and a sealed window is a real refusal, not a stub |
+///
+/// The tempting assertion here — "no sub-command answers `NOT_ALLOWED` any
+/// more" — is **false**, and would have been a broken test written with total
+/// confidence. `Export` reaches `if ops.backup_sealed() { return NotAllowed }`
+/// (`vendor_backup::export`), and a fresh keystore is sealed by design. The
+/// distinction this test actually needs is *dispatched* vs *unrecognised*, so
+/// `0x01` is the discriminator and `0x30` is allowed to mean what it means.
+#[test]
+fn every_subcommand_is_dispatched_on_the_device_path() {
+    const INVALID_COMMAND: u8 = 0x01;
+    use fapico2_fido::vendor41::PENDING;
+
+    assert!(
+        PENDING.is_empty(),
+        "this test's reasoning assumes the stub set has drained; PENDING names {:?}",
+        PENDING
+    );
+
+    for sub in Subcommand::ALL {
+        let req = rskey_request(sub.byte());
+        let (mut dev, _trng, mut store) = device_app();
+        let mut out: HV<u8, { fapico2_fido::CTAP2_MAX_MSG }> = HV::new();
+        let n =
+            dev.process_ctap2_with_store(VENDOR_41, &req, [1, 2, 3, 4], &mut out, Some(&mut store));
+
+        assert_ne!(
+            out[..n].first().copied(),
+            Some(INVALID_COMMAND),
+            "{sub:?} (0x{:02X}) answered INVALID_COMMAND on the device path, so the \
+             RP2350 dispatch does not recognise it. PENDING is empty, so this is not \
+             a stub refusing politely — it is a sub-command the device twin never \
+             routes. Fix the device path, not the list.",
+            sub.byte()
+        );
+    }
 }
 

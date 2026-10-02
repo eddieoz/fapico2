@@ -866,6 +866,67 @@ impl FidoApp {
             }
         }
 
+        // US-1526 — THE `up` POLICY, decided. This rejection is deliberate,
+        // legal and load-bearing. Everything the story asked to be written
+        // down is here, at the site, rather than in a commit message nobody
+        // reads at the next refactor:
+        //
+        // WHAT: a makeCredential carrying `options.up = false` is answered
+        // `CTAP2_ERR_INVALID_OPTION` (0x2C — US-1528 moved this from 0x2B,
+        // which every client decodes as UNSUPPORTED_OPTION), on both twins.
+        // It is NOT a parse failure and NOT an accident of ordering.
+        //
+        // WHY IT IS LEGAL: this authenticator does not advertise `up` at all
+        // (`ctap2.rs`'s `Ctap2Info::default`, pinned by
+        // `tests/getinfo.rs::test_get_info_has_required_fields`), and
+        // CTAP2.1 §6.1 requires a request naming an unadvertised option to be
+        // rejected. The alternative reading — "the spec permits up=false, so
+        // we must serve it" — ignores the half of the rule that the option has
+        // to be advertised for the request to be answerable at all.
+        //
+        // WHY IT IS ALSO C PARITY, which is the stronger argument: the
+        // reference firmware does exactly this, unconditionally, in every
+        // build — `pico-fido/src/fido/cbor_make_credential.c:387`:
+        //
+        //     if (options.up == pfalse) { //5.6
+        //         CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+        //     }
+        //
+        // It is not inside an `#ifdef`. The two lines the reference leaves
+        // commented out immediately below (`//else if (options.up == NULL)
+        // //5.7  //rup = ptrue;`) are the "absent means UP" default, which we
+        // get for free by never special-casing absence. So this is not a
+        // fapico2 policy invented on top of the reference — it is the
+        // reference.
+        //
+        // WHAT IT COSTS: a client that sends up=false gets an error where a
+        // CTAP2.1-conformant authenticator might have minted a credential.
+        // What we can verify, we checked: in `fido2` 2.2.1 the ONLY site that
+        // sends `up: false` is `_filter_creds`
+        // (`fido2/client/__init__.py:593`), a **getAssertion** allowList
+        // probe — `grep -rn '"up"' fido2/` returns exactly that one line —
+        // and getAssertion's `up:false` is served (below). `make_credential`
+        // takes `options` as a caller-supplied mapping
+        // (`fido2/ctap2/base.py:376`), so a caller *could* put up=false in it;
+        // we have no observation of one doing so. The epic's claim that
+        // Chrome's autofill and conditional-mediation paths send it is
+        // plausible and is NOT verified here — no Chrome source was read, and
+        // guessing at a browser's wire from a comment is exactly the failure
+        // mode a previous commit in this lane shipped.
+        //
+        // WHAT WOULD HAVE TO CHANGE TO RELAX IT: three things, not one.
+        // (1) Advertise `up` in the getInfo options map — which stops
+        // matching the reference and would make every *absent* option
+        // ambiguous. (2) Delete this check and the `req.up != Some(false)`
+        // guard on the presence gate below, or a plain rk=false / no-UV
+        // credential could be minted with zero touch, which is US-907's
+        // requirement and which this epic explicitly does not relax.
+        // (3) Mirror both in `app.rs` — the host twin has its own copy at
+        // `app.rs:1305`, and the epic's DoD is that the two answer
+        // identically. Relaxing only one twin is the exact defect US-1514
+        // was filed for.
+        //
+        // `tests/up_policy.rs` pins all of this on both twins.
         if req.options_present && req.up == Some(false) {
             return Err(err(Ctap2Response::InvalidOption));
         }
@@ -1136,6 +1197,26 @@ impl FidoApp {
             if !uv && self.keystore.pin_state.always_uv {
                 return Err(err(Ctap2Response::PuatRequired));
             }
+            // US-1526: getAssertion `up:false` is SERVED (a silent assertion, no UP
+            // bit) — unlike makeCredential above, which rejects it. That
+            // asymmetry is the reference's, not ours:
+            // `pico-fido/src/fido/cbor_get_assertion.c` takes the silent path
+            // (`bool silent = (up == false && uv == false);` at :322, and the
+            // UP gate at :488 fires only for `up == ptrue || absent`) and
+            // rejects exactly one combination — hmac-secret with a silent
+            // assertion, at :324:
+            //
+            //     if (options.up == pfalse && extensions.hmac_secret == ptrue) {
+            //         CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+            //     }
+            //
+            // The device twin had this check from the initial release; the
+            // host twin has its copy at `app.rs:1655`. The brief for this
+            // story flagged the two as possibly divergent (host-only). They
+            // are not: both reject, with the same byte, in the same position
+            // in the validation order. `tests/up_policy.rs` pins the parity
+            // so the next reader does not have to re-derive it by reading two
+            // parsers.
             if req.up == Some(false) && req.hmac_secret_input.is_some() {
                 return Err(err(Ctap2Response::InvalidOption));
             }
@@ -1556,10 +1637,24 @@ impl FidoApp {
                 Ok(())
             }
             0x07 => {
-                // getUVRetries: UV is not implemented; constant budget.
-                no_heap::push_map_header(out, 1).ok();
+                // getUVRetries: keys 4 (powerCycleState) and 5 (uvRetries),
+                // mirroring sub-command 0x01's conditional map header.
+                // US-1513: the budget was a hard-coded 3 and the existing
+                // test only checked the CBOR type, so nothing observed it.
+                // It now tracks the same `auth_failures` counter the latch
+                // uses, and the durable lockout is reported alongside.
+                let power = self.keystore.pin_state.blocked
+                    || self.keystore.pin_state.needs_power_cycle;
+                let uv_retries = crate::ctap2::uv_retries(self.auth_failures);
+                no_heap::push_map_header(out, if power { 2 } else { 1 }).ok();
+                // Ascending key order, as everywhere else in this map:
+                // 4 (powerCycleState) then 5 (uvRetries).
+                if power {
+                    no_heap::push_uint(out, 4).ok();
+                    no_heap::push_bool(out, true).ok();
+                }
                 no_heap::push_uint(out, 5).ok();
-                no_heap::push_uint(out, 3).ok();
+                no_heap::push_uint(out, uv_retries as u64).ok();
                 Ok(())
             }
             0x02 => {
@@ -1864,17 +1959,37 @@ impl FidoApp {
                 // nothing but a user-presence gesture, and this build's
                 // authenticator has no separate user-verification secret to
                 // check. It is what a client falls back to when the key has
-                // no PIN, and it is advertised as reachable because GetInfo
-                // reports the `uv` option — so it has to answer rather than
-                // refuse, or the client has no way to obtain a pinUvAuthToken
-                // at all and the resident-credential screens never resolve.
+                // no PIN, so it has to answer rather than refuse, or the
+                // client has no way to obtain a pinUvAuthToken at all and the
+                // resident-credential screens never resolve.
                 //
+                // US-1525: this comment used to justify the sub-command by
+                // claiming "GetInfo reports the `uv` option". It never did,
+                // and it still does not — `uv` is deliberately not
+                // advertised (see `ctap2::Ctap2Info::default`), because this
+                // build has nothing to verify against and promising a
+                // mechanism that does not exist would be the real lie. What
+                // is advertised is `pinUvAuthToken`, which claims the token
+                // *mechanism*, not a UV method; US-1512 sets its value to
+                // true except under the durable lockout — the same
+                // `blocked || needs_power_cycle` gate applied below — so the
+                // capability is advertised exactly when it is offered.
+                // `tests/pin_uv_advert.rs` asserts `uv` stays absent on both
+                // twins so this premise cannot be quietly reinstated.
                 // Fail-closed on presence: the grant is the only thing being
                 // asserted, so without a press this answers `UpRequired` and
                 // the transport opens a keepalive window and retries. A
                 // token is therefore never minted without a real touch.
                 let permissions = permissions.ok_or(err(Ctap2Response::MissingParameter))?;
                 let ka = key_agreement.ok_or(err(Ctap2Response::MissingParameter))?;
+                // US-1512: the durable lockout that every PIN leg already
+                // refuses. Without this gate `0x06` stayed the one token
+                // route that ignored it, so a locked-out device still
+                // minted a full-permission token while GetInfo — correctly —
+                // had stopped advertising that it could.
+                if self.keystore.pin_state.blocked || self.keystore.pin_state.needs_power_cycle {
+                    return Err(err(Ctap2Response::PinAuthBlocked));
+                }
                 let client_pub =
                     crypto::parse_cose_ec2_p256_bytes(&ka[..32], &ka[32..]).ok_or(err(Ctap2Response::PinAuthInvalid))?;
                 if !self.user_present(crate::device_app::presence_tag_from_channel(
@@ -2017,8 +2132,66 @@ impl FidoApp {
         info.enc_identifier = enc_id;
 
         info.set_option("clientPin", self.keystore.pin_state.pin_hash.is_some());
+        // US-1512: the capability half of the PIN/UV pair, kept adjacent to
+        // `clientPin` so a reader can check the two against each other. It
+        // goes through the shared helper so this twin and `app.rs` cannot
+        // drift; the rule is at `ctap2::pin_uv_auth_token_available`.
+        info.set_option(
+            "pinUvAuthToken",
+            crate::ctap2::pin_uv_auth_token_available(
+                self.keystore.pin_state.blocked,
+                self.keystore.pin_state.needs_power_cycle,
+            ),
+        );
         out.push(0x00).ok();
         info.write_cbor_into::<{ crate::CTAP2_MAX_MSG }>(out).ok();
+        out.len()
+    }
+
+    // ------------------------------------------------------------------
+    // authenticatorSelection (0x0B) — US-1514
+    // ------------------------------------------------------------------
+    //
+    // Deliberately NOT gated on user presence, and the reasoning is in the
+    // commit message rather than being a summary of it:
+    //
+    // * `fido2`'s `Ctap2.selection()` (ctap2/base.py:575) calls
+    //   `send_cbor(Ctap2.CMD.SELECTION, ...)` with no data, and `send_cbor`
+    //   (`:286`) does `status = response[0]; if status != 0x00: raise
+    //   CtapError(status)`. So *any* non-zero answer — `UpRequired` (0x3B),
+    //   `UserActionTimeout` (0x2F), `ActionTimeout` (0x3A) — is an exception
+    //   at the caller, not a wait. There is no wire shape in which a gated
+    //   selection reads as a successful selection to this client.
+    // * The `UpRequired` → keepalive → retry loop that turns a bare `0x3B`
+    //   into a touch prompt lives in the *transport*, not here, and its
+    //   predicate does not include `0x0B`:
+    //   `presence_windowed = ctap_cmd == 0x01 || ctap_cmd == 0x02 ||
+    //   ctap_cmd == 0x06 || ctap_cmd == vendor41::CMD` in
+    //   `firmware/src/tasks.rs`, mirrored in `firmware/src/emul_main.rs`.
+    //   So gating here would answer a bare 0x3B that never opens a window,
+    //   never prompts and never retries — a deadlock, not a prompt.
+    // * The reference C firmware gates too (`pico-fido/src/fido/
+    //   cbor_selection.c` calls `wait_button_pressed()`), but the gate is
+    //   disarmed by default: it resolves through
+    //   `button_wait_start()` (pico-keys-sdk/src/button.c:113), which
+    //   auto-queues `EV_BUTTON_PRESSED` when `up_btn` is unset AND
+    //   `force_button_wait` is false — and `cbor_selection.c`'s
+    //   `force_button_wait = true` is inside `#ifdef FORCE_BUTTON_WAIT`,
+    //   a CMake option that is off unless requested. fapico2's
+    //   `vendorff::PhyConfig` has no `up_btn` field either, so the other
+    //   disarm is unreachable here. The reference's *default build* answer is
+    //   therefore `CTAP2_OK` with no touch, which is what this returns and
+    //   what the host twin returns.
+    // * `Ctap2Response::ActionTimeout` (0x3A) stays unproduced. The
+    //   reference does not use it here either: on a real timeout
+    //   `cbor_selection.c` returns `CTAP2_ERR_USER_ACTION_TIMEOUT` = 0x2F,
+    //   not 0x3A. The old host comment cited 0x3A and was wrong.
+    pub(crate) fn handle_authenticator_selection(
+        &mut self,
+        out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
+    ) -> usize {
+        out.clear();
+        out.push(Ctap2Response::Ok.code()).ok();
         out.len()
     }
 }

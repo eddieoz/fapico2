@@ -609,31 +609,70 @@ impl FidoApp {
             0x07 => self.handle_reset(out),
             0x08 => self.handle_get_next_assertion(out, store),
             0x0A => self.handle_cred_mgmt(data, out),
+            // US-1514: authenticatorSelection. This arm is what made the
+            // emulator able to do something the board could not — the host
+            // twin had `0x0B` since FX-415 and this dispatch fell through to
+            // `_ =>` with INVALID_COMMAND, so a platform enumerating
+            // authenticators (Chrome on Windows calls this) got `OK` from
+            // the emulator and an error from the board.
+            //
+            // It answers `CTAP2_OK` without a touch, which is the point of
+            // story US-1514 rather than an oversight: `handle_authenticator_
+            // selection` in `device_core.rs` states the full argument. In
+            // short, a gated answer is unreachable from here (the
+            // `UpRequired` → keepalive → retry loop that makes a gate into a
+            // prompt is in `firmware/src/tasks.rs` and its predicate does
+            // not name `0x0B`), `fido2`'s `Ctap2.selection()` raises a
+            // `CtapError` on *any* non-zero status so no gated status reads
+            // as a selection, and the reference C firmware's gate is
+            // disarmed in its default build. Answering here is what makes
+            // the twins agree; the gate is a separate story that would have
+            // to change both twins *and* the transport.
+            0x0B => self.handle_authenticator_selection(out),
             0x0C => self.handle_large_blobs(data, out, store),
             0x0D => self.handle_authenticator_config(data, out, store),
             // US-106: the RS-Key vendor channel (PicoForge framing C) — the
             // first payload byte of a standard 0x90 CBOR frame. NOT the vendor
             // vault: that one dispatches on the CTAPHID frame CMD byte (its
             // arm in `firmware/src/tasks.rs`), so the two read disjoint fields
-            // of disjoint frames and cannot alias. Every sub-command is a
-            // NOT_ALLOWED stub until Phase I implements it; `vendor41` owns
-            // both the sub-command set and the shrink-to-empty discipline. The
-            // store is threaded now so those stories need not re-open this arm.
+            // of disjoint frames and cannot alias. `vendor41` owns the
+            // sub-command set and the shrink-to-empty discipline; the store is
+            // threaded so an arm need not re-open this dispatch.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
-            // rejected MAC against its three-strike counter. Neither is
-            // consulted by the twelve arms still in `vendor41::PENDING` —
-            // those still answer `0x30`, and
-            // `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-            // pins that with a real `0x20` token in hand. `CONFIG_READ` is
-            // ungated *by protocol*, so consulting either would be wrong for it
-            // rather than merely early.
+            // rejected MAC against its three-strike counter.
             //
-            // US-115: `CONFIG_WRITE` consults both, for its identity tier only,
-            // and this arm is where the record it returns gets committed —
-            // `vendor41` has the store but not the snapshot, and only this arm
-            // can make the write durable (see `vendor41::handle`).
+            // US-1516 replaces two sentences this comment used to carry. It
+            // said "every sub-command is a NOT_ALLOWED stub until Phase I
+            // implements it", and that the token "is not consulted by the
+            // twelve arms still in `vendor41::PENDING` — those still answer
+            // `0x30`". Both were true when written and outlived the stubs:
+            // `PENDING` drained across US-170 … US-175 and **all fourteen
+            // sub-commands now have real arms**. A comment claiming a
+            // capability this path does not have is the failure the decision
+            // table exists to prevent, one layer up — and it is worse here
+            // than in `vendor41`, because this is the arm the RP2350 runs.
+            // What replaced it: every arm is listed, with the gate it declares
+            // and what authorises a tokenless request, in `vendor41::decision`.
+            //
+            // The gate is therefore **per arm**, not per dispatch. `CONFIG_READ`
+            // is ungated *by protocol* — the client sends it as its probe for
+            // whether this firmware speaks `0x41` at all — so consulting a
+            // token for it would be wrong rather than early. `CONFIG_WRITE`
+            // consults it for the identity tier only. The twelve
+            // token-optional rows call `authorize` from inside their own gate
+            // helpers, so a bare request reaches them and is answered with a
+            // touch instead of refused for want of a token.
+            //
+            // US-115: `CONFIG_WRITE`'s record is committed here — `vendor41`
+            // has the store but not the snapshot, and only this arm can make
+            // the write durable (see `vendor41::handle`).
+            //
+            // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
+            // is what keeps this arm honest: it drives every sub-command over
+            // *this* path and requires a dispatched answer, so the module's
+            // claim cannot be true for the host twin and false here.
             crate::vendor41::CMD => {
                 let auth = self.pin_token.as_ref().map(|token| crate::vendor41::TokenAuth {
                     token,
@@ -839,12 +878,19 @@ mod tests {
         // it is supposed to describe. The coverage it used to give is now
         // `tests/vendor41.rs::vendor_prototype_set_led_gpio_persists`, which
         // drives the real `0xFF` path rather than asserting its absence.
-        // `0x0B` is still unimplemented and keeps its leg.
-        let n = app.process_ctap2(0x0Bu8, b"anything", [0; 4], &mut out);
+        // US-1514 removed the `0x0B` leg that used to sit here. It was asserted
+        // as INVALID_COMMAND purely because the device dispatch had no arm
+        // for it — the assertion pinned the exact parity hole the story is
+        // about. `0x09` (bio enrollment in this dialect) replaces it: still
+        // genuinely unimplemented, and it keeps this test's coverage honest
+        // rather than merely present. `tests/selection.rs` now asserts the
+        // twins agree on `0x0B`, which is the claim that has to survive a
+        // future refactor.
+        let n = app.process_ctap2(0x09u8, b"anything", [0; 4], &mut out);
         assert_eq!(
             out.as_slice()[..n],
             [CTAP2_ERR_INVALID_COMMAND],
-            "0x0B is still unimplemented and answers INVALID_COMMAND"
+            "0x09 (bio enrollment) is unimplemented and answers INVALID_COMMAND"
         );
         // S-701-5: the vault is implemented; malformed CBOR → INVALID_CBOR.
         let n = app.process_vendor_vault(b"{}", &mut out);

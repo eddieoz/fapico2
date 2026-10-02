@@ -749,13 +749,20 @@ pub fn lock_engage(ops: &mut dyn VendorOps, data: &[u8], auth: Option<TokenAuth<
 /// with [`VendorOps::unlocked_this_power_cycle`] already `true`.
 ///
 /// A release that arrives without it is refused with
-/// [`Ctap2Response::LockRequired`] (`0x07`) rather than honoured. The
+/// [`Ctap2Response::LockRequired`] rather than honoured. The
 /// alternative — clearing the lock anyway — is a lock that anyone with a `0x20`
 /// token can switch off, which is the same as no lock: the token is a
 /// *session* secret the desktop app holds, and the phrase is the thing the
-/// user is being asked to remember. `0x07` is also the status whose text
-/// ("authenticator is locked") is the true one when a human reads the desktop
+/// user is being asked to remember. `LockRequired` is also the status whose
+/// text ("authenticator is locked") is the true one when a human reads the desktop
 /// app's error string.
+///
+/// The **byte** is `0x0A`, not `0x07` (US-1528). `0x07` was a transcription slip
+/// and it collided with [`crate::ctap2::Ctap2Command::Reset`], which lives on a
+/// different layer entirely — a status and a command opcode must never share a
+/// value, because a reader that has lost track of which table it is holding
+/// then cannot tell. `CtapError.ERR.LOCK_REQUIRED` and the C SDK's
+/// `CTAP1_ERR_LOCK_REQUIRED 0x0a` agree on `0x0A`.
 ///
 /// # `0x3D` is deliberately **not** used here
 ///

@@ -17,6 +17,35 @@
 //! selected board's declaration*, and the override variables are a per-build
 //! experiment on top of it — see `platform/build.rs` for the precedence.
 //!
+//! # One source of truth, and what "one" has to mean (US-1517)
+//!
+//! **Every tracked build script serves these defaults.** `build.sh`,
+//! `build-signed.sh` (the release path) and `build-timeline.sh` set no
+//! identity variable between them, and
+//! `apps/fido/tests/aaguid_build.rs::no_tracked_build_script_overrides_the_identity`
+//! is what keeps that true — it fails if one of them ever grows an
+//! `FAPICO2_AAGUID_HEX=` assignment. That is the whole "one source" claim, and
+//! it is a claim about *files*, not about intentions.
+//!
+//! The other half is that no override can arrive by accident. Setting any of
+//! the four variables requires `FAPICO2_IDENTITY_OVERRIDE_ACK=1` as well
+//! (`platform/build.rs`), and the build **fails** without it. US-1517 exists
+//! because that was not true and the drift was invisible: a
+//! `build-custom.sh` — git-ignored, so present in one developer's checkout and
+//! in nobody else's — set `FAPICO2_AAGUID_HEX=89FB94B7…`, pico-fido2's own
+//! AAGUID (`../pico-fido2/src/fido/cbor.c:35`), so two images built from this
+//! repository served two identities while every test in the tree stayed green.
+//! The AAGUID is the leading 16 bytes of every attested credential blob, so
+//! those two devices were not one product with two builds; they were two
+//! authenticators sharing no passkeys, and only the flash log said which was
+//! which.
+//!
+//! An escape hatch that a stray `export` can reach is not an escape hatch, it
+//! is a second default. So the override survives — a development build aimed at
+//! a PicoForge that has not yet learned our AAGUID is a real job — but it now
+//! takes two deliberate variables, and an acknowledged override prints a
+//! `cargo:warning` naming what it changed on every build.
+//!
 //! They live in `platform` rather than in an app crate because `platform` is
 //! the only crate every participant depends on: the USB descriptor is built
 //! here, and `fapico2-fido` re-exports [`AAGUID`] for the CTAP2 layer. A
@@ -257,11 +286,18 @@ pub const fn select_vid_pid(override_str: &str, default: (u16, u16)) -> (u16, u1
 ///
 /// Defaults to [`DEFAULT_AAGUID`]. To build against a client whose table still
 /// carries the borrowed identity, set `FAPICO2_AAGUID_HEX` to 32 hex characters
-/// (case-insensitive, no separators, no `0x` prefix):
+/// (case-insensitive, no separators, no `0x` prefix) **and** acknowledge it:
 ///
 /// ```text
-/// FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7 cargo build --release -p fapico2-firmware
+/// FAPICO2_IDENTITY_OVERRIDE_ACK=1 \
+/// FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7 \
+///     cargo build --release -p fapico2-firmware
 /// ```
+///
+/// The acknowledgement is not decoration — see "One source of truth" in the
+/// module docs and `check_override_acknowledgement` in `platform/build.rs` for
+/// the drift it closes. A build with the override and no acknowledgement is a
+/// build failure.
 ///
 /// A malformed or wrong-length override is a **hard build failure**, never a
 /// silent fallback. Setting the variable to the empty string counts as
@@ -338,6 +374,14 @@ pub const DEFAULT_BUILD: bool = AAGUID_OVERRIDE_HEX.is_empty()
 /// shells out to a real `cargo build`; hardcoding one would be wrong the day
 /// the test is run under a different toolchain.
 pub const HOST_BUILD_TARGET: &str = env!("FAPICO2_PLATFORM_HOST_TARGET");
+
+#[cfg(fapico2_identity_override_unacknowledged)]
+const _: () = {
+    panic!(concat!(
+        "an identity override is set without FAPICO2_IDENTITY_OVERRIDE_ACK=1: ",
+        env!("FAPICO2_IDENTITY_OVERRIDE_ACK_ERROR")
+    ));
+};
 
 /// The build script rejected a set-but-malformed override and published the
 /// reason. Fail the build loudly here rather than shipping a

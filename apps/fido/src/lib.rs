@@ -11,11 +11,16 @@
 //!
 //! Build-time configuration (US-101, EPIC `PICOForge-COMPAT`):
 //! * `FAPICO2_AAGUID_HEX` — 32 hex characters (16 bytes, no separators, no
-//!   `0x` prefix) overriding the authenticator AAGUID. **Unset** ⇒
-//!   [`DEFAULT_AAGUID`] (the borrowed RS-Key profile). Anything else — a
-//!   malformed value, or the variable set but *empty* — is a hard build error,
-//!   never a silent fallback. See [`AAGUID`], [`AAGUID_OVERRIDE_ACTIVE`] and
-//!   `build.rs`.
+//!   `0x` prefix) overriding the authenticator AAGUID, together with
+//!   `FAPICO2_IDENTITY_OVERRIDE_ACK=1` (US-1517): an identity override now
+//!   needs two deliberate variables, and setting it alone is a build failure.
+//!   **Unset** ⇒ [`DEFAULT_AAGUID`] (fapico2's own identity — *not* the RS-Key
+//!   value this paragraph used to name; the borrow is over, `identity.rs` has
+//!   the history). Anything else — a malformed value, the variable set but
+//!   *empty*, or a missing acknowledgement — is a hard build error, never a
+//!   silent fallback. See [`AAGUID`], [`AAGUID_OVERRIDE_ACTIVE`] and
+//!   `fapico2_platform::identity` — the override is resolved by *that*
+//!   crate's build script; there is no `apps/fido/build.rs`.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
@@ -60,8 +65,9 @@ pub mod vault;
 // — the two `FidoApp` types have separate dispatch `match`es, so this module
 // (not either arm) is the single place the sub-command set is defined.
 pub mod vendor41;
-// US-176: the durable state the twelve `vendor41::PENDING` arms need, and the
-// two `vendor41::VendorOps` implementations over the host and device
+// US-176: the durable state the `vendor41` arms needed — twelve of them were
+// stubs then, and none is a stub now (US-1516) — and the two
+// `vendor41::VendorOps` implementations over the host and device
 // keystores. A sibling rather than a part of `vendor41` because `vendor41` is
 // the protocol and must stay keystore-free — see the module docs on why the
 // commit lives with the dispatch arm that owns the snapshot.
@@ -362,14 +368,20 @@ impl FidoError {
             FidoError::NoCredentials => 0x2E,          // NO_CREDENTIALS
             FidoError::CredentialExcluded => 0x19,     // CREDENTIAL_EXCLUDED
             FidoError::UnsupportedAlgorithm => 0x26,
-            FidoError::UnsupportedOption => 0x2B,
+            FidoError::UnsupportedOption => 0x2B,        // UNSUPPORTED_OPTION
             FidoError::OperationDenied => 0x27,
             FidoError::NotAllowed => 0x30,             // NOT_ALLOWED
             FidoError::KeyStoreFull => 0x28,
             FidoError::LimitExceeded => 0x15,          // LIMIT_EXCEEDED
             FidoError::IntegrityFailure => 0x3D,       // INTEGRITY_FAILURE
             FidoError::InvalidCommand => 0x01,
-            FidoError::InvalidChannel => 0x08,
+            // US-1528: was 0x08. `CtapError.ERR.INVALID_CHANNEL` is 0x0B and
+            // the C SDK agrees (`CTAP1_ERR_INVALID_CHANNEL 0x0b`). This is the
+            // same error `Ctap2Response::InvalidChannel` and
+            // `CtapHidError::InvalidChannel` carry, so all three now agree and
+            // `tests/status_table.rs` asserts the equality so they cannot
+            // diverge again.
+            FidoError::InvalidChannel => 0x0B,         // INVALID_CHANNEL
             FidoError::ChannelBusy => 0x06,
             FidoError::Timeout => 0x05,
             FidoError::InvalidSeq => 0x04,

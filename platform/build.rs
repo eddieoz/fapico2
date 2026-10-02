@@ -35,8 +35,31 @@
 //! | `FAPICO2_VID_PID` | USB VID:PID, `VVVV:PPPP` or `0xVVVV:0xPPPP` | the board file's `usb.vidpid` |
 //!
 //! ```text
-//! FAPICO2_BOARD=pico2w FAPICO2_PRODUCT="Acme Token" cargo build -p fapico2-firmware
+//! FAPICO2_BOARD=pico2w FAPICO2_IDENTITY_OVERRIDE_ACK=1 FAPICO2_PRODUCT="Acme Token" cargo build -p fapico2-firmware
 //! ```
+//!
+//! # An override is two variables, not one (US-1517)
+//!
+//! Setting any of the four above also requires
+//! `FAPICO2_IDENTITY_OVERRIDE_ACK=1`. Without it the build **fails**.
+//!
+//! Why that is a compile failure and not a warning: the drift US-1517 found
+//! was not that someone chose a different identity, but that they chose one in
+//! a script nobody could see and every test stayed green. An identity override
+//! that reaches a build by accident — a shell profile that exports it, a
+//! Makefile inherited from another project, a CI variable that resolves empty,
+//! a script that is not in version control — leaves the build producing a
+//! *different* AAGUID with nothing in the output to say so, and the AAGUID is
+//! the leading 16 bytes of every attested credential blob, so two devices built
+//! from one checkout are then two authenticators with no shared passkeys.
+//!
+//! Requiring a second, differently-named variable costs one more word in a
+//! command line a person types deliberately, and makes the accident require a
+//! deliberate act twice over. The escape hatch stays — a development build
+//! aimed at a client whose profile table still carries the borrowed identity is
+//! a real job — but it can no longer be taken by accident, and an
+//! acknowledged override announces itself on every build (see
+//! [`check_override_acknowledgement`]).
 //!
 //! # Precedence, and why it is that way
 //!
@@ -90,6 +113,26 @@ const MANUFACTURER_ENV: &str = "FAPICO2_MANUFACTURER";
 const PRODUCT_ENV: &str = "FAPICO2_PRODUCT";
 /// The USB VID:PID override.
 const VID_PID_ENV: &str = "FAPICO2_VID_PID";
+
+/// The acknowledgement that makes an identity override deliberate — US-1517.
+///
+/// One variable for the whole block, not one per value: a build has one
+/// identity, and "I mean to ship a different identity" is one decision, not
+/// four.
+const IDENTITY_ACK_ENV: &str = "FAPICO2_IDENTITY_OVERRIDE_ACK";
+
+/// The only value that acknowledgement takes. Deliberately not "any non-empty
+/// value": `FAPICO2_IDENTITY_OVERRIDE_ACK=` left behind by a template that
+/// rendered nothing would otherwise acknowledge whatever override happened to
+/// be in the environment.
+const IDENTITY_ACK_VALUE: &str = "1";
+
+/// The cfg `src/identity.rs` turns into a `compile_error!` when an identity
+/// override is set *without* the acknowledgement. Separate from
+/// [`INVALID_CFG`] because the two answer different questions: that one says
+/// "the value you gave is malformed", this one says "you did not say that you
+/// meant to".
+const UNACKED_CFG: &str = "fapico2_identity_override_unacknowledged";
 
 /// The cfg `src/identity.rs` turns into a `compile_error!` when an override is
 /// present but malformed. One cfg for the whole block rather than one per
@@ -350,10 +393,82 @@ fn publish(var: &str, validate: impl Fn(&str) -> Result<(), String>) {
     }
 }
 
+/// Gate the whole identity block on a deliberate second variable (US-1517).
+///
+/// `vars` is the override list; an override is "set" when the environment
+/// carries it with a non-empty value, matching how [`publish`] treats unset
+/// versus empty.
+///
+/// Four outcomes, and the last two are the ones that exist because of what
+/// US-1517 found:
+///
+/// * **no override** → nothing. This is the shipped path.
+/// * **override, acknowledged** → a `cargo:warning` naming every variable that
+///   deviates from the published default. Cargo replays a build script's
+///   warnings on later builds of the same package, so the identity of a stale
+///   artifact is stated without re-running anything.
+/// * **override, not acknowledged** → the cfg that becomes a `compile_error!`
+///   in `src/identity.rs`, carrying the reason (including which variables were
+///   set) so the message names the fix.
+/// * **acknowledgement with no override** → a warning saying so. An
+///   `export FAPICO2_IDENTITY_OVERRIDE_ACK=1` left in a shell profile
+///   acknowledges nothing, and silently doing nothing is exactly the shape of
+///   bug this whole mechanism exists to remove.
+fn check_override_acknowledgement(vars: &[&str]) {
+    let set: Vec<&str> = vars
+        .iter()
+        .copied()
+        .filter(|v| std::env::var(v).is_ok_and(|raw| !raw.is_empty()))
+        .collect();
+
+    if set.is_empty() {
+        if std::env::var(IDENTITY_ACK_ENV).is_ok_and(|raw| !raw.is_empty()) {
+            println!(
+                "cargo:warning={IDENTITY_ACK_ENV} is set but no identity override is, so it \
+                 acknowledges nothing: this build serves the published defaults from \
+                 platform/src/identity.rs (AAGUID, manufacturer, product, VID:PID)"
+            );
+        }
+        return;
+    }
+
+    let ack = std::env::var(IDENTITY_ACK_ENV).unwrap_or_default();
+    if ack != IDENTITY_ACK_VALUE {
+        let reason = format!(
+            "{} {} set ({}) without {IDENTITY_ACK_ENV}={IDENTITY_ACK_VALUE}. An identity \
+             override is a second deliberate act on purpose: it changes the AAGUID that is the \
+             leading 16 bytes of every attested credential blob, and an override that arrives by \
+             accident ships a device that shares no passkeys with every other build from this \
+             checkout. Add {IDENTITY_ACK_ENV}={IDENTITY_ACK_VALUE}, or unset {}.",
+            set.len(),
+            if set.len() == 1 { "variable is" } else { "variables are" },
+            set.join(", "),
+            set.join(", "),
+        );
+        println!("cargo:rustc-cfg={UNACKED_CFG}");
+        println!("cargo:rustc-env={IDENTITY_ACK_ENV}_ERROR={reason}");
+        return;
+    }
+
+    for var in &set {
+        let value = std::env::var(var).unwrap_or_default();
+        println!(
+            "cargo:warning={IDENTITY_ACK_ENV} is set: this build does NOT serve the published \
+             default identity — {var}={value} overrides it. The AAGUID is the leading 16 bytes \
+             of every attested credential blob, so this artifact's passkeys are not shared with \
+             a default build."
+        );
+    }
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg({INVALID_CFG})");
+    println!("cargo:rustc-check-cfg=cfg({UNACKED_CFG})");
     // Re-run when any override changes, or when the rules themselves change.
-    for var in [AAGUID_ENV, MANUFACTURER_ENV, PRODUCT_ENV, VID_PID_ENV] {
+    // The acknowledgement is on the same list for the same reason the two board
+    // variables are declared up front in `resolve_board`: a variable cargo has
+    // not been told about is one whose first run is missed.
+    for var in [AAGUID_ENV, MANUFACTURER_ENV, PRODUCT_ENV, VID_PID_ENV, IDENTITY_ACK_ENV] {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -391,4 +506,11 @@ fn main() {
     publish(MANUFACTURER_ENV, |s| validate_identity_string(MANUFACTURER_ENV, s));
     publish(PRODUCT_ENV, |s| validate_identity_string(PRODUCT_ENV, s));
     publish(VID_PID_ENV, validate_vid_pid);
+
+    // Last, so it reads the same four variables `publish` just resolved and can
+    // name the ones that deviated. The ordering matters only for the message:
+    // a *malformed* override already emitted INVALID_CFG above, and this emits
+    // UNACKED_CFG beside it, so an unacknowledged typo produces two named
+    // errors rather than one that hides the other.
+    check_override_acknowledgement(&[AAGUID_ENV, MANUFACTURER_ENV, PRODUCT_ENV, VID_PID_ENV]);
 }
