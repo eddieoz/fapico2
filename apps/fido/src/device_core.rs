@@ -2066,6 +2066,53 @@ impl FidoApp {
         info.write_cbor_into::<{ crate::CTAP2_MAX_MSG }>(out).ok();
         out.len()
     }
+
+    // ------------------------------------------------------------------
+    // authenticatorSelection (0x0B) — US-1514
+    // ------------------------------------------------------------------
+    //
+    // Deliberately NOT gated on user presence, and the reasoning is in the
+    // commit message rather than being a summary of it:
+    //
+    // * `fido2`'s `Ctap2.selection()` (ctap2/base.py:575) calls
+    //   `send_cbor(Ctap2.CMD.SELECTION, ...)` with no data, and `send_cbor`
+    //   (`:286`) does `status = response[0]; if status != 0x00: raise
+    //   CtapError(status)`. So *any* non-zero answer — `UpRequired` (0x3B),
+    //   `UserActionTimeout` (0x2F), `ActionTimeout` (0x3A) — is an exception
+    //   at the caller, not a wait. There is no wire shape in which a gated
+    //   selection reads as a successful selection to this client.
+    // * The `UpRequired` → keepalive → retry loop that turns a bare `0x3B`
+    //   into a touch prompt lives in the *transport*, not here, and its
+    //   predicate does not include `0x0B`:
+    //   `presence_windowed = ctap_cmd == 0x01 || ctap_cmd == 0x02 ||
+    //   ctap_cmd == 0x06 || ctap_cmd == vendor41::CMD` in
+    //   `firmware/src/tasks.rs`, mirrored in `firmware/src/emul_main.rs`.
+    //   So gating here would answer a bare 0x3B that never opens a window,
+    //   never prompts and never retries — a deadlock, not a prompt.
+    // * The reference C firmware gates too (`pico-fido/src/fido/
+    //   cbor_selection.c` calls `wait_button_pressed()`), but the gate is
+    //   disarmed by default: it resolves through
+    //   `button_wait_start()` (pico-keys-sdk/src/button.c:113), which
+    //   auto-queues `EV_BUTTON_PRESSED` when `up_btn` is unset AND
+    //   `force_button_wait` is false — and `cbor_selection.c`'s
+    //   `force_button_wait = true` is inside `#ifdef FORCE_BUTTON_WAIT`,
+    //   a CMake option that is off unless requested. fapico2's
+    //   `vendorff::PhyConfig` has no `up_btn` field either, so the other
+    //   disarm is unreachable here. The reference's *default build* answer is
+    //   therefore `CTAP2_OK` with no touch, which is what this returns and
+    //   what the host twin returns.
+    // * `Ctap2Response::ActionTimeout` (0x3A) stays unproduced. The
+    //   reference does not use it here either: on a real timeout
+    //   `cbor_selection.c` returns `CTAP2_ERR_USER_ACTION_TIMEOUT` = 0x2F,
+    //   not 0x3A. The old host comment cited 0x3A and was wrong.
+    pub(crate) fn handle_authenticator_selection(
+        &mut self,
+        out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
+    ) -> usize {
+        out.clear();
+        out.push(Ctap2Response::Ok.code()).ok();
+        out.len()
+    }
 }
 
 /// Derive the hmac-secret output for encrypted salts (CTAP2.1 §6.7) — the

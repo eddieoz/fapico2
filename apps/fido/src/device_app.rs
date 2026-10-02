@@ -609,6 +609,26 @@ impl FidoApp {
             0x07 => self.handle_reset(out),
             0x08 => self.handle_get_next_assertion(out, store),
             0x0A => self.handle_cred_mgmt(data, out),
+            // US-1514: authenticatorSelection. This arm is what made the
+            // emulator able to do something the board could not — the host
+            // twin had `0x0B` since FX-415 and this dispatch fell through to
+            // `_ =>` with INVALID_COMMAND, so a platform enumerating
+            // authenticators (Chrome on Windows calls this) got `OK` from
+            // the emulator and an error from the board.
+            //
+            // It answers `CTAP2_OK` without a touch, which is the point of
+            // story US-1514 rather than an oversight: `handle_authenticator_
+            // selection` in `device_core.rs` states the full argument. In
+            // short, a gated answer is unreachable from here (the
+            // `UpRequired` → keepalive → retry loop that makes a gate into a
+            // prompt is in `firmware/src/tasks.rs` and its predicate does
+            // not name `0x0B`), `fido2`'s `Ctap2.selection()` raises a
+            // `CtapError` on *any* non-zero status so no gated status reads
+            // as a selection, and the reference C firmware's gate is
+            // disarmed in its default build. Answering here is what makes
+            // the twins agree; the gate is a separate story that would have
+            // to change both twins *and* the transport.
+            0x0B => self.handle_authenticator_selection(out),
             0x0C => self.handle_large_blobs(data, out, store),
             0x0D => self.handle_authenticator_config(data, out, store),
             // US-106: the RS-Key vendor channel (PicoForge framing C) — the
@@ -839,12 +859,19 @@ mod tests {
         // it is supposed to describe. The coverage it used to give is now
         // `tests/vendor41.rs::vendor_prototype_set_led_gpio_persists`, which
         // drives the real `0xFF` path rather than asserting its absence.
-        // `0x0B` is still unimplemented and keeps its leg.
-        let n = app.process_ctap2(0x0Bu8, b"anything", [0; 4], &mut out);
+        // US-1514 removed the `0x0B` leg that used to sit here. It was asserted
+        // as INVALID_COMMAND purely because the device dispatch had no arm
+        // for it — the assertion pinned the exact parity hole the story is
+        // about. `0x09` (bio enrollment in this dialect) replaces it: still
+        // genuinely unimplemented, and it keeps this test's coverage honest
+        // rather than merely present. `tests/selection.rs` now asserts the
+        // twins agree on `0x0B`, which is the claim that has to survive a
+        // future refactor.
+        let n = app.process_ctap2(0x09u8, b"anything", [0; 4], &mut out);
         assert_eq!(
             out.as_slice()[..n],
             [CTAP2_ERR_INVALID_COMMAND],
-            "0x0B is still unimplemented and answers INVALID_COMMAND"
+            "0x09 (bio enrollment) is unimplemented and answers INVALID_COMMAND"
         );
         // S-701-5: the vault is implemented; malformed CBOR → INVALID_CBOR.
         let n = app.process_vendor_vault(b"{}", &mut out);

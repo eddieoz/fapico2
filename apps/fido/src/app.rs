@@ -925,10 +925,31 @@ impl<K: Keystore> FidoApp<K> {
         }
     }
 
-    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). The reference C
-    /// firmware auto-accepts selection in emulation, so the command returns
-    /// CTAP2_OK immediately here; a hardware build gates this on the board
-    /// button (30 s timeout → ACTION_TIMEOUT) behind US-324.
+    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). Returns CTAP2_OK
+    /// immediately, with no touch.
+    ///
+    /// US-1514 corrected the comment that used to sit here, which was wrong
+    /// in both halves. It said "the reference C firmware auto-accepts
+    /// selection **in emulation**" — the reference's gate is disarmed in its
+    /// *default build*, not only under emulation: `cbor_selection.c` does call
+    /// `wait_button_pressed()`, but the `force_button_wait = true` that
+    /// disarms `button_wait_start()`'s auto-complete branch
+    /// (`pico-keys-sdk/src/button.c:113`) sits inside
+    /// `#ifdef FORCE_BUTTON_WAIT`, a CMake option that is off unless
+    /// requested. And it said a hardware build would time out to
+    /// `ACTION_TIMEOUT` (0x3A) — the reference returns
+    /// `CTAP2_ERR_USER_ACTION_TIMEOUT` = **0x2F** on timeout and
+    /// `CTAP2_ERR_OPERATION_DENIED` = 0x27 on cancel. 0x3A is not what a
+    /// gated selection answers anywhere, and `Ctap2Response::ActionTimeout`
+    /// is accordingly still produced nowhere in this tree.
+    ///
+    /// The gate is still worth having and is still not implemented; see
+    /// `device_core::handle_authenticator_selection` for why it cannot be
+    /// added to this twin alone, and note that adding it would need the
+    /// transport (`firmware/src/tasks.rs`) to put `0x0B` in
+    /// `presence_windowed` — otherwise the `UpRequired` this returns would
+    /// never open a window and would go out as a bare error to a client
+    /// that turns every non-zero status into a `CtapError`.
     fn authenticator_selection(&mut self) -> Vec<u8> {
         vec![Ctap2Response::Ok.code()]
     }
