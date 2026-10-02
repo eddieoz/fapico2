@@ -866,6 +866,66 @@ impl FidoApp {
             }
         }
 
+        // US-1526 — THE `up` POLICY, decided. This rejection is deliberate,
+        // legal and load-bearing. Everything the story asked to be written
+        // down is here, at the site, rather than in a commit message nobody
+        // reads at the next refactor:
+        //
+        // WHAT: a makeCredential carrying `options.up = false` is answered
+        // `CTAP2_ERR_INVALID_OPTION` (0x2B), on both twins. It is NOT a
+        // parse failure and NOT an accident of ordering.
+        //
+        // WHY IT IS LEGAL: this authenticator does not advertise `up` at all
+        // (`ctap2.rs`'s `Ctap2Info::default`, pinned by
+        // `tests/getinfo.rs::test_get_info_has_required_fields`), and
+        // CTAP2.1 §6.1 requires a request naming an unadvertised option to be
+        // rejected. The alternative reading — "the spec permits up=false, so
+        // we must serve it" — ignores the half of the rule that the option has
+        // to be advertised for the request to be answerable at all.
+        //
+        // WHY IT IS ALSO C PARITY, which is the stronger argument: the
+        // reference firmware does exactly this, unconditionally, in every
+        // build — `pico-fido/src/fido/cbor_make_credential.c:387`:
+        //
+        //     if (options.up == pfalse) { //5.6
+        //         CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+        //     }
+        //
+        // It is not inside an `#ifdef`. The two lines the reference leaves
+        // commented out immediately below (`//else if (options.up == NULL)
+        // //5.7  //rup = ptrue;`) are the "absent means UP" default, which we
+        // get for free by never special-casing absence. So this is not a
+        // fapico2 policy invented on top of the reference — it is the
+        // reference.
+        //
+        // WHAT IT COSTS: a client that sends up=false gets an error where a
+        // CTAP2.1-conformant authenticator might have minted a credential.
+        // What we can verify, we checked: in `fido2` 2.2.1 the ONLY site that
+        // sends `up: false` is `_filter_creds`
+        // (`fido2/client/__init__.py:593`), a **getAssertion** allowList
+        // probe — `grep -rn '"up"' fido2/` returns exactly that one line —
+        // and getAssertion's `up:false` is served (below). `make_credential`
+        // takes `options` as a caller-supplied mapping
+        // (`fido2/ctap2/base.py:376`), so a caller *could* put up=false in it;
+        // we have no observation of one doing so. The epic's claim that
+        // Chrome's autofill and conditional-mediation paths send it is
+        // plausible and is NOT verified here — no Chrome source was read, and
+        // guessing at a browser's wire from a comment is exactly the failure
+        // mode a previous commit in this lane shipped.
+        //
+        // WHAT WOULD HAVE TO CHANGE TO RELAX IT: three things, not one.
+        // (1) Advertise `up` in the getInfo options map — which stops
+        // matching the reference and would make every *absent* option
+        // ambiguous. (2) Delete this check and the `req.up != Some(false)`
+        // guard on the presence gate below, or a plain rk=false / no-UV
+        // credential could be minted with zero touch, which is US-907's
+        // requirement and which this epic explicitly does not relax.
+        // (3) Mirror both in `app.rs` — the host twin has its own copy at
+        // `app.rs:1305`, and the epic's DoD is that the two answer
+        // identically. Relaxing only one twin is the exact defect US-1514
+        // was filed for.
+        //
+        // `tests/up_policy.rs` pins all of this on both twins.
         if req.options_present && req.up == Some(false) {
             return Err(err(Ctap2Response::InvalidOption));
         }
@@ -1136,6 +1196,26 @@ impl FidoApp {
             if !uv && self.keystore.pin_state.always_uv {
                 return Err(err(Ctap2Response::PuatRequired));
             }
+            // US-1526: getAssertion `up:false` is SERVED (a silent assertion, no UP
+            // bit) — unlike makeCredential above, which rejects it. That
+            // asymmetry is the reference's, not ours:
+            // `pico-fido/src/fido/cbor_get_assertion.c` takes the silent path
+            // (`bool silent = (up == false && uv == false);` at :322, and the
+            // UP gate at :488 fires only for `up == ptrue || absent`) and
+            // rejects exactly one combination — hmac-secret with a silent
+            // assertion, at :324:
+            //
+            //     if (options.up == pfalse && extensions.hmac_secret == ptrue) {
+            //         CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+            //     }
+            //
+            // The device twin had this check from the initial release; the
+            // host twin has its copy at `app.rs:1655`. The brief for this
+            // story flagged the two as possibly divergent (host-only). They
+            // are not: both reject, with the same byte, in the same position
+            // in the validation order. `tests/up_policy.rs` pins the parity
+            // so the next reader does not have to re-derive it by reading two
+            // parsers.
             if req.up == Some(false) && req.hmac_secret_input.is_some() {
                 return Err(err(Ctap2Response::InvalidOption));
             }

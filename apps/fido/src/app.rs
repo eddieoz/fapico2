@@ -1322,7 +1322,16 @@ impl<K: Keystore> FidoApp<K> {
         }
 
         // 4) User presence. In emulation we always succeed; set UP flag.
-        // options.up handling: if up==false → INVALID_OPTION (per spec 5.6).
+        // US-1526: MC `up:false` → INVALID_OPTION. The decision, the
+        // argument and what would have to change to relax it are written out
+        // in full on the device twin's copy of this check
+        // (`device_core.rs`, `make_credential_inner`, "THE `up` POLICY,
+        // decided" — reference C parity at
+        // `pico-fido/src/fido/cbor_make_credential.c:387`). This is the
+        // second copy of one policy in two files; the full text lives on the
+        // twin that actually ships, and this line says where. The pair must
+        // not be relaxed independently — that is the defect US-1514 was
+        // filed for.
         if req.options.present
             && req.options.up == Some(false) {
                 return vec![Ctap2Response::InvalidOption.code()];
@@ -1643,6 +1652,14 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // hmac-secret with silent authentication is not allowed (C parity).
+        // US-1526: the device twin has this same check
+        // (`device_core.rs`, `handle_get_assertion`, under "US-1526:
+        // getAssertion `up:false` is SERVED"), and the reasoning — the
+        // reference's one rejected combination, at
+        // `pico-fido/src/fido/cbor_get_assertion.c:324` — is written out
+        // there. The brief for this story suggested only the host twin had
+        // it; it does not, and `tests/up_policy.rs` pins the agreement so the
+        // question does not reopen.
         if req.options.up == Some(false) && req.extensions.hmac_secret_input.is_some() {
             return vec![Ctap2Response::InvalidOption.code()];
         }
