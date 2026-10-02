@@ -271,8 +271,12 @@ mod tests {
     use heapless::Vec as HeaplessVec;
 
     use crate::ctap_hid::{
-        CTAP2_ERR_KEEPALIVE_CANCEL, CTAP_HID_CANCEL, CTAP_HID_CBOR, CTAP_HID_KEEPALIVE,
+        CTAP2_ERR_KEEPALIVE_CANCEL, CTAP_HID_CANCEL, CTAP_HID_CBOR, CTAP_HID_INIT,
+        CTAP_HID_KEEPALIVE,
     };
+
+    /// The CTAPHID broadcast channel, as `fido2` sends it.
+    const BROADCAST: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 
     /// Wall-clock ceiling for one parity drive.
     ///
@@ -984,6 +988,121 @@ mod tests {
         for (i, r) in conts.iter().enumerate() {
             assert_eq!(r[4], i as u8, "continuation {i}: rolling sequence number");
         }
+    }
+
+    /// US-1511, on the epic's DoD item 6: the **whole** consent-window
+    /// scenario — a window open on one channel, an `INIT` on the broadcast
+    /// channel, a `getInfo` on a second channel, and a latched press — puts
+    /// the same 64-byte reports on the wire, in the same order, from the
+    /// emulator's `serve_pass` and from the shipped `serve_once` reached
+    /// through a device-shaped adapter. The cancel case is the same
+    /// comparison with a `CTAPHID_CANCEL` in place of the press.
+    ///
+    /// The four-way comparison above already covers a window with a
+    /// cross-channel request inside it; this one is the *story* rather than
+    /// a smoke test of the pieces, and it adds the broadcast `INIT` — the
+    /// frame a host sends before it has a channel, and the one that was
+    /// stranded in the endpoint buffer through the whole pre-US-1509
+    /// blackout.
+    ///
+    /// The answers are asserted as well as the equality. Equality alone would
+    /// be satisfied by both sides being wrong in the same way, and "the
+    /// broadcast INIT is answered in a full 17-byte reply echoing the nonce"
+    /// is a claim about the answer, not about the two wires matching.
+    #[test]
+    fn us1511_the_window_scenario_is_identical_on_both_paths() {
+        let _guard = presence_lock();
+
+        let a = [0u8, 0, 0, 9];
+        let b = [0u8, 0, 0, 0x21];
+        let nonce = [0xA1u8, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+
+        // (1) A window opens on `a`; an INIT lands on the broadcast channel
+        // and a getInfo on `b`, both while it is open; then a latched press
+        // completes the parked command on `a`.
+        let plan = Plan::new(vec![
+            Exchange {
+                at: StdDuration::ZERO,
+                frames: cbor_frame(a, &[0x01, 0x01]),
+            },
+            Exchange {
+                at: StdDuration::from_millis(120),
+                frames: frame(BROADCAST, CTAP_HID_INIT, &nonce),
+            },
+            Exchange {
+                at: StdDuration::from_millis(180),
+                frames: cbor_frame(b, &[0x04]),
+            },
+        ])
+        .grant_at(StdDuration::from_millis(420));
+        let (emu, dev) = both(&plan);
+        assert_eq!(
+            emu, dev,
+            "the grant-side window scenario diverged: {}",
+            describe(&dev)
+        );
+
+        // The three answers, on the device wire; the emulator wire is the same
+        // bytes by the assertion above.
+        let init_answer: Vec<u8> = dev
+            .iter()
+            .find(|r| r[..4] == BROADCAST && r[4] == CTAP_HID_INIT | 0x80)
+            .map(|r| payload_of(r))
+            .unwrap_or_else(|| {
+                panic!("the broadcast INIT was not answered; wire was {}", describe(&dev))
+            });
+        assert_eq!(
+            init_answer.len(),
+            17,
+            "a full INIT reply is nonce(8)+cid(4)+4 version bytes+capFlags(1)"
+        );
+        assert_eq!(&init_answer[..8], &nonce, "the INIT reply echoes the request nonce");
+        assert_eq!(
+            dev.iter()
+                .find(|r| r[..4] == b && r[4] == CTAP_HID_CBOR | 0x80)
+                .map(|r| payload_of(r)),
+            Some(vec![0xBB]),
+            "the cross-channel getInfo must be answered on its own channel"
+        );
+        assert_eq!(
+            dev.iter()
+                .find(|r| r[..4] == a && r[4] == CTAP_HID_CBOR | 0x80)
+                .map(|r| payload_of(r)),
+            Some(vec![0xAA, 0x01]),
+            "the latched press completes the parked command on the parked \
+             command's channel"
+        );
+        // And the window announced itself, so the scenario really did open one
+        // rather than passing because nothing was ever owed.
+        assert!(
+            dev.iter()
+                .any(|r| r[..4] == a && r[4] == CTAP_HID_KEEPALIVE | 0x80),
+            "the window on {a:?} must have announced itself; wire was {}",
+            describe(&dev)
+        );
+
+        // (2) The same opening, closed by a CANCEL instead of a press.
+        let plan = Plan::new(vec![
+            Exchange {
+                at: StdDuration::ZERO,
+                frames: cbor_frame(a, &[0x01, 0x01]),
+            },
+            Exchange {
+                at: StdDuration::from_millis(120),
+                frames: frame(a, CTAP_HID_CANCEL, &[]),
+            },
+        ])
+        .ungranted();
+        let (emu, dev) = both(&plan);
+        assert_eq!(emu, dev, "the cancel-side window scenario diverged: {}", describe(&dev));
+        assert_eq!(
+            dev.iter()
+                .find(|r| r[..4] == a && r[4] == CTAP_HID_CBOR | 0x80)
+                .map(|r| r[7]),
+            Some(CTAP2_ERR_KEEPALIVE_CANCEL),
+            "a cancelled CTAP2 window answers 0x2D; wire was {}",
+            describe(&dev)
+        );
     }
 
     // ── the shared presence runtime ────────────────────────────────────────

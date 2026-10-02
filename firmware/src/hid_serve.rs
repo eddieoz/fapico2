@@ -1096,6 +1096,24 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
     }
 }
 
+/// US-1511: the consent-window story as an end-to-end **black-box** test over
+/// the host seam — 64-byte reports in on one end, 64-byte reports out on the
+/// other, the shipped serve loop in a thread of its own, a real idle OUT
+/// endpoint that parks, and the real presence gate (so a stolen grant is
+/// observable rather than assumed).
+///
+/// A sibling of [`tests`] rather than part of it: that module is the
+/// unit-level seam and it *abandons* a parked pass so a drive's budget can
+/// elapse, which is correct there and fatal here — an abandon-and-retry
+/// harness will happily re-answer a cross-channel request that a reintroduced
+/// blocking `loop` should have swallowed. The rig in `window_black_box`
+/// therefore only ever drops a pass when no consent window is live, and
+/// records a wedge (a red test) when one is. The module docs there spell out
+/// why.
+#[cfg(test)]
+#[path = "hid_serve/window_black_box.rs"]
+mod window_black_box;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

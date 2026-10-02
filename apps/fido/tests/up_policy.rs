@@ -311,9 +311,8 @@ fn ga_up_false_asserts_a_credential_silently() {
     assert_eq!(made[0], 0x00, "host twin: the credential must mint");
     let asserted = h.process_ctap2(GA, &request, [1, 2, 3, 4]);
     assert_eq!(asserted[0], 0x00, "host twin: up:false must be served");
-    assert_eq!(
-        up_bit(&asserted),
-        false,
+    assert!(
+        !up_bit(&asserted),
         "host twin: a silent assertion must not set the UP flag"
     );
 
@@ -326,9 +325,8 @@ fn ga_up_false_asserts_a_credential_silently() {
     let mut out2 = HV::<u8, MAX_MSG>::new();
     let n2 = d.process_ctap2(GA, &request, [1, 2, 3, 4], &mut out2);
     assert_eq!(out2[0], 0x00, "device twin: up:false must be served");
-    assert_eq!(
-        up_bit(&out2[..n2]),
-        false,
+    assert!(
+        !up_bit(&out2[..n2]),
         "device twin: a silent assertion must not set the UP flag"
     );
 }
