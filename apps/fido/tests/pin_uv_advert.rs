@@ -49,6 +49,25 @@ fn option_of(opts: &[(String, bool)], key: &str) -> Option<bool> {
     opts.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
 }
 
+// ---------------------------------------------------------------------------
+// US-1525: `uv` is never advertised, on either twin.
+// ---------------------------------------------------------------------------
+
+/// The comment above sub-command `0x06` in `device_core.rs` used to justify
+/// the sub-command by claiming "GetInfo reports the `uv` option". It never
+/// did. Advertising it would promise a built-in user-verification mechanism
+/// this build has nothing to check against, so the invariant is pinned here
+/// instead — on both twins — and the comment must not cite it again.
+#[test]
+fn uv_is_never_advertised_on_the_host_twin() {
+    let mut app = FidoAppMem::with_keystore(fapico2_fido::keystore::MemoryKeystore::new());
+    let opts = options_of(&app.process_ctap2(0x04, &[], [1, 2, 3, 4]));
+    assert_eq!(option_of(&opts, "uv"), None, "the host twin must not advertise uv");
+    // ...while still advertising the token mechanism, which is what the
+    // sub-command's comment now points at instead.
+    assert_eq!(option_of(&opts, "pinUvAuthToken"), Some(true));
+}
+
 /// The options vector is a 16-slot heapless vec and `set_option` swallows a
 /// failed push with `.ok()`. A tenth key would truncate silently, so the
 /// advertised set is pinned by length as well as by value.
@@ -308,6 +327,16 @@ mod device {
         super::assert_pin_pair(&opts, false, true);
         // And the route is real: 0x06 answers a fresh, PIN-less device.
         assert_eq!(d.uv_token_status(), 0x00);
+    }
+
+    /// US-1525, device side: the comment above sub-command `0x06` must not
+    /// be able to cite a `uv` option that this binary does not send.
+    #[test]
+    fn uv_is_never_advertised_on_the_device_twin() {
+        let mut d = Device::boot();
+        let opts = d.options();
+        assert_eq!(super::option_of(&opts, "uv"), None, "the device twin must not advertise uv");
+        assert_eq!(super::option_of(&opts, "pinUvAuthToken"), Some(true));
     }
 
     #[test]

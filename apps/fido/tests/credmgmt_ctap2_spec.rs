@@ -367,8 +367,9 @@ fn dialect_discriminator_is_the_type_of_key_0x02() {
 
 /// `getPinUvAuthTokenUsingUvWithPermissions` (clientPIN sub-command `0x06`)
 /// is the only way a client on a PIN-less key can obtain a pinUvAuthToken,
-/// and GetInfo advertises `uv` — so it must be answered, not refused. Before
-/// this it fell through to `InvalidParameter`.
+/// and GetInfo advertises `pinUvAuthToken` — so it must be answered, not
+/// refused. Before this it fell through to `InvalidParameter`. (It does *not*
+/// advertise `uv`: there is no built-in UV secret to check — US-1525.)
 #[test]
 fn clientpin_uv_token_subcommand_is_implemented() {
     let (mut app, client) = setup();

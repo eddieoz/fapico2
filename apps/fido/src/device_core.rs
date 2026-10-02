@@ -1860,15 +1860,24 @@ impl FidoApp {
             0x06 => {
                 // getPinUvAuthTokenUsingUvWithPermissions.
                 //
-                // The no-PIN leg of the token exchange: the client proves
-                // nothing but a user-presence gesture, and this build's
-                // authenticator has no separate user-verification secret to
-                // check. It is what a client falls back to when the key has
-                // no PIN, and it is advertised as reachable because GetInfo
-                // reports the `uv` option — so it has to answer rather than
-                // refuse, or the client has no way to obtain a pinUvAuthToken
-                // at all and the resident-credential screens never resolve.
-                //
+// The no-PIN leg of the token exchange: the client proves
+				// nothing but a user-presence gesture, and this build's
+				// authenticator has no separate user-verification secret to
+				// check. It is what a client falls back to when the key has
+				// no PIN, so it has to answer rather than refuse, or the
+				// client has no way to obtain a pinUvAuthToken at all and the
+				// resident-credential screens never resolve.
+				//
+				// US-1525: this comment used to justify the sub-command by
+				// claiming "GetInfo reports the `uv` option". It never did,
+				// and it still does not — `uv` is deliberately not
+				// advertised (see `ctap2::Ctap2Info::default`), because this
+				// build has nothing to verify against and promising a
+				// mechanism that does not exist would be the real lie. What
+				// is advertised is `pinUvAuthToken`, which claims the token
+				// *mechanism*, not a UV method; US-1512 decides its value.
+				// `tests/pin_uv_advert.rs` asserts `uv` stays absent on both
+				// twins so this premise cannot be quietly reinstated.
                 // Fail-closed on presence: the grant is the only thing being
                 // asserted, so without a press this answers `UpRequired` and
                 // the transport opens a keepalive window and retries. A
