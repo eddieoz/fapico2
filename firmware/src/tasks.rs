@@ -713,18 +713,12 @@ async fn dispatch_hid_cmd(
         // counter) instead of the constant [0, 0, 0, 1]; the reply frame
         // itself goes out on the requesting (broadcast) channel per spec.
         let new_channel = cid_alloc.allocate(nonce);
-        // US-1507: the payload is built by `ctap_hid::init_reply`, which owns
-        // bytes 12..16 — `versionInterface`, the **YubiKey** firmware version
-        // bytes 13..15 (yubikit reads those as `device_version` in
-        // `_ManagementCtapBackend` and gates `read_device_info` on `>= 4.1`;
-        // reporting 2.1.0 there made every host synthesise a U2F-only device
-        // record and `ykman fido info` say `CTAP2: Not supported`; same
-        // version the management applet publishes in TAG_VERSION) and — the
-        // reason the helper is extracted rather than inlined here — the
-        // `capFlags` byte, which is the one byte that decides whether a
-        // spec-reading host discovers this key as a CTAP2 authenticator at
-        // all (`CTAPHID_INIT_CAP_FLAGS`: 0x05, CBOR+WINK under both live bit
-        // assignments; 0x04 read "no CTAP2" by any spec reader).
+        // US-1507: bytes 12..16 of the reply — versionInterface, the YubiKey
+        // firmware version, and capFlags — are built by `ctap_hid::init_reply`.
+        // The rationale for all of them (why the version bytes are the YubiKey
+        // version and not the CTAPHID one, and why capFlags is 0x05 rather than
+        // 0x04) lives on that function and on `CTAPHID_INIT_CAP_FLAGS`, so it
+        // is not restated here.
         let inner = init_reply(
             nonce,
             &new_channel,

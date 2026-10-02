@@ -548,9 +548,11 @@ mod tests {
         assert_ne!(channel, HID_CID_BROADCAST, "INIT must not answer on the broadcast CID");
 
         let inner = init_reply(&nonce, &channel, 5, 4, 0);
-        assert_eq!(inner.len(), 17, "INIT reply payload length is fixed by the wire format");
 
         // The echoed nonce, the freshly allocated CID, the interface version.
+        // (The payload *length* needs no assert: `init_reply` returns
+        // `[u8; CTAPHID_INIT_REPLY_LEN]`, so the const is what pins it, and an
+        // `inner.len() == 17` check would be comparing the const to itself.)
         assert_eq!(&inner[..8], &nonce[..]);
         assert_eq!(&inner[8..12], &channel[..]);
         assert_eq!(inner[12], 0x02, "versionInterface must be 2 (CTAP HID v2)");
