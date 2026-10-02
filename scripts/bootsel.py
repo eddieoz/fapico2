@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Drive the pico-keys-sdk *rescue* app to reboot the device or enter BOOTSEL.
+"""Drive the *rescue* app to reboot the device or enter BOOTSEL.
 
-The C firmware (pico-fido2 build) ships a rescue app on CCID:
+Both firmwares ship a rescue app on CCID with the same AID and the same
+command set — the C pico-fido2 build (`pico-keys-sdk/src/rescue.c`) and this
+repo's `apps/rescue/src/lib.rs`, which is registered on the DEVICE build, not
+only the emulator:
 
     AID  A0 58 3F C1 9B 7E 4F 21
-    80 1F 01 00 00   reboot into BOOTSEL (user presence: press board button)
+    80 1F 01 00 00   reboot into BOOTSEL   (mode in P1, P2 must be 0x00)
     80 1F 00 00 00   plain reboot into the running firmware
 
-See docs/bootsel.md. NOTE: the fapico2 RUST build does not implement the
-rescue app yet, so this script only works on the C firmware; on the Rust
-build use the physical button sequence instead (see docs/bootsel.md).
+See docs/bootsel.md.
+
+CAUTION on `pick_reader`: it matches the substring "pico" in the pcscd reader
+name, which is the *reference C board's* name, not ours. With both a
+pico-fido2 and a fapico2 attached, auto-detect targets the WRONG device and
+the fapico2 is never touched. Pass `--reader` when more than one is present.
 
 Requires: pcscd running and pyscard (`pip install pyscard`).
 """
@@ -61,6 +67,15 @@ def die(msg):
 
 
 def pick_reader(explicit=None):
+    """Choose a reader, or die asking for one.
+
+    WARNING — the `pico` substring below is the *reference C board's* reader
+    name, not a property of fapico2 hardware. On a desk with both a
+    pico-fido2 and a fapico2 attached this silently picks the reference board,
+    the fapico2 is never APDU'd, and the run then looks exactly like "the
+    rescue APDU reported success and the board did nothing". Pass --reader
+    whenever more than one reader is present.
+    """
     if explicit:
         return explicit
     found = readers()
@@ -91,7 +106,11 @@ def select_rescue(conn):
     if sw == SW_FILE_NOT_FOUND:
         die(
             "rescue AID not found (SW 6A82): the running firmware does not "
-            "implement the rescue app (e.g. fapico2 Rust build).\n"
+            "implement the rescue app.\n"
+            "Both the C pico-fido2 build and this repo's apps/rescue do, so on "
+            "a stock fapico2 image this means the board is older than US-161, "
+            "or you are talking to the wrong reader (pass --reader; see "
+            "pick_reader's note).\n"
             "Use the button sequence: hold BOOTSEL, press RESET, release "
             "RESET, keep holding BOOTSEL until the RP2350 volume appears.\n"
             "See docs/bootsel.md."

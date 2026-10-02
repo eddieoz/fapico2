@@ -267,13 +267,16 @@ _B_US413 = Break(
 
 _B_WRAPUP = Break(
     "docs/bootsel.md",
-    "**no rescue APDU in v1.0.0**",
-    "**rescue APDU works in v1.0.0**",
-    "docs/bootsel.md claims the C firmware's rescue APDU works on the Rust "
-    "build — it does not (the C firmware entered BOOTSEL with no button "
-    "press, verified 2026-09-08; the Rust build is physical BOOTSEL+RESET "
-    "only), and the claim is the one an operator acts on while holding a "
-    "dark board (US-392)",
+    "**same AID, same APDU, same script** (`apps/rescue`)",
+    "**no rescue applet — physical BOOTSEL+RESET only**",
+    "docs/bootsel.md's table stops claiming the Rust build speaks the rescue "
+    "APDU — the page is what a maintainer reads while planning a re-flash, "
+    "and until 2026-10-02 it said the opposite, sending them to hold BOOTSEL "
+    "by hand on a board they cannot reach. The anchor is a single-occurrence "
+    "phrase on purpose: gating on the substring 'apps/rescue' also matches "
+    "'apps/rescue/src/lib.rs', so that version of the check passed with the "
+    "claim deleted. NOTE the direction flip: this break used to pin the FALSE "
+    "claim in place; a gate that requires a lie is not a safety net",
 )
 
 _B_ASYNC_FRAME = Break(
