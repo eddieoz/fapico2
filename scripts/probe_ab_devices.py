@@ -1235,18 +1235,41 @@ def probe_consent_window(dev, manufacturer, label):
         raw.close()
 
     # (b) MakeCredential to a throwaway RP id, PINGed on the same channel.
+    #
+    # US-1530 FIX. The payload this probe used to send was malformed against
+    # the CTAP2.1 s6.3.2 makeCredential grammar: key 1 (clientDataHash) held a
+    # map, key 2 (rp) held a pubKeyCredParams *element*, key 3 (user) held an
+    # array, and key 5 (excludeList) held a bare byte string. Both boards
+    # answer 0x12 to that; our board's answer was unchanged across this whole
+    # branch, so the 0x12 was never a regression. See
+    # `.superpowers/sdd/report-mc-regression.md` and the pinned fixture in
+    # `apps/fido/tests/mc_probe_payload.rs`.
+    #
+    # The probe's job here is to reach the PRESENCE GATE, so it now sends a
+    # grammar-correct request. The expected outcome on a correct device is a
+    # consent window: keepalives plus no reply until the budget runs out.
+    # `0x12` on a board means that board's parser rejected the request, which
+    # is a *finding* and not a pass.
     raw = RawCtap.open(dev["descriptor"])
     try:
         raw.selftest(label)
         params = cbor.dumps(
             {
-                1: {"id": throwaway_rp, "name": "ab-probe.invalid"},
-                2: {"type": "public-key", "alg": -7},
-                3: [{"type": "public-key", "alg": -7}],
-                4: [{"type": "public-key", "alg": -7}],
-                5: b"\x00" * 32,  # clientDataHash -- deliberately not a real challenge
+                # 1 clientDataHash: 32 raw bytes. Deliberately not a real
+                # challenge -- this registration is never completed.
+                1: bytes(32),
+                # 2 rp: PublicKeyCredentialRpEntity
+                2: {"id": throwaway_rp, "name": "ab-probe.invalid"},
+                # 3 user: PublicKeyCredentialUserEntity -- 'id' is a bstr.
+                3: {"id": b"ab-probe-user", "name": "ab-probe.invalid",
+                    "displayName": "ab-probe"},
+                # 4 pubKeyCredParams: an ARRAY of {type, alg} descriptors.
+                4: [{"type": "public-key", "alg": alg} for alg in (-7, -8, -35, -36)],
+                # 5 excludeList: an ARRAY of credential descriptors (empty).
+                5: [],
+                # 6 extensions, 7 options.
                 6: {},
-                7: {},
+                7: {"rk": True},
             }
         )
         body = bytes([CTAP2_MAKE_CREDENTIAL]) + params
