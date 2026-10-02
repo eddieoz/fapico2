@@ -911,9 +911,19 @@ def main():
                                                      c["verdict"])
         log(f"{c['case']:<44} {c['gate']:<8} {mark}")
     log()
+    # Count ONLY real passes. A machine case that reported nothing is NOT a
+    # pass -- counting it as one would let CI go green on a case that never
+    # ran, which is exactly the failure mode this harness exists to prevent.
     machine = [c for c in all_cases if c["gate"] == "machine"]
+    machine_pass = [c for c in machine if c["verdict"] == "PASS"]
     machine_fail = [c for c in machine if c["verdict"] == "FAIL"]
-    log(f"machine-checkable: {len(machine) - len(machine_fail)}/{len(machine)} pass")
+    machine_notrun = [c for c in machine if c["verdict"] not in ("PASS", "FAIL")]
+    log(f"machine-checkable: {len(machine_pass)}/{len(machine)} pass "
+        f"({len(machine_fail)} fail, {len(machine_notrun)} not run)")
+    if machine_notrun:
+        log("  NOT counted as passes: "
+            + ", ".join(c["case"] for c in machine_notrun)
+            + "  (the page-side cases only run with --run-browser)")
     if any(c["gate"] == "human" for c in all_cases):
         log("human-gated: the ceremonies above need a physical touch; a "
             "'NOT RUN' there means the operator did not run them, which is "
