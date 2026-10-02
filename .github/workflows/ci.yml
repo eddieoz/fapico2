@@ -375,16 +375,18 @@ jobs:
           # US-1043, second half: the flash-budget RATCHET on the shipping
           # image. RS-Key's FIRMWARE_FLASH_BUDGET_KIB pattern — a ceiling that
           # is meant to be raised deliberately, with a reason, and never by
-          # accident. The slack is **512 B / 1 block** over the measured
-          # 1,572,352 B, not the "3 blocks over 1518.5 KiB" this comment
-          # carried before the 2026-10-02 raise to 1536 KiB; the current
-          # figures and the reason for the raise are in the header above
-          # (ci.yml:84-90) and at the top of docs/size-report.md. One more
-          # 512-byte block lands on exactly 1,572,864 B, which is NOT `>` the
-          # ceiling, so it still passes — the headroom is one block, not zero.
-          # So a genuine growth lands as a red that names the fix instead of as a
-          # number in a log. The 3.5 MiB text ceiling above is the absolute
-          # backstop; this is the ratchet that says "you have been told".
+          # accident. **The headroom is ZERO blocks.** The boot-phase LED work
+          # (`firmware/src/bootphase.rs`, `boot_led.rs`) added +228 B of text,
+          # which consumed the last 512-byte block: the shipping image is 3,072
+          # blocks / 1,572,864 B against a 1,572,864 B ceiling, and
+          # `SHIPPING -gt BUDGET_BYTES` is false only because they are equal.
+          # The figures and the reason are in the header above (ci.yml:84-90)
+          # and at the top of docs/size-report.md. So the NEXT 512 B anywhere in
+          # the firmware trips this, for a reason unrelated to whatever change
+          # caused it — which is the point: a red that names the fix beats a
+          # ratchet with headroom nobody reads. The 3.5 MiB text ceiling above
+          # is the absolute backstop; this is the ratchet that says "you have
+          # been told".
           BUDGET_KIB=${FIRMWARE_FLASH_BUDGET_KIB:?FIRMWARE_FLASH_BUDGET_KIB is not set}
           BUDGET_BYTES=$(( BUDGET_KIB * 1024 ))
           SHIPPING=$(stat -c %s /tmp/fapico2-a.uf2)
