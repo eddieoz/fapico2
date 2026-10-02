@@ -22,6 +22,13 @@ So the regression is asserted here, on the wire, where it is measurable:
       open a real consent window, walk away from it (no cancel, no touch, stop
       reading), then prove the device still answers.
 
+  abandoned-attempt-next-ceremony-engages
+      the same scenario, but asserting the SINGLE-OCCUPANCY contract: while the
+      abandoned slot is still held, a second ceremony is REFUSED with 0x24
+      CTAP2_ERR_OPERATION_PENDING (US-1510 -- refused, not queued), the device
+      keeps answering INIT/PING/GetInfo throughout the drain, and a new ceremony
+      engages once the slot is released.
+
   abandoned-attempt-does-not-block-the-host
       the same scenario, but measuring whether the host's own WRITE blocks --
       the second half of the defect, where writes block to ETIMEDOUT.
@@ -29,6 +36,19 @@ So the regression is asserted here, on the wire, where it is measurable:
   device-enumerates / device-answers-ping
       the baseline those two are compared against, measured in the same run on
       the same device, so the bound is derived rather than assumed.
+
+WHERE THE SLOT COMES FROM, AND HOW IT IS RELEASED
+-------------------------------------------------
+A consent window is opened with `authenticatorGetNextAssertion` (0x02) to a
+throwaway RP id -- the one request shape that reaches the presence gate on this
+board, verified empirically from a verified-idle slot (see
+`open_consent_window`). It holds for ~30 s and is released either by
+CTAPHID_CANCEL (measured 0.04 s) or by its own deadline (measured 29.78 s).
+
+CTAPHID_CANCEL is deliberately NOT acknowledged on this firmware, per CTAPHID
+and as both references behave -- a cancel reply makes fido2's inbound packet
+matcher raise. So nothing here waits for an ack; a cancel is verified by
+observing that the slot then accepts a new ceremony.
 
 The latency bound is not picked to pass. It is derived at run time from the
 device's own healthy PING round trip in the same run (see --bound-factor), with
@@ -98,10 +118,75 @@ BASELINE_PINGS = 5
 ABANDON_SETTLE_S = 3.0
 POST_ABANDON_PROBE_S = 12.0
 
-# How long to wait for the device to become answerable again after a case that
-# abandoned a ceremony. It recovers on its own once its own ~30 s window timer
-# expires (measured), so this is generous; exceeding it is a real result.
+# Measured on the flashed board, from an abandoned ceremony: the slot is
+# released at 29.78 s by the device's own window deadline, or at 0.04 s by
+# CTAPHID_CANCEL. Both are asserted, not assumed -- see
+# case_device_survives_repeated_abandonment, which measures both in-run.
+MEASURED_DEADLINE_RELEASE_S = 30.0
+MEASURED_CANCEL_RELEASE_S = 0.5
+
+# How long to wait for the device's user-presence slot to drain after a case
+# that abandoned a ceremony. The bound covers the measured 29.78 s deadline plus
+# slack for the probe interval; exceeding it is a real result, not a timeout to
+# paper over.
 RECOVERY_BUDGET_S = 90.0
+
+
+def open_consent_window(dev, rp_id, settle_s=ABANDON_SETTLE_S, phase="abandon"):
+    """Park the device in a real consent window, then walk away from it.
+
+    Returns (wire, parked_dict). The Wire is left OPEN and its request
+    OUTSTANDING, with its keepalives drained up to `settle_s`. That is the
+    shape of a dismissed browser prompt: the host stops reading and never
+    cancels.
+
+    WHICH REQUEST, and why not MakeCredential. Empirically verified on the
+    flashed board, from a verified-idle slot:
+
+      authenticatorGetNextAssertion (0x02)  -> PARKS (25 keepalives, 0x01/0x02)
+      MakeCredential (0x01), throwaway RP    -> 0x12 INVALID_CBOR, no window
+      authenticatorClientPIN (0x06) sub 0x06 -> 0x02 INVALID_PARAMETER, no window
+
+    The MakeCredential answer is not a defect and not this harness's business:
+    US-1530 established that a throwaway-RP MakeCredential is rejected at the
+    CBOR layer on this firmware and on the C reference alike (`CBOR_FIELD_GET_
+    BYTES` at the same key), because the request is not grammatical. And a PIN
+    is set on this board, so a well-formed MakeCredential is refused
+    `0x36 PIN_POLICY_VIOLATION` before the presence gate is ever consulted.
+    GetNextAssertion to a throwaway RP is the one shape that actually reaches
+    the gate here, so it is what parks the window. (The 0x02 clientPIN probe
+    is reported for completeness: it is the documented built-in-UV path, but on
+    this build it does not reach the gate, so it cannot stand in.)
+    """
+    w = ctap.Wire(dev)
+    w.init(timeout=5.0)
+    w.get_assertion_request(rp_id, b"\x11" * 32)
+    parked = w.drain_until_closed(timeout=settle_s)
+    return w, parked
+
+
+def release_window(w):
+    """Hand the device's user-presence slot back. Best-effort, never raises.
+
+    Closing a handle does NOT release the slot -- only CTAPHID_CANCEL or the
+    ~30 s deadline does. So a case that abandons a ceremony and then returns
+    EARLY (a failed assertion, an exception) leaves the slot occupied for the
+    rest of the window, and the next run's first case walks into
+    `0x24 OPERATION_PENDING` and reports it as its own failure. Observed: a run
+    whose predecessor had failed mid-case reported
+    `abandoned-attempt-leaves-device-enumerable` FAIL with
+    "never parked (0x24)" -- a failure manufactured by the previous case's
+    cleanup, not by the device.
+
+    Every abandoning case therefore cancels in its `finally`, so the device is
+    left idle whether the case passed or failed. Best-effort by design: a
+    cancel that does not take effect must not mask the case's real verdict, and
+    `wait_for_recovery` between cases is the backstop that drains it anyway.
+    """
+    try:
+        w.cancel(timeout=1.0)
+    except Exception:
+        pass
 
 
 class Case:
@@ -195,17 +280,51 @@ def hdr(title):
 
 
 def case_device_enumerates(ctx):
-    """The board is attached, is a CTAPHID node, and answers INIT."""
+    """The board is attached, is a CTAPHID node, and answers INIT.
+
+    Asserted specifically, because this case PASSED against the pre-fix
+    firmware too and its value comes entirely from what it now pins down. It
+    used to check only "INIT assigned a non-zero cid", which was true on both
+    firmwares -- a baseline that could not tell them apart. It now also pins:
+
+      * the CTAPHID protocol version, which must be 2 (the value the Yubico
+        client gates its FIDO2 support on);
+      * `capFlags == 0x05` (CBOR|WINK). This is the US-1507 fix and it is the
+        single byte most likely to separate "recognised" from "not offered" to
+        a host: measured 0x04 pre-fix and 0x05 on both this board and the C
+        reference after the flash. Asserting the exact value makes the case
+        falsifiable against a regression to 0x04, which "is non-zero" could
+        never do;
+      * the nonce echo, which must actually match rather than merely exist --
+        the old `payload[:8] is not None` was a tautology, true for every
+        reply that had ever been received.
+    """
     dev = ctx["device"]
     ev = {"device": ctap.describe(dev)}
+    expected_caps = 0x05  # CAPFLAG_CBOR | CAPFLAG_WINK, per US-1507
     try:
         with ctap.Wire(dev) as w:
+            t0 = time.monotonic()
             init = w.init()
+            init_ms = round((time.monotonic() - t0) * 1000, 1)
             ev["init"] = init
+            ev["init_ms"] = init_ms
+            ev["foreign_frames_seen"] = w.foreign_summary()
+            problems = []
             if init["cid"] == "0x00000000":
-                return CaseResult(False, "INIT assigned cid 0x00000000", ev)
-            return CaseResult(True, f"INIT ok, cid {init['cid']}, "
+                problems.append("INIT assigned cid 0x00000000")
+            if init["ctaphid_version"] != 2:
+                problems.append(f"CTAPHID protocol version "
+                                f"{init['ctaphid_version']}, expected 2")
+            caps = int(init["cap_flags"], 16)
+            if caps != expected_caps:
+                problems.append(f"capFlags {init['cap_flags']}, expected "
+                                f"0x{expected_caps:02x} (CBOR|WINK)")
+            if problems:
+                return CaseResult(False, "; ".join(problems), ev)
+            return CaseResult(True, f"INIT ok in {init_ms} ms, cid {init['cid']}, "
                                     f"firmware {init['firmware_version']}, "
+                                    f"CTAPHID v{init['ctaphid_version']}, "
                                     f"capFlags {init['cap_flags']}", ev)
     except (ctap.HarnessError, OSError) as e:
         return CaseResult(False, f"{type(e).__name__}: {e}", ev)
@@ -221,7 +340,13 @@ class CaseResult:
 def case_device_answers_ping(ctx):
     """Baseline: N PINGs on an idle device. This is what the post-abandon
     measurement is compared against, so it must be taken on the same device in
-    the same run rather than assumed."""
+    the same run rather than assumed.
+
+    This case is also the one whose FAILURE broke the two cases after it (see
+    `case_abandoned_attempt_enumerable`), so it is asserted harder than a
+    latency check: every sample must echo its own payload exactly, and a
+    plausible-looking latency on the wrong bytes is a failure, not a pass.
+    """
     dev = ctx["device"]
     ev = {}
     lat = []
@@ -229,19 +354,27 @@ def case_device_answers_ping(ctx):
         with ctap.Wire(dev) as w:
             w.init()
             for i in range(BASELINE_PINGS):
-                r = w.ping(b"BASELINE%02d" % i)
+                tag = b"BASELINE%02d" % i
+                r = w.ping(tag)
                 lat.append(r["latency_ms"])
                 if not r["echo_ok"]:
-                    ev.setdefault("echo_failures", []).append(i)
+                    ev.setdefault("echo_failures", []).append(
+                        {"i": i, "sent": tag.decode(), "got": r["echo"]})
+            ev["foreign_frames"] = w.foreign_summary()
     except (ctap.HarnessError, OSError) as e:
         return CaseResult(False, f"{type(e).__name__}: {e}", ev)
     ev["latencies_ms"] = lat
     if not lat:
         return CaseResult(False, "no PING samples", ev)
+    if ev.get("echo_failures"):
+        return CaseResult(False,
+                          f"{len(ev['echo_failures'])} of {len(lat)} PINGs echoed "
+                          f"the wrong bytes ({ev['echo_failures']}); the baseline "
+                          "this run derives its bound from is untrustworthy", ev)
     worst = max(lat)
     floor = ctx["bound_floor_ms"]
     ok = worst <= floor
-    return CaseResult(ok, f"{len(lat)} pings, worst {worst:.1f} ms "
+    return CaseResult(ok, f"{len(lat)} pings, all echoes correct, worst {worst:.1f} ms "
                           f"(median {sorted(lat)[len(lat)//2]:.1f} ms), "
                           f"floor {floor:.0f} ms", ev)
 
@@ -280,82 +413,97 @@ def case_abandoned_attempt_enumerable(ctx):
 
     "Walk away" is what a browser does when a user opens the passkey prompt and
     dismisses it. The common case, not an exotic one.
+
+    The TypeError this used to raise is fixed, and it was not cosmetic. The
+    failure message formatted `ctx['baseline_ms']` with `:.1f`, and
+    `baseline_ms` is only populated once `device-answers-ping` has run AND
+    succeeded. So when the ping case failed -- which it did, on the CID bug --
+    this case crashed formatting a `None` and the crash REPLACED a real
+    measurement with a Python traceback. Two of the reported failures were
+    therefore one failure plus two that could not report. The bound now falls
+    back to the absolute floor and says so in the verdict, so an uncalibrated
+    run is visible in the output instead of throwing.
     """
     dev = ctx["device"]
     ev = {"abandon_settle_s": ABANDON_SETTLE_S}
     rp = "us1518-abandon.invalid"
     try:
-        w = ctap.Wire(dev)
-    except OSError as e:
-        return CaseResult(False, f"could not open {dev['path']}: {e}", ev)
+        w, parked = open_consent_window(dev, rp)
+    except (ctap.HarnessError, OSError) as e:
+        return CaseResult(False, f"opening the consent window failed: "
+                                  f"{type(e).__name__}: {e}", ev)
+    ev["during_window"] = parked
+    if parked["keepalives"] == 0:
+        # Without a parked window this case would measure nothing at all, and
+        # would pass for the wrong reason -- which is exactly the failure mode
+        # this suite exists to avoid.
+        w.close()
+        return CaseResult(False,
+                          "the device never parked in a consent window "
+                          f"({parked['outcome']}), so the abandoned-attempt "
+                          "scenario was never exercised", ev)
     try:
-        w.init()
-        # Real consent window: GetNextAssertion to a throwaway RP parks the
-        # authenticator in the user-presence wait and streams KEEPALIVE 0x02.
-        # A MakeCredential to a throwaway RP is rejected at the CBOR layer on
-        # this firmware and never parks anything, so it cannot stand in here.
-        w.get_assertion_request(rp, b"\x11" * 32)
-        parked = w.drain_until_closed(timeout=ABANDON_SETTLE_S)
-        ev["during_window"] = parked
-        if parked["keepalives"] == 0:
-            ev["note"] = ("the device did not park in a consent window; the "
-                          "abandoned attempt may not have been exercised")
         # Walk away: stop reading. A real dismissal also stops the host from
         # draining, which is the whole shape of the defect.
         ev["walked_away"] = True
         time.sleep(0.2)
-    except (ctap.HarnessError, OSError) as e:
-        w.close()
-        return CaseResult(False, f"opening the consent window failed: "
-                                  f"{type(e).__name__}: {e}", ev)
 
-    bound = ctx["bound_ms"]
-    baseline = ctx["baseline_ms"]
-    try:
-        # A brand-new connection: this is "does the device still enumerate",
-        # not "does the old channel still work".
-        w2 = ctap.Wire(dev)
-    except OSError as e:
-        w.close()
-        return CaseResult(False, f"could not reopen the device after abandoning: {e}", ev)
-    try:
-        t0 = time.monotonic()
+        bound = ctx["bound_ms"]
+        baseline = ctx["baseline_ms"]
+        calibrated = baseline is not None
+        if not calibrated:
+            ev["bound_calibration"] = (
+                "the idle PING baseline did not measure this run, so the bound "
+                f"is the absolute floor {bound:.0f} ms, not a derived one")
         try:
-            init = w2.init(timeout=ctx["probe_timeout_s"])
-            reinit_ms = (time.monotonic() - t0) * 1000
-        except (ctap.HarnessError, OSError) as e:
-            w2.close()
+            # A brand-new connection: this is "does the device still enumerate",
+            # not "does the old channel still work".
+            w2 = ctap.Wire(dev)
+        except OSError as e:
             w.close()
-            ev["reinit_ms"] = round((time.monotonic() - t0) * 1000, 1)
+            return CaseResult(False, f"could not reopen the device after abandoning: {e}", ev)
+        try:
+            t0 = time.monotonic()
+            try:
+                init = w2.init(timeout=ctx["probe_timeout_s"])
+                reinit_ms = (time.monotonic() - t0) * 1000
+            except (ctap.HarnessError, OSError) as e:
+                ev["reinit_ms"] = round((time.monotonic() - t0) * 1000, 1)
+                return CaseResult(
+                    False,
+                    f"the device did NOT re-enumerate after the abandoned attempt: "
+                    f"{type(e).__name__}: {e} "
+                    f"(waited {ctx['probe_timeout_s']:.0f}s)",
+                    ev)
+            ev["reinit_ms"] = round(reinit_ms, 1)
+            ev["post_abandon_init"] = init
+            p = w2.ping(b"AFTERABANDON", timeout=ctx["probe_timeout_s"])
+            ev["post_abandon_ping"] = p
+            # The device must still be usable, not merely alive: the INIT it
+            # just answered has to be a real one and the PING a real echo.
+            if not p["echo_ok"]:
+                return CaseResult(False,
+                                  f"PING echoed wrong bytes after the abandoned "
+                                  f"attempt ({p['echo']!r}, {p['latency_ms']:.1f} ms)",
+                                  ev)
+            ratio = (p["latency_ms"] / baseline) if calibrated else None
+            ev["latency_ratio_vs_baseline"] = (
+                round(ratio, 1) if ratio is not None else None)
+            basis = (f"bound {bound:.0f} ms = {ctx['bound_factor']:.0f}x the "
+                     f"{baseline:.1f} ms idle baseline; ratio {ratio:.1f}x"
+                     if calibrated else
+                     f"bound {bound:.0f} ms (absolute floor; no idle baseline "
+                     f"measured this run)")
+            ok = p["latency_ms"] <= bound
             return CaseResult(
-                False,
-                f"the device did NOT re-enumerate after the abandoned attempt: "
-                f"{type(e).__name__}: {e} "
-                f"(waited {ctx['probe_timeout_s']:.0f}s)",
+                ok,
+                f"re-enumerated in {reinit_ms:.1f} ms, answered PING in "
+                f"{p['latency_ms']:.1f} ms ({basis})",
                 ev)
-        ev["reinit_ms"] = round(reinit_ms, 1)
-        ev["post_abandon_init"] = init
-        p = w2.ping(b"AFTERABANDON", timeout=ctx["probe_timeout_s"])
-        ev["post_abandon_ping"] = p
-        if not p["echo_ok"]:
-            return CaseResult(False,
-                              f"PING echoed wrong bytes after the abandoned "
-                              f"attempt ({p['latency_ms']:.1f} ms)", ev)
-        ok = p["latency_ms"] <= bound
-        ratio = (p["latency_ms"] / baseline) if baseline else float("inf")
-        ev["latency_ratio_vs_baseline"] = round(ratio, 1)
-        return CaseResult(
-            ok,
-            f"re-enumerated in {reinit_ms:.1f} ms, answered PING in "
-            f"{p['latency_ms']:.1f} ms "
-            f"(bound {bound:.0f} ms = {ctx['bound_factor']:.0f}x the "
-            f"{baseline:.1f} ms idle baseline; ratio {ratio:.1f}x)",
-            ev)
-    except (ctap.HarnessError, OSError) as e:
-        return CaseResult(False,
-                          f"post-abandon probe failed: {type(e).__name__}: {e}", ev)
+        finally:
+            w2.close()
     finally:
-        w2.close()
+        release_window(w)
         w.close()
 
 
@@ -370,30 +518,45 @@ def case_abandoned_attempt_does_not_block_host(ctx):
     It is separate from the enumerability case because it fails differently: the
     device may still answer on a fresh handle while a blocked write on the old
     one wedges the host. Both halves shipped together in the fix.
+
+    The PING echo bug this replaces. The case used to time a PING write
+    fire-and-forget and then call `ping()` with a different payload. Both
+    replies arrive, in order, and both are `TYPE_INIT|CTAPHID_PING`, so
+    CTAPHID's reply-matching cannot tell them apart: the second `ping()`
+    consumed the FIRST one's echo and reported `echo_ok: False` after a
+    flawless 8.0 ms round trip. Measured on the flashed board -- a device
+    answering correctly was recorded as "echoed wrong bytes". The write is now
+    paired with its own reply via `await_reply`, and a second PING issued after
+    that pairs with its own too. What is asserted now is what the case means:
+    the OUT endpoint is drained by the device, so writes land.
     """
     dev = ctx["device"]
     ev = {"write_watchdog_s": ctap.WATCHDOG_WRITE_S}
     rp = "us1518-block.invalid"
     try:
-        w = ctap.Wire(dev)
-    except OSError as e:
-        return CaseResult(False, f"could not open {dev['path']}: {e}", ev)
+        w, parked = open_consent_window(dev, rp)
+    except (ctap.HarnessError, OSError) as e:
+        return CaseResult(False, f"opening the consent window failed: "
+                                  f"{type(e).__name__}: {e}", ev)
+    ev["during_window"] = parked
+    if parked["keepalives"] == 0:
+        # No window means no abandoned ceremony, so there is nothing to block.
+        w.close()
+        return CaseResult(False,
+                          "the device never parked in a consent window "
+                          f"({parked['outcome']}), so the host-blocking "
+                          "scenario was never exercised", ev)
     try:
-        w.init()
-        w.get_assertion_request(rp, b"\x22" * 32)
-        parked = w.drain_until_closed(timeout=ABANDON_SETTLE_S)
-        ev["during_window"] = parked
         time.sleep(0.2)
         # Time a single write on the SAME handle the ceremony was issued on.
         # This is the write a browser would issue to poll or to cancel.
         t0 = time.monotonic()
         try:
-            w.send(ctap.CTAPHID_PING, b"WRITEAFTER", cid=w.cid)
+            w.send(ctap.CTAPHID_PING, b"WRITEAFTER")
             write_ms = (time.monotonic() - t0) * 1000
         except ctap.HidWriteBlocked as e:
             ev["write_blocked"] = True
             ev["write_ms"] = round((time.monotonic() - t0) * 1000, 1)
-            w.close()
             return CaseResult(
                 False,
                 f"the host's WRITE BLOCKED for "
@@ -401,75 +564,310 @@ def case_abandoned_attempt_does_not_block_host(ctx):
                 f"attempt ({e}). The device is not draining its OUT endpoint.",
                 ev)
         except (ctap.HarnessError, OSError) as e:
-            w.close()
             return CaseResult(False, f"write raised {type(e).__name__}: {e}", ev)
         ev["write_ms"] = round(write_ms, 1)
-        # The write landed; now make sure the device is still coherent.
+
+        # Pair that write with ITS OWN reply. Not a second PING: two PINGs are
+        # indistinguishable by frame command, which is the bug being fixed.
+        t1 = time.monotonic()
         try:
-            p = w.ping(b"AFTERWRITE", timeout=ctx["probe_timeout_s"])
-            ev["ping_after_write"] = p
-            ok = p["echo_ok"] and p["latency_ms"] <= ctx["bound_ms"]
-            return CaseResult(ok,
-                              f"write completed in {write_ms:.1f} ms and the "
-                              f"device still answered in {p['latency_ms']:.1f} ms "
-                              f"(bound {ctx['bound_ms']:.0f} ms)", ev)
+            echo = w.await_reply(ctap.CTAPHID_PING, timeout=ctx["probe_timeout_s"])
+            echo_ms = (time.monotonic() - t1) * 1000
         except (ctap.HarnessError, OSError) as e:
             return CaseResult(False,
-                              f"write completed in {write_ms:.1f} ms but the "
-                              f"device then failed to answer: "
-                              f"{type(e).__name__}: {e}", ev)
+                              f"write completed in {write_ms:.1f} ms but the device "
+                              f"never answered it: {type(e).__name__}: {e}", ev)
+        ev["write_echo_ms"] = round(echo_ms, 1)
+        ev["write_echo_ok"] = (echo == b"WRITEAFTER")
+        if echo != b"WRITEAFTER":
+            return CaseResult(False,
+                              f"the device echoed {echo!r} for the PING this case "
+                              f"wrote, not b'WRITEAFTER'", ev)
+
+        # A genuinely independent round trip, now that nothing is in flight.
+        p = w.ping(b"AFTERWRITE", timeout=ctx["probe_timeout_s"])
+        ev["ping_after_write"] = p
+        ok = (p["echo_ok"] and p["latency_ms"] <= ctx["bound_ms"]
+              and echo_ms <= ctx["bound_ms"])
+        return CaseResult(ok,
+                          f"write completed in {write_ms:.1f} ms, was answered in "
+                          f"{echo_ms:.1f} ms, and a further PING echoed correctly in "
+                          f"{p['latency_ms']:.1f} ms (bound {ctx['bound_ms']:.0f} ms) "
+                          "-- the OUT endpoint stayed drained throughout", ev)
     finally:
         try:
+            release_window(w)
             w.close()
         except Exception:
             pass
 
 
 def case_device_survives_repeated_abandonment(ctx):
-    """Abandon a ceremony, then prove the NEXT ceremony still engages.
+    """REGRESSION, rewritten. The assertion it used to make encoded the
+    PRE-FIX world, and would have passed a device that had simply gone dark.
 
-    Closes the loop on DoD item 8: it is not enough that the device answers a
-    PING; it must still service a fresh user-presence window afterwards.
+    THE OLD ASSERTION: "after an abandoned ceremony, a new ceremony engages."
+    Measured on the flashed board it fails immediately, with the device
+    answering `0x24 CTAP2_ERR_OPERATION_PENDING` -- and that refusal is the
+    DESIGNED behaviour, not a regression:
+
+      * US-1510 specifies that a second user-presence request arriving while the
+        slot is occupied is **refused, not queued**. A single-occupancy,
+        fail-closed slot is the whole point of that story.
+      * An abandoned attempt therefore holds the slot for the remainder of its
+        ~30 s window, so an immediate re-ceremony is *correctly* refused.
+      * The pico-fido2 C reference does the same; the sibling A/B probe
+        recorded it "STILL PARKED" under the same conditions.
+
+    WHY THE OLD ASSERTION WAS WRONG, not merely strict. Before the fix the
+    device went dark for the whole window. Anything sent during that period
+    either got nothing back or was refused, so "a new ceremony engages right
+    away" could only have been satisfied by a device that was NOT holding a
+    slot -- i.e. the assertion and the fix were pulling in opposite
+    directions. Pre-fix, the case could only pass if the very defect it exists
+    to catch were absent, and in practice it passed for the wrong reason: the
+    device, being dark, was trivially "not blocking" anything.
+
+    THE HONEST ASSERTION has three parts, each decided:
+
+      1. **Enumerate and answer, throughout the drain.** While the abandoned
+         slot is still held, the device must answer INIT, PING and GetInfo on
+         fresh channels, within the derived bound, repeatedly across the window.
+         This is the actual DoD-8 claim: the blackout is gone.
+
+      2. **Refuse, not queue, while occupied.** A second ceremony during the
+         drain must be answered `0x24 CTAP2_ERR_OPERATION_PENDING` and must NOT
+         park. Asserting the refusal is asserting US-1510 rather than
+         tolerating it -- a device that silently queued instead would fail
+         here.
+
+      3. **Engage once the slot is released.** The slot is released two ways,
+         both measured in this run and both asserted:
+           - `CTAPHID_CANCEL`, which this firmware deliberately does NOT
+             acknowledge (per CTAPHID, and as both references behave: a cancel
+             reply makes `fido2`'s inbound packet matcher raise). Measured
+             release: 0.04 s.
+           - the device's own ~30 s window deadline, with no cancel at all --
+             the true "user walked away" path. Measured release: 29.78 s.
     """
     dev = ctx["device"]
-    ev = {}
-    rp = "us1518-next.invalid"
+    ev = {"measured_deadline_release_s": MEASURED_DEADLINE_RELEASE_S,
+          "measured_cancel_release_s": MEASURED_CANCEL_RELEASE_S}
+    bound = ctx["bound_ms"]
+
+    # ---- (1) abandon one, then hold it while probing liveness -------------
+    try:
+        w, parked = open_consent_window(dev, "us1518-next.invalid")
+    except (ctap.HarnessError, OSError) as e:
+        return CaseResult(False, f"opening the consent window failed: "
+                                  f"{type(e).__name__}: {e}", ev)
+    ev["abandoned"] = parked
+    if parked["keepalives"] == 0:
+        w.close()
+        return CaseResult(False,
+                          "the device never parked in a consent window "
+                          f"({parked['outcome']}), so the abandoned-attempt "
+                          "scenario was never exercised", ev)
+
+    probes = []
+    refusals = []          # the status of every second ceremony sent while held
+    release_t = None       # when the slot accepted a new ceremony
+    parked_while_occupied = None
+    try:
+        # Probe across the window, sampling liveness and occupancy as we go.
+        # The window is ~30 s; we stop as soon as it releases on its own.
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < MEASURED_DEADLINE_RELEASE_S + 5:
+            rec = {"t_s": round(time.monotonic() - t0, 2)}
+            try:
+                w2 = ctap.Wire(dev)
+            except OSError as e:
+                rec["error"] = f"open failed: {e}"
+                probes.append(rec)
+                break
+            try:
+                init = w2.init(timeout=3.0)
+                rec["init_cid"] = init["cid"]
+                p = w2.ping(b"DRAINING", timeout=3.0)
+                rec["ping_ms"] = p["latency_ms"]
+                rec["ping_ok"] = p["echo_ok"]
+                rec["ping_within_bound"] = p["latency_ms"] <= bound
+                status, info, _ = w2.get_info()
+                rec["getinfo_status"] = f"0x{status:02x}"
+                rec["getinfo_keys"] = len(info) if info else 0
+
+                # (2)/(3a) A second ceremony on yet another channel. While the
+                # slot is held this must be REFUSED (US-1510). The probe is what
+                # detects the release, so when it DOES park we must release it
+                # again -- otherwise this probe occupies the slot for another
+                # 30 s and every later probe reads its own damage.
+                w3 = ctap.Wire(dev)
+                w3.init(timeout=3.0)
+                w3.get_assertion_request("us1518-second.invalid", b"\x55" * 32)
+                try:
+                    frame_cmd, payload = w3.read_frame(
+                        3.0, skip_foreign_cids=True)
+                    if frame_cmd == ctap.TYPE_INIT | ctap.CTAPHID_KEEPALIVE:
+                        rec["second_ceremony"] = "PARKED (slot released)"
+                        rec["released_here"] = True
+                        release_t = time.monotonic() - t0
+                        w3.cancel(timeout=1.0)
+                    elif payload:
+                        rec["second_ceremony"] = (
+                            f"0x{payload[0]:02x} {ctap.status_name(payload[0])}")
+                        refusals.append(payload[0])
+                    else:
+                        rec["second_ceremony"] = "empty reply"
+                        refusals.append(None)
+                except ctap.HidTimeout:
+                    rec["second_ceremony"] = "no reply"
+                    refusals.append(None)
+                finally:
+                    w3.close()
+            except (ctap.HarnessError, OSError) as e:
+                rec["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                w2.close()
+            probes.append(rec)
+            if release_t is not None:
+                break
+            time.sleep(1.0)
+    finally:
+        release_window(w)
+        w.close()
+
+    ev["probes"] = probes
+    ev["refusals_observed"] = sorted({f"0x{s:02x}" for s in refusals if s is not None})
+    ev["release_by_deadline_s"] = round(release_t, 2) if release_t is not None else None
+
+    liveness = [p for p in probes if p.get("ping_ok")]
+    if not liveness:
+        return CaseResult(False,
+                          "the device answered nothing while the abandoned slot "
+                          "drained -- it went dark, which is the regression this "
+                          "case exists to catch", ev)
+    slowest = max(p["ping_ms"] for p in liveness)
+    all_within = all(p.get("ping_within_bound") for p in liveness)
+    all_info = all(p.get("getinfo_status") == "0x00" for p in liveness)
+    ev["probes_answered"] = len(liveness)
+    ev["slowest_ping_ms"] = slowest
+
+    if not all_within:
+        bad = [p for p in liveness if not p.get("ping_within_bound")]
+        return CaseResult(False,
+                          f"{len(bad)} of {len(liveness)} liveness probes exceeded "
+                          f"the {bound:.0f} ms bound (worst {slowest:.1f} ms) while "
+                          "the abandoned slot drained", ev)
+    if not all_info:
+        return CaseResult(False,
+                          f"GetInfo did not answer 0x00 on every one of the "
+                          f"{len(liveness)} liveness probes while the abandoned "
+                          "slot drained", ev)
+
+    # (2) Every second ceremony sent BEFORE the release must have been refused
+    # with 0x24. Anything else -- a park, or a different status -- means the
+    # single-occupancy rule was not honoured.
+    occupied_probes = [p for p in probes
+                       if p.get("t_s") is not None and not p.get("released_here")]
+    undecided = [p for p in occupied_probes
+                 if not str(p.get("second_ceremony", "")).startswith("0x24")]
+    if undecided:
+        first = undecided[0]
+        return CaseResult(False,
+                          f"while the abandoned slot was still occupied, a second "
+                          f"ceremony was answered "
+                          f"{first.get('second_ceremony')!r} at t+"
+                          f"{first['t_s']}s rather than being refused with 0x24 "
+                          "CTAP2_ERR_OPERATION_PENDING (US-1510)", ev)
+    if not occupied_probes:
+        return CaseResult(False,
+                          "the abandoned slot was never observed in the occupied "
+                          "state, so the refusal behaviour was not exercised", ev)
+
+    # (3a) released by the device's own deadline, with no cancel from us.
+    if release_t is None:
+        return CaseResult(False,
+                          f"the abandoned slot never released on its own within "
+                          f"{MEASURED_DEADLINE_RELEASE_S + 5:.0f}s; a new ceremony "
+                          "must engage once the device's own ~30 s window expires",
+                          ev)
+    ev["released_by_deadline"] = True
+
+    # ---- (3b) release by CTAPHID_CANCEL, measured -----------------------
+    try:
+        wc, parked_c = open_consent_window(dev, "us1518-cancel.invalid")
+    except (ctap.HarnessError, OSError) as e:
+        return CaseResult(False, f"could not park for the CANCEL measurement: "
+                                  f"{type(e).__name__}: {e}", ev)
+    if parked_c["keepalives"] == 0:
+        release_window(wc)
+        wc.close()
+        return CaseResult(False,
+                          f"could not park for the CANCEL measurement "
+                          f"({parked_c['outcome']}) -- the slot from the previous "
+                          "measurement had not been released", ev)
+    try:
+        ev["cancel_parked_on"] = f"0x{wc.cid:08x}"
+        tc0 = time.monotonic()
+        cancel = wc.cancel(timeout=1.0)
+        ev["cancel"] = cancel
+        # Deliberately NOT waiting for an ack: this firmware does not send one,
+        # and per CTAPHID a cancel reply breaks fido2's packet matcher.
+        released = None
+        while time.monotonic() - tc0 < MEASURED_DEADLINE_RELEASE_S + 5:
+            if _try_engage_standalone(dev, timeout=2.0):
+                released = time.monotonic() - tc0
+                break
+            time.sleep(0.2)
+        if released is None:
+            return CaseResult(False,
+                              "after CTAPHID_CANCEL the slot never accepted a new "
+                              f"ceremony within {MEASURED_DEADLINE_RELEASE_S + 5:.0f}s",
+                              ev)
+        ev["cancel_release_s"] = round(released, 3)
+    finally:
+        release_window(wc)
+        wc.close()
+
+    # Timed from when the ceremony was actually issued, not from when the probe
+    # loop started -- the loop begins only after the settle period during which
+    # the device was already holding the slot.
+    ev["release_s_from_request"] = round(release_t + ABANDON_SETTLE_S, 2)
+    distinct = sorted({s for s in refusals if s is not None})
+    return CaseResult(
+        True,
+        f"across {len(liveness)} probes spanning {release_t:.1f}s of drain the "
+        f"device answered INIT/PING/GetInfo every time (worst PING {slowest:.1f} ms, "
+        f"bound {bound:.0f} ms); all {len(refusals)} second ceremonies sent while "
+        f"the slot was held were refused with "
+        f"{['0x%02x %s' % (s, ctap.status_name(s)) for s in distinct]}; the slot "
+        f"released on the device's own deadline {release_t + ABANDON_SETTLE_S:.1f}s "
+        f"after the request, and {released:.2f}s after CTAPHID_CANCEL",
+        ev)
+
+
+def _try_engage_standalone(dev, timeout=2.0):
+    """On a throwaway handle: does a new ceremony engage right now?
+
+    CANCELS the ceremony it opens. That matters: this probes whether the slot
+    is free, and a probe that left the slot occupied would hold it for another
+    ~30 s and poison whatever ran next -- which is precisely how the first
+    version of this case failed, reading its own damage as the device's.
+    """
     try:
         w = ctap.Wire(dev)
-    except OSError as e:
-        return CaseResult(False, f"could not open {dev['path']}: {e}", ev)
+    except OSError:
+        return False
     try:
-        w.init()
-        # Abandon one.
-        w.get_assertion_request(rp, b"\x33" * 32)
-        ev["abandoned"] = w.drain_until_closed(timeout=ABANDON_SETTLE_S)
-        time.sleep(0.5)
-        # Now the next ceremony, on a fresh connection.
-        w2 = ctap.Wire(dev)
-        try:
-            w2.init(timeout=ctx["probe_timeout_s"])
-            w2.get_assertion_request("us1518-next2.invalid", b"\x44" * 32)
-            next_window = w2.drain_until_closed(timeout=ABANDON_SETTLE_S)
-            ev["next_window"] = next_window
-            if next_window["keepalives"] == 0:
-                return CaseResult(
-                    False,
-                    "after an abandoned ceremony the device did not engage a "
-                    f"new user-presence window ({next_window['outcome']})", ev)
-            return CaseResult(True,
-                              f"after abandoning one ceremony the device "
-                              f"engaged the next ({next_window['keepalives']} "
-                              f"keepalives, statuses {next_window['statuses']})",
-                              ev)
-        finally:
-            w2.close()
-    except (ctap.HarnessError, OSError) as e:
-        return CaseResult(False, f"{type(e).__name__}: {e}", ev)
+        w.init(timeout=3.0)
+        engaged = _try_engage(w, timeout=timeout)
+        if engaged:
+            w.cancel(timeout=1.0)
+        return engaged
+    except (ctap.HarnessError, OSError):
+        return False
     finally:
-        try:
-            w.close()
-        except Exception:
-            pass
+        w.close()
 
 
 def case_ctap_identity_is_ours(ctx):
@@ -535,13 +933,22 @@ def case_get_info_options(ctx):
     options map cannot tell you whether the fix landed. Prints the keys with
     their TYPES, because an earlier probe in this epic reported a column of
     option ids for a device that emits string keys, and had to be retracted.
+
+    It used to return PASS on an absent options map, reporting "recorded, not
+    assumed". That is a pass for the wrong reason: the whole point of this case
+    is that the map IS present and readable on this firmware, so an absent map
+    now FAILS. A case that cannot report what it exists to report should not be
+    able to pass. It also now pins that the keys are TEXT on this device --
+    measured `key type(s) ['str']` -- so a regression to integer-keyed options
+    (which an earlier probe mistakenly reported) is caught rather than recorded.
     """
     dev = ctx["device"]
     ev = {}
     try:
         with ctap.Wire(dev) as w:
             w.init()
-            status, info, _ = w.get_info()
+            status, info, trailing = w.get_info()
+            ev["status"] = f"0x{status:02x}"
             if status != 0 or info is None:
                 return CaseResult(False,
                                   f"GetInfo status 0x{status:02x}", ev)
@@ -551,9 +958,11 @@ def case_get_info_options(ctx):
             options = info.get(4)
             if options is None:
                 ev["options"] = "member 4 absent from the reply (unobserved)"
-                return CaseResult(True,
-                                  "GetInfo answered; no options map present "
-                                  "(recorded, not assumed)", ev)
+                return CaseResult(False,
+                                  "GetInfo answered but carried NO options map "
+                                  "(member 4 absent); this case exists to report "
+                                  "that map, so an absent one is a failure, not "
+                                  "a neutral observation", ev)
             if not isinstance(options, dict):
                 ev["options"] = f"member 4 is {type(options).__name__}: {options!r}"
                 return CaseResult(False,
@@ -565,26 +974,50 @@ def case_get_info_options(ctx):
             ev["options"] = rendered
             ev["option_key_types"] = sorted({type(k).__name__ for k in options})
             ev["option_keys"] = sorted(str(k) for k in options)
+            ev["option_count"] = len(options)
+            ev["trailing_bytes"] = trailing
+            key_types = ev["option_key_types"]
+            if key_types != ["str"]:
+                return CaseResult(False,
+                                  f"options map is keyed by {key_types}, expected "
+                                  "['str'] -- this device emits text keys, so a "
+                                  "different key type is a wire change", ev)
             return CaseResult(True,
                               f"options map: {len(options)} entries, "
-                              f"key type(s) {ev['option_key_types']}", ev)
+                              f"key type(s) {key_types}, {trailing} trailing bytes",
+                              ev)
     except (ctap.HarnessError, OSError) as e:
         return CaseResult(False, f"{type(e).__name__}: {e}", ev)
 
 
 def wait_for_recovery(ctx, budget_s=RECOVERY_BUDGET_S):
-    """Wait until the device is answerable again, and report how long it took.
+    """Wait until the device's user-presence SLOT is free again, and report how long.
 
-    Why this is not just politeness: the device under test is known to go blind
-    after an abandoned ceremony and to recover on its own once its ~30 s window
-    timer expires (measured: it recovered unattended during this session).
-    Without an explicit wait between cases, the FIRST regression case leaves
-    the device blind and the SECOND and THIRD then fail because of the first
-    one's damage rather than their own. Three FAILs that are really one FAIL is
-    worse than useless -- it hides which parts of the fix are broken.
+    Why this gate changed, and why the old one silently destroyed the suite.
 
-    So each regression case starts from a verified-healthy device, and the
-    recovery time is recorded as evidence in its own right.
+    The old gate polled INIT+PING and called the device "recovered" when both
+    answered. That was written for the PRE-FIX world, where an abandoned
+    ceremony took the device dark for 30 s: there, INIT+PING failing *was* the
+    damage. Post-fix the exact opposite holds — the device stays fully
+    answerable throughout the drain (measured: INIT/PING/GetInfo all answered in
+    16-64 ms at every second of a 30 s drain, while a second ceremony was
+    refused with `0x24` each time). So INIT+PING now succeed **0.08 s** after a
+    case abandons a ceremony, `wait_for_recovery` returns `recovered: True`, and
+    the next case starts with the slot still occupied.
+
+    The consequence was not subtle: every case after the first abandon case ran
+    its own ceremony into an occupied slot, got `0x24` instead of a window, and
+    recorded that as its own result. One case's damage was reported as three
+    independent failures — exactly what this function exists to prevent, and it
+    did the opposite of its stated purpose because it measured the wrong state.
+
+    So the gate now probes the thing the next case actually needs: **can a new
+    ceremony engage?** Measured on the flashed board, from an abandoned
+    ceremony: released at **29.78 s** by the device's own window deadline, or
+    at **0.04 s** by `CTAPHID_CANCEL`. `wait_for_recovery` deliberately does NOT
+    cancel — it waits out the real deadline, so each case starts from the state
+    a real user reaches by walking away, and the recovery time it reports is
+    the device's own measured drain, not a figure the harness manufactured.
     """
     dev = ctx["device"]
     t0 = time.monotonic()
@@ -596,15 +1029,27 @@ def wait_for_recovery(ctx, budget_s=RECOVERY_BUDGET_S):
             w = ctap.Wire(dev)
         except OSError as e:
             last = f"open failed: {e}"
-            time.sleep(2)
+            time.sleep(1.0)
             continue
         try:
             w.init(timeout=3.0)
             p = w.ping(b"RECOVER", timeout=3.0)
-            if p["echo_ok"]:
-                return {"recovered": True, "waited_s": round(time.monotonic() - t0, 1),
-                        "attempts": attempts, "ping_ms": p["latency_ms"]}
-            last = f"PING echo mismatch ({p['latency_ms']} ms)"
+            if not p["echo_ok"]:
+                last = f"PING echo mismatch ({p['latency_ms']} ms)"
+                time.sleep(1.0)
+                continue
+            # Liveness is necessary but NOT sufficient: prove the slot is free
+            # by engaging a real ceremony and confirming a keepalive arrives.
+            # Cancelling it leaves the device as we found it.
+            engaged = _try_engage(w, timeout=3.0)
+            if not engaged:
+                last = "answerable, but the user-presence slot is still occupied"
+                time.sleep(1.0)
+                continue
+            w.cancel(timeout=1.0)
+            return {"recovered": True, "waited_s": round(time.monotonic() - t0, 1),
+                    "attempts": attempts, "ping_ms": p["latency_ms"],
+                    "slot_state": "free (a ceremony engaged, then was cancelled)"}
         except (ctap.HarnessError, OSError) as e:
             last = f"{type(e).__name__}: {e}"
         finally:
@@ -612,9 +1057,34 @@ def wait_for_recovery(ctx, budget_s=RECOVERY_BUDGET_S):
                 w.close()
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(1.0)
     return {"recovered": False, "waited_s": round(time.monotonic() - t0, 1),
             "attempts": attempts, "last_error": last}
+
+
+def _try_engage(w, timeout=2.0):
+    """On handle `w`, ask for a throwaway ceremony. True if a window opens.
+
+    True means the slot was free. This deliberately leaves the slot OCCUPIED
+    when it returns True -- the caller is expected to `cancel()` or abandon it.
+    The discard is safe: any follow-up frame for this request is ignored,
+    because it can never be another request's reply once we stop reading.
+    """
+    w.send(ctap.CTAPHID_CBOR,
+           bytes([ctap.CTAP2_GET_NEXT_ASSERTION])
+           + ctap.cbor_encode({1: "slot-probe.invalid", 2: b"\x77" * 32}))
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            frame_cmd, _ = w.read_frame(max(0.2, timeout - (time.monotonic() - t0)),
+                                        skip_foreign_cids=True)
+        except ctap.HidTimeout:
+            return False
+        if frame_cmd == ctap.TYPE_INIT | ctap.CTAPHID_KEEPALIVE:
+            return True
+        # Any other reply means the slot refused it, so it was not free.
+        return False
+    return False
 
 
 # (id, title, fn, abandons_a_ceremony)
@@ -641,8 +1111,9 @@ MACHINE_CASES = [
      "REGRESSION: after an abandoned attempt the host's write is not blocked",
      case_abandoned_attempt_does_not_block_host, True),
     ("abandoned-attempt-next-ceremony-engages",
-     "REGRESSION: after an abandoned attempt the device still engages the "
-     "next ceremony",
+     "REGRESSION: the abandoned slot refuses a second ceremony (US-1510), the "
+     "device stays answerable while it drains, and a new ceremony engages once "
+     "the slot is released",
      case_device_survives_repeated_abandonment, True),
 ]
 
@@ -860,8 +1331,9 @@ def main():
                 c.evidence = {"recovery": rec}
                 cases.append(c)
                 continue
-            log(f"    (device recovered in {rec['waited_s']}s after "
-                f"{rec['attempts']} attempt(s), ping {rec['ping_ms']} ms)")
+            log(f"    (user-presence slot released {rec['waited_s']}s after the "
+                f"previous case abandoned a ceremony; {rec['attempts']} probe(s), "
+                f"ping {rec['ping_ms']} ms — {rec.get('slot_state', '?')})")
         c = Case(cid, title, "machine", fn)
         t0 = time.monotonic()
         try:

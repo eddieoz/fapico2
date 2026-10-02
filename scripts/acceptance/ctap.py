@@ -77,12 +77,23 @@ CTAP2_STATUS = {
     0x21: "CTAP2_ERR_PROCESSING",
     0x23: "CTAP2_ERR_USER_ACTION_PENDING",
     0x24: "CTAP2_ERR_OPERATION_PENDING",
+    0x25: "CTAP2_ERR_NO_OPERATIONS",
+    0x26: "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
+    0x27: "CTAP2_ERR_OPERATION_DENIED",
+    0x28: "CTAP2_ERR_KEY_STORE_FULL",
     0x2A: "CTAP2_ERR_NO_CREDENTIALS",
+    0x2B: "CTAP2_ERR_USER_ACTION_TIMEOUT",
+    0x2C: "CTAP2_ERR_NOT_BUSY",
+    0x2D: "CTAP2_ERR_KEEPALIVE_CANCEL",
+    0x2E: "CTAP2_ERR_NO_CREDENTIALS",
+    0x2F: "CTAP2_ERR_USER_ACTION_TIMEOUT",
     0x30: "CTAP2_ERR_PIN_REQUIRED",
     0x31: "CTAP2_ERR_PIN_INVALID",
     0x34: "CTAP2_ERR_PIN_NOT_SET",
+    0x36: "CTAP2_ERR_PIN_POLICY_VIOLATION",
     0x39: "CTAP2_ERR_ACTION_TIMEOUT",
     0x3A: "CTAP2_ERR_UP_REQUIRED",
+    0x3B: "CTAP2_ERR_UV_BLOCKED",
     0x3F: "CTAP2_ERR_UNAUTHORIZED_PERMISSION",
     0xDF: "CTAP2_ERR_UP_DISABLED",
 }
@@ -565,13 +576,42 @@ class Wire:
         self._fd = os.open(self.path, os.O_RDWR)
         OPENED_PATHS.append(self.path)
         self._packet_size, self._packet_size_note = self._packet_size_from_descriptor()
-        # Frames the device sent on a channel this handle does not own, usually
-        # the tail of an abandoned ceremony. Counted, never treated as a fault.
+        # Frames the device sent on a channel this handle does not own.
+        #
+        # WHY THERE ARE ANY, and why they are counted by kind rather than
+        # merely skipped. The kernel's HID driver fans one input report out to
+        # EVERY open hidraw handle for the device, so a frame the device put on
+        # the wire is delivered to a handle that never sent the request that
+        # earned it. Measured on this board: with an abandoned ceremony still
+        # draining on channel 0x2e4, a handle that had just been INITed onto
+        # 0x2e7 received that ceremony's KEEPALIVE (0xBB) frames -- 2 of 12
+        # probes hit one. A frame on a channel this handle does not own cannot
+        # be the answer to a request issued on it; CTAPHID replies are addressed
+        # to the requesting channel. So raising on it was wrong.
+        #
+        # But *silently* discarding it is also wrong, and the old harness did
+        # exactly that: the failure it produced said "0 foreign frames skipped"
+        # and named neither the channel nor the frame kind, which is why the
+        # first post-fix run could not distinguish "the device is streaming
+        # another ceremony's keepalives" (benign, expected) from "a stale reply
+        # to a dead transaction" (would be a real anomaly). Both counters are
+        # reported as evidence so the distinction is visible in the run log.
         self.foreign_frames = 0
         self.foreign_cids = set()
+        self.foreign_keepalives = 0
+        self.foreign_other = 0
         # Writes the kernel refused because the device stopped draining its OUT
         # endpoint. This is the defect itself, counted where it happens.
         self.blocked_writes = 0
+
+    def foreign_summary(self):
+        """What the foreign-channel frames actually were, for the evidence."""
+        return {
+            "frames": self.foreign_frames,
+            "cids": [f"0x{c:08x}" for c in sorted(self.foreign_cids)],
+            "keepalives": self.foreign_keepalives,
+            "other_kinds": self.foreign_other,
+        }
 
     # -- lifecycle --
 
@@ -650,12 +690,26 @@ class Wire:
         to other commands on the same channel, and a reader that just takes
         "the next frame" reports garbage.
 
-        `skip_foreign_cids` is for a freshly-opened handle. The kernel delivers
-        whatever the device queued, which after an abandoned ceremony still
-        includes that ceremony's trailing frames on its old channel. Those are
-        not an error and must not be mistaken for this connection's reply --
-        but they are also not evidence of a fault. Reading past them is what a
-        real host does when it reconnects.
+        `skip_foreign_cids` tolerates frames on a channel this handle does not
+        own. It is NOT a blind skip, and the reason is worth stating because
+        the opposite was the original defect:
+
+        A frame arriving on a foreign channel **cannot** be this handle's
+        answer. CTAPHID addresses every reply to the channel the request came
+        in on, so a frame on channel X is only ever the answer to a request
+        this handle never sent. The realistic source is the kernel, not the
+        device: `hidraw_send_event` fans each incoming report out to *every*
+        open handle for the device, so while an abandoned ceremony is still
+        draining on its own channel, any handle this harness opens also
+        receives that ceremony's KEEPALIVE stream. Measured on the flashed
+        board: 2 of 12 PINGs issued on a freshly-INITed channel hit exactly
+        that, and the old code raised `frame on cid 0x2e4, expected 0x2e7`.
+
+        So the frames are classified, not discarded: a KEEPALIVE on a foreign
+        channel is the normal, expected shape (another ceremony is live) and
+        the read continues; anything ELSE on a foreign channel is not
+        explainable that way, so it is counted separately and reported, so a
+        stale reply can never hide inside a "benign skip".
         """
         seq, r_len, response, frame_cmd = 0, 0, b"", None
         deadline = time.monotonic() + timeout
@@ -665,7 +719,9 @@ class Wire:
                 raise HidTimeout(
                     f"no CTAPHID frame for this handle within {timeout}s "
                     f"({self.foreign_frames} frames on foreign channels "
-                    f"{sorted(self.foreign_cids)} were skipped first)")
+                    f"{sorted(self.foreign_cids)} were seen first: "
+                    f"{self.foreign_keepalives} KEEPALIVE, "
+                    f"{self.foreign_other} other)")
             raw = self._read_packet(remaining)
             if len(raw) < 7:
                 raise HarnessError(f"runt CTAPHID frame ({len(raw)} B)")
@@ -674,11 +730,22 @@ class Wire:
                 if skip_foreign_cids:
                     self.foreign_frames += 1
                     self.foreign_cids.add(cid)
+                    raw_cmd = raw[4] if len(raw) > 4 else None
+                    if raw_cmd == TYPE_INIT | CTAPHID_KEEPALIVE:
+                        self.foreign_keepalives += 1
+                    else:
+                        self.foreign_other += 1
+                    # A partial message belongs to the foreign channel; drop it
+                    # rather than letting its bytes concatenate onto ours.
                     seq, r_len, response, frame_cmd = 0, 0, b"", None
                     continue
                 raise HarnessError(
-                    f"frame on cid 0x{cid:08x}, expected 0x{self.cid:08x} "
-                    f"({self.foreign_frames} foreign frames skipped)")
+                    f"frame on cid 0x{cid:08x}, expected 0x{self.cid:08x}; "
+                    f"pass skip_foreign_cids=True to tolerate the live traffic "
+                    f"of other channels (this handle has so far seen "
+                    f"{self.foreign_keepalives} foreign KEEPALIVE and "
+                    f"{self.foreign_other} other foreign frames on "
+                    f"{sorted(self.foreign_cids)})")
             body = raw[4:]
             if frame_cmd is None:
                 frame_cmd, r_len = struct.unpack_from(">BH", body)
@@ -695,9 +762,30 @@ class Wire:
 
     # -- commands --
 
-    def call(self, cmd, data=b"", timeout=5.0, cid=None, skip_foreign=False):
-        """Send one command and return the payload of the reply to *it*."""
+    def call(self, cmd, data=b"", timeout=5.0, cid=None, skip_foreign=True):
+        """Send one command and return the payload of the reply to *it*.
+
+        `skip_foreign` defaults to True because a frame on another channel can
+        never be this request's answer (see `read_frame`), and on this board
+        they are routinely present while another ceremony is draining. The
+        frames are still classified and counted; they are just not fatal.
+        """
         self.send(cmd, data, cid)
+        return self.await_reply(cmd, timeout=timeout, skip_foreign=skip_foreign)
+
+    def await_reply(self, cmd, timeout=5.0, skip_foreign=True):
+        """Consume the reply to a command already sent by `send()`.
+
+        Separate from `call` because CTAPHID replies are matched by *frame
+        command*, and that is ambiguous when two requests of the same kind are
+        in flight. Measured: sending PING "WRITEAFTER" and then PING
+        "AFTERWRITE" without draining between them yields both replies in
+        order, so a `ping()` issued second consumed the FIRST one's echo and
+        reported `echo_ok: False` -- a harness artefact that read as a device
+        fault. Code that times a write it does not intend to read must therefore
+        await that specific reply rather than firing another PING over the top
+        of it.
+        """
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -717,12 +805,11 @@ class Wire:
     def init(self, timeout=5.0):
         """CTAPHID_INIT on the broadcast channel; adopt the assigned cid.
 
-        Skips frames on foreign channels: after an abandoned ceremony the
-        kernel may still deliver that ceremony's trailing frames, and a fresh
-        handle has to read past them to reach its own INIT reply.
+        Tolerates frames on foreign channels: while another ceremony is
+        draining, the kernel delivers its KEEPALIVEs to this handle too, and a
+        fresh handle has to read past them to reach its own INIT reply.
         """
-        payload = self._call_skipping_foreign(
-            CTAPHID_INIT, os.urandom(8), timeout, BROADCAST_CID)
+        payload = self.call(CTAPHID_INIT, os.urandom(8), timeout, BROADCAST_CID)
         if len(payload) < 17:
             raise HarnessError(f"INIT reply {len(payload)} B, expected 17")
         assigned = struct.unpack_from(">I", payload, 8)[0]
@@ -740,24 +827,36 @@ class Wire:
         echo = self.call(CTAPHID_PING, tag, timeout)
         elapsed = (time.monotonic() - t0) * 1000
         return {"latency_ms": round(elapsed, 1), "echo_ok": echo == tag,
-                "foreign_frames": self.foreign_frames}
-
-    def _call_skipping_foreign(self, cmd, data, timeout, cid):
-        return self.call(cmd, data, timeout, cid, skip_foreign=True)
+                "echo": echo.decode("latin-1"),
+                "foreign": self.foreign_summary()}
 
     def get_info(self, timeout=10.0):
-        payload = self.call(CTAPHID_CBOR, bytes([CTAP2_GET_INFO]), timeout,
-                            skip_foreign=True)
+        payload = self.call(CTAPHID_CBOR, bytes([CTAP2_GET_INFO]), timeout)
         status = payload[0]
         info, rest = cbor_decode(payload[1:])
         return status, (info if isinstance(info, dict) else None), len(rest)
 
     def cancel(self, timeout=5.0):
+        """Send CTAPHID_CANCEL and report whether a reply arrived.
+
+        NOT acknowledged on this firmware, deliberately: per CTAPHID, and as
+        both references behave, a cancel produces no reply, so `fido2`'s
+        inbound packet matcher raises on it. Measured here: after a CANCEL the
+        original channel emitted NO frame within 4 s, and the slot was free
+        0.04 s later. So the return value reports the observed absence rather
+        than treating it as a failure, and callers must not wait for an ack.
+        """
+        self.send(CTAPHID_CANCEL, b"", cid=self.cid)
+        t0 = time.monotonic()
         try:
-            self.call(CTAPHID_CANCEL, b"", timeout)
-            return True
-        except (HarnessError, OSError) as e:
-            return f"{type(e).__name__}: {e}"
+            self.await_reply(CTAPHID_CANCEL, timeout=timeout)
+            return {"acked": True, "waited_ms": round((time.monotonic() - t0) * 1000, 1)}
+        except HidTimeout:
+            return {"acked": False, "waited_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "note": "no ack, as CTAPHID specifies and both references behave"}
+        except HarnessError as e:
+            return {"acked": False, "waited_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "note": f"{type(e).__name__}: {e}"}
 
     def get_assertion_request(self, rp_id, challenge):
         """authenticatorGetNextAssertion for a throwaway RP.
@@ -777,14 +876,21 @@ class Wire:
         return body
 
     def drain_until_closed(self, timeout, on_keepalive=None):
-        """Read until the parked request settles. Returns the outcome dict."""
+        """Read until the parked request settles. Returns the outcome dict.
+
+        Tolerates other channels' frames: when the harness opens a second
+        handle while a ceremony is parked, the kernel delivers that ceremony's
+        KEEPALIVEs to *both* handles, so this read sees its own channel's
+        KEEPALIVEs interleaved with the other channel's.
+        """
         t0 = time.monotonic()
         keepalives = 0
         statuses = set()
         while time.monotonic() - t0 < timeout:
             try:
                 frame_cmd, payload = self.read_frame(
-                    max(0.1, timeout - (time.monotonic() - t0)))
+                    max(0.1, timeout - (time.monotonic() - t0)),
+                    skip_foreign_cids=True)
             except HidTimeout:
                 return {"outcome": "still parked when the read budget ran out",
                         "keepalives": keepalives, "statuses": sorted(statuses),
