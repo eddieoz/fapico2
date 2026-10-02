@@ -1402,11 +1402,17 @@ def main():
         log("when prompted. A case that does not report before its deadline is")
         log("a FAIL, not a skip.")
         log()
-        browser_results = run_browser(chrome, srv.url,
-                                      os.path.join(https_server.CERT_DIR, "udd"),
-                                      args.browser_wait_s, extra,
-                                      autorun=args.browser_autorun)
-        srv.stop()
+        try:
+            browser_results = run_browser(chrome, srv.url,
+                                          https_server.user_data_dir(),
+                                          args.browser_wait_s, extra,
+                                          autorun=args.browser_autorun)
+        finally:
+            # The cert and the browser profile are torn down on the process
+            # exit path (see the __main__ block), which also covers a
+            # KeyboardInterrupt or SIGTERM in here. The socket is this run's
+            # own resource and stops here.
+            srv.stop()
         log()
         log("page-reported results:")
         log(json.dumps(browser_results, indent=2))
@@ -1521,5 +1527,41 @@ def main():
     return exit_code
 
 
+def _install_signal_handlers():
+    """Turn SIGTERM/SIGHUP into exceptions so `finally` still runs.
+
+    A harness that is generating a private key is killed by plenty of things
+    the operator did not plan on -- a CI timeout, a closing terminal, a
+    supervisor. Default SIGTERM disposition skips every cleanup handler in
+    Python, which is exactly how a key ends up left in the working tree. The
+    handler raises, the `finally` below does the work, and the process then
+    exits 130 rather than dying silently mid-run -- which is the honest
+    status for "interrupted, and here is what it managed to clean up".
+    """
+
+    def _raise(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _raise)
+        except (ValueError, OSError):
+            pass  # not the main thread, or the platform disagrees; nothing to do
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _install_signal_handlers()
+    # The single place generated material is torn down. Wrapping the whole
+    # entry point rather than just the browser phase is deliberate: argparse's
+    # SystemExit on a bad flag, every early `return 2` from main(), an
+    # exception from a case, and Ctrl-C all land here, and the ones that
+    # actually created a key are the ones most likely to be interrupted. This
+    # is a no-op for a run that never made one.
+    try:
+        sys.exit(main())
+    finally:
+        for path in https_server.cleanup_generated():
+            print("cleanup: removed " + path)

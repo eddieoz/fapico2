@@ -33,6 +33,18 @@ PAGE = os.path.join(HERE, "page.html")
 # Everything this generates is a build artefact and is gitignored.
 CERT_DIR = os.path.join(HERE, ".cert")
 
+# What THIS process generated, recorded at the moment it generated it.
+#
+# Cleanup removes exactly this set -- never `CERT_DIR` wholesale. The directory
+# is the operator's: they may have parked a mkcert CA, a trusted copy of
+# `localhost.pem`, or a browser profile there, and a run that rmtree'd the
+# directory would take any of it with it. A file that was already on disk when
+# we looked (an earlier run's cert, reused on purpose so the trust note and
+# the fingerprint stay stable) is not ours to delete either. What we created,
+# we take with us; what we found, we leave.
+_GENERATED_FILES = set()
+_GENERATED_DIRS = set()
+
 
 def free_port():
     with socket.socket() as s:
@@ -62,6 +74,7 @@ def ensure_certificate(host="localhost"):
                 + (ca.stdout.strip() or ca.stderr.strip()))
         if _run(["mkcert", "-cert-file", cert, "-key-file", key,
                  host, "127.0.0.1"]).returncode == 0:
+            _GENERATED_FILES.update((cert, key))
             return cert, key, note
         note += " (mkcert generation failed; falling back to self-signed)"
 
@@ -81,6 +94,7 @@ def ensure_certificate(host="localhost"):
               "-keyout", key, "-out", cert, "-days", "30",
               "-config", conf])
         os.chmod(key, 0o600)
+        _GENERATED_FILES.update((cert, key, conf))
 
     note = (
         "Self-signed certificate written to " + CERT_DIR + ". The browser will "
@@ -196,6 +210,55 @@ class Server:
             AcceptanceHandler.results.clear()
 
 
+def user_data_dir():
+    """Chrome profile for one run, claimed as ours only if it is not already
+    there. A profile that outlived an earlier run is left alone: it is not
+    proof of anything about this one, and it may be in use."""
+    d = os.path.join(CERT_DIR, "udd")
+    if not os.path.exists(d):
+        _GENERATED_DIRS.add(d)
+    return d
+
+
+def cleanup_generated():
+    """Remove what this process generated; return the paths actually removed.
+
+    Safe to call on any exit path, repeatedly, and on a run that never created
+    anything. Deliberately does NOT rmtree CERT_DIR -- see the note on
+    _GENERATED_FILES. The directory itself is removed only when cleaning left
+    it empty, which is the case for a normal run and the case that matters:
+    an empty `.cert/` in the working tree is the leftover the tree-wide
+    `no_private_key_material_is_committed` guard is there to catch.
+
+    Best-effort by design. A cleanup that raises would replace the run's real
+    result with a traceback about a temporary directory, so every removal is
+    swallowed and reported instead.
+    """
+    removed = []
+    for d in sorted(_GENERATED_DIRS, key=len, reverse=True):
+        shutil.rmtree(d, ignore_errors=True)
+        if not os.path.exists(d):
+            removed.append(d)
+    for f in sorted(_GENERATED_FILES, key=len, reverse=True):
+        try:
+            os.remove(f)
+        except OSError:
+            continue
+        removed.append(f)
+    _GENERATED_FILES.clear()
+    _GENERATED_DIRS.clear()
+
+    # The directory goes only if it is now empty, so anything the operator
+    # left in it survives.
+    if os.path.isdir(CERT_DIR) and not os.listdir(CERT_DIR):
+        try:
+            os.rmdir(CERT_DIR)
+            removed.append(CERT_DIR)
+        except OSError:
+            pass
+    return removed
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
@@ -210,3 +273,6 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         srv.stop()
+    finally:
+        for p in cleanup_generated():
+            print("removed " + p)
