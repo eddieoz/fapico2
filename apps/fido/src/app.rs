@@ -1136,6 +1136,13 @@ impl<K: Keystore> FidoApp<K> {
         let pin_state = self.keystore.get_pin_state();
         let pin_set = pin_state.pin_hash.is_some();
         info.set_option("clientPin", pin_set);
+        // US-1512: the capability half of the PIN/UV pair, set from the same
+        // shared helper the device twin uses so the two cannot drift — the
+        // rule is at `ctap2::pin_uv_auth_token_available`.
+        info.set_option(
+            "pinUvAuthToken",
+            crate::ctap2::pin_uv_auth_token_available(pin_state.blocked, pin_state.needs_power_cycle),
+        );
         // authnrCfg is advertised by the reference firmware.
         info.set_option("authnrCfg", true);
         // Enterprise attestation is implemented (FX-408): Config 0x01 enables

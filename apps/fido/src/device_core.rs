@@ -1875,6 +1875,14 @@ impl FidoApp {
                 // token is therefore never minted without a real touch.
                 let permissions = permissions.ok_or(err(Ctap2Response::MissingParameter))?;
                 let ka = key_agreement.ok_or(err(Ctap2Response::MissingParameter))?;
+                // US-1512: the durable lockout that every PIN leg already
+                // refuses. Without this gate `0x06` stayed the one token
+                // route that ignored it, so a locked-out device still
+                // minted a full-permission token while GetInfo — correctly —
+                // had stopped advertising that it could.
+                if self.keystore.pin_state.blocked || self.keystore.pin_state.needs_power_cycle {
+                    return Err(err(Ctap2Response::PinAuthBlocked));
+                }
                 let client_pub =
                     crypto::parse_cose_ec2_p256_bytes(&ka[..32], &ka[32..]).ok_or(err(Ctap2Response::PinAuthInvalid))?;
                 if !self.user_present(crate::device_app::presence_tag_from_channel(
@@ -2017,6 +2025,17 @@ impl FidoApp {
         info.enc_identifier = enc_id;
 
         info.set_option("clientPin", self.keystore.pin_state.pin_hash.is_some());
+        // US-1512: the capability half of the PIN/UV pair, kept adjacent to
+        // `clientPin` so a reader can check the two against each other. It
+        // goes through the shared helper so this twin and `app.rs` cannot
+        // drift; the rule is at `ctap2::pin_uv_auth_token_available`.
+        info.set_option(
+            "pinUvAuthToken",
+            crate::ctap2::pin_uv_auth_token_available(
+                self.keystore.pin_state.blocked,
+                self.keystore.pin_state.needs_power_cycle,
+            ),
+        );
         out.push(0x00).ok();
         info.write_cbor_into::<{ crate::CTAP2_MAX_MSG }>(out).ok();
         out.len()

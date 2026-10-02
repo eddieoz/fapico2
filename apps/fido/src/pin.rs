@@ -572,6 +572,14 @@ impl<'a> PinProtocol<'a> {
     /// presence probe and auto-acks, matching the rest of the host stack
     /// (US-908).
     fn get_pin_token_uv(&mut self, params: ClientPinParams) -> Result<PinProtocolOutput, FidoError> {
+        // US-1512: mirror of the lockout gate the device twin puts in front
+        // of the same sub-command. A durable lockout refuses every PIN leg,
+        // so the one route that needs no PIN must refuse too — otherwise this
+        // twin mints a token the board would not.
+        let state = self.keystore.get_pin_state();
+        if state.blocked || state.needs_power_cycle {
+            return Err(FidoError::PinAuthBlocked);
+        }
         let permissions = params.permissions.ok_or(FidoError::MissingParameter)?;
         if permissions & 0x08 != 0 && params.pin_uv_auth_protocol != 2 {
             return Err(FidoError::PinAuthInvalid);

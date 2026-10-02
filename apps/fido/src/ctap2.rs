@@ -396,13 +396,62 @@ impl Ctap2Info {
     }
 }
 
+/// US-1512: the rule behind GetInfo's `pinUvAuthToken` option.
+///
+/// The option is a **capability**, not a configuration flag. CTAP 2.1
+/// §5.4.6 asks "can this authenticator return a pinUvAuthToken?", and
+/// `clientPin` already answers the separate question "is a PIN configured
+/// right now" (`handle_get_info` sets that from `pin_hash.is_some()`).
+///
+/// The tempting rule — `pin_hash.is_some()`, mirroring `clientPin` — is
+/// wrong in the fail-safe direction. Sub-command `0x06`
+/// (getPinUvAuthTokenUsingUvWithPermissions) needs no PIN: it asserts a
+/// user-presence grant and nothing else, because this build has no
+/// user-verification secret to check, and credentialManagement honours the
+/// token it returns even with `pin_hash == None`
+/// (`device_core.rs:2520`, and `pin.rs:2029` in the host twin). A
+/// factory-fresh key therefore *does* have the capability, and reporting
+/// `false` would tell a client to stop using a path that answers.
+///
+/// Nor can the client library be used to argue the other way. In fido2
+/// 2.2.1 the option's only reader is `ClientPin.is_token_supported()`
+/// (`fido2/ctap2/pin.py:263`), whose single call site sits inside
+/// `if allow_uv and info.options.get("uv")`
+/// (`fido2/client/__init__.py:681-683`). This authenticator deliberately
+/// never advertises `uv` (see the `Default` note below), so that reader is
+/// unreachable here and the bit's value is wire-inert for that library.
+///
+/// What the value *must* track is lockout. Once the durable flag latches,
+/// every PIN leg refuses (`verify_token`, credentialManagement and Config
+/// all return PIN_AUTH_BLOCKED), so advertising a token the device will not
+/// honour is exactly the incoherence this story is about: a client reads
+/// `true`, mints a token, and is then refused at the first command. The
+/// token sub-command gates on the same flags, so the advertisement is true
+/// whenever it is made rather than merely fail-closed.
+/// It takes the two durable lockout flags rather than a state struct: the
+/// twins keep different ones (`keystore::PinState` and
+/// `device_keystore::DevicePinState`), and this signature is what keeps one
+/// rule behind both.
+pub fn pin_uv_auth_token_available(blocked: bool, needs_power_cycle: bool) -> bool {
+    !(blocked || needs_power_cycle)
+}
+
 impl Default for Ctap2Info {
     fn default() -> Self {
         // NOTE: "up" is deliberately NOT advertised, matching the reference
         // C firmware: the suite's test_option_up can only run when the option
         // is absent (its conftest Device.doGA has no options kwarg).
+        // The same goes for "uv": there is no built-in user-verification
+        // secret in this build to check (US-1525), so advertising it would
+        // promise a mechanism that does not exist.
         // clientPin key is always present (it advertises PIN capability);
-        // get_info sets the value from the actual PIN state.
+        // get_info sets the value from the actual PIN state. pinUvAuthToken
+        // is seeded here so the key is on the wire, but get_info overrides it
+        // with `pin_uv_auth_token_available` in every reachable state.
+        let mut options: HeaplessVec<(&'static str, bool), 16> = HeaplessVec::new();
+        options.push(("rk", true)).ok();
+        options.push(("clientPin", false)).ok();
+        options.push(("pinUvAuthToken", true)).ok();
         let mut options: HeaplessVec<(&'static str, bool), 16> = HeaplessVec::new();
         options.push(("rk", true)).ok();
         options.push(("clientPin", false)).ok();
