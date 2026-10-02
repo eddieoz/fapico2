@@ -881,5 +881,27 @@ pub fn stats() -> PresenceStats {
     unsafe { runtime().stats() }
 }
 
+/// US-1524: the one serialisation point for **every** test that touches the
+/// process-wide presence state — the pending-request slot, the press latch,
+/// the manual clock and the write-once touch-prompt hook.
+///
+/// It was two locks until US-1524: one here (`presence/tests.rs::TEST_LOCK`)
+/// and one in `hid_serve`'s harness (`SERVE_TEST_LOCK`). Two locks on one
+/// singleton serialise each suite against itself and against nothing else, so
+/// a consent window opened by one suite was still holding the single pending
+/// slot when the other suite started. That is how `emul_hid`'s parity suite
+/// first turned five `presence` tests and five `hid_serve` tests red in a
+/// single run.
+///
+/// A leaked slot is the symptom; the prompt hook is the sharper edge. It is
+/// write-once, so whichever test installs it turns every later
+/// `touch_prompt` — from any suite — into an append to its own log, and an
+/// assertion on "the last thing logged" is then a race against the rest of the
+/// test binary.
+///
+/// **A test that opens a window must close it before releasing this lock.**
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests;

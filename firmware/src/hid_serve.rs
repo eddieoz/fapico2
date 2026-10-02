@@ -1097,7 +1097,7 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use core::future::{pending, Future};
     use core::pin::pin;
@@ -1284,10 +1284,10 @@ mod tests {
 
     /// The serve loop touches the *shared* presence runtime (one pending slot,
     /// one prompt) — the same single instance the device has. Tests therefore
-    /// serialise the way `presence/tests.rs` does, and every test **closes
-    /// the window it opened** before releasing the lock, so a leaked slot
-    /// cannot make the next test fail for the wrong reason.
-    static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// serialise on **`presence::TEST_LOCK`**, the module-level lock US-1524
+    /// moved here to be shared, and every test **closes the window it opened**
+    /// before releasing it, so a leaked slot cannot make the next test fail for
+    /// the wrong reason.
     static PRESENCE_ONCE: std::sync::Once = std::sync::Once::new();
 
     fn serve_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1297,7 +1297,27 @@ mod tests {
             // one installs the slot.
             presence::init(host_now_ms);
         });
-        SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::presence::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// US-1524: the **same** guard, for tests that live outside this module
+    /// but drive this loop — `emul_hid`'s emulator-vs-board parity tests.
+    ///
+    /// The presence runtime is a process-wide singleton with exactly one
+    /// pending-request slot, and `cargo test` runs a crate's tests in
+    /// parallel threads. A second, independent lock would serialise
+    /// `emul_hid`'s tests against each other and against nothing else, while
+    /// two suites still fought over the one slot — which is exactly what the
+    /// first run of that suite did: five `hid_serve` tests went red on
+    /// `the window still opens with 0x01 before it is cancelled` because an
+    /// emulator-side window was still holding the slot when they started.
+    ///
+    /// One lock, both suites. A caller that parks a window must close it
+    /// before releasing, or the next suite inherits the leak.
+    pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        serve_test_guard()
     }
 
     // ── the app ────────────────────────────────────────────────────────────

@@ -11,10 +11,12 @@ use super::{
     adopt_wait_level, emul_inject_press, note_wait_level, set_touch_prompt_hook, u2f_up_refusal,
     LatchSource, PresenceRuntime, TouchWindow, CCID_WINDOW_MS, PRESS_LATCH,
 };
+/// US-1524: the presence suite's serialisation lock is the module-level one
+/// (see its doc comment) — shared with `hid_serve`'s harness so a consent
+/// window opened there cannot be holding this suite's slot.
+use super::TEST_LOCK;
 /// Manual clock: tests advance `NOW_MS` explicitly.
 static NOW_MS: AtomicU32 = AtomicU32::new(0);
-/// Serializes the shared `PRESS_LATCH` across the parallel test threads.
-static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
 fn tick_to(ms: u32) {
     NOW_MS.store(ms, Ordering::SeqCst);

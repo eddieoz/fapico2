@@ -1,15 +1,24 @@
-"""US-921 harness check: the emulation's consent-window parity.
+"""US-921 / US-1524 harness check: the emulator's consent-window parity.
 
-The emulation mirrors the device's keepalive-driven cross-call window
-(firmware/src/emul_main.rs, tasks.rs parity comments) over the shared
-presence runtime, but its FIDO app AUTO-ACKS presence — so the windowed
-retry loop completes on iteration 1 and the observable reply sequence is
-the device's happy path:
+US-1524 moved the emulator's CTAP-HID half onto the shipped serve loop
+(`firmware/src/hid_serve.rs`, driven from `firmware/src/emul_hid.rs`), so the
+frames this suite observes are the *board's* frames by construction rather
+than a second implementation's.
 
-  - makeCredential/getAssertion: exactly ONE CTAPHID keepalive
-    (0x3B, status 0x02) BEFORE the CBOR reply (FX-402), then the 0x90
-    frame — the window must not add spurious frames.
-  - U2F register: a direct MSG reply (SW 0x9000), no keepalive.
+The observable sequence is the device's:
+
+  - makeCredential/getAssertion: the CBOR answer and nothing else. The
+    unconditional pre-dispatch `0x02` keepalive US-1506 removed from the
+    board is gone here too — it claimed "waiting for your touch" before the
+    command had been run. The host FIDO app auto-acks presence, so no
+    consent window opens at all and there is no frame to put in one.
+  - U2F register: a direct MSG reply (SW 0x9000), no keepalive, fragmented
+    into one INIT report plus continuations when it does not fit in one.
+
+Before US-1524 this suite asserted "exactly one 0x3B/0x02 keepalive before
+the CBOR reply" — the emulator's own dispatcher emitted that frame and the
+board did not. That expectation was the divergence, and it is what the
+migration removed; see `.superpowers/sdd/report-us1524.md`.
 
 Runs against a private HID port (default 35966) with its own emulator
 process, like test_restart.py.
@@ -164,9 +173,17 @@ def emu(tmp_path):
         e.stop()
 
 
-def test_mc_replies_keepalive_then_cbor_and_never_repeats(emu):
-    """makeCredential: exactly one keepalive (0x3B/0x02), then the CBOR
-    success — the auto-ack window loop must not add frames."""
+def test_mc_answers_cbor_with_no_keepalive(emu):
+    """makeCredential: the CBOR success and nothing else.
+
+    The emulator's FIDO app auto-acks presence, so `process_ctap2` never
+    answers `UpRequired` and the shared serve loop never parks a consent
+    window — which means there is no frame a keepalive could legitimately
+    precede. US-1506 removed the unconditional pre-dispatch `0x02` from the
+    board for exactly that reason (it emitted 301 of them in a 30 s window);
+    US-1524 removed the emulator's remaining copy of it. A keepalive here
+    would be the divergence returning.
+    """
     req = cbor_encode(
         {
             1: os.urandom(32),
@@ -178,13 +195,10 @@ def test_mc_replies_keepalive_then_cbor_and_never_repeats(emu):
     emu.send_cbor(0x01, req)
     first = emu.recv_frame()
     # Reply command bytes carry the CTAPHID type bit (0x80|cmd).
-    assert first[4] == 0x80 | 0x3B, (
-        f"expected CTAPHID keepalive first, got {first[4]:02x}"
+    assert first[4] == 0x80 | 0x10, (
+        f"expected the CBOR reply first, got {first[4]:02x}"
     )
-    assert first[7] == 0x02, f"keepalive must report UP NEEDED (0x02), got {first[7]:02x}"
-    # No second keepalive: the auto-ack app grants on the (virtual) retry.
-    second = emu.recv_frame()
-    resp = emu.recv_cbor(second)
+    resp = emu.recv_cbor(first)
     assert resp[0] == 0x00, f"makeCredential failed: {resp[0]:02x}"
 
 

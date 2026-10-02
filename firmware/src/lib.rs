@@ -121,6 +121,16 @@ pub mod pending_up;
 /// emulation builds pull in.
 #[cfg(any(feature = "device", feature = "emulation"))]
 pub mod hid_serve;
+/// US-1524: the **emulation binary's** half of the CTAP-HID seam — the
+/// `HidLink`/`HidIo` transport adapter and one iteration of the shared serve
+/// loop — so `emul_main.rs` no longer carries its own assembler, reply framer,
+/// dispatcher or consent `loop`.
+///
+/// Gated on `emulation`, not on `device or emulation` like [`hid_serve`]:
+/// `serve_pass` needs a `block_on`, and a `std` dependency must never reach
+/// the `thumbv8m` release image. Nothing on the device path imports this.
+#[cfg(feature = "emulation")]
+pub mod emul_hid;
 
 /// US-130 (PICOForge-COMPAT): the OATH applet's SELECT `TAG_NAME` device-id —
 /// the per-unit PBKDF2 salt for the OATH access key.
