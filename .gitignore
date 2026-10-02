@@ -80,3 +80,9 @@ docs/tasks/
 
 # ZCode session state (not repo content)
 .zcode/
+
+# US-1518 acceptance harness: locally generated TLS material and the browser
+# profile the harness drives. Both are per-developer build artefacts -- a
+# committed private key in a repo would be worse than useless, and a committed
+# browser profile carries the operator's state.
+scripts/acceptance/.cert/
