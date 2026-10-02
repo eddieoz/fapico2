@@ -368,14 +368,20 @@ impl FidoError {
             FidoError::NoCredentials => 0x2E,          // NO_CREDENTIALS
             FidoError::CredentialExcluded => 0x19,     // CREDENTIAL_EXCLUDED
             FidoError::UnsupportedAlgorithm => 0x26,
-            FidoError::UnsupportedOption => 0x2B,
+            FidoError::UnsupportedOption => 0x2B,        // UNSUPPORTED_OPTION
             FidoError::OperationDenied => 0x27,
             FidoError::NotAllowed => 0x30,             // NOT_ALLOWED
             FidoError::KeyStoreFull => 0x28,
             FidoError::LimitExceeded => 0x15,          // LIMIT_EXCEEDED
             FidoError::IntegrityFailure => 0x3D,       // INTEGRITY_FAILURE
             FidoError::InvalidCommand => 0x01,
-            FidoError::InvalidChannel => 0x08,
+            // US-1528: was 0x08. `CtapError.ERR.INVALID_CHANNEL` is 0x0B and
+            // the C SDK agrees (`CTAP1_ERR_INVALID_CHANNEL 0x0b`). This is the
+            // same error `Ctap2Response::InvalidChannel` and
+            // `CtapHidError::InvalidChannel` carry, so all three now agree and
+            // `tests/status_table.rs` asserts the equality so they cannot
+            // diverge again.
+            FidoError::InvalidChannel => 0x0B,         // INVALID_CHANNEL
             FidoError::ChannelBusy => 0x06,
             FidoError::Timeout => 0x05,
             FidoError::InvalidSeq => 0x04,

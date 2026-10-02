@@ -15,6 +15,21 @@ pub enum CtapHidCommand {
 }
 
 /// CTAP HID error codes.
+///
+/// US-1528: the last two were `0x07`/`0x08` and are now `0x0A`/`0x0B`. Same
+/// transcription error as [`crate::ctap2::Ctap2Response`], and it is recorded
+/// here because the two tables used to agree with each other and disagree with
+/// the reference together — which is what made it invisible. `fido2` 2.2.1
+/// `CtapError.ERR` has `LOCK_REQUIRED = 0x0A` / `INVALID_CHANNEL = 0x0B`; the
+/// C SDK agrees at `pico-keys-sdk/src/usb/hid/ctap_hid.h:157-158`
+/// (`CTAP1_ERR_LOCK_REQUIRED 0x0a`, `CTAP1_ERR_INVALID_CHANNEL 0x0b`).
+/// `firmware/src/ctap_hid.rs:37` in the firmware worktree already emits `0x0B`
+/// for the same condition, so the `0x08` here was a third, private spelling of
+/// a value two other files in this project had already got right.
+///
+/// `Unknown` (`0x0F`) is not a CTAP HID code; it is this crate's catch-all for
+/// a byte it does not recognise, deliberately outside the reference range so it
+/// cannot be mistaken for one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum CtapHidError {
@@ -24,8 +39,8 @@ pub enum CtapHidError {
     InvalidSeq = 0x04,
     Timeout = 0x05,
     ChannelBusy = 0x06,
-    LockRequired = 0x07,
-    InvalidChannel = 0x08,
+    LockRequired = 0x0A,
+    InvalidChannel = 0x0B,
     Unknown = 0x0F,
 }
 
@@ -44,8 +59,8 @@ impl From<u8> for CtapHidError {
             0x04 => CtapHidError::InvalidSeq,
             0x05 => CtapHidError::Timeout,
             0x06 => CtapHidError::ChannelBusy,
-            0x07 => CtapHidError::LockRequired,
-            0x08 => CtapHidError::InvalidChannel,
+            0x0A => CtapHidError::LockRequired,
+            0x0B => CtapHidError::InvalidChannel,
             0x0F => CtapHidError::Unknown,
             _ => CtapHidError::Unknown,
         }

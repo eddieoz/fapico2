@@ -13,15 +13,22 @@
 //!
 //! | request | answer | why |
 //! |---|---|---|
-//! | MC `options.up = false` | `0x2B` INVALID_OPTION | `up` is not advertised (CTAP2.1 §6.1), and the reference rejects it outright — `pico-fido/src/fido/cbor_make_credential.c:387` |
+//! | MC `options.up = false` | `0x2C` INVALID_OPTION | `up` is not advertised (CTAP2.1 §6.1), and the reference rejects it outright — `pico-fido/src/fido/cbor_make_credential.c:387` |
 //! | MC `options.up = true` / absent | gated on presence | US-907; never a silent credential |
 //! | GA `options.up = false` | **served**, silently, UP bit clear | a silent assertion is a real thing; reference takes it at `cbor_get_assertion.c:322` |
-//! | GA `up = false` + hmac-secret | `0x2B` INVALID_OPTION | the reference's one rejected combination, `cbor_get_assertion.c:324` |
+//! | GA `up = false` + hmac-secret | `0x2C` INVALID_OPTION | the reference's one rejected combination, `cbor_get_assertion.c:324` |
 //!
 //! The GA row and the MC row look contradictory and are not: MC never mints
 //! anything new, so refusing `up:false` costs a client nothing it was
 //! entitled to; GA signs with a key that already exists, which is what makes
 //! a silent assertion meaningful at all.
+//!
+//! US-1528 moved INVALID_OPTION from `0x2B` to `0x2C`. The *policy* below is
+//! unchanged and is not what this story is about — only the byte the policy
+//! travels on was wrong, so every one of these rejections was being read by
+//! every client as UNSUPPORTED_OPTION. `tests/status_table.rs` is what keeps
+//! the byte itself honest; the constant here is deliberately written as a
+//! literal so this file keeps testing the wire and not the enum.
 
 use fapico2_fido::app::FidoApp as HostApp;
 use fapico2_fido::cbor::{self, Value};
@@ -33,7 +40,16 @@ use heapless::Vec as HV;
 
 const MAX_MSG: usize = fapico2_fido::CTAP2_MAX_MSG;
 
-const INVALID_OPTION: u8 = 0x2B;
+/// `CTAP2_ERR_INVALID_OPTION` — `CtapError.ERR.INVALID_OPTION`, **0x2C**.
+/// US-1528: this was `0x2B`, which is `UNSUPPORTED_OPTION`. Kept as a literal
+/// rather than `Ctap2Response::InvalidOption.code()` on purpose: this file's
+/// job is to prove the *wire* byte, and reading the value back out of the enum
+/// it is supposed to be checking would make every assertion below vacuous.
+const INVALID_OPTION: u8 = 0x2C;
+/// `CTAP2_ERR_UNSUPPORTED_OPTION` — the byte INVALID_OPTION used to be, and
+/// the one a `ne!` guard must also exclude, so "not INVALID_OPTION" is not
+/// satisfied by accident by having become UNSUPPORTED_OPTION instead.
+const UNSUPPORTED_OPTION: u8 = 0x2B;
 const UP_REQUIRED: u8 = 0x3B;
 const INVALID_COMMAND: u8 = 0x01;
 
@@ -188,7 +204,12 @@ fn mc_up_false_is_not_a_dispatch_failure() {
 }
 
 /// The neighbouring shapes must NOT be swept into the same rejection — if
-/// they were, `0x2B` above would prove nothing about `up` in particular.
+/// they were, `0x2C` above would prove nothing about `up` in particular.
+///
+/// Both option-statuses are excluded. Under US-1528 a `ne!(INVALID_OPTION)`
+/// alone was exactly the assertion that kept passing for the wrong reason: the
+/// rejection had quietly become `UNSUPPORTED_OPTION`, which is a different
+/// byte and still "not INVALID_OPTION".
 #[test]
 fn mc_up_true_and_absent_are_not_invalid_option() {
     for request in [mc(Some(true)), mc(None)] {
@@ -198,6 +219,11 @@ fn mc_up_true_and_absent_are_not_invalid_option() {
             "only an explicit up:false is rejected; up:true and an absent \
              options map must not be"
         );
+        assert_ne!(
+            device_status, UNSUPPORTED_OPTION,
+            "and not by the neighbouring status either — a sweep into \
+             UNSUPPORTED_OPTION would satisfy the check above"
+        );
         assert_eq!(host_status, device_status, "twins must agree");
     }
 }
@@ -205,7 +231,7 @@ fn mc_up_true_and_absent_are_not_invalid_option() {
 /// Ordering, and this is the part US-907 turns on: the `up:false` rejection
 /// happens **before** the presence gate. With a fail-closed presence source —
 /// what the device build default resolves to — a request that reached the
-/// gate instead of the check would answer `0x3B`, not `0x2B`.
+/// gate instead of the check would answer `0x3B`, not `0x2C`.
 ///
 /// So there is no path from an accepted MC to a credential minted with zero
 /// touch: the only way to skip the touch is to send `up:false`, and that is
@@ -228,7 +254,7 @@ fn mc_up_false_is_rejected_before_the_presence_gate() {
     assert_eq!(
         out2[0], UP_REQUIRED,
         "up:true must reach the presence gate and be refused for want of a \
-         touch — if this also answered 0x2B the rejection would be catching \
+         touch — if this also answered 0x2C the rejection would be catching \
          something other than up:false"
     );
 }

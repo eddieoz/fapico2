@@ -1775,10 +1775,10 @@ fn zero_mask_refusal(tag: PhyTag, value: &[u8]) -> Option<Ctap2Response> {
     }
     // The width is checked before the value, and it has to be: this tag's value
     // is one byte, so `value.first() == Some(&0)` alone would also fire on a
-    // three-byte record that merely *starts* with zero — and `0x2B` means "an
+    // three-byte record that merely *starts* with zero — and `0x2C` means "an
     // invalid value for a real option", which is not what a wrong-width record
     // is. Falling through instead lets `apply_phy_record` give its own answer
-    // (`0x2A`, this firmware has no field for the record), so each status keeps
+    // (`0x2B`, this firmware has no field for the record), so each status keeps
     // meaning one thing. The client only ever writes one byte
     // (`tlv.push(RSKEY_PHY_TAG_ENABLED_USB_ITF); tlv.push(0x01)`,
     // `picoforge/src/hal/fido/mod.rs:1127-1128`), so this is defence in depth

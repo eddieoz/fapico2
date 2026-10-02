@@ -872,8 +872,9 @@ impl FidoApp {
         // reads at the next refactor:
         //
         // WHAT: a makeCredential carrying `options.up = false` is answered
-        // `CTAP2_ERR_INVALID_OPTION` (0x2B), on both twins. It is NOT a
-        // parse failure and NOT an accident of ordering.
+        // `CTAP2_ERR_INVALID_OPTION` (0x2C — US-1528 moved this from 0x2B,
+        // which every client decodes as UNSUPPORTED_OPTION), on both twins.
+        // It is NOT a parse failure and NOT an accident of ordering.
         //
         // WHY IT IS LEGAL: this authenticator does not advertise `up` at all
         // (`ctap2.rs`'s `Ctap2Info::default`, pinned by

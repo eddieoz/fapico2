@@ -37,7 +37,51 @@ pub enum Ctap2Command {
     Config = 0x0D,
 }
 
-/// CTAP2 response codes.
+/// CTAP2 status codes (the *response* table — see [`Ctap2Command`] for the
+/// separate, deliberately-non-spec command table).
+///
+/// US-1528. Every byte below is a **wire value** a client decodes, so this enum
+/// is transcribed, not designed. The two authorities, which agree with each
+/// other, are:
+///
+///   * `fido2` 2.2.1, `fido2/ctap.py` `CtapError.ERR` — what `ykman`, Yubico
+///     Authenticator and every first-party tool actually decode. Executed, not
+///     grepped: the enum is read at runtime in the test that pins this table.
+///   * the C reference, `pico-fido2/src/fido/ctap.h` `CTAP2_ERR_*`.
+///
+/// Where they differ the **library wins**, because it is the decoder. That is
+/// the whole reason `PinTokenExpired` is `0x38` here and absent from
+/// `ctap.h`: `CtapError.ERR` defines it, so a client reading our `0x38` gets
+/// `PIN_TOKEN_EXPIRED` and a client reading the C firmware's silence gets
+/// nothing to read.
+///
+/// The previous table was off by one across `0x2B`..`0x2D` and wrong again at
+/// `0x07`/`0x08`, which meant **every** `InvalidOption` this firmware returned
+/// was read by every client as `UNSUPPORTED_OPTION` — a different sentence
+/// ("you named a value we do not support" vs "you named a value that is
+/// malformed for a parameter we do support"). `tests/status_table.rs` pins
+/// every value below against the executed library so this cannot drift again;
+/// do not "tidy" a value here without running that test.
+///
+/// ## `NoOperationPending` was removed, deliberately
+///
+/// US-1528 listed it as one of the four non-reference codes to resolve. It is
+/// gone rather than aligned or re-valued, for three reasons that all point the
+/// same way:
+///
+///   1. The spec **withdrew** the code. `fido2` keeps it as a comment —
+///      `# NO_OPERATION_PENDING = 0x2A  # No longer in spec` — so no client
+///      can decode it whatever byte it carries.
+///   2. Even the withdrawn code was `0x2A`, not the `0x29` we had. `0x29` was
+///      `NOT_BUSY`, a *different* withdrawn code. The variant was wrong at
+///      both the semantic and the numeric level, which is the signature of a
+///      name copied down a column without the value ever being checked.
+///   3. It had **zero producers and zero assertions** anywhere in the tree
+///      (`grep -rn NoOperationPending` returns this paragraph and nothing
+///      else), so removing it breaks no caller.
+///
+/// Keeping a wrong-valued, unreachable variant in the one table whose entire
+/// job is to be transcribed correctly is a drift vector, not documentation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum Ctap2Response {
@@ -48,8 +92,20 @@ pub enum Ctap2Response {
     InvalidSeq = 0x04,
     Timeout = 0x05,
     ChannelBusy = 0x06,
-    LockRequired = 0x07,
-    InvalidChannel = 0x08,
+    /// `CTAP2_ERR_LOCK_REQUIRED`.
+    ///
+    /// Was `0x07`, which is wrong twice over: the reference value is `0x0A`
+    /// (`CtapError.ERR.LOCK_REQUIRED`; the C SDK agrees at
+    /// `pico-fido2/pico-keys-sdk/src/usb/hid/ctap_hid.h:157`,
+    /// `CTAP1_ERR_LOCK_REQUIRED 0x0a`), and `0x07` collided with
+    /// [`Ctap2Command::Reset`] — a status byte and a command opcode that are
+    /// never on the same layer but must never share a value, because a reader
+    /// that has lost track of which table it is in then has no way to tell.
+    LockRequired = 0x0A,
+    /// `CTAP2_ERR_INVALID_CHANNEL`. Was `0x08`; the reference value is `0x0B`
+    /// (`CtapError.ERR.INVALID_CHANNEL`; `ctap_hid.h:158`,
+    /// `CTAP1_ERR_INVALID_CHANNEL 0x0b`).
+    InvalidChannel = 0x0B,
     CborUnexpectedType = 0x11,
     InvalidCbor = 0x12,
     MissingParameter = 0x14,
@@ -63,10 +119,33 @@ pub enum Ctap2Response {
     UnsupportedAlgorithm = 0x26,
     OperationDenied = 0x27,
     KeyStoreFull = 0x28,
-    NoOperationPending = 0x29,
-    UnsupportedOption = 0x2A,
-    InvalidOption = 0x2B,
-    KeepAliveCancel = 0x2C,
+    /// `CTAP2_ERR_UNSUPPORTED_OPTION` — the request named an option this
+    /// authenticator does not advertise.
+    ///
+    /// Was `0x2A`, which is not a live code at all. The reference skips
+    /// straight from `KEY_STORE_FULL` (`0x28`) to `UNSUPPORTED_OPTION`
+    /// (`0x2B`); `fido2` keeps the commented-out
+    /// `# NOT_BUSY = 0x29  # No longer in spec` and
+    /// `# NO_OPERATION_PENDING = 0x2A  # No longer in spec` as the reason the
+    /// gap exists, so `0x2A` is a **withdrawn** code. Emitting it put a value
+    /// on the wire that no client can name.
+    UnsupportedOption = 0x2B,
+    /// `CTAP2_ERR_INVALID_OPTION` — the option is advertised, but the value
+    /// carried is not one it accepts.
+    ///
+    /// Was `0x2B`, which every client decodes as `UNSUPPORTED_OPTION`. This is
+    /// the bug US-1528 was filed for: a conformance-visible difference in what
+    /// the firmware says, at roughly ten producer sites, and the `up: false`
+    /// rejection US-1526 deliberately decided and pinned is one of them.
+    InvalidOption = 0x2C,
+    /// `CTAP2_ERR_KEEPALIVE_CANCEL` — user cancelled a keepalive.
+    ///
+    /// Was `0x2C`. `firmware/src/ctap_hid.rs` (a separate worktree) is the
+    /// first thing in this project to *produce* a keepalive-cancel answer and
+    /// emits `0x2D` on the strength of the same two sources. Aligning here is
+    /// what makes the two halves agree by value; do not "fix" one from the
+    /// other, re-derive both from the table above.
+    KeepAliveCancel = 0x2D,
     NoCredentials = 0x2E,
     UserActionTimeout = 0x2F,
     NotAllowed = 0x30,
@@ -77,6 +156,19 @@ pub enum Ctap2Response {
     PinNotSet = 0x35,
     PuatRequired = 0x36,
     PinPolicyViolation = 0x37,
+    /// `CTAP2_ERR_PIN_TOKEN_EXPIRED`.
+    ///
+    /// **Not in the C reference** — `ctap.h` runs `PIN_POLICY_VIOLATION`
+    /// (`0x37`) straight to `REQUEST_TOO_LARGE` (`0x39`) — but **in the client
+    /// library**, which is the authority that matters: `CtapError.ERR` defines
+    /// `PIN_TOKEN_EXPIRED = 0x38`. So this value is *correct* and the C
+    /// firmware's silence is the omission, not this. Verified by executing the
+    /// enum rather than grepping the literal, and re-verified on every run of
+    /// `tests/status_table.rs`.
+    ///
+    /// Fate, per US-1528's "align or write down": **kept as-is.** Aligning it
+    /// to a C-header-only reading would mean emitting a byte every client
+    /// decodes as `REQUEST_TOO_LARGE`.
     PinTokenExpired = 0x38,
     RequestTooLarge = 0x39,
     ActionTimeout = 0x3A,

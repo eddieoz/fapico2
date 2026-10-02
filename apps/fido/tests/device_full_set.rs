@@ -332,8 +332,10 @@ fn cred_mgmt_largeblobs_u2f_device_path() {
     // --- credMgmt enumerateRpsBegin (0x02) → 2 RPs, totalRps = 2 ---
     let (status, _cbor) = client.cred_mgmt(0x02, None);
     assert_eq!(status, 0x00, "enumerateRpsBegin");
-    // enumerateRpsGetNext (0x03) until NotAllowed (0x2C is keepalive; here
-    // the sequence ends with the second RP).
+    // enumerateRpsGetNext (0x03) until NotAllowed (0x2D is keepalive-cancel;
+    // here the sequence ends with the second RP). US-1528 moved the
+    // keepalive-cancel byte 0x2C → 0x2D, so this aside was the one place in
+    // the tree that quoted it as a live value and had to move with it.
     let (status, _) = client.cred_mgmt(0x03, None);
     assert_eq!(status, 0x00, "enumerateRpsGetNext (2nd RP)");
 

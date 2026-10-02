@@ -305,12 +305,16 @@ fn device_app() -> (DeviceApp, HostTrng, HostSecureStore) {
 //
 // | byte | CTAP2.1 name | meaning |
 // |---|---|---|
-// | `0x2B` | `CTAP2_ERR_INVALID_OPTION` | the request is *malformed* — a parameter had an unusable value |
+// | `0x2C` | `CTAP2_ERR_INVALID_OPTION` | the request is *malformed* — a parameter had an unusable value |
 // | `0x30` | `CTAP2_ERR_NOT_ALLOWED` | the request was *well-formed and recognised*, but this authenticator does not permit it |
 //
 // A pending sub-command is the second case, not the first: the host sent a
 // valid RS-Key sub-command with valid params, and we declined. Answering
-// `0x2B` would blame the caller's request for a limitation that is ours.
+// `0x2C` would blame the caller's request for a limitation that is ours.
+//
+// (US-1528: the INVALID_OPTION row was `0x2B` until then. The argument above
+// never depended on the number — it is about malformed vs. well-formed — so
+// the move changed which byte travels with the decision, not the decision.)
 //
 // `0x30` is also what this crate already does for the identical meaning. The
 // sibling vendor-vault path returns `Ctap2Response::NotAllowed` for its
@@ -4544,12 +4548,16 @@ const TARGET_LED_LITERAL: u8 = 0x02;
 const DEV_CONF_TAG_USB_ENABLED_LITERAL: u8 = 0x03;
 
 /// CTAP2.1 `CTAP2_ERR_UNSUPPORTED_OPTION` — a well-formed request naming
-/// something this authenticator does not do.
-const UNSUPPORTED_OPTION: u8 = 0x2A;
+/// something this authenticator does not do. US-1528: was `0x2A`, a code the
+/// spec withdrew; the reference value is `0x2B`.
+const UNSUPPORTED_OPTION: u8 = 0x2B;
 /// CTAP2.1 `CTAP2_ERR_INVALID_OPTION` — a well-formed option carrying a value
 /// that is never acceptable. Used for exactly one thing: the zero
-/// enabled-USB-interface mask.
-const INVALID_OPTION: u8 = 0x2B;
+/// enabled-USB-interface mask. US-1528: was `0x2B`; the reference value is
+/// `0x2C`, and the old value is what made the two constants below swap
+/// meanings silently — a test that asserted "not UNSUPPORTED_OPTION" would
+/// have been satisfied by the INVALID_OPTION it was meant to rule out.
+const INVALID_OPTION: u8 = 0x2C;
 /// CTAP2.1 `CTAP2_ERR_UP_REQUIRED` — a touch is needed before this proceeds.
 const UP_REQUIRED: u8 = 0x3B;
 /// CTAP2.1 `CTAP2_ERR_PIN_AUTH_BLOCKED` — pinUvAuth is refused outright
@@ -4957,9 +4965,9 @@ fn config_write_mixed_blob_needs_the_token_but_not_a_touch() {
 /// configuration.
 ///
 /// The three *different* statuses in the companion assertions are what make
-/// this one specific. `0x0B` with the value `1` is `0x2A`
+/// this one specific. `0x0B` with the value `1` is `0x2B`
 /// (no field for it in the persisted record) and a VID/PID write with no token
-/// is `0x36`, so `0x2B` can only be the zero-mask rule and not one of those
+/// is `0x36`, so `0x2C` can only be the zero-mask rule and not one of those
 /// two rules leaking into the answer.
 #[test]
 fn config_write_rejects_zero_interface_mask_unconditionally() {
@@ -4994,11 +5002,14 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
     // because 0x0B is simply refused.
     //
     // US-117 changed what the non-zero value answers. It used to be
-    // `0x2A` (`UnsupportedOption`) because the mask had no field in the
+    // `UnsupportedOption` because the mask had no field in the
     // persisted record on the PHY path; `DEV_CONF` (`0x00`) now gives it one,
     // so `0x0B` is writable and reaches the identity gate — and a request with
-    // no token is `0x36` (`PuatRequired`). The status is still *not* `0x2B`,
-    // which is the property the control exists to protect.
+    // no token is `0x36` (`PuatRequired`). The status is still *not*
+    // `INVALID_OPTION` (`0x2C`), which is the property the control exists to
+    // protect. (US-1528: the byte quoted here moved from `0x2A` to `0x2B`
+    // when the status table was corrected; the alternative it is not is now
+    // named rather than numbered, so it cannot be re-pinned to a stale byte.)
     let nonzero = phy_blob(&[(TAG_ENABLED_USB_ITF, &[0x01])]);
     let unsupported = run_config_write(&nonzero, None, false, &phy);
     assert_eq!(
@@ -5006,8 +5017,8 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
         PUAT_REQUIRED,
         "0x0B with a non-zero value is a different fault — the mask is now \
          writable, so what stops it is the identity tier's gate, not the \
-         record. It must answer 0x36 (no token) and not 0x2B. If it answered \
-         0x2B the loop above would be passing for the wrong reason"
+         record. It must answer 0x36 (no token) and not 0x2C. If it answered \
+         0x2C the loop above would be passing for the wrong reason"
     );
     assert_eq!(
         unsupported.phy, None,
@@ -5035,30 +5046,33 @@ fn config_write_rejects_zero_interface_mask_unconditionally() {
         vidpid_no_token.status.code(),
         PUAT_REQUIRED,
         "and a VID/PID write with a press but no token is the *identity* rule \
-         at 0x36 — so 0x2B above can only be the zero-mask rule"
+         at 0x36 — so 0x2C above can only be the zero-mask rule"
     );
 
     // The width is checked before the value, so a multi-byte `0x0B` record that
-    // merely *starts* with zero gets the width status, not `0x2B`. The
+    // merely *starts* with zero gets the width status, not `0x2C`. The
     // client's reader would skip such a record (`picoforge/src/hal/fido/
-    // mod.rs:1001-1003`) rather than misread it, and `0x2B` — "an invalid value
-    // for a real option" — is not what a wrong-width record is.
+    // mod.rs:1001-1003`) rather than misread it, and `INVALID_OPTION` — "an
+    // invalid value for a real option" — is not what a wrong-width record is.
     //
-    // US-117 changed the status here from `0x2A` to `0x02`, and the change is
-    // the rule working rather than drifting. `0x2A` was right for the wrong
-    // reason: `0x0B` had no field in the persisted record, so *every* `0x0B`
-    // record was unsupported and the width never had to be looked at. Now that
-    // the tag is writable the width *is* checked, and a three-byte record is a
-    // wrong-width record — `InvalidParameter` (`0x02`), the same status a
-    // wrong-width VID/PID earns. The status is still not `0x2B`, which is the
-    // property this leg exists to protect.
+    // US-117 changed the status here from `UnsupportedOption` to `0x02`, and
+    // the change is the rule working rather than drifting. `UnsupportedOption`
+    // was right for the wrong reason: `0x0B` had no field in the persisted
+    // record, so *every* `0x0B` record was unsupported and the width never had
+    // to be looked at. Now that the tag is writable the width *is* checked, and
+    // a three-byte record is a wrong-width record — `InvalidParameter` (`0x02`),
+    // the same status a wrong-width VID/PID earns. The status is still not
+    // `INVALID_OPTION`, which is the property this leg exists to protect.
+    // (US-1528 renamed the alternatives rather than numbering them: the two
+    // byte values this paragraph used to quote are both the wrong values under
+    // the corrected table.)
     let wrong_width = phy_blob(&[(TAG_ENABLED_USB_ITF, &[0x00, 0x01, 0x00])]);
     let bad_width = run_config_write(&wrong_width, None, false, &phy);
     assert_eq!(
         bad_width.status.code(),
         INVALID_PARAMETER,
         "a three-byte 0x0B record whose leading byte is zero is a wrong-width \
-         record, not a zero mask: it must answer 0x02, or 0x2B would be \
+         record, not a zero mask: it must answer 0x02, or 0x2C would be \
          reachable by a shape the rule was never about"
     );
     assert_eq!(
@@ -5257,8 +5271,8 @@ fn config_write_refuses_records_with_no_destination_in_the_persisted_record() {
             } else {
                 "it has no field in PhyConfig, and a partial apply is not \
                  available — see vendor41::config_write. Note the status is \
-                 0x2A (unsupported), not 0x2B (invalid): the record is one this \
-                 firmware does not do, not one it does badly"
+                 UNSUPPORTED_OPTION (0x2B), not INVALID_OPTION (0x2C): the record is \
+                 one this firmware does not do, not one it does badly"
             },
         );
     }

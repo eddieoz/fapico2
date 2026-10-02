@@ -134,7 +134,17 @@ fn test_ga_up_false_uv_true_is_not_invalid_option() {
         ),
     ]));
     let resp = app.process_ctap2(0x02, &req, [1, 2, 3, 4]);
-    assert_ne!(resp[0], 0x2B, "up=false+uv=true must not be InvalidOption");
+    // US-1528: INVALID_OPTION is 0x2C. This used to read `assert_ne!(resp[0],
+    // 0x2B, ...)` — after the table fix that asserted nothing at all, because
+    // the rejection it guards against had simply moved one byte along and
+    // 0x2B is now UNSUPPORTED_OPTION. Both neighbours are excluded so the
+    // guard cannot be satisfied by either.
+    assert_ne!(resp[0], 0x2C, "up=false+uv=true must not be InvalidOption");
+    assert_ne!(
+        resp[0], 0x2B,
+        "…nor UNSUPPORTED_OPTION, which is exactly what this assertion \
+         silently degraded into"
+    );
     assert_eq!(resp[0], 0x36, "uv=true must demand a PUAT");
 }
 
