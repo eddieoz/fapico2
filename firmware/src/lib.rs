@@ -89,11 +89,19 @@ pub const TASK_ARENA_DEMAND_B: usize = 21_944;
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "014837326a4909371ad2d400815220ccf23f7dc5d422d56be28fb8c6bd8913a6";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "59c34a8dd4f7afefd08046c56619674d2d086363a7ca2a055c05e766dab41f7f";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
 pub mod ccid_reasm;
+/// The **boot-phase LED ladder** — the pure, host-tested core of the "power
+/// cycle it and watch one LED" instrument for a board that flashes but never
+/// re-enumerates. Ungated and device-independent on purpose: the whole point
+/// is that the next person does not have to rebuild, and a feature-gated
+/// instrument is a rebuild. The LED driver is the device bin's
+/// (`boot_led.rs`); this module owns the encoding, the ordering contract and
+/// the release/pin-handover rule, all of which are testable without hardware.
+pub mod bootphase;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
