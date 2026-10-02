@@ -77,15 +77,54 @@ const CTAP_READ_CONFIG: u8 = 0x42;
 /// this loop publishes is stated in terms of the constant that sets it.
 pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 
-/// US-1502's **stated bound**, in milliseconds: how long a request that
-/// arrives on any channel waits for its answer while a consent window is
-/// open. **US-1506 re-derived it; the figure is now 1750 ms, not 2100 ms**,
-/// and the number of terms went from four replies to three.
+/// US-1502's **stated bound**, in milliseconds. **US-1506 re-derived it; the
+/// figure is 1750 ms, not 2100 ms**, and the number of terms went from four
+/// replies to three.
 ///
-/// It is three CTAPHID reply writes plus the one keepalive period the
-/// outbound read is bounded by, and that is the whole argument — every term
-/// is a deadline the loop actually holds itself to. Walking one
-/// [`serve_once`] pass, in order, while a window is live:
+/// ## What this bounds, precisely
+///
+/// It bounds the **loop's own waiting** on behalf of a request that arrives
+/// while a consent window is open: how long before the serve loop has picked
+/// the frame up and put a reply on the wire for it. Every term in the sum is a
+/// deadline the loop actually holds itself to, and there are exactly two kinds
+/// of them — `with_timeout` appears on the OUT read (`read_one`,
+/// [`hid_serve.rs:449`]) and on the reply write (`hid_reply.rs:109`), and
+/// nowhere else in the loop.
+///
+/// It does **not** bound the work the app does once the frame is in hand. The
+/// `dispatch` call at the end of a pass — `app.process_ctap2` plus the
+/// `app.persist()` flash program at `hid_serve.rs:862` — is synchronous, holds
+/// no deadline, and is excluded. Nor is the re-drive's app call. The sentence
+/// that used to carry this exclusion said "for the **re-drive**", which is
+/// true and much narrower than the arithmetic is: it is equally true of the
+/// initial dispatch of any command that arrives mid-window.
+///
+/// That is not a harmless caveat, so it is stated as a limit rather than
+/// buried: **a command that is not presence-windowed can exceed this bound by
+/// exactly as long as its own parse, crypto and flash persist take.**
+/// `presence_windowed` (below) covers `0x01`/`0x02`/`0x41`/`0x06` only, so a
+/// `largeBlobs` (`0x0C`) or `config` (`0x0D`) frame arriving mid-window runs
+/// to completion inside the same pass, inside the same `3 x 500 + 250`, with no
+/// deadline anywhere on that path. It is not deferred and not queued — it is
+/// simply not covered by this number, and the blackout this constant exists to
+/// rule out (a request *starved* by a window) is not what it would experience.
+/// Extending the arithmetic to cover it would mean wrapping `dispatch` in a
+/// deadline, and on the device that means abandoning a command part-way
+/// through a flash persist — trading a published latency bound for a violation
+/// of the durable-before-ack invariant. That is a behaviour change with its own
+/// story, not something to smuggle into a comment.
+///
+/// The commands this DOES bound end to end are the ones whose reply path is
+/// transport-only: `INIT`, `PING`, `WINK`, `CANCEL`, the window's keepalives,
+/// and a presence-windowed request answered `UP_REQUIRED` without reaching the
+/// app's crypto. Those are the cases the black-box suite asserts against it
+/// (`window_black_box`), and the case the blackout produced.
+///
+/// ## The arithmetic
+///
+/// Three CTAPHID reply writes plus the one keepalive period the outbound read
+/// is bounded by. Walking one [`serve_once`] pass, in order, while a window is
+/// live:
 ///
 /// 1. **the bounded read.** A frame that arrives on the OUT endpoint is
 ///    picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (now **250 ms**),
@@ -107,9 +146,6 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 /// about, where the three replies complete immediately rather than costing
 /// their deadlines.
 ///
-/// The re-drive is one synchronous app call and the persist gate is one
-/// flash program; neither is in the arithmetic.
-///
 /// ## Why the term count went *down*
 ///
 /// The published 2100 ms counted **four** replies: the live window's
@@ -128,8 +164,13 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 /// (1500 ms), which under-counted by dropping the read's own bound and
 /// then counting three replies for a pass that made four; and a
 /// re-derivation that left the removed pre-command keepalive in would
-/// over-count. The rule both times: enumerate the pass frame by frame,
-/// then add only what is still there.
+/// over-count.
+///
+/// The rule, which both of those errors and the over-broad claim above share:
+/// **enumerate the pass frame by frame, add only what is still there, and
+/// publish a bound no wider than what the deadlines actually cover.** A term
+/// that is not a deadline is not a term; a case the sum does not describe is
+/// not a case the sum may claim.
 pub const SERVE_BOUND_MS: u64 = 3 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
 
 /// Something the serve loop wants the transport to say in its log. The loop
@@ -1643,10 +1684,173 @@ pub(crate) mod tests {
 
     // ── the tests ──────────────────────────────────────────────────────────
 
+    /// The narrowed scope of [`SERVE_BOUND_MS`], asserted rather than left to
+    /// the doc comment.
+    ///
+    /// The constant used to be documented as the wait for "a request that
+    /// arrives on **any** channel". Its arithmetic only ever covered the
+    /// loop's own deadlines — the bounded OUT read and the reply writes — and
+    /// the exclusion sentence named only "the re-drive", which is true and far
+    /// narrower than the claim: the initial `dispatch` of a command arriving
+    /// mid-window is equally outside the sum. So a `largeBlobs` (`0x0C`) or
+    /// `config` (`0x0D`) frame was inside a published 1750 ms bound while
+    /// running its full parse, crypto and flash persist with no deadline at
+    /// all on that path.
+    ///
+    /// Narrowing a claim in a comment is worth nothing if the next reader can
+    /// widen it back, so the two halves of the scope are pinned here as
+    /// behaviour:
+    ///
+    /// * a **presence-windowed** command arriving mid-window is refused
+    ///   (`OPERATION_PENDING`) and never reaches the app — one reply, fully
+    ///   inside the bound, with no crypto or persist on the path at all;
+    /// * a **non-windowed** command arriving mid-window is *not* refused and
+    ///   *does* reach the app in the same pass. That is the case the bound
+    ///   does not cover, and if it ever starts being refused instead, this
+    ///   test fails and the doc's scope paragraph has to be re-derived rather
+    ///   than inherited.
+    ///
+    /// A second assertion pins the predicate's membership, because the scope
+    /// paragraph names `0x01`/`0x02`/`0x41`/`0x06` as the covered set and a
+    /// silently widened predicate would make the bound wrong without changing
+    /// the constant.
+    #[test]
+    fn the_bound_covers_the_windowed_commands_and_names_the_rest() {
+        let _g = serve_test_guard();
+
+        // (a) presence-windowed: refused, app untouched.
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let chan_b = [0x00, 0x00, 0x00, 0x02];
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), cbor(chan_a, &[0x01, 0xA0])),
+                // A second MakeCredential mid-window. `up_request` is refused
+                // outright (US-1510), unlike 0x41/0x06 which are refused only
+                // on a contending tag — and a second channel is the point of
+                // the case, since a same-channel frame would contend by
+                // construction.
+                (StdDuration::from_millis(200), cbor(chan_b, &[0x01, 0xA0])),
+            ],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+        block_on(
+            "a windowed command mid-window is refused without reaching the app",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(900)),
+        );
+        injector.join().unwrap();
+        assert!(
+            app.window_open,
+            "the window must actually be live or this proves nothing"
+        );
+        assert!(
+            io.sent().iter().any(|s| s.channel == chan_b
+                && s.cmd == CTAP_HID_CBOR
+                && s.payload == vec![fapico2_fido::ctap2::Ctap2Response::OperationPending.code()]),
+            "a presence-windowed command arriving mid-window must be refused with \
+             OPERATION_PENDING — that refusal is one reply and no app work, which \
+             is why the published bound covers it"
+        );
+
+        grant.store(true, Ordering::SeqCst);
+        block_on(
+            "release the window before the shared presence slot",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
+        );
+
+        // (b) not presence-windowed: dispatched in the same pass.
+        let bus2 = Arc::new(Mutex::new(Bus::default()));
+        let chan_c = [0x00, 0x00, 0x00, 0x03];
+        let chan_d = [0x00, 0x00, 0x00, 0x04];
+        let injector2 = script(
+            &bus2,
+            &[
+                (StdDuration::from_millis(0), cbor(chan_c, &[0x01, 0xA0])),
+                // largeBlobs (0x0C) mid-window — NOT presence_windowed.
+                (StdDuration::from_millis(200), cbor(chan_d, &[0x0C, 0xFF])),
+            ],
+        );
+        let grant2 = Arc::new(AtomicBool::new(false));
+        let mut ctap_out2: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv2 = HidServe::new(host_now_ms, &mut ctap_out2);
+        let mut io2 = Script::new(bus2.clone());
+        let mut app2 = FakeApp::new(grant2.clone());
+        let mut slot2 = PendingUp::new();
+        block_on(
+            "a non-windowed command mid-window runs to completion in the same pass",
+            drive(&mut srv2, &mut io2, &mut app2, &mut slot2, StdDuration::from_millis(900)),
+        );
+        injector2.join().unwrap();
+        // The payload is the discriminator, not the frame type: a refusal
+        // ALSO answers `CTAP_HID_CBOR`, so asserting only `cmd == CBOR` would
+        // pass against a loop that refused everything — verified, and it did.
+        // `FakeApp` echoes the CTAP2 opcode it was asked to run, so `[0x0C]`
+        // can only have come from the app actually running largeBlobs.
+        assert!(
+            io2.sent().iter().any(|s| s.channel == chan_d
+                && s.cmd == CTAP_HID_CBOR
+                && s.payload == vec![0x0C]),
+            "a largeBlobs frame arriving mid-window must still be DISPATCHED and \
+             answered by the app — it is NOT covered by SERVE_BOUND_MS, and if it \
+             ever starts being refused the constant's scope paragraph must be \
+             re-derived"
+        );
+        assert!(
+            !io2.sent().iter().any(|s| s.channel == chan_d
+                && s.payload == vec![fapico2_fido::ctap2::Ctap2Response::OperationPending.code()]),
+            "0x0C must not be routed through the presence_windowed refusal — that \
+             is the arm the bound's scope paragraph says it is outside of"
+        );
+        grant2.store(true, Ordering::SeqCst);
+        block_on(
+            "release the second window before the shared presence slot",
+            drive(&mut srv2, &mut io2, &mut app2, &mut slot2, StdDuration::from_millis(400)),
+        );
+
+        // (c) the predicate's membership is what the doc names. `0x01`/`0x02`
+        // live in `up_request` one binding above `presence_windowed`, so the
+        // slice opens at that one.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hid_serve.rs"))
+            .expect("hid_serve.rs must be readable from the test's own crate");
+        let start = src
+            .find("let up_request =")
+            .expect("the dispatch must bind `up_request`");
+        let end = src[start..]
+            .find("if presence_windowed && slot.is_occupied()")
+            .map(|i| start + i)
+            .expect("the predicates must precede the refusal arm");
+        let preds = &src[start..end];
+        for covered in [
+            "ctap_cmd == 0x01 || ctap_cmd == 0x02",
+            "fapico2_fido::vendor41::CMD",
+            "ctap_cmd == 0x06",
+        ] {
+            assert!(
+                preds.contains(covered),
+                "the bound's scope paragraph names `{covered}` as \
+                 presence_windowed; the predicate no longer contains it, so the \
+                 scope claim must be re-derived: {preds}"
+            );
+        }
+        for uncovered in ["0x0C", "0x0D"] {
+            assert!(
+                !preds.contains(&format!("ctap_cmd == {uncovered}")),
+                "largeBlobs/config ({uncovered}) must NOT be presence_windowed: \
+                 it is named in SERVE_BOUND_MS's scope paragraph as a command the \
+                 bound does not cover"
+            );
+        }
+    }
+
     /// US-1502 (RED before the fix, green after): *given* a consent window is
     /// open, *when* a request arrives on another channel, *then* it is
     /// answered inside [`SERVE_BOUND_MS`].
-    ///
     /// The host opens the window with a `MakeCredential` at t=0 and writes a
     /// `PING` on a **second** channel at t=200 ms. The device must echo it.
     ///
