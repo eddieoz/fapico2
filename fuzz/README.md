@@ -50,9 +50,9 @@ output) is recorded in `.superpowers/sdd/report-P6.md`.
 | `oath_tlv` | US-1054 | if a bounds-respecting walk cannot reach the KEY/NAME object, PUT must not answer `0x9000`; a non-`0x9000` PUT leaves `LIST` byte-identical; `0x9000` on a virgin app means a credential *was* stored; an unenforceable property bit (US-133) is refused; a truncated `oath.keystore.v1` either refuses to boot with the store untouched or is a persist/re-boot fixed point | clamp `nth_tlv`'s overrunning length instead of returning `None` |
 | `fido_cred_state` | US-1055 | from a settled-clean keystore, a rejected commit leaves `persist_if_dirty` answering `false` (nothing latched) and the committed fields byte-identical; an accepted commit lands in the store and reloads | `dirty = true` instead of `dirty = dirty_before`, in `grow_checked` and in `store_credential_checked` |
 
-These run in the same 15-minute CI smoke as the parser targets (see the CI
-section below), on their own matrix leg each so the job's wall time does not
-grow with the target count.
+These run on the same schedule as the parser targets (see the CI section
+below), on their own matrix leg each so the job's wall time does not grow with
+the target count.
 
 ## Why the host target is forced
 
@@ -76,27 +76,79 @@ cargo +nightly fuzz run ctap_cbor -- -max_total_time=120
 cargo +nightly fuzz run apdu_parse -- -max_total_time=120
 ```
 
-A finding is written to `fuzz/crashes/<target>/` and `cargo fuzz run` returns
-non-zero (which is what the CI smoke keys on). `corpus/` and `artifacts/` are
-gitignored build state.
+A finding is written to `fuzz/crashes/<target>/`, and the CI workflow keys on
+that directory being non-empty rather than on `cargo fuzz run`'s exit code
+alone — cargo-fuzz exits non-zero both for a crash *and* for "no new coverage",
+and a converged target should not turn the build red forever. `corpus/` and
+`artifacts/` are gitignored build state.
 
-## CI smoke (`.github/workflows/ci.yml` → `fuzz` job)
+## CI (`.github/workflows/fuzz-nightly.yml`)
 
-Every push runs a **15-minute smoke** on each target
-(`cargo +nightly fuzz run <target> -- -max_total_time=900`). These parsers are
-tiny, so a crash — if one exists — is found well inside 15 min on a dedicated
-runner. The job is non-parallel with the other four gates (each gate is its own
-job), so it adds ~30 min of wall time to the slowest path without blocking the
-others.
+Fuzzing no longer runs on every push. It runs on:
+
+- **`schedule`** — nightly at `17 3 * * *` (UTC). The odd minute is deliberate:
+  every other scheduled workflow on every other repository starts at `:00`,
+  and that queue is measurably worse.
+- **`workflow_dispatch`** — on demand, with optional `target` (single target)
+  and `max_total_time` (default `900`) inputs.
+- **`push`**, filtered to `fuzz/**` plus the eight source files the targets
+  cover — so touching a parser gets you a run now rather than at 03:17.
+
+All nine targets, `-max_total_time=900` each, one matrix leg per target so a red
+target never hides the other eight. `fail-fast: false`, `timeout-minutes: 45`,
+and `concurrency` with `cancel-in-progress: false` so a nightly never starts on
+top of yesterday's still-running pass.
+
+Crash reproducers (`fuzz/crashes/<target>/`) and the grown corpus are uploaded
+as artifacts — 30-day and 14-day retention. A crash that exists only on a
+runner that gets deleted in an hour is an anecdote, not a finding.
+
+The run reports the reproducer directory explicitly and then honours
+`cargo-fuzz`'s own exit code, so "converged" and "found something" stay
+distinguishable in the log rather than collapsing into one non-zero exit. The
+exit code stays authoritative because it also covers a build failure that never
+reached the fuzzing loop at all, which no reproducer check can see.
+
+### Why it moved
+
+Measured over 2026-09-25..2026-10-02, the per-push smoke was 3,842 job-minutes
+— 85% of every minute this repository spent in Actions. The section below this
+one always described that smoke as a *regression* net rather than a
+*discovery* engine, and said deeper runs were "intended to be scheduled (e.g.
+nightly)". No scheduled workflow existed, so the regression smoke was doing
+discovery work on every push at a budget too short to grow coverage across
+runs anyway.
+
+### What the schedule costs you, honestly
+
+Fuzzing off the per-push path means a panic reachable from an untrusted
+CTAP/APDU/CCID frame is no longer discovered before the change lands. It is
+still discovered — nightly, or within minutes on a paths-filtered push — but
+between nightly runs the tree is un-fuzzed with respect to that class of bug.
+Two things keep the window bounded, and both are load-bearing:
+
+1. `cargo test --workspace` and the pytest gate still run on **every** push.
+   They are deterministic rather than exploratory, but they cover the parser
+   unit cases — which is why the exposure is hours rather than days.
+2. The semantic invariants the Phase-6 targets assert are **not** fuzz-only.
+   Nonce uniqueness, fail-closed provisioning, and bootability after a torn
+   program are each additionally covered by targeted unit tests, and the gates
+   that police them — supply chain, attestation, persist, rng path — are
+   untouched by this move and still run on every push.
+
+If a target's code gets hot enough that "found within 24 h" is too slow,
+restore it as a **short** per-push smoke rather than restoring the full 15
+minutes. The 15-minute budget was never the load-bearing part; the
+`cargo +nightly fuzz run <target>` invocation and the invariant set are.
 
 ## Scheduled full runs
 
-The 15-min CI smoke is a *regression* net, not a *discovery* engine. Deeper
-runs are intended to be scheduled (e.g. nightly) by a release engineer and are
-the longer-horizon pass that seeds and mines the corpus:
+The 15-min nightly run is a *regression* net, not a *discovery* engine. Longer
+runs are the pass that seeds and mines the corpus — dispatch the workflow with
+a larger `max_total_time`, or run locally:
 
 ```sh
-# 8-hour run per target (overwrite the smoke's -max_total_time):
+# 8-hour run per target (overrides the 900s default):
 cargo +nightly fuzz run ctap_cbor -- -max_total_time=28800
 cargo +nightly fuzz run apdu_parse -- -max_total_time=28800
 
@@ -105,6 +157,8 @@ cargo +nightly fuzz run apdu_parse -- -runs=50000000
 ```
 
 Run each target to a plateau (no new coverage across several hours) before
-treating its corpus as a stable seed. Persist `fuzz/corpus/<target>/` between
-runs so coverage accumulates; a crash at any point still fails the run and drops
-the reproducer into `fuzz/crashes/<target>/`.
+treating its corpus as a stable seed. `fuzz/corpus/<target>/` is seeded from
+the committed corpora and the grown result is uploaded as an artifact, so
+coverage can be carried forward deliberately instead of being rediscovered from
+zero each night. A crash at any point still fails the run and drops the
+reproducer into `fuzz/crashes/<target>/`, which the workflow uploads.

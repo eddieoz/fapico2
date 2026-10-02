@@ -42,19 +42,22 @@ gh api repos/eddieoz/fapico2/rulesets
 
 ## Two gaps this ruleset does NOT close
 
-**1. The fuzz jobs are not required checks.** `ci.yml`'s fuzz job is a matrix,
-so its check name is `fuzz <target> (15-min smoke)` — different per target, and
-not statically nameable. The 8 targets therefore run on every push but nothing
-*requires* them to pass. Adding a context that never posts would silently block
-every merge; omitting them means a fuzz regression does not block. This is a
-real hole, and it needs either a single non-matrix summariser job or a
-manually-maintained list of the 8 target names.
+**1. The fuzz jobs are not required checks.** Fuzzing is a matrix in
+`fuzz-nightly.yml`, so its check name is `fuzz <target>` — different per target,
+and not statically nameable. The 9 targets run nightly but nothing *requires*
+them to pass, and since 2026-10-02 they no longer run on the per-push path at
+all (see `fuzz/README.md` for the measurement and the residual-risk note).
+Requiring them is now incoherent — a required check must post on every PR, and
+a nightly job does not. If a fuzz regression must block a merge, the answer is
+a single non-matrix summariser job in `ci.yml` (cheap: one `if-no-crashes-found`
+over a short smoke), not required-check entries for nine matrix legs.
 
 **2. The `Phase 3 Gate` workflow is not required.** `phase3-gate.yml` is a
 *separate workflow* from `ci.yml` and its check is named `gate`. Its content
 largely duplicates `ci.yml`'s `pytest gate`, but it is not in the required list
 above. Decide deliberately whether it is redundant (and delete it) or
-independent (and require it).
+independent (and require it). **Still open** — it was not resolved when fuzzing
+moved off the per-push path.
 
 ## Signed commits
 

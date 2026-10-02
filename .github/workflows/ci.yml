@@ -717,67 +717,29 @@ jobs:
           echo "ok: release provenance + artefact agreement green"
 
   # ---------------------------------------------------------------------------
-  # Fuzz the untrusted boundaries. A 15-minute smoke per target on every push;
-  # a crash fails that target's leg.
+  # FUZZING IS NOT HERE ANY MORE. It was: a 15-minute smoke per target on
+  # every push, nine targets in a matrix. Measured over 2026-09-25..10-02 that
+  # was 3,842 job-minutes — 85% of every minute this repository spent in
+  # Actions — and fuzz/README.md describes it in its own words as
   #
-  #   parsers (US-384)  — ctap_cbor, apdu_parse: malformed host input must not
-  #                       panic the device.
-  #   resync  (US-920)  — ccid_reasm: the CCID bulk-OUT reassembler's
-  #                       wedge-resync invariant.
-  #   semantic (Phase 6, US-1050..US-1055) — store_v3, persist_sink, migration,
-  #                       attest_provision, oath_tlv, fido_cred_state. These do
-  #                       NOT assert absence-of-panic; each asserts a named
-  #                       semantic invariant and was shown to go red under a
-  #                       deliberately broken build of the code it covers. See
-  #                       fuzz/README.md and .superpowers/sdd/report-P6.md.
+  #   "a *regression* net, not a *discovery* engine ... Deeper runs are
+  #    intended to be scheduled (e.g. nightly)"
   #
-  # Matrix, not a sequence of steps: nine targets at 15 minutes each would be
-  # 2h15m of wall time on one leg, against a job budget that has been 30
-  # minutes since the first two targets landed. One leg per target keeps the
-  # budget and, since each leg is independent, a red target no longer hides
-  # the other eight.
+  # while no scheduled workflow existed at all. The discovery engine was never
+  # built, so the regression smoke was doing discovery work on every push, at a
+  # wall-clock budget too short to grow coverage across runs anyway.
   #
-  # cargo-fuzz needs a nightly toolchain and a HOST target (the fuzz crate's
-  # .cargo/config.toml overrides the workspace's default thumbv8m target); see
-  # fuzz/README.md for how to run deeper (scheduled) fuzzing.
+  # It now lives in .github/workflows/fuzz-nightly.yml: all nine targets, the
+  # same 15-minute per-target budget, nightly at 03:17 UTC, plus
+  # workflow_dispatch and a paths-filtered push trigger for the "I am touching
+  # a parser right now" case. No target was dropped and no budget shortened;
+  # crash reproducers are uploaded as artefacts so a finding survives the
+  # runner.
+  #
+  # Nothing else was cut. The gates below are the security posture and they are
+  # untouched: supply chain, device integration, attestation, assurance, rng
+  # path, heap, persist, erase budget.
   # ---------------------------------------------------------------------------
-  fuzz:
-    name: fuzz ${{ matrix.target }} (15-min smoke)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - ctap_cbor
-          - apdu_parse
-          - ccid_reasm
-          - store_v3
-          - persist_sink
-          - migration
-          - attest_provision
-          - oath_tlv
-          - fido_cred_state
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      # Nightly is addressed EXPLICITLY, on purpose. `rust-toolchain.toml` pins
-      # the ACTIVE toolchain to `stable`, so a `rustup show`-style probe always
-      # succeeds here and would never install nightly — and a bare
-      # `rustup component add rust-src` would attach rust-src to STABLE, not
-      # nightly, which is not the toolchain `cargo +nightly` builds with. Naming
-      # `--toolchain nightly` on both the install and the component is what makes
-      # this correct rather than merely plausible.
-      - name: Set up Rust (nightly)
-        run: |
-          rustup toolchain install nightly --profile minimal --component rust-src --no-self-update
-      - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --locked
-      - name: "Fuzz smoke (15 min)"
-        working-directory: fapico2
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=900
 
   # ---------------------------------------------------------------------------
   # 4/4 — full pytest gate (Phase 3 exit config). Builds the single Rust

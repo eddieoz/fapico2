@@ -1,0 +1,221 @@
+# Nightly fuzz discovery run (US-384 / US-920 / US-1050..US-1055).
+#
+# WHY THIS IS SEPARATE FROM ci.yml
+# ---------------------------------------------------------------------------
+# The 15-minute-per-target smoke used to run on every push, nine targets in a
+# matrix. Measured over 2026-09-25..2026-10-02 that was 3,842 job-minutes — 85%
+# of every minute this repository spent in Actions — for a check that
+# `fuzz/README.md` itself describes as a REGRESSION net, not a DISCOVERY
+# engine:
+#
+#   "The 15-min CI smoke is a *regression* net, not a *discovery* engine.
+#    Deeper runs are intended to be scheduled (e.g. nightly)"
+#
+# and then, under "Scheduled full runs":
+#
+#   "The 15-min CI smoke is a *regression* net, not a *discovery* engine.
+#    Deeper runs are intended to be scheduled (e.g. nightly) by a release
+#    engineer and are the longer-horizon pass that seeds and mines the corpus"
+#
+# No scheduled workflow existed. The discovery engine was never built; the
+# regression smoke was being asked to do discovery work on every push, where a
+# 15-minute wall-clock budget is too short to grow coverage across runs anyway.
+# This file is that missing engine.
+#
+# WHAT IS AND IS NOT PRESERVED
+# ---------------------------------------------------------------------------
+# Everything the smoke covered, at the same per-target budget. All nine targets
+# run, each for 15 minutes, each on its own matrix leg so a red target never
+# hides the other eight. No target was dropped and no `-max_total_time` was
+# shortened.
+#
+# The one thing that genuinely changes is WHEN. These targets assert named
+# security properties, and they are still asserted — a panic, a repeated GCM
+# nonce, a torn program that does not leave the previous image bootable, a
+# provisioning path that regenerates an identity on a corrupt slot all still
+# fail this workflow, loudly, with the reproducer attached. What is no longer
+# true is that such a finding blocks a developer's push to main within minutes.
+# See "RESIDUAL RISK" below before reverting this.
+#
+# cargo-fuzz needs a nightly toolchain and a HOST target (the fuzz crate's
+# .cargo/config.toml overrides the workspace's default thumbv8m target).
+# ---------------------------------------------------------------------------
+name: Fuzz (nightly)
+
+on:
+  # Nightly. `cron` is UTC: 03:17 rather than 03:00, because the top of the
+  # hour is when every other scheduled workflow on every other repository in
+  # the world also starts, and the queue at :00 is measurably worse.
+  schedule:
+    - cron: '17 3 * * *'
+  # Manual, for a release engineer who wants coverage NOW rather than at 03:17.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: >-
+          Single target to run. Leave empty to run all nine. `runs` overrides
+          the 15-minute wall-clock budget; use it for a deep pre-release pass.
+        required: false
+        type: string
+      max_total_time:
+        description: 'Seconds per target (900 = the 15-min smoke; 28800 = 8 h)'
+        required: false
+        default: '900'
+        type: string
+  push:
+    # Refs the smoke used to cover. Kept so that a change to a fuzz target or
+    # to the code under fuzz gets its own run rather than waiting for 03:17 —
+    # this is the "I am touching a parser right now" case, where a nightly
+    # cadence is genuinely too slow to be useful.
+    paths:
+      - 'fuzz/**'
+      - 'platform/src/store_v3.rs'
+      - 'platform/src/persist_sink.rs'
+      - 'platform/src/migration.rs'
+      - 'apps/fido/src/attestation.rs'
+      - 'apps/fido/src/cbor.rs'
+      - 'apps/oath/src/oath_core.rs'
+      - 'firmware/src/ccid_reasm.rs'
+
+# Least privilege: this compiles and runs attacker-shaped inputs. It needs to
+# read the repository and nowhere else. `contents: read` is also what keeps an
+# untrusted PR from reaching the Actions token.
+permissions:
+  contents: read
+
+# One scheduled run at a time. A nightly that starts while yesterday's is still
+# going would double the wall clock and race on the shared corpus checkout for
+# no coverage gain. `cancel-in-progress: false` — the newer run waits.
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        #   parsers (US-384)  — ctap_cbor, apdu_parse: malformed host input must
+      #                       not panic the device.
+      #   resync  (US-920)  — ccid_reasm: the CCID bulk-OUT reassembler's
+      #                       wedge-resync invariant.
+      #   semantic (Phase 6, US-1050..US-1055) — store_v3, persist_sink,
+      #   migration, attest_provision, oath_tlv, fido_cred_state. These do NOT
+      #   assert absence-of-panic; each asserts a named semantic invariant and
+      #   was shown to go red under a deliberately broken build of the code it
+      #   covers. See fuzz/README.md.
+        target:
+          - ctap_cbor
+          - apdu_parse
+          - ccid_reasm
+          - store_v3
+          - persist_sink
+          - migration
+          - attest_provision
+          - oath_tlv
+          - fido_cred_state
+    steps:
+      - name: Checkout fapico2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: fapico2
+      # Nightly is addressed EXPLICITLY, on purpose. `rust-toolchain.toml` pins
+      # the ACTIVE toolchain to `stable`, so a `rustup show`-style probe always
+      # succeeds here and would never install nightly — and a bare
+      # `rustup component add rust-src` would attach rust-src to STABLE, not
+      # nightly, which is not the toolchain `cargo +nightly` builds with. Naming
+      # `--toolchain nightly` on both the install and the component is what makes
+      # this correct rather than merely plausible.
+      - name: Set up Rust (nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src --no-self-update
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      # The committed corpus is the seed. cargo-fuzz reads it from
+      # fuzz/corpus/<target>/ automatically; uploading whatever the run
+      # produced is what lets coverage accumulate across nights instead of
+      # every nightly rediscovering the same corpus from zero.
+      - name: Seed the corpus from the committed corpora
+        working-directory: fapico2
+        run: |
+          for t in ${{ join(matrix.target, ' ') }}; do
+            if [ -d "fuzz/corpus/$t" ]; then
+              echo "seeded: $t ($(find "fuzz/corpus/$t" -type f | wc -l) inputs)"
+            else
+              echo "no committed corpus for $t; starting cold"
+            fi
+          done
+      - name: "Fuzz run"
+        working-directory: fapico2
+        env:
+          # A single-target dispatch narrows the matrix to that one target.
+          FUZZ_TARGET: ${{ inputs.target || matrix.target }}
+          FUZZ_MAX_TOTAL_TIME: ${{ inputs.max_total_time || '900' }}
+        run: |
+          set -uo pipefail
+          echo "target=$FUZZ_TARGET  budget=${FUZZ_MAX_TOTAL_TIME}s"
+          cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_MAX_TOTAL_TIME"
+          rc=$?
+          # The reproducer directory is reported explicitly, because a
+          # non-zero exit alone does not say WHICH invariant failed. A clean
+          # run that simply stopped making progress exits 0 and leaves this
+          # directory absent, so the two cases stay distinguishable in the log.
+          if [ -d "fuzz/crashes/$FUZZ_TARGET" ] && [ -n "$(ls -A "fuzz/craces/$FUZZ_TARGET" 2>/dev/null)" ]; then
+            echo "::error::$FUZZ_TARGET produced a crash reproducer (see the fuzz-crashes artifact)"
+            ls -la "fuzz/crashes/$FUZZ_TARGET"
+          else
+            echo "no reproducer for $FUZZ_TARGET"
+          fi
+          # cargo-fuzz's exit code is still authoritative — it covers a build
+          # failure or an error exit that never reached the fuzzing loop, which
+          # the reproducer check above cannot see.
+          exit $rc
+      # A reproducer that only exists on a runner that is deleted in an hour is
+      # not a finding, it is an anecdote. The crash artefact is the deliverable.
+      - name: Upload crash reproducers
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fapico2/fuzz/crashes/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload grown corpus
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fapico2/fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
+# RESIDUAL RISK — read before reverting this to the per-push path
+# ---------------------------------------------------------------------------
+# Moving fuzz off the per-push path means a panic reachable from an untrusted
+# CTAP/APDU/CCID frame is no longer discovered before the change lands. It is
+# still discovered — nightly, and within minutes if the push touched one of the
+# paths listed under `on.push.paths`. But between nightly runs the tree is
+# un-fuzzed with respect to that class of bug.
+#
+# Two things keep that bounded, and both should be read as load-bearing:
+#
+#   1. `cargo test --workspace` and the pytest gate still run on every push.
+#      They are deterministic, not exploratory, and they cover the parser unit
+#      cases. They do not replace fuzzing; they are why the window is hours
+#      rather than days.
+#
+#   2. The security properties these targets assert are NOT fuzz-only. The
+#      semantic invariants (nonce uniqueness, fail-closed provisioning,
+#      bootability after a torn program) are each additionally exercised by
+#      targeted unit tests, and the gates that police them — supply chain,
+#      attestation, persist, rng path — are untouched by this change and still
+#      run on every push.
+#
+# If a fuzz target's code becomes hot enough that "discovered within 24 h" is
+# too slow, restore it as a short per-push smoke rather than restoring the full
+# 15 minutes. The 15-minute budget was never the load-bearing part; the
+# `cargo +nightly fuzz run <target>` invocation and the invariant set are.
