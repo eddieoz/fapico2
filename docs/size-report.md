@@ -158,8 +158,16 @@ covering them.**
 1536 KiB = 1,572,864 B against a measured 1,572,352 B, so the slack this leaves
 is **512 B**. That is tighter than the ~1.5 KiB the previous two raises left,
 and deliberately so: 1536 is the smallest whole-KiB value the shipping image
-fits under, which is the most informative number this ratchet can carry — the
-next ordinary growth is a red again, immediately.
+fits under, which is the most informative number this ratchet can carry.
+
+**The headroom is one 512-byte block, not zero.** The ratchet fires on
+`SHIPPING -gt BUDGET_BYTES` (`ci.yml`), and one more block lands the image on
+exactly 1,572,864 — which is **not** greater than the 1,572,864 B ceiling, so
+it passes. Two blocks (1,573,376 B) is the first size that trips it. An
+earlier draft of this paragraph said the next ordinary growth is "a red again,
+immediately"; that is one block optimistic, and the block is the smallest unit
+the UF2 format can grow in, so it is the difference between "the next change
+trips this" and "the change after next does".
 
 Prior header:
 
