@@ -1,3 +1,105 @@
+**Date:** 2026-10-02 (**the boot-phase LED diagnosability ladder** — commits
+`5b15f48`, `63c9009`, `d0a94ca`, `f96f3d7`. A post-mortem read channel for a
+board that flashes cleanly and then never re-enumerates: nine rungs driven on
+GPIO25, one short pulse per boundary crossed, released to the runtime before the
+executor is entered. This is a **re-stamp only** for the image, and it is the
+entry where the flash ratchet's last block of slack is spent — see "the slack is
+now zero" below before reading anything else in it.)
+**Measured: `text` 818,148 → 818,376 B (**+228 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); worst call chain 91,988 B (**0**, 6,316 B of
+margin against the 98,304 B ceiling); task-arena demand 21,944 B (**0** — no
+task future grew; the stamp moved `014837326a49…` → `59c34a8dd4f7…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3071 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), 1,572,352 → **1,572,864 bytes**. Shipping
+sha256 `3f46f624cc14…` → **`306f5568f4501f2039351c0f742ebe7dd67f2cfa87d4fc31ce6d35389be95448`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+306f5568f4501f2039351c0f742ebe7dd67f2cfa87d4fc31ce6d35389be95448  firmware/fapico2.uf2
+```
+
+**The +228 B is all `.text`, and it is one of three commits.** `5b15f48` is the
+pure half — `fapico2_firmware::bootphase`, the encoding, the rung table, the
+ordering contract and the release rule, in the *lib* rather than the bin so
+`cargo test --lib` reaches it. Most of that is `#[cfg(test)]` and tables that
+fold at compile time, so what it contributes to the shipping image is the
+encoding arithmetic and the rung lookup. `63c9009` is ~40 lines turning a
+`bootphase::Mark` into GPIO25 writes plus a local `busy_wait_us` (a copy, not a
+call into `dbg` — the `dbg` module is feature-gated out of the default build, so
+sharing it would un-gate the 12 KiB ring with it). `d0a94ca` is the nine
+`mark!` call sites and `release()`. `f96f3d7` is `docs/bootsel.md` prose:
+**0 B.**
+
+**`.bss` did not move, and that is the useful fact here.** The ladder is nine
+GPIO writes and a delay loop; it allocates nothing. A diagnosability feature
+that had cost RAM would have been bought out of the main stack zone, which on
+this build has 4 B of alignment slack and no unallocated SRAM at all — the same
+`ALIGN(4)` arithmetic the 2026-09-30 entry describes. Nothing was bought from
+anywhere, because nothing was needed.
+
+**The block count moved this time: 3,071 before, 3,072 after.** The prior
+re-stamp (US-1529, +164 B) did not cross a block boundary and the one before it
+did not either; this one does, because 3072 × 512 = **1,572,864 B**, and that is
+the first whole block above the old image. So unlike the last two entries the
+size itself changed, and the sha256 changed with it for the ordinary reason.
+
+**THE SLACK IS NOW ZERO. The last block of headroom was spent by the
+boot-phase LED.** `FIRMWARE_FLASH_BUDGET_KIB` is **1536**, i.e.
+`BUDGET_BYTES` = 1,572,864 B, and the shipping image is **1,572,864 B**. The
+gate compares `SHIPPING -gt BUDGET_BYTES`, so 1,572,864 is not greater than
+1,572,864 and **the ratchet passes — with nothing left over**. Write the
+arithmetic down rather than rounding it: 1536 KiB = 3072 blocks, the image is
+3072 blocks, the headroom is **0 blocks / 0 B**, and the very next block
+(3,073 blocks, 1,573,376 B) trips it.
+
+This matters more than the arithmetic suggests. The ratchet is a *regression*
+detector, and it now fires for a reason unrelated to whatever change caused the
+red. A maintainer who adds a string constant somewhere, or lets LTO land
+differently on a different toolchain, gets a CI failure that names the flash
+budget and offers exactly two readings — shrink it, or raise the number — when
+the honest third reading is "this was already at the wall". The US-1519 raise
+(1532 → 1536 KiB) bought one block and the epic said explicitly that one block
+was the most informative number the ratchet could carry; that block is now
+gone, spent on a diagnostic that a later author may not even know exists.
+
+**The ratchet is NOT raised by this entry, and per US-1519's own acceptance
+criterion it must not be unless the reason is written here.** The epic says:
+*"if the ratchet bites, shrink the implementation rather than raise the
+number — and if it must be raised, the reason is written in this document."*
+It has not bitten. The image is at the ceiling, not over it. Raising 1536 →
+1537 now would be spending a KiB of permanent, invisible budget to avoid a
+sentence in a file that already contains the sentence.
+
+**What the next growth costs, concretely.** The next 512 B of flash anywhere in
+the firmware — one string table, one new applet stub, one monomorph that LTO
+stops folding — makes the ratchet red. The response per US-1519 is to shrink,
+and the honest list of what can be shrunk is short: this file has already
+established that `emul_hid` is gated out (0 B to recover), that the `dbg` ring
+is feature-gated (0 B to recover), and that the two SHA-512 call sites cannot
+evict the stock `sha2` backend because `trussed`'s `hmac-sha512` mechanism still
+reaches it (8.9× of latent win that is not collectable without dropping a PIV
+algorithm attribute). There is one lever specific to this entry, and it is
+already measured: **`FAPICO2_BOOT_LED=0` produces text 818,148 B** — byte-for-byte
+the pre-LED baseline, which is the point, since the kill switch exists so a
+build that cannot afford the ladder can drop it without editing code. It is
+recorded here as a fact, not as a plan: setting it to make a gate green would
+ship a board whose dark-boot failure mode is undiagnosable again, which is the
+entire reason these +228 B were spent. `check_size_report.py` and the CI
+flash-budget job will not notice the difference; a person debugging at 2am
+will.
+
+**The one claim in the entries below that this entry supersedes.** US-1519's
+headroom paragraph and US-1529's restatement of it both say the headroom is one
+512-byte block. As of this build that is **zero blocks**, and both have been
+annotated in place below rather than silently rewritten — see the dated
+correction notes there.
+
+Prior header:
+
 **Date:** 2026-10-02 (**US-1529 — `makeCredUvNotRqd` was a hard-coded lie;
 derive it from PIN state.** The option was seeded `true` in
 `Ctap2Info::default`, so a PIN-set device advertised support for a
@@ -61,6 +163,13 @@ nothing was flashed.
 does not need to. Against the budget the slack is unchanged at **512 B** — the
 same single 512-byte block of headroom US-1519's entry describes, since
 1,572,352 B measured against 1,572,864 B is exactly one block.
+> **Corrected 2026-10-02 by the boot-phase LED entry above.** The first two
+> sentences of this paragraph are about US-1529 and are still true *of US-1529*;
+> the 512 B figure is not true of the tree any more. The boot-phase LED spent
+> the last block: the image is 3072 blocks / 1,572,864 B against a 1,572,864 B
+> budget, so the slack is **0 B, zero blocks**, and the next block trips the
+> ratchet. The 512 B above is left as written because it is what the gate
+> compared against on that commit.
 
 **Which edits in this story cost 0 B, named so this re-stamp is not read as
 covering them.**
@@ -91,6 +200,13 @@ passes, while 1,573,376 B is. Every term in that paragraph is unchanged by
 US-1529, because US-1529 did not move the block count. The earlier,
 overstated phrasing ("the next ordinary growth is a red again, immediately")
 remains corrected in place and is **not** restored by this entry.
+> **Superseded 2026-10-02 by the boot-phase LED entry above.** The paragraph
+> quoted here is accurate *as of US-1529* and is left as written for that
+> reason, but it no longer describes the tree: the boot-phase LED took the
+> image from 3071 to 3072 blocks, so "one more block lands the image on exactly
+> 1,572,864" has already happened. The headroom is now **zero blocks**, and
+> 1,573,376 B is not a hypothetical size any more — it is the size of the next
+> 512 B of flash anyone adds.
 
 Prior header:
 
@@ -255,6 +371,9 @@ covering them.**
 is **512 B**. That is tighter than the ~1.5 KiB the previous two raises left,
 and deliberately so: 1536 is the smallest whole-KiB value the shipping image
 fits under, which is the most informative number this ratchet can carry.
+> **Spent 2026-10-02.** That 512 B was consumed in full by the boot-phase LED
+> entry at the top of this document. The ratchet was **not** raised to replace
+> it.
 
 **The headroom is one 512-byte block, not zero.** The ratchet fires on
 `SHIPPING -gt BUDGET_BYTES` (`ci.yml`), and one more block lands the image on
@@ -264,6 +383,15 @@ earlier draft of this paragraph said the next ordinary growth is "a red again,
 immediately"; that is one block optimistic, and the block is the smallest unit
 the UF2 format can grow in, so it is the difference between "the next change
 trips this" and "the change after next does".
+> **Superseded 2026-10-02.** Written when the measured image was 3,071 blocks,
+> this said the headroom was one block and the block after that would be the
+> first to trip the ratchet. The **boot-phase LED entry** at the top of this
+> document is the "one more block": the image is now 3,072 blocks /
+> 1,572,864 B, exactly on the ceiling, so the headroom is **zero blocks** and
+> 1,573,376 B is the first size that trips it — which is what this paragraph
+> already predicted, one commit earlier than it expected it. The two earlier
+> corrections in this paragraph are a history of the same ratchet losing room;
+> this is the third and the last block.
 
 Prior header:
 
@@ -1080,10 +1208,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,172 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb2e0` | no (flash) |
+| `.text` | 766,400 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb3c0` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfcc0` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfda0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1091,14 +1219,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,172 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 766,400 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,148**. That identity is stated so a reader can check
+the `X` flag) = **818,376**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,148 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,376 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
