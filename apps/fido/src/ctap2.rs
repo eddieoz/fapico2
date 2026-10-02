@@ -519,16 +519,40 @@ impl Ctap2Info {
 ///   - `Client._get_token` (`client/__init__.py:683`), the only
 ///     uv-gated one, inside `if allow_uv and info.options.get("uv")`.
 ///
-/// What the value *must* track is lockout. Once the durable flag latches,
-/// every PIN leg refuses (`verify_token`, credentialManagement and Config
-/// all return PIN_AUTH_BLOCKED), so advertising a token the device will not
-/// honour is exactly the incoherence this story is about: a client reads
-/// `true`, mints a token, and is then refused at the first command. The
-/// token sub-command gates on the same flags, so the advertisement is true
-/// whenever it is made rather than merely fail-closed. Withdrawing the bit
-/// also downgrades `get_pin_token` to the legacy opcode, but both share one
-/// match arm (`device_core.rs:1764`) whose outcome the PIN decides, not the
-/// opcode, so that costs no behaviour.
+/// What the value *must* track is lockout. While a durable lockout flag is
+/// latched, every PIN leg refuses: `verify_token` answers `PIN_AUTH_BLOCKED`
+/// on `needs_power_cycle` (`device_core.rs:801`), and the token sub-command
+/// `0x06` refuses on the same pair (`device_core.rs:1990`, US-1512).
+/// Advertising a token route the device will not honour is exactly the
+/// incoherence this story is about — a client reads `true`, mints a token,
+/// and is then refused at the first command that uses it. So the
+/// advertisement tracks the latch, and it is true whenever the route is made
+/// rather than merely fail-closed.
+///
+/// **The latch is a lockout, not a wall: a correct PIN is the key.**
+/// Sub-commands `0x05`/`0x09` carry NO up-front `needs_power_cycle` gate —
+/// deliberately, and stated at `device_core.rs:1742` for changePIN — and their
+/// success path clears `blocked`, `needs_power_cycle` and `new_pin_mismatches`
+/// AND mints the token in the same breath (`device_core.rs:1917-1925`).
+/// So `false` means "not until you present the correct PIN", never "not
+/// ever": one correct PIN both restores the advertisement and returns `0x00`
+/// with a usable token. Measured on **both** twins —
+/// `tests/pin_uv_advert.rs::a_correct_pin_restores_the_route_it_withdrew`.
+///
+/// The paragraph this replaces claimed the latch was terminal ("every PIN leg
+/// refuses ... a client reads `true`, mints a token, and is then refused at
+/// the first command"), which is the inverse of what the code thirteen lines
+/// below it does, and which contradicted itself four sentences later. It is
+/// the fourth claim in this epic that came out the inverse way because it was
+/// read rather than executed; the ledger already carried the correction
+/// ("M2's premise was wrong: that is only true for a wrong PIN") and it reached
+/// the ledger and not the code. The invariant worth keeping is the narrower
+/// one, and it is the one that is actually checkable: **the advertisement and
+/// the token route agree, in both directions.** Neither has to be permanent.
+///
+/// Withdrawing the bit also downgrades `get_pin_token` to the legacy opcode,
+/// but both share one match arm (`device_core.rs:1764`) whose outcome the PIN
+/// decides, not the opcode, so that costs no behaviour.
 ///
 /// It takes the two durable lockout flags rather than a state struct: the
 /// twins keep different ones (`keystore::PinState` and

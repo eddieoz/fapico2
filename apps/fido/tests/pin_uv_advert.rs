@@ -12,9 +12,14 @@
 //!   token it returns, so reporting `false` here would point a client away
 //!   from a path that answers.
 //! * PIN set, healthy    → `true`, via the `0x05`/`0x09` legs as well.
-//! * durable lockout     → `false`, because every PIN leg refuses and
-//!   sub-command `0x06` now refuses with it (the gate it is checked against
-//!   lives in the test below).
+//! * durable lockout     → `false`, because the token sub-command refuses
+//!   with it (the gate it is checked against lives in the test below).
+//!
+//! `false` is a LOCKOUT, not a wall: the `0x05`/`0x09` legs carry no up-front
+//! gate on purpose and their success path clears the latch and mints the
+//! token together, so one correct PIN restores the advertisement. Pinned on
+//! BOTH twins by `a_correct_pin_restores_the_route_it_withdrew` and
+//! `device::device_correct_pin_restores_the_route_it_withdrew`.
 
 mod common;
 
@@ -129,6 +134,66 @@ fn host_locked_out_withdraws_the_token_route() {
     latch_host(&mut app, &client);
     let opts = options_of(&app.process_ctap2(0x04, &[], [1, 2, 3, 4]));
     assert_pin_pair(&opts, true, false);
+}
+
+/// The lockout is a LOCKOUT, not a wall, and this is the test that says so.
+///
+/// `ctap2::pin_uv_auth_token_available`'s doc comment once claimed that once
+/// the durable flag latches "every PIN leg refuses ... a client reads `true`,
+/// mints a token, and is then refused at the first command" — which is the
+/// inverse of what `device_core.rs:1917-1925` does thirteen lines later: the
+/// `0x05`/`0x09` success path clears `blocked` and `needs_power_cycle` *and*
+/// mints the token in the same breath. The value `!(blocked ||
+/// needs_power_cycle)` was always right; the reason given for it was not, and
+/// it contradicted itself four sentences later.
+///
+/// So the corrected claim — "not until you present the correct PIN", not "not
+/// ever" — gets a test on the host twin, and the device module below pins the
+/// same thing on the twin that actually ships. Without this, the next reader
+/// of the doc comment has only prose to go on, and prose is what was wrong.
+#[test]
+fn a_correct_pin_restores_the_route_it_withdrew() {
+    let (mut app, client) = setup();
+    latch_host(&mut app, &client);
+    assert_pin_pair(
+        &options_of(&app.process_ctap2(0x04, &[], [1, 2, 3, 4])),
+        true,
+        false,
+    );
+
+    // The correct PIN, on the leg that has no up-front lockout gate.
+    let correct = fapico2_fido::crypto::pin_hash(b"1234");
+    let enc = fapico2_fido::crypto::pin_encrypt(2, &client.enc_key, &correct);
+    let req = cbor::encode(&Value::M(vec![
+        (Value::U(0x01), Value::U(2)),
+        (Value::U(0x02), Value::U(0x05)),
+        (Value::U(0x03), client.client_cose()),
+        (Value::U(0x06), Value::B(enc)),
+    ]));
+    let resp = app.process_ctap2(0x06, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "a correct PIN must not be refused by the latch");
+    // ...and it really is a token: key 0x02, a byte string, present and
+    // non-empty. `assert_ne!(resp[0], 0x00)` alone would pass on any other
+    // success shape, which is the "test that cannot fail" failure the US-1528
+    // work already hit once in this tree.
+    let (v, _) = cbor::decode(&resp[1..]).expect("valid CBOR");
+    let Value::M(m) = v else { panic!("token response must be a map") };
+    let tok = m
+        .iter()
+        .find_map(|(k, v)| match k {
+            Value::U(0x02) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("token response key 0x02");
+    let Value::B(b) = tok else { panic!("key 0x02 must be a byte string") };
+    assert!(!b.is_empty(), "the restored route must mint a real token");
+
+    // The advertisement came back, in the same exchange.
+    assert_pin_pair(
+        &options_of(&app.process_ctap2(0x04, &[], [1, 2, 3, 4])),
+        true,
+        true,
+    );
 }
 
 #[test]
@@ -296,6 +361,25 @@ mod device {
             self.call(0x06, req.as_slice()).0
         }
 
+        /// getPinToken (0x05) with the CORRECT pin — the leg that clears the
+        /// durable latch (`device_core.rs:1917-1925`) and mints the token in
+        /// the same breath. Returns the status byte.
+        fn correct_pin(&mut self, pin: &[u8]) -> (u8, usize) {
+            let enc = self.v1_encrypt(&crypto::pin_hash(pin));
+            let mut req: HV<u8, 256> = HV::new();
+            nh::push_map_header(&mut req, 4).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 5).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            self.push_client_key_agreement(&mut req);
+            nh::push_uint(&mut req, 6).unwrap();
+            nh::push_bstr(&mut req, &enc).unwrap();
+            let (status, body) = self.call(0x06, req.as_slice());
+            (status, body.len())
+        }
+
         /// getPinUvAuthTokenUsingUvWithPermissions (0x06) — no PIN leg.
         fn uv_token_status(&mut self) -> u8 {
             self.derive_keys();
@@ -383,6 +467,33 @@ mod device {
             locked.uv_token_status(),
             PIN_AUTH_BLOCKED,
             "a locked-out device must not mint a token it has stopped advertising"
+        );
+    }
+
+    /// The device half of `a_correct_pin_restores_the_route_it_withdrew`.
+    ///
+    /// This is the twin that matters: `device_core.rs`, not `app.rs`, is what
+    /// the RP2350 runs, and the corrected reading of the lockout is a claim
+    /// about `device_core.rs:1917-1925`. The host twin alone would leave it
+    /// unproven on hardware.
+    #[test]
+    fn device_correct_pin_restores_the_route_it_withdrew() {
+        let mut d = Device::boot();
+        d.set_pin(b"1234");
+        for _ in 0..3 {
+            d.wrong_pin(b"0000");
+        }
+        super::assert_pin_pair(&d.options(), true, false);
+
+        let (status, body_len) = d.correct_pin(b"1234");
+        assert_eq!(status, 0x00, "a correct PIN must not be refused by the latch");
+        assert!(body_len > 0, "the restored route must return a token body");
+        super::assert_pin_pair(&d.options(), true, true);
+        // And the route really works afterwards, not merely advertised.
+        assert_eq!(
+            d.uv_token_status(),
+            0x00,
+            "the token sub-command must agree with the advertisement it restored"
         );
     }
 }
