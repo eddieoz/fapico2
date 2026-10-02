@@ -436,6 +436,33 @@ pub fn pin_uv_auth_token_available(blocked: bool, needs_power_cycle: bool) -> bo
     !(blocked || needs_power_cycle)
 }
 
+/// US-1513: the budget `getUVRetries` (clientPIN sub-command `0x07`) reports.
+///
+/// The constant 3 was never arbitrary — it is the `auth_failures` latch
+/// threshold that `note_pin_auth_failure` uses in both twins
+/// (`device_core.rs:780`, `app.rs:515`). Reporting the *remaining* budget
+/// against the same counter makes the value mean something: a client polling
+/// `uvRetries` sees it fall to 0 exactly when the device stops answering
+/// PIN/UV at all, and recovers when a good `pinUvAuthParam` resets the
+/// counter.
+///
+/// The semantic mismatch, stated rather than hidden: `auth_failures` counts
+/// **pinUvAuthParam MAC** verification failures, not UV-gesture failures.
+/// The UV leg (sub-command `0x06`) proves user presence, not a secret, so a
+/// refused presence check answers `UpRequired` and deliberately does not
+/// charge this counter — charging it would let anyone who declines to touch
+/// the key drive the authenticator into a lockout.
+///
+/// So `uvRetries` reads as "PIN/UV authorization attempts remaining before
+/// the latch", which is the budget this build actually enforces.
+pub fn uv_retries(auth_failures: u8) -> u8 {
+    UV_RETRY_BUDGET.saturating_sub(auth_failures)
+}
+
+/// The latch threshold both twins use for `auth_failures`, and therefore the
+/// ceiling on the value [`uv_retries`] can report.
+pub const UV_RETRY_BUDGET: u8 = 3;
+
 impl Default for Ctap2Info {
     fn default() -> Self {
         // NOTE: "up" is deliberately NOT advertised, matching the reference

@@ -1556,10 +1556,24 @@ impl FidoApp {
                 Ok(())
             }
             0x07 => {
-                // getUVRetries: UV is not implemented; constant budget.
-                no_heap::push_map_header(out, 1).ok();
+                // getUVRetries: keys 4 (powerCycleState) and 5 (uvRetries),
+                // mirroring sub-command 0x01's conditional map header.
+                // US-1513: the budget was a hard-coded 3 and the existing
+                // test only checked the CBOR type, so nothing observed it.
+                // It now tracks the same `auth_failures` counter the latch
+                // uses, and the durable lockout is reported alongside.
+                let power = self.keystore.pin_state.blocked
+                    || self.keystore.pin_state.needs_power_cycle;
+                let uv_retries = crate::ctap2::uv_retries(self.auth_failures);
+                no_heap::push_map_header(out, if power { 2 } else { 1 }).ok();
+                // Ascending key order, as everywhere else in this map:
+                // 4 (powerCycleState) then 5 (uvRetries).
+                if power {
+                    no_heap::push_uint(out, 4).ok();
+                    no_heap::push_bool(out, true).ok();
+                }
                 no_heap::push_uint(out, 5).ok();
-                no_heap::push_uint(out, 3).ok();
+                no_heap::push_uint(out, uv_retries as u64).ok();
                 Ok(())
             }
             0x02 => {
