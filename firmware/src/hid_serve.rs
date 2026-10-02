@@ -58,7 +58,8 @@ use heapless::Vec as HeaplessVec;
 use crate::ctap_hid::{
     init_reply, CidAllocator, HidAssembler, HidFeed, HID_REPORT_SIZE, CTAP2_ERR_KEEPALIVE_CANCEL,
     CTAP_HID_CANCEL, CTAP_HID_CBOR, CTAP_HID_ERROR, CTAP_HID_INIT, CTAP_HID_KEEPALIVE,
-    CTAP_HID_MSG, CTAP_HID_PING, CTAP_HID_WINK, HID_ERR_INVALID_CMD,
+    CTAP_HID_MSG, CTAP_HID_PING, CTAP_HID_WINK, CTAPHID_KEEPALIVE_PROCESSING,
+    CTAPHID_KEEPALIVE_UPNEEDED, HID_ERR_INVALID_CMD,
 };
 use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
 use crate::presence::{self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, TouchWindow};
@@ -78,41 +79,58 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 
 /// US-1502's **stated bound**, in milliseconds: how long a request that
 /// arrives on any channel waits for its answer while a consent window is
-/// open.
+/// open. **US-1506 re-derived it; the figure is now 1750 ms, not 2100 ms**,
+/// and the number of terms went from four replies to three.
 ///
-/// It is four CTAPHID reply writes plus the one keepalive period the
+/// It is three CTAPHID reply writes plus the one keepalive period the
 /// outbound read is bounded by, and that is the whole argument — every term
-/// is a deadline the loop actually holds itself to:
+/// is a deadline the loop actually holds itself to. Walking one
+/// [`serve_once`] pass, in order, while a window is live:
 ///
-/// * while a window is live, a frame that arrives on the OUT endpoint is
-///   picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (100 ms), because
-///   [`read_one`] is bounded by it;
-/// * then, worst case, the rest of *that* pass still has to run: the live
-///   window's keepalive, a `check_timeout` error (only if a fragmented
-///   transaction really is stale), and the dispatched answer. That is three
-///   further replies, and
-/// * every reply is bounded by [`HID_REPLY_WRITE_TIMEOUT_MS`] (500 ms), so a
-///   host that has stopped reading the IN endpoint costs a bounded 500 ms per
-///   frame rather than parking the loop forever (US-1504).
+/// 1. **the bounded read.** A frame that arrives on the OUT endpoint is
+///    picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (now **250 ms**),
+///    because [`read_one`] is bounded by it. This is the term US-1506
+///    moved, and it moved *with* the emitted cadence, because the same
+///    constant is both — see the note there on why they must not be
+///    split.
+/// 2. **the live window's keepalive** — [`redrive_window`], one reply, at
+///    most [`HID_REPLY_WRITE_TIMEOUT_MS`] (500 ms) if the host has stopped
+///    reading the IN endpoint (US-1504).
+/// 3. **a `check_timeout` error** — [`serve_once`] step 2, and only if a
+///    fragmented transaction really is stale. One more reply, same bound.
+/// 4. **the dispatched answer** — the frame read in step 1 is dispatched
+///    and answered with exactly **one** reply, same bound.
 ///
-/// So **2100 ms worst case**, and **200 ms (2 x the keepalive period)
-/// against a host that is actually reading the IN endpoint** — the case the
-/// blackout is about.
+/// So **1750 ms worst case** (3 x 500 + 250) against a host that has
+/// stopped reading the IN endpoint, and **one keepalive period (250 ms)**
+/// against a host that is actually reading it — the case the blackout is
+/// about, where the three replies complete immediately rather than costing
+/// their deadlines.
 ///
-/// The re-drive is one synchronous app call and the persist gate is one flash
-/// program; neither is in the arithmetic.
+/// The re-drive is one synchronous app call and the persist gate is one
+/// flash program; neither is in the arithmetic.
 ///
-/// If US-1506 moves the keepalive cadence, the second number moves with it
-/// and the `+ CTAP_KEEPALIVE_PERIOD_MS` term with the first. The reply
-/// deadline still dominates both.
+/// ## Why the term count went *down*
 ///
-/// The earlier figure of `3 x HID_REPLY_WRITE_TIMEOUT_MS` (1500 ms) was
-/// published by the first cut of this story and **under-counted**: it dropped
-/// the read's own bound and counted three replies for a pass that can make
-/// four — the live window's keepalive, the assembler's timeout error, the
-/// dispatched command's pre-command keepalive, and its answer. A bound that is
-/// 600 ms optimistic is not a bound.
-pub const SERVE_BOUND_MS: u64 = 4 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
+/// The published 2100 ms counted **four** replies: the live window's
+/// keepalive, the assembler's timeout error, **the dispatched command's
+/// pre-command keepalive**, and its answer. US-1506 removed that third one
+/// — the unconditional pre-dispatch `0x02`, which was emitted for CTAP2
+/// `0x01`/`0x02` before the command had been run. A term that no longer
+/// exists cannot stay in the sum, and leaving it in would publish a bound
+/// 500 ms looser than the loop's real worst case: a bound that is
+/// pessimistic is merely wasteful, but one derived from frames that are not
+/// sent has stopped describing the thing it claims to bound.
+///
+/// The two bounds that were *wrong* are the two this constant has been
+/// corrected away from, and both are recorded here so neither is
+/// reintroduced: the first cut published `3 x HID_REPLY_WRITE_TIMEOUT_MS`
+/// (1500 ms), which under-counted by dropping the read's own bound and
+/// then counting three replies for a pass that made four; and a
+/// re-derivation that left the removed pre-command keepalive in would
+/// over-count. The rule both times: enumerate the pass frame by frame,
+/// then add only what is still there.
+pub const SERVE_BOUND_MS: u64 = 3 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
 
 /// Something the serve loop wants the transport to say in its log. The loop
 /// itself has no logger: `defmt` is a device concern, and US-1504 moved the
@@ -459,14 +477,33 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
     let now = now_ms();
 
     if slot.is_expired(now) {
-        // The window ran out on an unanswered touch. The refusal the command
-        // last produced goes out verbatim — the command is deliberately NOT
-        // re-driven one last time, so a press landing on the closing tick
-        // cannot retroactively authorise what the window already refused
-        // (US-921's rule, in the time dimension).
+        // The window ran out on an unanswered touch. The command is
+        // deliberately NOT re-driven one last time, so a press landing on
+        // the closing tick cannot retroactively authorise what the window
+        // already refused (US-921's rule, in the time dimension).
+        //
+        // US-1506: what *is* sent is `CTAP2_ERR_KEEPALIVE_CANCEL` (0x2D)
+        // for a CTAP2 window, not the bare `UpRequired` (0x3B) the window
+        // was refusing with. A `0x3B` is "not yet — touch, and I will ask
+        // again", and it is the wrong sentence at a close: the request is
+        // finished. `fido2/ctap2/base.py:285-287` raises on the first
+        // non-zero byte, so a host sees `CtapError(KEEPALIVE_CANCEL)` and
+        // `fido2/client/__init__.py:105-110` maps it to
+        // `ClientError.TIMEOUT` — which is what a 30 s unanswered ceremony
+        // is. (See `ctap_hid::CTAP2_ERR_KEEPALIVE_CANCEL` for why the byte
+        // is 0x2D and not this crate's own 0x2C.)
+        //
+        // The U2F arm keeps its recorded refusal: CTAP1 has no cancel code,
+        // and `6985` / `0700` is the one shape that is both true and
+        // parseable.
         let mut refusal = [0u8; 2];
-        let n = slot.refusal().len().min(refusal.len());
+        let mut n = slot.refusal().len().min(refusal.len());
         refusal[..n].copy_from_slice(&slot.refusal()[..n]);
+        let kind = slot.parked().map(|p| p.ticket.kind).unwrap_or(PendingKind::Ctap2);
+        if kind == PendingKind::Ctap2 {
+            refusal[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
+            n = 1;
+        }
         let ticket = close_window(slot);
         if app.persist() {
             reply(
@@ -514,7 +551,22 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
 
     if still_owed {
         slot.note_refusal(&ctap_out[..len]);
-        reply(io, &channel, CTAP_HID_KEEPALIVE, &[0x02]).await;
+        // US-1506: `0x02` UP NEEDED — which is true now, and only now. The
+        // slot is occupied, the command has been re-driven, and it is still
+        // refusing for want of a touch. The pre-command `0x02` that used to
+        // be emitted before the command had run is gone, so `0x01` (sent
+        // once, at the park) strictly precedes this.
+        //
+        // Rate-limited to `CTAP_KEEPALIVE_PERIOD_MS` (250 ms since US-1506,
+        // 100 ms before), mirroring the reference's own gate at
+        // `pico-keys-sdk/src/usb/hid/hid.c:615`. The clock is re-read here
+        // rather than reusing the `now` from the top of the pass: the
+        // re-drive is a synchronous app call, and stamping before it would
+        // let the next keepalive arrive sooner than the period it claims.
+        if slot.keepalive_due(now_ms()) {
+            slot.note_keepalive(now_ms());
+            reply(io, &channel, CTAP_HID_KEEPALIVE, &[CTAPHID_KEEPALIVE_UPNEEDED]).await;
+        }
         return;
     }
 
@@ -637,20 +689,27 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
             return;
         }
         let ctap_cmd = payload[0];
-        // User-presence requests emit a CTAPHID keepalive (UP NEEDED)
-        // before completing (FX-402 parity).
+        // US-1506: the **unconditional pre-command keepalive is gone.**
+        //
+        // It used to sit here: for CTAP2 opcodes `0x01`/`0x02` a `0x02`
+        // (UP NEEDED) went out *before* the command had been run at all.
+        // That put a frame on the wire saying "waiting for your touch" at a
+        // moment when we had not established that a touch was owed — and,
+        // measured, it produced **301** of them in a 30 s window, all `0x02`,
+        // against the reference's one `0x01`. A `0x02` is a claim about a
+        // human's attention; making it before we know is a claim that can
+        // be false, and this firmware made it unconditionally.
+        //
+        // What replaces it is at the `park()` call below: a `0x01`
+        // (PROCESSING) the moment the window really is open, then `0x02`s
+        // only on later passes where the touch is genuinely still owed.
         //
         // US-115 adds the `0x41` vendor channel to `presence_windowed`
-        // below, and *not* to this one. The pre-command keepalive is
-        // unconditional for 0x01/0x02, which always need a touch; `0x41`
-        // only needs one for the *benign tier* of `CONFIG_WRITE`, and
-        // emitting a keepalive for the identity tier — which answers `0x00`
-        // on the first pass — would put a frame on the wire that the client
-        // has no reason to expect and that says nothing true about progress.
+        // below, and *not* to this one — unchanged by US-1506. `0x41` only
+        // needs a touch for the *benign tier* of `CONFIG_WRITE`, and a
+        // keepalive for the identity tier (which answers `0x00` on the first
+        // pass) would say nothing true about progress.
         let up_request = ctap_cmd == 0x01 || ctap_cmd == 0x02;
-        if up_request {
-            reply(io, channel, CTAP_HID_KEEPALIVE, &[0x02]).await;
-        }
         // US-115: the commands whose arm may answer `UpRequired`, and so may
         // need the cross-call consent window below.
         //
@@ -728,6 +787,40 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
                 Ok(()) => {
                     if presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS) {
                         presence::touch_prompt(true);
+                        // US-1506: the window's **first** keepalive, `0x01`
+                        // PROCESSING. It goes out the instant the window is
+                        // open — which is the reference's
+                        // `last_keepalive_time = 0; send_keepalive();` at
+                        // `pico-keys-sdk/src/usb/hid/hid.c:586-587`, and
+                        // which is unconditional for the same reason: the
+                        // limiter below has nothing to measure against yet.
+                        //
+                        // `0x01` and not `0x02`, deliberately. The reference
+                        // picks between them with
+                        // `is_req_button_pending() ? 2 : 1`
+                        // (`hid.c:622`) and the button wait has not started
+                        // at this point, so the reference's first keepalive
+                        // is `0x01` too. RS-Key draws the same line the
+                        // other way and says why, which is also the reason
+                        // this is not unconditional across both arms: "CBOR
+                        // keeps `PROCESSING` for its genuinely slow
+                        // operations", while "U2F (MSG) is fast apart from
+                        // the touch wait, and U2FHID hosts — including the
+                        // FIDO conformance tool — mishandle a `PROCESSING`
+                        // keepalive sent before a quick MSG response ...
+                        // they read it as the response's first frame and
+                        // desync" (`RS-Key/crates/rsk-usb/src/ctaphid.rs:63-67`,
+                        // and the measured `U2F-Authenticate P-3`/`F-2`
+                        // "sequence out of order" at `RS-Key/CHANGELOG.md:13368-13375`).
+                        // The MSG arm below therefore sends nothing here.
+                        slot.note_keepalive(now_ms());
+                        reply(
+                            io,
+                            channel,
+                            CTAP_HID_KEEPALIVE,
+                            &[CTAPHID_KEEPALIVE_PROCESSING],
+                        )
+                        .await;
                         return;
                     }
                     // The platform presence slot is busy — a CCID window
@@ -960,6 +1053,13 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
                 Ok(()) => {
                     if presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS) {
                         presence::touch_prompt(true);
+                        // US-1506: no `0x01` here, and that is the finding
+                        // above applied — a `PROCESSING` keepalive ahead of a
+                        // quick U2F response desyncs U2FHID hosts. The window
+                        // still starts its cadence clock, so the first `0x02`
+                        // on the next pass is a whole period away rather than
+                        // arriving twice in the same instant.
+                        slot.note_keepalive(now_ms());
                         return;
                     }
                     // As in the CBOR arm: the platform presence slot is busy,
@@ -1032,19 +1132,30 @@ mod tests {
     /// (correctly — an idle bus must park the loop), and `drive`'s own stop
     /// condition never gets to run.
     ///
-    /// 150 ms sits deliberately between the two regimes: longer than the
-    /// 100 ms bounded read a *live window* imposes, so a live window's pass
-    /// is never cut short and no real frame is dropped; shorter than any
-    /// budget a test hands to `drive`, so an idle pass costs a fixed, small
-    /// amount and the loop exits. This is a harness stop condition and nothing
-    /// else — no assertion reads it, and the device build has no counterpart.
+    /// It sits deliberately between the two regimes: longer than the bounded
+    /// read a *live window* imposes, so a live window's pass is never cut
+    /// short and no real frame is dropped; shorter than any budget a test
+    /// hands to `drive`, so an idle pass costs a fixed amount and the loop
+    /// exits. This is a harness stop condition and nothing else — no
+    /// assertion reads it, and the device build has no counterpart.
     ///
-    /// The number is an `embassy_time::Duration`, because it is spent inside
-    /// the same `with_timeout` the loop uses; a `std::time::Duration` here
-    /// would not be the same clock the keepalive bound is stated in.
+    /// US-1506 made it a function of the constant rather than a second
+    /// literal. It was `150`, chosen against a 100 ms keepalive period, and
+    /// moving the period to 250 ms silently made the harness *shorter than
+    /// the read it was required to outlast*: every live-window pass was cut
+    /// short, `note_blocked_live_pass` counted all of them, US-1502's
+    /// blackout assertion went red, and the panic skipped the release drive
+    /// that closes each test's window — leaking the process-wide presence
+    /// slot into the next nine tests. Ten tests failed for one stale number.
+    /// A harness bound that is derived from the firmware bound it has to
+    /// outlast cannot rot that way again.
+    ///
+    /// The numbers are an `embassy_time::Duration` because the time is spent
+    /// inside the same `with_timeout` the loop uses; a `std::time::Duration`
+    /// here would not be the same clock the keepalive bound is stated in.
     const DRIVE_IDLE_PARK: embassy_time::Duration =
         embassy_time::Duration::from_millis(DRIVE_IDLE_PARK_MS);
-    const DRIVE_IDLE_PARK_MS: u64 = 150;
+    const DRIVE_IDLE_PARK_MS: u64 = CTAP_KEEPALIVE_PERIOD_MS + 150;
 
     /// The device clock. Real time, from the same driver the device reads, so
     /// the 30 s `CTAP_TOUCH_WINDOW_MS` and the 100 ms keepalive period are
@@ -1069,6 +1180,11 @@ mod tests {
         inbound: VecDeque<[u8; HID_REPORT_SIZE]>,
         /// Messages the device sent, in order.
         sent: Vec<Sent>,
+        /// When each of `sent` went out, index-aligned. US-1506: the keepalive
+        /// *cadence* is a claim about time, and asserting it needs the clock
+        /// the frames were sent on — a count inside a fixed budget can only
+        /// say how the test host happened to be scheduled.
+        sent_at: Vec<StdInstant>,
     }
 
     /// A host with an OUT endpoint that delivers a script and then goes
@@ -1093,6 +1209,30 @@ mod tests {
         /// The first message the device sent on `channel`, if any.
         fn first_on(&self, channel: [u8; 4]) -> Option<Sent> {
             self.sent().into_iter().find(|s| s.channel == channel)
+        }
+
+        /// US-1506: the exact `(cmd, payload)` sequence a host reads on one
+        /// channel. The frames, not a summary of them.
+        fn frames_on(&self, channel: [u8; 4]) -> Vec<(u8, Vec<u8>)> {
+            self.sent()
+                .into_iter()
+                .filter(|s| s.channel == channel)
+                .map(|s| (s.cmd, s.payload))
+                .collect()
+        }
+
+        /// US-1506: the gap before each KEEPALIVE on `channel`, in order. The
+        /// first is measured from the start of the drive, so a keepalive
+        /// emitted *before* the window opened shows up as a gap far shorter
+        /// than a period rather than hiding.
+        fn keepalive_gaps(&self, channel: [u8; 4], t0: StdInstant) -> Vec<StdDuration> {
+            let bus = self.bus.lock().unwrap();
+            bus.sent
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.channel == channel && s.cmd == CTAP_HID_KEEPALIVE)
+                .map(|(i, _)| bus.sent_at[i].saturating_duration_since(t0))
+                .collect()
         }
     }
 
@@ -1123,7 +1263,9 @@ mod tests {
             cmd: u8,
             payload: &[u8],
         ) -> impl Future<Output = bool> {
-            self.bus.lock().unwrap().sent.push(Sent {
+            let mut bus = self.bus.lock().unwrap();
+            bus.sent_at.push(StdInstant::now());
+            bus.sent.push(Sent {
                 channel: *channel,
                 cmd,
                 payload: payload.to_vec(),
@@ -1653,15 +1795,37 @@ mod tests {
             app.up_calls.len()
         );
         // And the host is told the device is still waiting (FX-402).
-        let keepalives = io
-            .sent()
-            .into_iter()
-            .filter(|s| s.cmd == CTAP_HID_KEEPALIVE && s.channel == chan_a)
-            .count();
+        //
+        // US-1506 made this a *condition* rather than a count inside a fixed
+        // budget. At the 250 ms cadence a 600 ms budget buys the window's
+        // `0x01` plus two `0x02`s in the best case and one `0x02` on a
+        // loaded host — so the count stopped measuring the firmware and
+        // started measuring the scheduler, which is the same intermittent
+        // red this test already had once at a 100 ms cadence (see the note
+        // above). The property US-1509 claims is "the host is kept told",
+        // not "how many times in half a second".
+        let keepalive_count = |io: &Script| {
+            io.sent()
+                .into_iter()
+                .filter(|s| s.cmd == CTAP_HID_KEEPALIVE && s.channel == chan_a)
+                .count()
+        };
+        block_on("US-1509: the host keeps being told", async {
+            // `drive_until` cannot be used here: its stop condition is
+            // `Fn(&HidServe, &A)`, and the thing being waited on lives on
+            // `io`, which it also needs mutably. One bounded loop, same
+            // shape.
+            let start = StdInstant::now();
+            while keepalive_count(&io) < 2 && start.elapsed() < StdDuration::from_millis(2_000) {
+                drive_one_pass(&mut srv, &mut io, &mut app, &mut slot).await;
+            }
+        });
+        let keepalives = keepalive_count(&io);
         assert!(
             keepalives >= 2,
-            "US-1509: only {keepalives} keepalive(s) in 600 ms; the progress-frame \
-             cadence must survive the restructure."
+            "US-1509: only {keepalives} keepalive(s) for a window that stayed open \
+             across many serve passes; the progress-frame cadence must survive the \
+             restructure."
         );
 
         grant.store(true, Ordering::SeqCst);
@@ -1919,6 +2083,403 @@ mod tests {
             "a mismatched tag must not consume another window's grant"
         );
         crate::presence::end_window(tag_a);
+    }
+
+    /// US-1506: the serve bound's **term count**, asserted rather than
+    /// asserted-in-prose. (Not `the_...` — a second test in this file already
+    /// starts `the_` and prefix-matching them makes both harder to run.)
+    ///
+    /// [`SERVE_BOUND_MS`] is `3 x HID_REPLY_WRITE_TIMEOUT_MS +
+    /// CTAP_KEEPALIVE_PERIOD_MS` because one serve pass makes at most three
+    /// replies while a window is live. This drives the worst pass that can
+    /// be built from the pieces `serve_once` actually has — a live window's
+    /// keepalive, a stale fragmented transaction (the `check_timeout` error),
+    /// and a dispatched answer, all in the same pass — and counts the
+    /// frames.
+    ///
+    /// The Phase C review already caught one unsound derivation in this
+    /// exact area, and a bound published in a doc comment is only as good
+    /// as the reviewer's mood. This is the same argument with a number
+    /// behind it: reintroduce the unconditional pre-command keepalive
+    /// US-1506 removed and the count goes to four and this fails, which is
+    /// the point — the fourth term of the old 2100 ms is exactly that frame.
+    #[test]
+    fn a_live_window_pass_makes_at_most_three_replies() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan_a = [0x00, 0x00, 0x00, 0x01];
+        let chan_b = [0x00, 0x00, 0x00, 0x02];
+
+        // A PING init packet that claims 200 bytes and never sends them: the
+        // assembler holds it `expecting_cont` until `check_timeout` gives up.
+        let mut partial = [0u8; HID_REPORT_SIZE];
+        partial[..4].copy_from_slice(&chan_b);
+        partial[4] = CTAP_HID_PING | 0x80;
+        partial[5..7].copy_from_slice(&200u16.to_be_bytes());
+
+        let injector = script(
+            &bus,
+            &[
+                (StdDuration::from_millis(0), cbor(chan_a, &[0x01, 0xA0])),
+                (StdDuration::from_millis(50), vec![partial]),
+
+                (StdDuration::from_millis(600), cbor(chan_b, &[0x01, 0xB1])),
+            ],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        let (mut worst, mut passes) = (0usize, 0usize);
+        block_on("US-1506: per-pass reply count", async {
+            let start = StdInstant::now();
+            while start.elapsed() < StdDuration::from_millis(1_600) {
+                let before = io.sent().len();
+                // The same abandonment `drive` uses; a pass cut short emits
+                // fewer frames, which can only lower the maximum.
+                let _ = embassy_time::with_timeout(
+                    DRIVE_IDLE_PARK,
+                    serve_once(&mut srv, &mut io, &mut app, &mut slot),
+                )
+                .await;
+                worst = worst.max(io.sent().len() - before);
+                passes += 1;
+            }
+        });
+        injector.join().unwrap();
+
+        assert!(
+            slot.is_occupied(),
+            "the window must still be live, or the count was taken with nothing to bound"
+        );
+        assert!(passes >= 2, "the drive must have run several passes ({passes})");
+        assert!(
+            worst >= 2,
+            "US-1506: the worst pass emitted {worst} frame(s). The counter is not \
+             seeing the multi-frame pass this test exists to build, so the upper \
+             bound below would be vacuous."
+        );
+        assert!(
+            worst <= 3,
+            "US-1506: a pass while a window is live emitted {worst} frames. \
+             SERVE_BOUND_MS is derived as 3 replies + one keepalive period, so a \
+             fourth frame makes the published bound wrong again — which is what \
+             reintroducing the pre-command keepalive would do."
+        );
+
+        grant.store(true, Ordering::SeqCst);
+        block_on(
+            "US-1506: release the consent window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
+        );
+    }
+
+    /// US-1506: the three frame sequences a client actually sees, asserted as
+    /// literal `(command, payload)` lists.
+    ///
+    /// The A/B probe is what makes these worth writing down. Two boards, one
+    /// machine, identical probe:
+    ///
+    /// | | this firmware, before | pico-fido2 C reference |
+    /// |---|---|---|
+    /// | keepalives in a consent window | **301, all `0x02`** | **1, `0x01`** |
+    /// | `PING` answered during it | 1, at 30047.7 ms | 4, at 8.0 ms each |
+    ///
+    /// A count is not the defect; the *status bytes* are. `0x02` is UP_NEEDED
+    /// — "waiting for your touch" — and the pre-fix arm emitted it before
+    /// the command had even been run, so 301 of the 301 were a claim that
+    /// could be false. The three sequences below are the fix: `0x01` first,
+    /// `0x02` only once a window is genuinely open and a re-drive has found
+    /// the touch still owed, and `0x2D` at the end either way the window
+    /// closes without a grant.
+    mod keepalive_frames {
+        use super::*;
+
+        /// How long the "normal progress" drive runs, and therefore how many
+        /// periods it spans. Long enough for several `0x02`s, short enough
+        /// not to sit on the 30 s window.
+        const PROGRESS_MS: u64 = 1_200;
+
+        /// US-1506 pins the cadence's **value**, because every behavioural
+        /// assertion about it is written in terms of the same constant the
+        /// firmware obeys and is therefore unfalsifiable on its own.
+        ///
+        /// 250 is not a preference: it is the reference's gate,
+        /// `pico-keys-sdk/src/usb/hid/hid.c:615` —
+        /// `if (last_keepalive_time != 0 && now - last_keepalive_time <
+        /// 250) return;` — and it is what the A/B probe measured the C board
+        /// doing. Setting this back to 100 must turn this test red, or the
+        /// reversion is invisible to the suite.
+        #[test]
+        fn the_cadence_is_the_references_250_ms() {
+            assert_eq!(
+                CTAP_KEEPALIVE_PERIOD_MS,
+                250,
+                "US-1506: the keepalive cadence is 250 ms, from \
+                 `pico-keys-sdk/src/usb/hid/hid.c:615`. Reverting it to the pre-story \
+                 100 ms restores 301 frames in a 30 s window."
+            );
+        }
+
+        /// Drive a window open on `chan_a` with a `MakeCredential`, optionally
+        /// grant it part way through, and return what the host saw.
+        ///
+        /// The returned `t0` is the instant the drive started, so the
+        /// keepalive gaps are measured from the beginning of the window
+        /// rather than from the first frame.
+        fn run(
+            chan_a: [u8; 4],
+            inject_after_open: Vec<(StdDuration, Vec<[u8; HID_REPORT_SIZE]>)>,
+            grant_at: Option<StdDuration>,
+            total: StdDuration,
+        ) -> (Vec<(u8, Vec<u8>)>, Vec<StdDuration>, bool) {
+            let bus = Arc::new(Mutex::new(Bus::default()));
+            // Never granted up front: a grant before the window opens would mean
+            // no window at all, which is not the sequence under test.
+            let grant = Arc::new(AtomicBool::new(false));
+            let mut events = vec![(StdDuration::from_millis(0), cbor(chan_a, &[0x01, 0xA0]))];
+            events.extend(inject_after_open);
+            let injector = script(&bus, &events);
+
+            let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+            let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+            let mut io = Script::new(bus.clone());
+            let mut app = FakeApp::new(grant.clone());
+            let mut slot = PendingUp::new();
+
+            let t0 = StdInstant::now();
+            if let Some(at) = grant_at {
+                let g = grant.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(at);
+                    g.store(true, Ordering::SeqCst);
+                });
+            }
+            block_on(
+                "US-1506: keepalive frame sequence",
+                drive(&mut srv, &mut io, &mut app, &mut slot, total),
+            );
+            injector.join().unwrap();
+            let grant_still_outstanding = !grant.load(Ordering::SeqCst);
+            (
+                io.frames_on(chan_a),
+                io.keepalive_gaps(chan_a, t0),
+                grant_still_outstanding,
+            )
+        }
+
+        /// **Normal progress.** A window opens, the host is told `0x01` and
+        /// then `0x02` on a 250 ms cadence, and the granted answer closes the
+        /// sequence.
+        ///
+        /// Before US-1506 this sequence was: `0x02` (before the command ran),
+        /// then `0x02` on every re-drive at 100 ms, and 301 of them.
+        #[test]
+        fn normal_progress_is_0x01_then_rate_limited_0x02_then_the_granted_answer() {
+            let _g = serve_test_guard();
+            let chan_a = [0x00, 0x00, 0x00, 0x01];
+            let (frames, gaps, still_outstanding) =
+                run(chan_a, Vec::new(), Some(StdDuration::from_millis(900)), StdDuration::from_millis(1_400));
+
+            assert!(!still_outstanding, "the window must have been granted");
+            assert!(
+                !frames.is_empty() && frames[0].0 == CTAP_HID_KEEPALIVE,
+                "US-1506: the first frame on a windowed channel must be a KEEPALIVE, got {:?}",
+                frames.first()
+            );
+            assert_eq!(
+                frames[0],
+                (CTAP_HID_KEEPALIVE, vec![CTAPHID_KEEPALIVE_PROCESSING]),
+                "the window's first keepalive is 0x01 PROCESSING, sent the moment the window is open — \
+                 not 0x02, which would claim a touch is owed before any re-drive has looked"
+            );
+
+            // Every keepalive before the answer is 0x02, and the answer is
+            // last. No other frame may appear on this channel.
+            let answer = frames.len() - 1;
+            assert_eq!(
+                frames[answer],
+                (CTAP_HID_CBOR, vec![0xAA, 0x01]),
+                "the window's final reply is the granted MakeCredential answer"
+            );
+            for (cmd, payload) in &frames[1..answer] {
+                assert_eq!(
+                    (*cmd, payload.as_slice()),
+                    (CTAP_HID_KEEPALIVE, [CTAPHID_KEEPALIVE_UPNEEDED].as_slice()),
+                    "US-1506: the only keepalive after 0x01 is 0x02 UP_NEEDED. A second \
+                     0x01 would say the command is still processing, and it is not — it is \
+                     waiting for a human. Got cmd {cmd:#04x} payload {payload:02x?}"
+                );
+            }
+            assert!(
+                frames[1..answer].len() >= 2,
+                "US-1506: only {} re-drive keepalive(s) in {PROGRESS_MS} ms; the cadence \
+                 must survive the restructure",
+                frames[1..answer].len()
+            );
+
+            // The cadence itself, on the clock the frames were sent on. The
+            // gaps are absolute (measured from the start of the drive), so the
+            // spacing is one minus the previous; asserting on the absolute
+            // value would pass on a firmware that emitted ten frames in the
+            // first period and then went quiet.
+            //
+            // 60 ms of slack for scheduling: the limiter tests `>=` the period
+            // against the *serve loop's* clock, and a loaded test host can make
+            // a pass start late. The slack is well inside the pre-US-1506
+            // 100 ms period, so a regression to that cadence still fails.
+            let period = StdDuration::from_millis(CTAP_KEEPALIVE_PERIOD_MS);
+            let slack = StdDuration::from_millis(60);
+            for i in 1..gaps.len() {
+                let spacing = gaps[i].saturating_sub(gaps[i - 1]);
+                assert!(
+                    spacing + slack >= period,
+                    "US-1506: keepalives {} and {i} went out {spacing:?} apart, inside \
+                     the {period:?} period. The rate limiter is not holding.",
+                    i - 1
+                );
+            }
+            assert!(
+                // An ABSOLUTE cap, not one written in terms of the constant.
+                // The first attempt at this line divided the budget by
+                // CTAP_KEEPALIVE_PERIOD_MS, which made it unfalsifiable: the
+                // constant it checks against is the one the firmware obeys,
+                // so setting the cadence back to 100 ms made the test assert
+                // 100 ms spacing and pass. That is a test that cannot fail,
+                // and it was caught by deliberately reverting the cadence.
+                // ~1.4 s at 250 ms is at most six keepalives; at the
+                // pre-US-1506 100 ms it is thirteen.
+                gaps.len() <= 7,
+                "US-1506: {} keepalives in a ~1.4 s window is above the reference's \
+                 250 ms cadence (at most six). A 100 ms cadence would produce \
+                 thirteen — the 301-in-30 s shape.",
+                gaps.len()
+            );
+        }
+
+        /// **Cancel.** The same window, closed by a `CTAPHID_CANCEL` instead
+        /// of a touch: the final frame is `CTAP2_ERR_KEEPALIVE_CANCEL`, and
+        /// nothing follows it.
+        ///
+        /// Before US-1506 there was no cancel at all, so a host that gave up
+        /// got `0x3F` / `0x01 INVALID_CMD` (measured) and then silence for
+        /// the rest of the 30 s window.
+        #[test]
+        fn cancel_is_the_same_sequence_ending_in_keepalive_cancel() {
+            let _g = serve_test_guard();
+            let chan_a = [0x00, 0x00, 0x00, 0x01];
+            let (frames, _gaps, outstanding) = run(
+                chan_a,
+                vec![(
+                    StdDuration::from_millis(700),
+                    frame(chan_a, CTAP_HID_CANCEL, &[]),
+                )],
+                None,
+                StdDuration::from_millis(1_200),
+            );
+
+            assert!(outstanding, "no press ever arrives: only the cancel ends this");
+            assert!(
+                !frames
+                    .iter()
+                    .any(|(cmd, _)| *cmd == CTAP_HID_ERROR),
+                "a cancel must never be answered 0x3F/INVALID_CMD"
+            );
+            let last = frames.len() - 1;
+            assert_eq!(
+                frames[0],
+                (CTAP_HID_KEEPALIVE, vec![CTAPHID_KEEPALIVE_PROCESSING]),
+                "the window still opens with 0x01 before it is cancelled"
+            );
+            assert_eq!(
+                frames[last],
+                (CTAP_HID_CBOR, vec![CTAP2_ERR_KEEPALIVE_CANCEL]),
+                "the cancelled command's final frame is CTAP2_ERR_KEEPALIVE_CANCEL (0x2D)"
+            );
+            for (cmd, payload) in &frames[1..last] {
+                assert_eq!(
+                    (*cmd, payload.as_slice()),
+                    (CTAP_HID_KEEPALIVE, [CTAPHID_KEEPALIVE_UPNEEDED].as_slice()),
+                    "only 0x02 may sit between 0x01 and the cancel answer"
+                );
+            }
+        }
+
+        /// **Expiry.** The same window, run out on its deadline rather than
+        /// answered: the final frame is *also* `0x2D`.
+        ///
+        /// Before US-1506 it was the bare `0x3B UpRequired` the window had
+        /// been refusing with — which says "not yet, touch me again" at the
+        /// one moment the request is over. `fido2` raises on the first
+        /// non-zero byte (`fido2/ctap2/base.py:285-287`), so this is the
+        /// difference between a host concluding the ceremony timed out and a
+        /// host retrying a request it already abandoned.
+        ///
+        /// The window is expired on an **injected** clock rather than by
+        /// waiting 30 s: `HidServe::new` takes the clock as a parameter
+        /// precisely so the deadline is reachable in a unit test.
+        #[test]
+        fn expiry_ends_in_keepalive_cancel_not_a_bare_up_required() {
+            let _g = serve_test_guard();
+            static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            fn fake_now() -> u64 {
+                NOW.load(Ordering::SeqCst)
+            }
+            NOW.store(0, Ordering::SeqCst);
+
+            let bus = Arc::new(Mutex::new(Bus::default()));
+            let chan_a = [0x00, 0x00, 0x00, 0x01];
+            let injector = script(&bus, &[(StdDuration::from_millis(0), cbor(chan_a, &[0x01, 0xA0]))]);
+            let grant = Arc::new(AtomicBool::new(false));
+
+            let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+            let mut srv = HidServe::new(fake_now, &mut ctap_out);
+            let mut io = Script::new(bus.clone());
+            let mut app = FakeApp::new(grant.clone());
+            let mut slot = PendingUp::new();
+
+            // A couple of real-time passes so the window is live and has sent
+            // at least its 0x01. The clock is then moved past the deadline;
+            // `read_one` still runs on the real clock, so only the window's
+            // own `is_expired` is being exercised.
+            block_on(
+                "US-1506: open the window",
+                drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(500)),
+            );
+            injector.join().unwrap();
+            assert!(slot.is_occupied(), "the window must be open before it can expire");
+            assert_eq!(
+                io.frames_on(chan_a),
+                vec![(CTAP_HID_KEEPALIVE, vec![CTAPHID_KEEPALIVE_PROCESSING])],
+                "on an injected clock nothing has elapsed, so only the window's \
+                 unconditional 0x01 has gone out"
+            );
+
+            NOW.store(CTAP_TOUCH_WINDOW_MS + 1, Ordering::SeqCst);
+            block_on(
+                "US-1506: expire the window",
+                drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(300)),
+            );
+
+            assert!(!slot.is_occupied(), "the window closed on its deadline");
+            assert_eq!(
+                io.frames_on(chan_a).last(),
+                Some(&(CTAP_HID_CBOR, vec![CTAP2_ERR_KEEPALIVE_CANCEL])),
+                "an expired window answers 0x2D, not the 0x3B UpRequired it was \
+                 refusing with. A host reading 0x3B retries a request that is over."
+            );
+            assert!(
+                !io.sent()
+                    .iter()
+                    .any(|s| s.payload == vec![Ctap2Response::UpRequired.code()]),
+                "US-1506: no bare UpRequired answer may reach the host on a windowed \
+                 channel once the window has closed"
+            );
+        }
     }
 
     /// US-1505: a `CTAPHID_CANCEL` during a live consent window closes it,

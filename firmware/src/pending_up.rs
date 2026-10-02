@@ -165,6 +165,22 @@ pub struct PendingUp {
     /// answering whatever that produced.
     refusal: [u8; 2],
     refusal_len: u8,
+    /// When the last keepalive went out for this window (US-1506).
+    ///
+    /// The rate limiter that the reference implements as a file-static
+    /// `last_keepalive_time` (`pico-keys-sdk/src/usb/hid/hid.c:336`, checked
+    /// at `:615`). It lives here rather than in the serve loop because the
+    /// two keepalives of a window are sent from two different places — the
+    /// `0x01` from the dispatch arm that parks the request, the `0x02`s from
+    /// `redrive_window` — and a limiter one of them could not see is not a
+    /// limiter. Cleared by [`PendingUp::park`], so a stale stamp from a
+    /// previous window can never gate this one's first `0x02`.
+    last_keepalive_ms: u64,
+    /// Whether a keepalive has actually gone out for this window. A separate
+    /// flag rather than a sentinel `0`, because `now_ms` is a real clock
+    /// that reads 0 for the first millisecond of uptime and a keepalive
+    /// stamped then would leave the next one "due" immediately.
+    keepalive_sent: bool,
 }
 
 impl Default for PendingUp {
@@ -190,6 +206,8 @@ impl PendingUp {
             payload: [0; PENDING_UP_PAYLOAD_MAX],
             refusal: [0; 2],
             refusal_len: 0,
+            last_keepalive_ms: 0,
+            keepalive_sent: false,
         }
     }
 
@@ -266,6 +284,8 @@ impl PendingUp {
         self.ticket = ticket;
         self.refusal = [0; 2];
         self.refusal_len = 0;
+        self.last_keepalive_ms = 0;
+        self.keepalive_sent = false;
         self.occupied = true;
         Ok(())
     }
@@ -282,6 +302,32 @@ impl PendingUp {
         }
         self.refusal[..answer.len()].copy_from_slice(answer);
         self.refusal_len = answer.len() as u8;
+    }
+
+    /// US-1506: is a keepalive due for this window at `now_ms`?
+    ///
+    /// The first keepalive of a window — the `0x01` the dispatch arm sends
+    /// the moment the window opens — is unconditional, which is the
+    /// reference's `last_keepalive_time = 0; send_keepalive();` at
+    /// `pico-keys-sdk/src/usb/hid/hid.c:586-587` (and its `!= 0` test at
+    /// `:615`). Everything after it is rate-limited to
+    /// `CTAP_KEEPALIVE_PERIOD_MS`.
+    ///
+    /// Meaningful only while occupied; an empty slot is due, because a slot
+    /// with no window has no cadence to keep.
+    pub fn keepalive_due(&self, now_ms: u64) -> bool {
+        !self.occupied
+            || !self.keepalive_sent
+            || now_ms.saturating_sub(self.last_keepalive_ms)
+                >= crate::presence::CTAP_KEEPALIVE_PERIOD_MS
+    }
+
+    /// Stamp a keepalive that has just gone out, at `now_ms`.
+    pub fn note_keepalive(&mut self, now_ms: u64) {
+        if self.occupied {
+            self.last_keepalive_ms = now_ms;
+            self.keepalive_sent = true;
+        }
     }
 
     /// The refusal the parked command last answered with, for a window that
@@ -305,6 +351,8 @@ impl PendingUp {
         self.occupied = false;
         self.payload_len = 0;
         self.refusal_len = 0;
+        self.last_keepalive_ms = 0;
+        self.keepalive_sent = false;
         Some(self.ticket)
     }
 }

@@ -1272,15 +1272,26 @@ fn a_press_between_two_button_samples_is_invisible_to_every_path() {
 /// that is precisely the inline await US-1509 removed — so its ABSENCE is
 /// asserted, not just the steps around it. A test that only pins what is
 /// present would pass just as happily against a reintroduced blackout.
+///
+/// **US-1506 changed the shape, and this pin changed with it.** The step it
+/// used to require — `reply(io, channel, CTAP_HID_KEEPALIVE, &[0x02])`, the
+/// unconditional *pre-dispatch* keepalive — is exactly the frame US-1506
+/// deleted: it claimed "waiting for your touch" before the command had been
+/// run, 301 times in a 30 s window. A pin that kept requiring it would have
+/// made the removal impossible to make, so the pin now requires the two
+/// frames that replaced it (`0x01` at the park, `0x02` rate-limited) and
+/// **asserts the old one is absent**. Both halves matter: pinning presence
+/// alone would pass against a firmware that emits every frame; pinning
+/// absence alone would pass against one that emits none.
 #[test]
 fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hid_serve.rs"))
         .expect("hid_serve.rs must be readable from the test's own crate");
     // The slice opens at the *arm*, not at `presence_windowed`: the CBOR
-    // arm's pre-command keepalive (the one FX-402 parity requires, emitted
-    // before the app runs) sits above the `presence_windowed` binding, and
+    // arm's keepalives sit above the `presence_windowed` binding (the `0x01`
+    // is sent inside the `park()` match arm, which is below it), and
     // pinning from the narrower start would have quietly stopped checking
-    // it.
+    // them.
     let start = src
         .find("} else if cmd == CTAP_HID_CBOR {")
         .expect("the dispatch must have a CBOR arm");
@@ -1294,7 +1305,11 @@ fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
         "let presence_windowed",
         "Ctap2Response::UpRequired.code()",
         "presence::begin_window(tag, CTAP_TOUCH_WINDOW_MS)",
-        "reply(io, channel, CTAP_HID_KEEPALIVE, &[0x02])",
+        // US-1506: the window's first keepalive is `0x01` PROCESSING, sent
+        // at the park rather than before the command ran, and its `0x02`s
+        // are rate-limited inside `redrive_window`.
+        "CTAPHID_KEEPALIVE_PROCESSING",
+        "slot.note_keepalive(now_ms());",
         // US-1509: the command is PARKED, not looped on. The slot carries
         // the channel-derived tag and the deadline the model derives from
         // `TouchWindow`, so the model's window budget is the device's.
@@ -1307,6 +1322,19 @@ fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
              assumes it, and a model that outlives its subject tests nothing"
         );
     }
+
+    // US-1506's regression pin, the negative half: the unconditional
+    // pre-dispatch `0x02` must not come back. It is a bare `&[0x02]` literal
+    // at the top of the arm, and its return is the single most-reverted line
+    // in this file's history — it was correct once (FX-402 wanted a progress
+    // frame) and became a 301-frame lie once a window was parked instead of
+    // looped over.
+    assert!(
+        !arm.contains("CTAP_HID_KEEPALIVE, &[0x02]"),
+        "US-1506: the CBOR arm is emitting a bare 0x02 keepalive again. That frame \
+         says 'waiting for your touch' and must only be sent once the window is \
+         open and a re-drive has found the touch still owed."
+    );
 
     // US-1509's regression pin: the consent arm must not wait. The blackout
     // was exactly `Timer::after_millis(CTAP_KEEPALIVE_PERIOD_MS).await`

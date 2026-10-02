@@ -265,6 +265,11 @@ const CTAP_HID_CANCEL: u8 = fapico2_firmware::ctap_hid::CTAP_HID_CANCEL;
 /// a fourth local constant.
 const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = fapico2_firmware::ctap_hid::CTAP2_ERR_KEEPALIVE_CANCEL;
 
+/// US-1506: the keepalive status constants, from the one definition of
+/// record rather than a fifth and sixth local constants.
+const CTAPHID_KEEPALIVE_PROCESSING: u8 =
+    fapico2_firmware::ctap_hid::CTAPHID_KEEPALIVE_PROCESSING;
+
 /// US-1505: "a `CTAPHID_CANCEL` arrived while a consent window was open".
 ///
 /// The emulator's consent loop is still the pre-US-1509 nested `loop` — a
@@ -1033,11 +1038,31 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                     // CTAP2 CBOR command
                     if !payload.is_empty() {
                         let ctap_cmd = payload[0];
-                        // User-presence requests emit a CTAPHID keepalive
-                        // (UP NEEDED) before completing; emulation auto-grants
-                        // UP, but clients still expect the frame (FX-402).
+                        // US-1506: the unconditional pre-dispatch `0x02`
+                        // (UP NEEDED) is gone here for the same reason it is
+                        // gone on the device — it claimed "waiting for your
+                        // touch" before the command had been run, and the
+                        // device emitted 301 of them in a 30 s window. The
+                        // device's replacement is a `0x01` (PROCESSING) sent
+                        // at the park; this binary's consent loop is still
+                        // the pre-US-1509 nested `loop` and the park happens
+                        // further down, so the single frame moves with it.
+                        //
+                        // **The cadence is not addressed here.** The loop
+                        // below re-drives without emitting anything, and
+                        // giving it a 250 ms `0x02` cadence means moving it
+                        // onto `PendingUp` — which is US-1524's migration,
+                        // and pre-empting it wholesale is out of scope. With
+                        // the emulator's auto-ack FIDO app the window is
+                        // granted on the first re-drive, so the loop is never
+                        // observed repeating anyway.
                         if ctap_cmd == 0x01 || ctap_cmd == 0x02 {
-                            send_hid_response(&mut transport, &channel, CTAP_HID_KEEPALIVE, &[0x02]);
+                            send_hid_response(
+                                &mut transport,
+                                &channel,
+                                CTAP_HID_KEEPALIVE,
+                                &[CTAPHID_KEEPALIVE_PROCESSING],
+                            );
                         }
                         let ctap_payload = &payload[1..];
                         // US-921 (device tasks.rs CBOR-arm parity): an
