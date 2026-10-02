@@ -105,7 +105,29 @@ macro_rules! bphase {
     };
 }
 
+// Boot-phase **LED** marker (the `bootphase` ladder — ON in the default
+// build, every profile, no feature and no rebuild). Unlike `bphase!`, which
+// writes the RAM ring and therefore only exists in diagnostic builds, this
+// resolves in every image: the ring needs the enumeration that failed on a
+// dark board, and the LED is the one channel that does not.
+//
+// The encoding is one short pulse per boundary crossed, so the pulse count a
+// frozen board shows is "how far did boot get" — and the 1 Hz heartbeat,
+// which is unmistakable next to a 25 ms pulse, is what says "alive but USB
+// dead". See `firmware/src/boot_led.rs` for the pin-sharing contract and
+// `firmware/src/bootphase.rs` for the (host-tested) encoding.
+//
+// The call sites are the `RUNG_*` boundaries, which are a *subset* of the
+// `P_*` ring boundaries: the LED gets the nine that localise a hang, the ring
+// keeps all nineteen for a boot that enumerated and can be drained.
+macro_rules! mark {
+    ($rung:expr) => {
+        crate::boot_led::mark($rung)
+    };
+}
+
 mod boot;
+mod boot_led;
 mod button;
 #[cfg(any(feature = "dbg-log", feature = "apdu-trace", feature = "boot-timeline"))]
 mod dbg;
@@ -245,6 +267,12 @@ async fn main(spawner: Spawner) -> ! {
     // device that never enumerates (see `dbg::phase_blinks`).
     #[cfg(any(feature = "dbg-log", feature = "boot-timeline"))]
     crate::dbg::mark_led_ready();
+    // …and the boot-phase LED ladder, which is **not** feature-gated: the
+    // dark-board case it exists for is a *shipping* image failing, so an
+    // instrument behind `dbg-log` (release-forbidden, US-922) could never
+    // answer it. One pulse per boundary from here on; see `boot_led.rs`.
+    crate::boot_led::ready();
+    mark!(fapico2_firmware::bootphase::RUNG_HAL);
 
     // US-929 boot ladder, stage 1 (dbg-log builds only): main entered /
     // `.bss` cleared, the embassy HAL initialized, and the board LED
@@ -267,6 +295,12 @@ async fn main(spawner: Spawner) -> ! {
         fapico2_firmware::presence::set_touch_prompt_hook(Some(button::set_touch_prompt_led)),
         "touch-prompt hook double-install"
     );
+    // Boot-phase rung 2: everything from here to the store mount is TRNG /
+    // clock bring-up (`Rp2350Trng::from_peri`, the `TIMER0` proof, the boot
+    // sanity draw) — the first boundary that can catch a peripheral-level
+    // hang. Emitted here so the rung covers the driver construction too, not
+    // just the clock check below.
+    mark!(fapico2_firmware::bootphase::RUNG_TRNG);
 
     // US-1020: the presence handshake's event sink — the presence runtime
     // stamps one event per press / arm / discard / window / grant, and this
@@ -540,6 +574,15 @@ async fn main(spawner: Spawner) -> ! {
     // as a tag-verified v3 image; legacy v2 in both slots is the one-time
     // migration signature (the restore below loads the primary's v2 image
     // and the final boot persist re-seals it into v3).
+    // Boot-phase rung 3: **immediately before** the OTP key-row read, so a
+    // freeze inside `derive_boot_store_key` is attributable to the read and
+    // not to the phase before it. This is the leading suspect for a
+    // post-flash dark boot, and it is the one rung where the "could adding a
+    // marker perturb what it measures" question is real — answered in
+    // `boot_led.rs`: the pulse completes ~80 ms before the first `OTP_DATA`
+    // read, touches only GPIO25 and a read-only TIMER0 counter, and runs with
+    // interrupts enabled. Nothing the read depends on is written.
+    mark!(fapico2_firmware::bootphase::RUNG_OTP);
     let store_key = boot::derive_boot_store_key();
     bphase!(crate::dbg::P_STORE_KEY);
     // US-918: best-effort software lock of the C key row's page (OTP 0xE90)
@@ -568,6 +611,9 @@ async fn main(spawner: Spawner) -> ! {
             .from_partition_image_reader(&mut slot_reader)
     }
     bphase!(crate::dbg::P_STORE_MOUNTED);
+    // Boot-phase rung 4: the slot is decided and the winning image is
+    // restored into `STORE`. A freeze below this rung is *not* the OTP read.
+    mark!(fapico2_firmware::bootphase::RUNG_STORE);
 
     // US-929 boot ladder, stage 2 (dbg-log builds only): the secure store is
     // mounted — the slot decision made and the winning image restored into
@@ -620,6 +666,10 @@ async fn main(spawner: Spawner) -> ! {
     // request: it stretches one block across `RESEED_INTERVAL` of them.
     let drbg = unsafe { boot::init_drbg(seed_probe) };
     bphase!(crate::dbg::P_DRBG);
+    // Boot-phase rung 5: a DRBG exists. Everything below this rung draws
+    // through it, so a freeze below it cannot be an unbounded-peripheral
+    // draw (US-1001/US-1005).
+    mark!(fapico2_firmware::bootphase::RUNG_DRBG);
 
     // US-919: foreign-image boot admission (EPIC `security-hardening`, R9):
     // hash the running image's flash region and compare against the
@@ -666,6 +716,8 @@ async fn main(spawner: Spawner) -> ! {
         defmt::info!("booting with a fresh store; C→Rust migration deferred (US-919)");
     }
     bphase!(crate::dbg::P_MIGRATION);
+    // Boot-phase rung 6: first-boot C→Rust migration finished.
+    mark!(fapico2_firmware::bootphase::RUNG_MIGRATION);
 
     // US-387: a failed keystore boot is fatal — a silently re-derived hkey
     // would orphan every enrolled credential. US-939: the app is constructed
@@ -968,6 +1020,12 @@ async fn main(spawner: Spawner) -> ! {
     let dispatcher =
         boot::init_static_slot(core::ptr::addr_of_mut!(boot::CCID_DISPATCHER), dispatcher);
     bphase!(crate::dbg::P_DISPATCHER);
+    // Boot-phase rung 7: every applet is constructed into its write-once slot
+    // and registered. Placed *after* the trussed-UI window
+    // (`DeviceBackend::boot`, which drives the same pin with
+    // `set_status(Processing)`), so this pulse's "park the pin off" is the
+    // last thing that happens to GPIO25 before the dispatcher boundary.
+    mark!(fapico2_firmware::bootphase::RUNG_APPS);
 
     // S-722-6: final persistence after restore/registration, BEFORE serving.
     // The `persist_start` binding exists only to feed the `E_PSD` record's
@@ -1023,6 +1081,16 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(usb_task(parts.device)).unwrap();
     bphase!(crate::dbg::P_USB_UP);
+    // Boot-phase rung 8: the USB device is constructed and `usb_task`
+    // spawned. This is the rung that answers the question the dark board
+    // actually poses: a freeze *below* it never reached USB at all, a board
+    // that reaches it and then stops enumerating is a different fault with
+    // the same symptom.
+    //
+    // `spawner.spawn` only enqueues — the executor does not poll `usb_task`
+    // until `main` awaits, so this marker and `release()` below still own the
+    // pin.
+    mark!(fapico2_firmware::bootphase::RUNG_USB);
     // US-929 boot ladder, stage 3 (dbg-log builds only): the USB device is
     // constructed and `usb_task` spawned — configuration completes when the
     // executor first polls `usb_task` (stage 4's record proves that poll
@@ -1084,6 +1152,21 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "dbg-log")]
     crate::dbg::boot_stage(4);
     bphase!(crate::dbg::P_SERVING);
+    // Boot-phase rung 9: every serve-loop task, including the 1 Hz heartbeat,
+    // is spawned. A board that shows nine pulses and then settles into the
+    // heartbeat booted fine — the fault is post-boot (USB enumeration), and
+    // the two are now one glance apart.
+    mark!(fapico2_firmware::bootphase::RUNG_SERVING);
+    // Hand GPIO25 to the runtime drivers, and **park it dark**.
+    //
+    // This is the last statement before `main` parks into the executor, which
+    // makes it the earliest instant at which any other owner of the pin can
+    // exist: the heartbeat task (first polled only when `main` awaits), the
+    // trussed `LedUi` (inside a serve task), and the touch-prompt hook
+    // (inside a presence window). After `release()` the ladder is inert for
+    // the rest of the run, so a boot-phase pulse can never leave GPIO25
+    // latched on and read as an open consent window — see `boot_led.rs`.
+    crate::boot_led::release();
 
     // Executor alive with the serve loops running.
     loop {
