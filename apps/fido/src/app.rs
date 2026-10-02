@@ -1189,6 +1189,20 @@ impl<K: Keystore> FidoApp<K> {
         info.set_option("enterpriseAttestation", true);
         // alwaysUv reflects the current config state (toggled by Config 0x02).
         info.set_option("alwaysUv", pin_state.always_uv);
+        // US-1529: makeCredUvNotRqd is DERIVED, never hard-coded. The host
+        // twin had its own hard-coded `true` (via `Ctap2Info::default`) and
+        // the device twin inherited it the same way — the twin trap in its
+        // plainest form: a wire claim that was false on hardware and merely
+        // untested on the host. Both now call the one shared helper
+        // (`ctap2::make_cred_uv_not_rqd`, same pattern as
+        // `pin_uv_auth_token_available` above) with the same two facts the
+        // MC UV gate reads, so the two cannot drift and cannot contradict
+        // `alwaysUv`, which §6.1.3 requires to be `false` whenever this is
+        // `true`.
+        info.set_option(
+            "makeCredUvNotRqd",
+            crate::ctap2::make_cred_uv_not_rqd(pin_set, pin_state.always_uv),
+        );
         // Dynamic state fields.
         info.force_pin_change = pin_state.force_pin_change;
         info.pin_complexity_policy = Some(pin_state.pin_complexity_policy);
@@ -1312,6 +1326,9 @@ impl<K: Keystore> FidoApp<K> {
         }
 
         // 8.1 rule: if PIN set and no pinUvAuthParam and options.uv != false → PUAT_REQUIRED.
+        // US-1529: unchanged; the `makeCredUvNotRqd` advertisement was fixed
+        // to match it rather than the reverse. See the twin's copy in
+        // `device_core.rs::make_credential_inner` for the full argument.
         if pin_set && req.pin_uv_auth_param.is_none()
             && (!req.options.present || req.options.uv != Some(false)) {
                 return vec![Ctap2Response::PuatRequired.code()];

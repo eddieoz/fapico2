@@ -190,6 +190,17 @@ is observed** — it is the value the device sent, not a translation:
 | `uv` | not sent as `uv`; `alwaysUv` and `makeCredUvNotRqd` are what govern a MakeCredential's UV requirement | **`alwaysUv` = False**, `makeCredUvNotRqd` = True |
 | `up` | **not sent.** CTAP2 has no `up` option — user presence is implied, not optional | n/a — nothing to read |
 
+> **Superseded in part by US-1529.** The `uv` row reads
+> `makeCredUvNotRqd` = True above because that is what this device *sent* on
+> the date of the run, and the map above is kept verbatim for the audit trail.
+> That value was a hard-coded claim and it was wrong: the device does not
+> implement the UV relaxation the option advertises — with a PIN set it
+> refuses a `makeCredential` carrying neither `pinUvAuthParam` nor `uv` with
+> `0x36`. The option is now **derived** (`!pin_set && !always_uv`), so a
+> PIN-set device reports `False`, which is the state every entry in this
+> document was captured in. See `ctap2::make_cred_uv_not_rqd` and
+> `docs/webauthn-discovery-ab.md`.
+
 > **Correction, recorded because it is the kind of error worth catching.**
 > An earlier draft of this table carried a third column naming integer option
 > ids (`clientPin` = `0x06`, `pinUvAuthToken` = `0x0C`, `uv` = `0x03`/`0x0E`).

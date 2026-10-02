@@ -1,4 +1,63 @@
 
+# How to read the two option asymmetries (US-1529)
+
+Everything below is a raw, unedited `scripts/probe_ab_devices.py` transcript
+taken against both boards. The transcript is evidence; it is not a
+conclusion. Two `getInfo` differences between **A** (this firmware) and **B**
+(the C reference) have been read as "ours is more permissive, so ours should
+work at least as well". That reading was wrong in both directions, and US-1529
+is what established it. Re-run the probe before quoting a line from here: the
+option values below are from the **pre-fix** firmware.
+
+| option | A (ours, then) | B (C reference) | verdict |
+|---|---|---|---|
+| `makeCredUvNotRqd` | `true` | `false` | **A was lying.** A hard-coded `true` claimed a UV relaxation A does not implement; with a PIN set A answers `0x36` to the very request the claim licenses. Fixed: it is now derived (`!pin_set && !always_uv`), so A reports `false` with a PIN set — matching B, and matching what A actually does. |
+| `alwaysUv` | `false` | `true` | **Not an asymmetry to fix.** B advertises the *more* restrictive value, so this difference cannot explain A failing where B succeeds. A's `alwaysUv` was already derived from the same config bit its gate reads. It is kept here only because §6.1.3 makes `alwaysUv: true` force `makeCredUvNotRqd: false` — the two options are coupled, so they must now be read together. |
+
+## Why the `makeCredUvNotRqd` value mattered
+
+The installed client decides whether to ask for a PIN before a
+`makeCredential` **from this option by name**
+(`fido2/client/__init__.py::_should_use_uv`):
+
+```python
+elif mc and uv_configured and not info.options.get("makeCredUvNotRqd"):
+    return True
+```
+
+A read `true`, it declines to request UV; `make_credential` then sends
+`opts = None` (`fido2/client/__init__.py:833`) — a `makeCredential` with no
+options map and no `pinUvAuthParam` — which A answered `0x36`. B, reporting
+`false`, sends the client down the PIN path and succeeds. So the asymmetry was
+not "A is laxer": it was A advertising a capability in order to be handed a
+request it refuses.
+
+## The remaining unexplained difference
+
+Neither board was probed with a `makeCredential` that differs only in its UV
+handling, because both answer `0x36` to a bare one — **for different reasons**,
+which is worth stating so the next reader does not repeat the shortcut:
+
+* **A** refuses at `device_core.rs::make_credential_inner`, the 8.1 gate
+  (`pin_set && pinUvAuthParam absent && uv != false`). It is the
+  *PIN-set* rule, and a PIN-less A answers `0x00`.
+* **B** refuses at `pico-fido/src/fido/cbor_make_credential.c:393`, the
+  `FIDO2_OPT_AUV` branch, which is unconditional once `alwaysUv` is set — it
+  fires *even with no PIN file present*. B's `alwaysUv: true` is therefore a
+  stronger claim than "a PIN is set".
+
+So "both answer 0x36, because a PIN is set on both" conflates two different
+mechanisms. Do not use that sentence as a shared explanation.
+
+**Not determined:** whether the `makeCredUvNotRqd` lie was *the* cause of the
+reported browser symptom (a device not offered as a passkey authenticator on
+some sites). The mechanism above is real and is in the create path, but no
+browser source was read and no browser was driven; the board's flashed image is
+still the pre-fix one. Treat it as a fixed wire-level incoherence of the same
+class as US-1512, not as a confirmed root cause.
+
+---
+
 ```text
 python  : 3.12.3
 fido2   : 2.2.1

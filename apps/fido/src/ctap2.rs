@@ -562,6 +562,73 @@ pub fn pin_uv_auth_token_available(blocked: bool, needs_power_cycle: bool) -> bo
     !(blocked || needs_power_cycle)
 }
 
+/// US-1529: the `makeCredUvNotRqd` option is a *claim about the makeCredential
+/// UV gate*, so it is computed from the same two facts that gate reads.
+///
+/// The hard-coded `true` this replaces was wrong in exactly the state that
+/// matters — a device with a PIN set. The comment that justified it ("make
+/// Credential does not require UV when no PIN is set") is a misreading of the
+/// option, and the misreading is what made it look safe. CTAP 2.1 §6.1.3
+/// defines it as *"Support for making non-discoverable credentials without
+/// requiring User Verification … the authenticator allows creation of
+/// non-discoverable credentials without requiring any form of user
+/// verification, if the platform requests this behaviour"*, with `false` /
+/// absent meaning the device *"requires some form of user verification for
+/// creating non-discoverable credentials, **regardless of the parameters the
+/// platform supplies**"*. Nothing in that text is scoped to the no-PIN state.
+///
+/// Why the lie was load-bearing rather than cosmetic: a client that reads
+/// `true` is licensed by §6.1.2 step 7.2 to send `makeCredential` with no
+/// `pinUvAuthParam` and no `uv` option, and both twins refuse exactly that.
+/// The installed client says so in its own source —
+/// `fido2/client/__init__.py::_should_use_uv`:
+///
+/// ```text
+/// elif mc and uv_configured and not info.options.get("makeCredUvNotRqd"):
+///     return True
+/// ```
+///
+/// i.e. this option is the switch that decides whether the client asks for a
+/// PIN before a `makeCredential`. With `true` it declines to ask, and
+/// `make_credential` then sends `opts = None`
+/// (`fido2/client/__init__.py:833`: `if not (rk or internal_uv): opts = None`)
+/// — a request with no options map at all, which the 8.1 gate refuses with
+/// `0x36`. With `false` the same client takes the PIN path and the request
+/// succeeds. This is US-1512's rule again, in a second option: the
+/// advertisement must not put a client on a path the device cannot complete.
+///
+/// The device's own behaviour is the reference's **8.1** branch
+/// (`pico-fido/src/fido/cbor_make_credential.c:404`, reached when neither
+/// `FIDO2_OPT_AUV` nor `FIDO2_OPT_MCUV_NOTRQD` is set): any
+/// `pinUvAuthParam`-less, `uv`-false request is refused once a PIN file
+/// exists. The reference computes the matching advertisement from the very
+/// flags that select that branch (`cbor_get_info.c:149`), so this is that
+/// expression, written in terms of this firmware's state instead of its bits.
+///
+/// * `pin_set == false` → `true`. Measured on both twins: a no-options
+///   `makeCredential` answers `0x00` on a fresh device, and with no PIN set
+///   the device is not "protected by some form of user verification", so
+///   §6.1.2 steps 7.1–7.3 do not fire at all. The claim holds.
+/// * `pin_set == true` → `false`. The claim does not hold and the refusal is
+///   real (`0x36`), so the client has to be told to do UV instead.
+/// * `always_uv` → `false` regardless, which §6.1.3 makes a MUST: *"If the
+///   alwaysUv option ID is present and true the authenticator MUST set the
+///   value of makeCredUvNotRqd to false."* With `always_uv` set, both twins
+///   refuse a no-UV `makeCredential` outright (`app.rs`/`device_core.rs`:
+///   `if !uv && always_uv { PuatRequired }`).
+///
+/// This weakens no gate. It only stops the wire from claiming something the
+/// device refuses to do; changing the gate instead would move the PIN/UV
+/// security posture, which US-907 (presence) and US-921 (anti-harvest) own,
+/// and this story does not touch.
+///
+/// Two flags rather than a state struct, for the reason
+/// [`pin_uv_auth_token_available`] gives: the twins keep different pin-state
+/// types, and this signature is what keeps one rule behind both.
+pub fn make_cred_uv_not_rqd(pin_set: bool, always_uv: bool) -> bool {
+    !pin_set && !always_uv
+}
+
 /// US-1513: the budget `getUVRetries` (clientPIN sub-command `0x07`) reports.
 ///
 /// The constant 3 was never arbitrary — it is the `auth_failures` latch
@@ -616,8 +683,15 @@ impl Default for Ctap2Info {
         options.push(("largeBlobs", true)).ok();
         options.push(("credMgmt", true)).ok();
         options.push(("setMinPINLength", true)).ok();
-        // makeCredUvNotRqd: makeCredential does not require UV when no PIN is set.
-        options.push(("makeCredUvNotRqd", true)).ok();
+        // makeCredUvNotRqd is seeded with the SAFE value and then set from
+        // actual state by both getInfo handlers, via
+        // `ctap2::make_cred_uv_not_rqd`. US-1529: it used to be seeded with
+        // a hard-coded `true` on the reasoning that "makeCredential does not
+        // require UV when no PIN is set" — which is not what the option means
+        // (CTAP 2.1 §6.1.3) and is false on a PIN-set device, whose 8.1 gate
+        // refuses that exact request with `0x36`. A bare `default()` must
+        // never over-claim, so the seed is the direction that fails closed.
+        options.push(("makeCredUvNotRqd", false)).ok();
 
         let mut versions: HeaplessVec<&'static str, 8> = HeaplessVec::new();
         for v in ["U2F_V2", "FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"] {

@@ -851,6 +851,14 @@ impl FidoApp {
                 return Err(err(Ctap2Response::PinAuthInvalid));
             }
         }
+        // US-1529: this is the gate the `makeCredUvNotRqd` advertisement
+        // describes. It is deliberately UNCHANGED — the advertisement was
+        // fixed to match it, not the reverse (weakening the gate is US-907 /
+        // US-921's to make, not this story's). It is the reference's 8.1
+        // branch, `pico-fido/src/fido/cbor_make_credential.c:404`. Read
+        // together with `ctap2::make_cred_uv_not_rqd`: a client that sees
+        // `makeCredUvNotRqd: false` here knows to send `pinUvAuthParam`, and
+        // a client that does not is refused on purpose.
         if pin_set && req.pin_uv_auth_param.is_none() && (!req.options_present || req.uv != Some(false)) {
             return Err(err(Ctap2Response::PuatRequired));
         }
@@ -2100,6 +2108,20 @@ impl FidoApp {
         info.set_option("authnrCfg", true);
         info.set_option("enterpriseAttestation", true);
         info.set_option("alwaysUv", self.keystore.pin_state.always_uv);
+        // US-1529: derived, not hard-coded — see `ctap2::make_cred_uv_not_rqd`
+        // for the spec text, the client-side decision it feeds, and the
+        // measured per-state behaviour. Both UV options are read from the same
+        // `pin_state`, so they cannot contradict each other on the wire: with
+        // `always_uv` set, `makeCredUvNotRqd` is necessarily `false` (§6.1.3's
+        // MUST), which is exactly what the MC gate in `make_credential_inner`
+        // does — `if !uv && always_uv { PuatRequired }`.
+        info.set_option(
+            "makeCredUvNotRqd",
+            crate::ctap2::make_cred_uv_not_rqd(
+                self.keystore.pin_state.pin_hash.is_some(),
+                self.keystore.pin_state.always_uv,
+            ),
+        );
         // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
         // plaintext over the persisted device random (host parity).
         let mut iv = [0u8; 16];
