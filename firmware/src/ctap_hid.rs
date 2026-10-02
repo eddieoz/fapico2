@@ -29,6 +29,81 @@ pub const CTAP_HID_KEEPALIVE: u8 = 0x3B;
 pub const CTAP_HID_ERROR: u8 = 0x3F;
 const TYPE_INIT: u8 = 0x80;
 
+/// `capFlags` byte of the CTAPHID_INIT reply — **0x05, both bits, on purpose.
+///
+/// Two incompatible bit assignments for this one byte are live at once, and
+/// they disagree about what `0x04` means:
+///
+/// | bit | CTAP 2.1 spec §11.2.1.1 | pico-keys-sdk / Yubico `fido2` (de facto) |
+/// |---|---|---|
+/// | `0x01` | **CBOR** | **WINK** |
+/// | `0x02` | NMSG | LOCK (unused) |
+/// | `0x04` | **WINK** | **CBOR** |
+///
+/// (Evidence for the right-hand column: `pico-keys-sdk/src/usb/hid/ctap_hid.h`
+/// `CAPFLAG_WINK 0x01` / `CAPFLAG_CBOR 0x04`, and `fido2/hid/__init__.py`
+/// `class CAPABILITY(IntFlag): WINK = 0x01; CBOR = 0x04`. The C reference sends
+/// exactly this pair — `resp->capFlags = CAPFLAG_WINK | CAPFLAG_CBOR` at
+/// `pico-keys-sdk/src/usb/hid/hid.c:451`.)
+///
+/// So `0x04` alone is a trap in both directions: the de-facto readers call it
+/// "CBOR supported", while a spec reader calls it "WINK yes, **CBOR no**" — the
+/// device announces it has no CTAP2 while serving CTAP2 happily. `fido2`
+/// 2.2.1 gates CTAP2 on exactly that bit and raises
+/// `ValueError("Device does not support CTAP2.")` (`fido2/ctap2/base.py`), so
+/// a spec-reading host never offers the key as a passkey authenticator at all
+/// — the US-1507 discovery symptom (works on some sites, never offered on
+/// others).
+///
+/// `0x05` reads as **CBOR + WINK under both** conventions, and this device
+/// serves both: CBOR on `CTAP_HID_CBOR`, WINK acknowledged on `CTAP_HID_WINK`
+/// (`firmware/src/tasks.rs`). Do **not** "simplify" this back to a single
+/// `0x04` — that byte is the whole regression this constant exists to prevent.
+/// `init_reply_advertises_cbor_and_wink_under_both_conventions` decodes the
+/// reply under each assignment and fails if either reader could conclude
+/// "no CTAP2".
+pub const CTAPHID_INIT_CAP_FLAGS: u8 = 0x05;
+
+/// Length of the CTAPHID_INIT reply payload: nonce(8) + cid(4) +
+/// versionInterface(1) + versionMajor(1) + versionMinor(1) + versionBuild(1) +
+/// capFlags(1).
+pub const CTAPHID_INIT_REPLY_LEN: usize = 17;
+
+/// Build the 17-byte CTAPHID_INIT reply payload.
+///
+/// US-1507: extracted verbatim from `dispatch_hid_cmd` in
+/// `firmware/src/tasks.rs`, which is an `async fn` — the construction itself
+/// is pure stack work with no I/O, so the one byte that decides whether a host
+/// discovers this key as a CTAP2 authenticator (see
+/// [`CTAPHID_INIT_CAP_FLAGS`]) is now reachable from this module's unit tests.
+/// The firmware builds its reply through *this* function, so the test covers
+/// the shipped bytes rather than a copy of them.
+///
+/// `version_major` / `version_minor` / `version_build` are the **YubiKey**
+/// firmware version bytes, not the CTAPHID protocol version: `yubikit` reads
+/// INIT bytes 13..15 as `device_version` (`_ManagementCtapBackend`) and gates
+/// `read_device_info` on `>= 4.1`. The caller passes the management applet's
+/// `VERSION_MAJOR`/`VERSION_MINOR` (the same pair `TAG_VERSION` publishes).
+/// `nonce` is truncated to the 8-byte INIT nonce size.
+pub fn init_reply(
+    nonce: &[u8],
+    new_channel: &[u8; 4],
+    version_major: u8,
+    version_minor: u8,
+    version_build: u8,
+) -> [u8; CTAPHID_INIT_REPLY_LEN] {
+    let mut inner = [0u8; CTAPHID_INIT_REPLY_LEN];
+    let n = nonce.len().min(8);
+    inner[..n].copy_from_slice(&nonce[..n]);
+    inner[8..12].copy_from_slice(new_channel);
+    inner[12] = 0x02; // versionInterface (2 = CTAP HID v2)
+    inner[13] = version_major;
+    inner[14] = version_minor;
+    inner[15] = version_build;
+    inner[16] = CTAPHID_INIT_CAP_FLAGS;
+    inner
+}
+
 // CTAPHID error codes (CTAP spec §11.2.4).
 pub const HID_ERR_INVALID_CMD: u8 = 0x01;
 pub const HID_ERR_INVALID_SEQ: u8 = 0x04;
@@ -441,5 +516,54 @@ mod tests {
         let (chan, code) = asm.check_timeout().expect("timeout after 600 ms idle");
         assert_eq!(chan, HID_CID_BROADCAST);
         assert_eq!(code, HID_ERR_TIMEOUT);
+    }
+
+    // The two live `capFlags` decoders, spelled out here so the test carries
+    // them itself rather than trusting the constant under test. See
+    // `CTAPHID_INIT_CAP_FLAGS` for why both exist.
+    //
+    // CTAP 2.1 spec §11.2.1.1.
+    const SPEC_CBOR: u8 = 0x01;
+    const SPEC_WINK: u8 = 0x04;
+    // pico-keys-sdk `ctap_hid.h` / Yubico `fido2` `CAPABILITY` (de facto).
+    const DEFACTO_CBOR: u8 = 0x04;
+    const DEFACTO_WINK: u8 = 0x01;
+
+    /// US-1507: the INIT reply's `capFlags` byte must read as **CBOR + WINK
+    /// under both live bit assignments**, because a host that reads it under
+    /// the spec assignment concludes the device has no CTAP2 support —
+    /// `fido2` 2.2.1 raises `ValueError("Device does not support CTAP2.")`
+    /// (`fido2/ctap2/base.py`) and the key is never offered as a passkey
+    /// authenticator. That is the discovery symptom this story fixes, so the
+    /// test asserts the *decode*, not just the literal: `0x04` would pass a
+    /// `== 0x04` check and still fail a spec reader.
+    #[test]
+    fn init_reply_advertises_cbor_and_wink_under_both_conventions() {
+        // Built through the same code path the firmware uses (the INIT
+        // handshake's own channel allocation, then `init_reply`, which is
+        // what `dispatch_hid_cmd` sends).
+        let nonce: [u8; 8] = [0xA0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let mut alloc = CidAllocator::new();
+        let channel = alloc.allocate(&nonce);
+        assert_ne!(channel, HID_CID_BROADCAST, "INIT must not answer on the broadcast CID");
+
+        let inner = init_reply(&nonce, &channel, 5, 4, 0);
+        assert_eq!(inner.len(), 17, "INIT reply payload length is fixed by the wire format");
+
+        // The echoed nonce, the freshly allocated CID, the interface version.
+        assert_eq!(&inner[..8], &nonce[..]);
+        assert_eq!(&inner[8..12], &channel[..]);
+        assert_eq!(inner[12], 0x02, "versionInterface must be 2 (CTAP HID v2)");
+
+        let cap = inner[16];
+        assert_eq!(cap, 0x05, "capFlags must be CBOR|WINK, not a single bit");
+
+        // Decoder 1 — CTAP 2.1 spec §11.2.1.1 (0x01 CBOR, 0x04 WINK).
+        assert_ne!(cap & SPEC_CBOR, 0, "spec reader concluded: no CTAP2 support");
+        assert_ne!(cap & SPEC_WINK, 0, "spec reader concluded: no WINK");
+
+        // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04 CBOR).
+        assert_ne!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: no CTAP2 support");
+        assert_ne!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: no WINK");
     }
 }

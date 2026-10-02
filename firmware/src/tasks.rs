@@ -713,21 +713,25 @@ async fn dispatch_hid_cmd(
         // counter) instead of the constant [0, 0, 0, 1]; the reply frame
         // itself goes out on the requesting (broadcast) channel per spec.
         let new_channel = cid_alloc.allocate(nonce);
-        let mut inner = [0u8; 17];
-        inner[..nonce.len()].copy_from_slice(nonce);
-        inner[8..12].copy_from_slice(&new_channel);
-        inner[12] = 0x02; // versionInterface (2 = CTAP HID v2)
-        // Bytes 13..15 are the **YubiKey firmware version**, not the CTAPHID
-        // protocol version. yubikit reads them as `device_version`
-        // (`_ManagementCtapBackend`) and gates `read_device_info` on
-        // `>= 4.1`; reporting 2.1.0 here made every host treat this
-        // interface as a pre-YubiKey-4 key and synthesise a U2F-only device
-        // record, so `ykman fido info` said `CTAP2: Not supported`. Same
-        // version the management applet publishes in TAG_VERSION.
-        inner[13] = fapico2_mgmt::VERSION_MAJOR;
-        inner[14] = fapico2_mgmt::VERSION_MINOR;
-        inner[15] = 0x00; // versionBuild
-        inner[16] = 0x04; // capFlags: CBOR supported
+        // US-1507: the payload is built by `ctap_hid::init_reply`, which owns
+        // bytes 12..16 — `versionInterface`, the **YubiKey** firmware version
+        // bytes 13..15 (yubikit reads those as `device_version` in
+        // `_ManagementCtapBackend` and gates `read_device_info` on `>= 4.1`;
+        // reporting 2.1.0 there made every host synthesise a U2F-only device
+        // record and `ykman fido info` say `CTAP2: Not supported`; same
+        // version the management applet publishes in TAG_VERSION) and — the
+        // reason the helper is extracted rather than inlined here — the
+        // `capFlags` byte, which is the one byte that decides whether a
+        // spec-reading host discovers this key as a CTAP2 authenticator at
+        // all (`CTAPHID_INIT_CAP_FLAGS`: 0x05, CBOR+WINK under both live bit
+        // assignments; 0x04 read "no CTAP2" by any spec reader).
+        let inner = init_reply(
+            nonce,
+            &new_channel,
+            fapico2_mgmt::VERSION_MAJOR,
+            fapico2_mgmt::VERSION_MINOR,
+            0x00, // versionBuild
+        );
         reply_hid(hid_in, channel, 0x06, &inner).await;
     } else if cmd == CTAP_READ_CONFIG {
         // DeviceInfo page 0 over the FIDO interface. The payload is the
