@@ -8,7 +8,7 @@ long one, and it is the document to read before changing a default.
 
 Four values decide the product's identity. All are resolved at compile time by
 `platform/build.rs` and published as `cargo:rustc-env`, then read back and
-resolved in `platform/src/identity.rs` with `option_env!` + `const fn`. Nothing
+resolved in `platform/src/identity.rs` with `env!` + `const fn`. Nothing
 is read at runtime and nothing is read from flash.
 
 | Value | Where it lands | Default | Override variable |
@@ -27,12 +27,49 @@ hardcoded.
 
 ```bash
 # A build aimed at a PicoForge that has not yet been taught fapico2's AAGUID.
+FAPICO2_IDENTITY_OVERRIDE_ACK=1 \
 FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7 cargo build --release -p fapico2-firmware
 
 # A fork publishing under its own name, with a registered VID.
-FAPICO2_MANUFACTURER="Acme" FAPICO2_PRODUCT="Acme Token" \
+FAPICO2_IDENTITY_OVERRIDE_ACK=1 FAPICO2_MANUFACTURER="Acme" FAPICO2_PRODUCT="Acme Token" \
 FAPICO2_VID_PID=1234:5678 cargo build --release -p fapico2-firmware
 ```
+
+## One source of truth (US-1517)
+
+**The defaults in the table above are the only identity this repository
+builds.** `build.sh`, `build-signed.sh` (the release path) and
+`build-timeline.sh` set none of the four variables, and
+`apps/fido/tests/aaguid_build.rs::no_tracked_build_script_overrides_the_identity`
+fails if one of them ever grows an assignment.
+
+**An override takes two variables, and the second one is mandatory.**
+`FAPICO2_IDENTITY_OVERRIDE_ACK=1` must accompany any of the four, or the build
+**fails** with a message naming what to type. An acknowledged override prints a
+`cargo:warning` naming what it changed, on every build.
+
+That is not fussiness. The drift the rule closes was real and invisible: a
+`build-custom.sh` — git-ignored, so present in one developer's checkout and in
+nobody else's — set `FAPICO2_AAGUID_HEX=89FB94B706C936739B7E30526D968145`,
+which is **pico-fido2's own AAGUID**
+(`../pico-fido2/src/fido/cbor.c:35`, the first 16 bytes of
+`SHA256("Pico FIDO2")`), and also set the Yubico USB strings and VID:PID
+`1050:0407`. So `./build.sh` and `./build-custom.sh` produced two images from
+one checkout with two identities, and every test in the tree stayed green —
+because an override build has always been a *supported* configuration, and the
+suite tests the mechanism rather than the policy.
+
+What the drift cost, stated plainly: the AAGUID is the leading 16 bytes of
+every attested credential blob, so a device flashed from one and a device
+flashed from the other are two authenticators that share no passkeys. A passkey
+enrolled on one is invisible to the other. The only record of which image was
+which was somebody's flash log.
+
+The escape hatch stays — developing against a PicoForge that has not yet
+learned our AAGUID is a real job, and so is a fork shipping under its own name.
+It is now a thing you have to say you are doing, twice, in a command line that
+gets copied around. `docs/identity.md` and the `platform::identity` module docs
+both say so; a build that skips it does not build.
 
 ## The fifth build-time parameter: `FAPICO2_FOREIGN_IMAGE_WIPE`
 

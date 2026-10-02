@@ -11,11 +11,16 @@
 //!
 //! Build-time configuration (US-101, EPIC `PICOForge-COMPAT`):
 //! * `FAPICO2_AAGUID_HEX` — 32 hex characters (16 bytes, no separators, no
-//!   `0x` prefix) overriding the authenticator AAGUID. **Unset** ⇒
-//!   [`DEFAULT_AAGUID`] (the borrowed RS-Key profile). Anything else — a
-//!   malformed value, or the variable set but *empty* — is a hard build error,
-//!   never a silent fallback. See [`AAGUID`], [`AAGUID_OVERRIDE_ACTIVE`] and
-//!   `build.rs`.
+//!   `0x` prefix) overriding the authenticator AAGUID, together with
+//!   `FAPICO2_IDENTITY_OVERRIDE_ACK=1` (US-1517): an identity override now
+//!   needs two deliberate variables, and setting it alone is a build failure.
+//!   **Unset** ⇒ [`DEFAULT_AAGUID`] (fapico2's own identity — *not* the RS-Key
+//!   value this paragraph used to name; the borrow is over, `identity.rs` has
+//!   the history). Anything else — a malformed value, the variable set but
+//!   *empty*, or a missing acknowledgement — is a hard build error, never a
+//!   silent fallback. See [`AAGUID`], [`AAGUID_OVERRIDE_ACTIVE`] and
+//!   `fapico2_platform::identity` — the override is resolved by *that*
+//!   crate's build script; there is no `apps/fido/build.rs`.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
