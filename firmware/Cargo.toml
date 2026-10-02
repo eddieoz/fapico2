@@ -98,6 +98,18 @@ embassy-time = { version = "0.5", features = ["generic-queue-8"], optional = tru
 rp-pac = { version = "7", optional = true }
 defmt-rtt = { version = "1.0", optional = true }
 
+# US-1504: the HOST build of the pure lib carries embassy-time's `std` time
+# driver, so the CTAPHID reply-write deadline (`hid_reply::write_reply`) is
+# exercised by the unit tests through the SAME `embassy_time::with_timeout`
+# the device runs — not a stand-in for it. The device build is unaffected: the
+# arm scope above already provides embassy-time (embassy-rp's `time-driver` +
+# `generic-queue-8`), and this target-scoped dependency is not resolved for
+# thumbv8m at all, so nothing lands in the release image. The std driver
+# initialises lazily (on the first `Instant::now()`), so the emulation binary,
+# which never calls into `hid_reply`, links it without starting a thread.
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+
 [features]
 # US-919: the foreign-image wipe is selected by the BUILD PARAMETER
 # `FAPICO2_FOREIGN_IMAGE_WIPE` (1/0), published by `firmware/build.rs` as
