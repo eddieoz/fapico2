@@ -41,12 +41,45 @@ HOOK = r"""
                 + ' mediation=' + opts.mediation + ' options=' + show(opts.publicKey.authenticatorAttachment));
     log.push('create');
     return orig(opts).then(function (c) {
-      const r = c.response, ad = r.authenticatorData;
-      const b = new Uint8Array(ad.buffer, ad.byteOffset, ad.byteLength);
-      console.log('[WATRACE] OK flags=0x' + b[32].toString(16)
-                  + ' UP=' + !!(b[32] & 1) + ' UV=' + !!(b[32] & 4)
-                  + ' aaguid=' + Array.from(b.slice(37,53)).map(x=>x.toString(16).padStart(2,'0')).join(''));
-      log.push('ok');
+      // NOTE: response.authenticatorData is an ArrayBuffer, not a view, so
+      // ad.buffer is undefined. Reading it wrongly threw *inside this then()*,
+      // which rejects the promise the page itself awaits — the site then
+      // reported "operation timed out or was aborted" while the device had
+      // actually succeeded. Nothing in the hook may throw: it observes.
+      try {
+        const r = c.response;
+        const proto = Object.getPrototypeOf(r);
+        const names = [];
+        let pr = proto;
+        while (pr && pr !== Object.prototype) {
+          names.push(pr.constructor.name);
+          pr = Object.getPrototypeOf(pr);
+        }
+        let extra = '';
+        try {
+          extra = ' ctor=' + names.join('/')
+                + ' keys=' + JSON.stringify(Object.keys(r))
+                + ' idLen=' + c.id.length
+                + ' attach=' + c.authenticatorAttachment
+                + ' clientExt=' + JSON.stringify(c.getClientExtensionResults());
+        } catch (e2) { extra = ' (introspect failed: ' + e2 + ')'; }
+        const ad = r.authenticatorData;
+        if (!ad) {
+          console.log('[WATRACE] OK but response.authenticatorData is UNDEFINED' + extra);
+        } else {
+          const b = new Uint8Array(ad);
+          console.log('[WATRACE] OK flags=0x' + b[32].toString(16)
+                      + ' UP=' + !!(b[32] & 1) + ' UV=' + !!(b[32] & 4)
+                      + ' AT=' + !!(b[32] & 0x40)
+                      + ' fmt=' + new TextDecoder().decode(r.attestationObject.slice(0, 3))
+                      + ' aaguid=' + Array.from(b.slice(37,53)).map(x=>x.toString(16).padStart(2,'0')).join('')
+                      + extra);
+        }
+        log.push('ok');
+      } catch (e) {
+        console.log('[WATRACE] OK (hook could not read the credential: ' + e + ')');
+        log.push('ok-unreadable');
+      }
       return c;
     }, function (e) {
       console.log('[WATRACE] FAIL ' + e.name + ': ' + e.message);

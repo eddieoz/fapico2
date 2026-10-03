@@ -1,6 +1,6 @@
-# US-1531 — a PIN-set device must not advertise `U2F_V2`
+# US-1531 / US-1532 — why browser registration failed, and what fixed it
 
-**Status:** fixed (`8853f88`), hardware verification pending a power cycle.
+**Status:** both fixed and verified on hardware (`8853f88`, `b807547`).
 **Devices:** fapico2 `/dev/hidraw8` (serial `94746395`), pico-fido2 reference `/dev/hidraw10`.
 
 ## The report
@@ -143,10 +143,75 @@ No, on both counts, and they are orthogonal:
   presence alone — the reference's `FIDO2_OPT_MCUV_NOTRQD` mode. That leaves
   every credential on the device UV-unprotected and is not needed here.
 
-## Unresolved
+## US-1532 — `pubKeyCredParams` was capped at 8 on the device twin
 
-The reference was observed completing this page with **no PIN prompt**, yet it
-returns `0x36` to a token-less makeCredential exactly as we do, which obliges
-Chrome to prompt. Not reproduced; not rewritten. It does not change the fix —
-either way the reference does not enter the failing U2F path — but it would be
-settled by one confirmation run with both boards attached.
+The first fix moved the failure but did not end it. With `U2F_V2` gone Chrome
+reached the CTAP2 path properly — PIN prompt, token, `kClientPinTapAgain` — and
+then:
+
+```text
+<- 0x1 (kAuthenticatorMakeCredential) {..., 4: [
+     {"alg": -7}, {"alg": -8}, {"alg": -35}, {"alg": -36}, {"alg": -37},
+     {"alg": -257}, {"alg": -47}, {"alg": -48}, {"alg": -49}, {"alg": -50}], ...}
+-> (CTAP2 error code 0x15 (kCtap2ErrLimitExceeded))
+```
+
+`McReq::algs` was `HeaplessVec<i32, 8>` and `parse_mc` answers
+`CTAP2_ERR_LIMIT_EXCEEDED` on overflow (`device_core.rs:340`). CTAP 2.1 §6.1.2
+caps that array at nothing. Reproduced on hardware: Chrome's ten entries give
+`0x15` with zero keepalives and no presence window; one algorithm arms
+normally. `app.rs` keeps the same list in an unbounded `Vec`, so the whole host
+suite stayed green — AGENTS.md §1's twin trap on the request parser. Capacity
+is now 16, tested in both directions.
+
+Note this is **not** a storage limit. `DEVICE_MAX_CREDS = 12`
+(`device_keystore.rs:34`) is the real bound, set by the chunked snapshot slot
+(12 parts x 496 B). `exclude` (capacity 8) is the per-request excludeList,
+also an input, not storage; and `maxCredentialCountInList` (19) is read by
+`tests/pico-fido/test_022_discoverable.py` as resident-key capacity per RP, so
+lowering it to match would be a functional regression rather than a fix.
+
+## Correction: authentication without a PIN prompt is correct
+
+An earlier revision of this file recorded the reference's PIN-free completion on
+this page as unexplained. That was wrong: the MakeCredential gate was
+over-generalised to GetAssertion. The reference's rule is
+`cbor_get_assertion.c:265`:
+
+```c
+if (options.uv == NULL || pinUvAuthParam.present == true) {
+    uv = false;      // the platform did not ask for UV -> presence is enough
+}
+```
+
+Ours matches: `device_core.rs:1242` refuses only when `req.uv == Some(true)`
+and UV was not performed. So when a site asks for
+`userVerification: "discouraged"`, one touch is enough with no PIN, on both
+devices. token2's demo differs only in asking for `required`.
+
+## Verification
+
+| | result |
+|---|---|
+| demo.yubico.com registration | succeeds — PIN prompt, touch, registered |
+| demo.yubico.com authentication | succeeds — touch only, authenticated |
+| token2.com registration | succeeds — `User verification: required`, AAGUID `66617069-...` |
+| token2.com login | **"Login successful v"**, "Credential matched the registered key" |
+| authData from demo.yubico.com | `rpIdHash` = SHA-256("demo.yubico.com"), flags `0x45` (UP+UV+AT), signCount 328 |
+| Chrome's U2F lines after the fix | zero `u2f_register` / `Ignoring status` |
+| wrong PIN | refused `0x31`; empty PIN refused `0x31` |
+| fido suite | 54 suites, 0 failures |
+| UF2 | 1,572,352 B = 1535.5 KiB, slack 512 B, ratchet unchanged |
+
+## Known gaps, deliberately not hidden
+
+* **CTAP1 over `CTAPHID_MSG`** — raw U2F messages are fed to the APDU parser,
+  so a U2F version request answers `0x6700` instead of `"U2F_V2"`. Unreachable
+  from a browser while a PIN is set, because `U2F_V2` is withheld. Pinned by
+  `tests/u2f_v2_advertisement.rs::ctap1_is_not_servable_yet`.
+* **GetInfo key `0x1D`** carries `max_pin_length` (`ctap2.rs:392`), but CTAP 2.1
+  assigns that key to `remainingDiscoverableCredentials`. A conformant client
+  reads 63 free discoverable slots where the device holds 12. Same
+  advertisement-does-not-match-implementation class as `makeCredUvNotRqd`.
+* **`alwaysUv: true`** (Config `0x02`) is advertised but not enforced by
+  GetAssertion, which is the opposite-direction version of the same class.
