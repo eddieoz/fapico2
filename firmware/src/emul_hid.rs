@@ -50,15 +50,41 @@
 //! outside `cfg(test)`, and the module is gated on `feature = "emulation"`
 //! because a `std` dependency has no business in the `thumbv8m` release image.
 //!
-//! # Parity, and how the tests below can fail
+//! # Parity, and — precisely — what these tests can and cannot fail on
 //!
 //! The parity tests compare **raw 64-byte reports**, in order, between the
 //! emulator's [`serve_pass`] and the shipped `serve_once` driven through a
-//! device-shaped adapter. They are not unfalsifiable by construction: the two
-//! sides reach the bus by different code (`EmulHid` + `HidLink` vs. a direct
-//! writer), and every divergence US-1524 removes changed bytes, not just
-//! control flow — the pre-US-1506 pre-dispatch `0x02` keepalive, the
-//! cancel-latch, the second reply framer, the blackout itself.
+//! device-shaped adapter. But after US-1524 both halves call the *same*
+//! [`crate::hid_serve::serve_once`], so the honest description of what the
+//! equality proves is narrow, and it is stated here rather than left for a
+//! reader to assume:
+//!
+//! * **What it proves.** The two *transports* are interchangeable. Reaching
+//!   the bus through `EmulHid` over a [`HidLink`] produces the same 64-byte
+//!   reports, in the same order, as reaching it through the device-shaped
+//!   `HidIo`. A reply framer that disagreed about continuation sequence
+//!   numbers, or forgot fragmentation, would show up here and nowhere else.
+//! * **What it does not prove.** Anything about `serve_once` itself. A
+//!   mutation in shared code — the cancel byte `0x2D`→`0x3B`, the keepalive
+//!   cadence, the expiry arm — changes **both** halves identically, so the
+//!   comparison holds. This was verified, not assumed: with the pre-US-1509
+//!   blackout reinstated (the OUT endpoint not read at all while a window is
+//!   live), `the_emulator_and_the_shipped_loop_agree_report_for_report` and
+//!   `a_long_reply_is_fragmented_the_same_way` both stayed **green**, because
+//!   both sides blackout together. A comment claiming this suite "is not the
+//!   emulator against itself" was exactly the kind of overclaim this repo
+//!   treats as a defect.
+//! * **What actually catches shared code.** The behavioural tests below, which
+//!   assert *absolute answers* rather than an equality: the cross-channel
+//!   GetInfo must be answered inside a window, a cancel must answer `0x2D`,
+//!   an idle cancel must not latch. Under the same blackout those four are
+//!   red, deterministically.
+//!
+//! The structural guarantee that makes this suite worth keeping at all is the
+//! one thing parity *cannot* express, and it has its own check: the emulator
+//! contains no second copy of the assembler, the reply framer or a consent
+//! loop. That is a property of the source, not of a run — see
+//! [`tests::the_emulator_carries_no_second_copy_of_the_serve_loop`].
 
 extern crate std;
 
@@ -260,10 +286,10 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::thread::JoinHandle;
     use std::time::{Duration as StdDuration, Instant as StdInstant};
 
     use fapico2_fido::CTAP2_MAX_MSG;
@@ -278,13 +304,69 @@ mod tests {
     /// The CTAPHID broadcast channel, as `fido2` sends it.
     const BROADCAST: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 
-    /// Wall-clock ceiling for one parity drive.
+    /// One virtual tick of the drive, in milliseconds.
     ///
-    /// The firmware's own bounds ([`crate::hid_serve::SERVE_BOUND_MS`]) are
-    /// **not** lowered — the drives use the real constants. The ceiling exists
-    /// so a diverged loop fails the test in seconds rather than hanging the
-    /// suite, which is exactly how US-1501's wedge survived a green suite.
-    const CEILING: StdDuration = StdDuration::from_millis(3_000);
+    /// The clock these tests run on is **injected and stepped by hand**
+    /// ([`VIRTUAL_NOW_MS`]), never read off the wall clock. That is what makes
+    /// a drive reproducible: `keepalive_due` is a function of elapsed time,
+    /// so a wall-clock drive emits a *scheduling-dependent* number of `0x02`
+    /// keepalives, and two independently-timed wires compared byte for byte
+    /// are a coin flip once the rates differ at all.
+    const STEP_MS: u64 = 50;
+
+    /// How long [`release_window`] drives passes before giving up on a window
+    /// the plan never closed. A count of passes, not a duration: the cancel is
+    /// delivered synchronously, so a healthy window closes on the next pass
+    /// and this bound only fires on a wedged one.
+    const RELEASE_PASSES: u32 = 64;
+
+    /// Real-time watchdog on one drive.
+    ///
+    /// The pass count is a property of the plan, so nothing in a healthy drive
+    /// depends on the wall clock: a whole drive is microseconds (all six tests,
+    /// well under a millisecond). That makes a *generous* real-time ceiling
+    /// free — it cannot perturb a run, because no run comes near it — and it
+    /// converts a pass that has become pathologically slow into a named failure
+    /// in seconds.
+    ///
+    /// What it does **not** catch: a pass that never *returns*. The drive can
+    /// only reach this check between passes, so a future that parks forever
+    /// still hangs. That exposure is not new — the old `while
+    /// start.elapsed() < budget` loop could not reach its budget check either,
+    /// so the wall-clock ceiling this replaces never bounded that case
+    /// either. Catching it properly would mean bounding the production
+    /// `block_on`, which is a behaviour change and out of scope here.
+    const WATCHDOG: StdDuration = StdDuration::from_secs(20);
+
+    // The injected clock, as a plain `fn() -> u64` because that is what
+    // `HidServe::new` and `presence::init` take. (A `//` comment, not `///`:
+    // the latter would attach to the `thread_local!` invocation and warn.)
+    //
+    // Thread-local, not a `static`: `cargo test` runs a crate's tests in
+    // parallel threads, and two drives must never share one timeline. Each
+    // drive resets it before its first pass, so it starts from a known origin
+    // however the thread was reused.
+    thread_local! {
+        static VIRTUAL_NOW_MS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn virtual_now_ms() -> u64 {
+        VIRTUAL_NOW_MS.with(|c| c.get())
+    }
+
+    /// Set the injected clock to `ms`.
+    fn set_clock(ms: u64) {
+        VIRTUAL_NOW_MS.with(|c| c.set(ms));
+    }
+
+    fn reset_clock() {
+        set_clock(0);
+    }
+
+    /// Virtual milliseconds a scripted offset names.
+    fn ms_of(d: StdDuration) -> u64 {
+        d.as_millis() as u64
+    }
 
     // ── the two transports ────────────────────────────────────────────────
 
@@ -323,14 +405,17 @@ mod tests {
     }
 
     /// The device-shaped half of the comparison: the same [`HidServe`] and the
-    /// same [`crate::hid_serve::serve_once`], reached through two real USB
-    /// endpoints rather than a [`HidLink`].
+    /// same [`crate::hid_serve::serve_once`], reached directly rather than
+    /// through a [`HidLink`].
     ///
-    /// It exists so the comparison is not "the emulator against itself". Both
-    /// sides run `serve_once` — that is the migration — but they reach it over
-    /// different transports through different framing entry points, and every
-    /// divergence this story removed shows up as a difference in the bytes each
-    /// one put on its wire.
+    /// It exists to compare the two **transports**, and the comparison is worth
+    /// exactly that much. Both sides run `serve_once` — that is the migration —
+    /// so this detects a divergence *between* `EmulHid`/`HidLink` and a direct
+    /// writer: a second reply framer that disagreed about fragmentation or
+    /// continuation sequence numbers would show up here. It cannot detect a
+    /// defect in `serve_once` itself, because both halves would carry it. See
+    /// the module docs for the measurements behind that statement, and for the
+    /// behavioural tests that do cover shared code.
     struct DeviceIo {
         inbound: Arc<Mutex<VecDeque<[u8; HID_REPORT_SIZE]>>>,
         sent: Wire,
@@ -519,21 +604,15 @@ mod tests {
         frame(channel, CTAP_HID_CBOR, body)
     }
 
-    /// The injected clock: monotonic millis, std parity of the device's
-    /// embassy millis (`emul_main::emul_now_ms` is the same shape). The serve
-    /// loop only ever reads differences — the assembler transaction window, the
-    /// consent deadline, the keepalive cadence — so the origin is arbitrary.
-    fn now_ms() -> u64 {
-        static EPOCH: std::sync::OnceLock<StdInstant> = std::sync::OnceLock::new();
-        EPOCH
-            .get_or_init(StdInstant::now)
-            .elapsed()
-            .as_millis() as u64
-    }
-
     // ── the two drives ────────────────────────────────────────────────────
 
-    /// One batch of host frames, delivered `at` after the drive starts.
+    /// One batch of host frames, delivered on the pass whose virtual clock has
+    /// reached `at`.
+    ///
+    /// `at` is virtual, not wall-clock: the drive advances [`VIRTUAL_NOW_MS`]
+    /// by [`STEP_MS`] per pass, so `at` names a pass index and the same plan
+    /// delivers the same frames on the same pass on every run and on every
+    /// machine.
     #[derive(Clone)]
     struct Exchange {
         at: StdDuration,
@@ -575,10 +654,20 @@ mod tests {
             self
         }
 
-        /// How long the drive must run: past the last scripted event, plus
-        /// enough slack for a bounded OUT read (`CTAP_KEEPALIVE_PERIOD_MS`) and
-        /// a pass or two to deliver the answer.
-        fn budget(&self) -> StdDuration {
+        /// How many passes the drive must run: past the last scripted event,
+        /// plus enough slack for a bounded OUT read
+        /// (`CTAP_KEEPALIVE_PERIOD_MS`) and a pass or two to deliver the
+        /// answer.
+        ///
+        /// A **count of passes**, not a wall-clock duration. The old budget was
+        /// `StdDuration` compared against `start.elapsed()`, so the number of
+        /// passes — and therefore the number of keepalives each wire carried —
+        /// depended on how the OS happened to schedule the two drives. That is
+        /// what made this suite nondeterministic: under a mutating build the
+        /// same script reported 2 red / 0 red / 1 red / 0 red / 0 red across
+        /// five runs. A pass count is a property of the plan, so it is the
+        /// same every time.
+        fn passes(&self) -> u32 {
             let last = self
                 .script
                 .iter()
@@ -586,64 +675,48 @@ mod tests {
                 .chain(self.grant_at)
                 .max()
                 .unwrap_or(StdDuration::ZERO);
-            last + StdDuration::from_millis(
-                crate::presence::CTAP_KEEPALIVE_PERIOD_MS * 4 + 200,
-            )
+            let slack_ms = crate::presence::CTAP_KEEPALIVE_PERIOD_MS * 4 + 200;
+            // Round UP to the next whole tick so a scripted offset that is not
+            // a multiple of STEP_MS still lands inside the drive.
+            let total_ms = ms_of(last) + slack_ms;
+            u32::try_from(total_ms.div_ceil(STEP_MS) + 1).expect("plan horizon fits in u32")
         }
     }
 
-    /// Split the `t=0` batch (delivered synchronously, before the drive — a
-    /// frame that raced a thread would hang the first pass) from the rest.
-    fn queue_of(plan: &Plan) -> (VecDeque<[u8; HID_REPORT_SIZE]>, Vec<Exchange>) {
-        let mut queue = VecDeque::new();
-        let mut later = Vec::new();
-        for e in &plan.script {
-            if e.at.is_zero() {
-                queue.extend(e.frames.iter().copied());
-            } else {
-                later.push(Exchange {
-                    at: e.at,
-                    frames: e.frames.clone(),
-                });
-            }
-        }
-        (queue, later)
+    /// Deliver one batch of host frames into the shared inbound queue.
+    fn deliver(
+        inbound: &Arc<Mutex<VecDeque<[u8; HID_REPORT_SIZE]>>>,
+        frames: &[[u8; HID_REPORT_SIZE]],
+    ) {
+        inbound.lock().unwrap().extend(frames.iter().copied());
     }
 
-    /// The scripted injector: a thread that drops the later frames and the
-    /// grant into the shared queue at their offsets.
-    fn inject(
+    /// Everything a plan schedules at or before virtual `now_ms`, handed over
+    /// in one place so both drives and [`release_window`] apply the plan
+    /// identically.
+    ///
+    /// Deterministic by construction: no thread, no sleep, no race with the
+    /// serve loop. The injector used to be a background thread that woke at
+    /// wall-clock offsets, so *when* a frame arrived relative to a pass was up
+    /// to the scheduler — the root of the nondeterminism.
+    fn pump(
         plan: &Plan,
-        grant: Arc<AtomicBool>,
-        inbound: Arc<Mutex<VecDeque<[u8; HID_REPORT_SIZE]>>>,
-    ) -> JoinHandle<()> {
-        let later = plan.script.clone();
-        let grant_at = plan.grant_at;
-        std::thread::spawn(move || {
-            let start = StdInstant::now();
-            for e in later {
-                // The `t=0` batch was already delivered synchronously by
-                // `queue_of`. Re-delivering it here would put a second copy of
-                // every opening command on the bus, and a second
-                // MakeCredential while the first one's window is live answers
-                // `OperationPending` (US-1510) — a real answer, but not the one
-                // this exchange is about.
-                if e.at.is_zero() {
-                    continue;
-                }
-                wait_until(start + e.at);
-                inbound.lock().unwrap().extend(e.frames);
+        now_ms: u64,
+        inbound: &Arc<Mutex<VecDeque<[u8; HID_REPORT_SIZE]>>>,
+        grant: &Arc<AtomicBool>,
+        delivered: &mut usize,
+    ) {
+        for e in plan.script.iter().skip(*delivered) {
+            if ms_of(e.at) > now_ms {
+                break;
             }
-            if let Some(at) = grant_at {
-                wait_until(start + at);
+            deliver(inbound, &e.frames);
+            *delivered += 1;
+        }
+        if let Some(at) = plan.grant_at {
+            if ms_of(at) <= now_ms {
                 grant.store(true, Ordering::SeqCst);
             }
-        })
-    }
-
-    fn wait_until(deadline: StdInstant) {
-        while StdInstant::now() < deadline {
-            std::thread::sleep(StdDuration::from_millis(1));
         }
     }
 
@@ -651,66 +724,85 @@ mod tests {
     /// over a `HidLink`. This is the shipped emulator call site, the one
     /// `emul_main.rs::serve_loop` calls on every iteration of its main loop.
     fn drive_emulator(plan: &Plan) -> Wire {
-        let (queue, _) = queue_of(plan);
-        let inbound = Arc::new(Mutex::new(queue));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
         // A fresh flag per drive: `both()` runs the two sides back to back on
         // one Plan, and a shared flag would leave the second drive starting
         // with the first one's press already granted — which silently turns
         // the consent-window case into the granted one and makes the
         // comparison pass for the wrong reason.
         let grant = Arc::new(AtomicBool::new(plan.granted_at_start));
-        let injector = inject(plan, grant.clone(), inbound.clone());
         let mut link = FakeLink {
             inbound: inbound.clone(),
             sent: Vec::new(),
         };
-        let mut app = ScriptedApp { grant };
+        let mut app = ScriptedApp { grant: grant.clone() };
         let mut out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
-        let mut srv = HidServe::new(now_ms, &mut out);
-        let mut slot = PendingUp::new();
-        let start = StdInstant::now();
-        let budget = plan.budget();
-        while start.elapsed() < budget {
-            serve_pass(&mut srv, &mut link, &mut app, &mut slot);
-        }
-        release_window(
-            &inbound,
-            |slot| serve_pass(&mut srv, &mut link, &mut app, slot),
-            &mut slot,
-        );
-        injector.join().ok();
+        let mut srv = HidServe::new(virtual_now_ms, &mut out);
+        drive_plan(plan, &inbound, &grant, &mut |slot| {
+            serve_pass(&mut srv, &mut link, &mut app, slot);
+        });
         link.sent
     }
 
     /// Drive the **shipped** loop (`hid_serve::serve_once`) through the
     /// device-shaped adapter.
     fn drive_device(plan: &Plan) -> Wire {
-        let (queue, _) = queue_of(plan);
-        let inbound = Arc::new(Mutex::new(queue));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
         let grant = Arc::new(AtomicBool::new(plan.granted_at_start));
-        let injector = inject(plan, grant.clone(), inbound.clone());
         let mut io = DeviceIo {
             inbound: inbound.clone(),
             sent: Vec::new(),
         };
-        let mut app = ScriptedApp { grant };
+        let mut app = ScriptedApp { grant: grant.clone() };
         let mut out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
-        let mut srv = HidServe::new(now_ms, &mut out);
-        let mut slot = PendingUp::new();
-        let start = StdInstant::now();
-        let budget = plan.budget();
-        while start.elapsed() < budget {
-            block_on(serve_once(&mut srv, &mut io, &mut app, &mut slot));
-        }
-        release_window(
-            &inbound,
-            |slot| {
-                block_on(serve_once(&mut srv, &mut io, &mut app, slot));
-            },
-            &mut slot,
-        );
-        injector.join().ok();
+        let mut srv = HidServe::new(virtual_now_ms, &mut out);
+        drive_plan(plan, &inbound, &grant, &mut |slot| {
+            block_on(serve_once(&mut srv, &mut io, &mut app, slot));
+        });
         io.sent
+    }
+
+    /// Run one plan to completion on the injected clock: `passes()` passes of
+    /// [`STEP_MS`] each, handing the script's frames over on the pass whose
+    /// virtual clock reaches them, then releasing any window the plan left
+    /// parked.
+    ///
+    /// This is the whole determinism argument for the parity suite. The drive
+    /// used to be `while start.elapsed() < plan.budget()` against a wall
+    /// clock, with a background thread delivering frames at wall-clock
+    /// offsets: how many passes ran — and therefore how many `0x02` keepalives
+    /// each wire carried — was a function of the scheduler. Two independently
+    /// timed wires compared byte for byte are then a coin flip, which is how
+    /// one script reported 2 red / 0 / 1 / 0 / 0 across five runs. Now the
+    /// pass count and every delivery point are functions of the plan alone, so
+    /// the same script produces byte-identical wires on every run.
+    fn drive_plan<F>(
+        plan: &Plan,
+        inbound: &Arc<Mutex<VecDeque<[u8; HID_REPORT_SIZE]>>>,
+        grant: &Arc<AtomicBool>,
+        pass: &mut F,
+    ) where
+        F: FnMut(&mut PendingUp),
+    {
+        // A fresh origin: the two drives of one `both()` share this thread, and
+        // a leftover value from the first would open the second mid-drive.
+        reset_clock();
+        let mut slot = PendingUp::new();
+        let mut delivered = 0usize;
+        let started = StdInstant::now();
+        for i in 0..plan.passes() {
+            let now = i as u64 * STEP_MS;
+            set_clock(now);
+            pump(plan, now, inbound, grant, &mut delivered);
+            pass(&mut slot);
+            assert!(
+                started.elapsed() < WATCHDOG,
+                "pass {i} of {} is still running after {WATCHDOG:?} of real time. \
+                 A healthy pass completes in microseconds, so this is not load.",
+                plan.passes()
+            );
+        }
+        release_window(inbound, pass, &mut slot);
     }
 
     /// Both sides of one exchange, run back to back on the same script.
@@ -1105,6 +1197,69 @@ mod tests {
         );
     }
 
+    // ── the structural check: no second copy ─────────────────────────────
+
+    /// Strip comments, so the scan below reads code rather than prose.
+    ///
+    /// These files are full of prose *about* the symbols the scan forbids —
+    /// the module docs name `HidAssembler`, `HidFeed` and `send_hid_response`
+    /// precisely to say they are gone. Scanning the raw text would make the
+    /// check permanently red; scanning the code is what the claim is about.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let cut = line.find("//").unwrap_or(line.len());
+            out.push_str(&line[..cut]);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// US-1524's actual guarantee, as an assertion: the emulator carries **one**
+    /// copy of the CTAPHID serve loop, not two.
+    ///
+    /// The parity tests above cannot express this. Both their halves call
+    /// [`crate::hid_serve::serve_once`], so a fork — a second assembler, a
+    /// second reply framer, a second consent loop living in the emulator —
+    /// would *keep them green*: the two sides would still agree, just about
+    /// the wrong implementation. That is the whole reason US-1524 existed (the
+    /// emulator's private copy of the blackout), and the parity comparison
+    /// would not notice its return.
+    ///
+    /// This check does. It scans the emulator **binary** (`emul_main.rs` — the
+    /// file that actually carried the fork) for the symbols a second copy is
+    /// built from, with comments stripped so the prose documenting their
+    /// absence is not mistaken for their presence. `emul_hid.rs` is not
+    /// scanned because this very test names the symbols; `emul_hid` is the
+    /// shared seam itself, and its thinness is asserted by the compiler-level
+    /// wiring test in `emul_main.rs`'s own `us1524_tests`.
+    ///
+    /// Scope, stated so the next reader does not over-read it: this pins the
+    /// *types* a duplicate implementation is built from. It cannot see a
+    /// consent loop written without naming any of them — that would be a
+    /// hand-rolled copy of the window policy, and the honest way to catch it
+    /// is a behavioural test, which is what the four above are for.
+    #[test]
+    fn the_emulator_carries_no_second_copy_of_the_serve_loop() {
+        let name = "firmware/src/emul_main.rs";
+        let code = code_only(include_str!("emul_main.rs"));
+        // A second assembler, a second assembler feed, a second reply
+        // framer. `HidServe` is the one type the emulator is *meant* to
+        // name, so it is deliberately not on this list.
+        for forbidden in ["HidAssembler", "HidFeed", "send_hid_response", "frame_reply"] {
+            assert!(
+                !code.contains(forbidden),
+                "{name} names `{forbidden}` in executable code, so the emulator \
+                 has a second copy of the CTAPHID serve loop again. US-1524 \
+                 removed exactly this — a private assembler, framer and \
+                 consent loop in emul_main.rs that encoded the 30 s blackout \
+                 the board had already been fixed for. The parity tests will \
+                 NOT catch its return, because both their halves call the \
+                 shared serve_once; this check is what does."
+            );
+        }
+    }
+
     // ── the shared presence runtime ────────────────────────────────────────
 
     /// The serve loop touches the *shared* presence runtime — one pending
@@ -1138,12 +1293,16 @@ mod tests {
         if !slot.is_occupied() {
             return;
         }
-        inbound
-            .lock()
-            .unwrap()
-            .extend(frame([0u8, 0, 0, 9], CTAP_HID_CANCEL, &[]));
-        let start = StdInstant::now();
-        while slot.is_occupied() && start.elapsed() < CEILING {
+        deliver(
+            inbound,
+            &frame([0u8, 0, 0, 9], CTAP_HID_CANCEL, &[]),
+        );
+        let base = virtual_now_ms();
+        for i in 1..=RELEASE_PASSES {
+            if !slot.is_occupied() {
+                return;
+            }
+            set_clock(base + i as u64 * STEP_MS);
             pass(slot);
         }
         assert!(
