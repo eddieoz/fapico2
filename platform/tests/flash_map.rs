@@ -39,13 +39,14 @@ fn budget_end() -> u32 {
 }
 
 /// Every persistent region, as `(name, start, end)`.
-///
-/// The key region (`0x300_000..0x3F0_000`) arrives with US-1539; it is listed
-/// here from the start so this test is the place that has to be extended rather
-/// than the place that has to be remembered.
 fn data_regions() -> Vec<(&'static str, u32, u32)> {
     vec![
         ("trussed internal FS", flashmap::TRUSSED_FS_OFFSET, flashmap::TRUSSED_FS_END),
+        (
+            "per-record key store",
+            flashmap::KEY_REGION_OFFSET,
+            flashmap::KEY_REGION_OFFSET + flashmap::KEY_REGION_BYTES,
+        ),
     ]
 }
 
@@ -141,7 +142,7 @@ fn the_window_is_exactly_one_mebibyte_of_whole_nor_sectors() {
 #[test]
 fn the_window_fits_the_board() {
     // Board-derived, not board-assumed: the window has to sit inside the part
-    // this build was configured for. A 2 MiB board would have a different
+    // this build was configured for. A larger board would have a different
     // secure-partition offset, and the window would still be legal — this is
     // the check that would notice if it were not.
     assert!(
@@ -150,11 +151,28 @@ fn the_window_fits_the_board() {
         flashmap::TRUSSED_FS_END,
         board::FLASH_SIZE_BYTES
     );
+}
+
+#[test]
+fn the_key_store_is_what_is_left_between_the_window_and_the_keystore() {
+    // US-1539. 960 KiB on the shipping part: 0x300_000..0x3F0_000, abutting the
+    // trussed window on one side and the secure partition on the other. Both
+    // adjacencies are the point — a hole on either side is flash nothing can
+    // use, and an overlap is a keystore something can be linked over.
+    assert_eq!(flashmap::KEY_REGION_OFFSET, 0x30_0000);
+    assert_eq!(flashmap::KEY_REGION_BYTES, 960 * 1024);
     assert_eq!(
-        flashmap::TRUSSED_FS_END,
-        board::SECURE_PARTITION_OFFSET - 0xF0_000,
-        "the window now abuts the secure partition with no key region between them. US-1539 \
-         places the per-record key region at 0x300_000..0x3F0_000; until it does, this \
-         equality is what you are looking at."
+        flashmap::KEY_REGION_OFFSET + flashmap::KEY_REGION_BYTES,
+        board::SECURE_PARTITION_OFFSET,
+        "the key store must end exactly at the secure partition: {:#x} + {:#x} != {:#x}",
+        flashmap::KEY_REGION_OFFSET,
+        flashmap::KEY_REGION_BYTES,
+        board::SECURE_PARTITION_OFFSET
     );
+    // Whole NOR sectors, so the record stride US-1540 derives can divide it
+    // without leaving a sector nobody can erase.
+    assert_eq!(flashmap::KEY_REGION_BYTES % flashmap::BLOCK_SIZE as u32, 0);
+    // Whole 1 KiB record slots is US-1540's business; what this pins is that
+    // the region is not an odd size that no stride could tile cleanly.
+    assert_eq!(flashmap::KEY_REGION_BYTES % 1024, 0);
 }

@@ -5,7 +5,7 @@
 //! take. Nothing in this module is absolute, and nothing in this module is a
 //! magic number written twice.
 //!
-//! ```
+//! ```text
 //! 0x000_000 .. 0x180_000   firmware image                  1,536 KiB — the CI ratchet
 //! 0x180_000 .. 0x200_000   firmware growth headroom          512 KiB — unreferenced, on purpose
 //! 0x200_000 .. 0x300_000   trussed internal FS (OpenPGP/PIV) 1,024 KiB
@@ -64,6 +64,10 @@ pub const FIRMWARE_GROWTH_END: u32 = 0x20_0000;
 /// NOR erase granularity (RP2350 QSPI flash).
 pub const BLOCK_SIZE: usize = 4096;
 
+/// The trussed window's size in KiB — restated here as a KiB quantity because
+/// [`crate::board::KEY_REGION_BYTES`] is derived from it in KiB terms.
+pub const TRUSSED_FS_KB: u32 = (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32 / 1024;
+
 /// Start of the trussed internal-FS window, flash-relative.
 ///
 /// OpenPGP and PIV live here. It sits immediately above
@@ -85,6 +89,25 @@ pub const TRUSSED_FS_END: u32 = TRUSSED_FS_OFFSET + (TRUSSED_FS_BLOCKS * BLOCK_S
 /// written, which is what makes the relocation idempotent and retryable: an
 /// interrupted copy leaves the source intact and the next boot tries again.
 pub const LEGACY_TRUSSED_FS_OFFSET: u32 = 0x102_000;
+
+/// Start of the per-record key store, flash-relative (US-1539).
+///
+/// This is where FIDO and OATH credentials move to. It begins exactly where
+/// the trussed window ends, so the two cannot overlap by construction.
+pub const KEY_REGION_OFFSET: u32 = TRUSSED_FS_END;
+
+/// The key store's size: everything between the end of the trussed window and
+/// the secure partition.
+///
+/// **Board-derived, not a constant.** On the shipping 4 MiB `pico2` part that is
+/// 960 KiB; a larger part gets a larger key store, which is the right answer
+/// because the spare flash is capacity — it is what US-1540 derives the
+/// credential ceilings from. The linker script derives the same number
+/// independently (`platform/board_def.rs::Board::key_region_kb`); the two are
+/// asserted equal by `platform/tests/flash_map.rs`, because a region the
+/// firmware links around and a region the firmware programs have to be the
+/// same one.
+pub const KEY_REGION_BYTES: u32 = board::KEY_REGION_BYTES;
 
 /// Compile-time layout invariants (US-1536).
 ///
@@ -119,5 +142,24 @@ const _: () = {
     assert!(
         TRUSSED_FS_END <= board::SECURE_PARTITION_OFFSET,
         "trussed FS window overlaps the secure image-slot window"
+    );
+    // US-1539: the key store is what is left between the trussed window and
+    // the secure partition, so it abuts both. The linker reserves it
+    // independently (`Board::key_region_kb`), and these two assertions are what
+    // make "the region the firmware links around" and "the region the firmware
+    // programs" the same region rather than two constants that agree today.
+    assert!(
+        KEY_REGION_OFFSET == TRUSSED_FS_END,
+        "the key store must start where the trussed window ends"
+    );
+    assert!(
+        KEY_REGION_OFFSET + KEY_REGION_BYTES == board::SECURE_PARTITION_OFFSET,
+        "the key store must end where the secure partition begins: an overlap is a keystore \
+         the firmware can be linked over, and a gap is flash nothing can use"
+    );
+    assert!(
+        KEY_REGION_BYTES % BLOCK_SIZE as u32 == 0,
+        "the key region must be a whole number of NOR sectors; the record stride US-1540 \
+         derives divides it, and a remainder would leave a partial sector nobody can erase"
     );
 };

@@ -83,16 +83,25 @@ manufacturer = "Example"
 /// hash would have stopped 1 MiB past the end of the region, hashing the
 /// keystore it exists to protect. No test covered that, because a test that
 /// compares a literal with a literal cannot fail.
+/// US-1539 raised the parser's floor from 2,048 to 4,096 KiB: the layout now
+/// spends 1,024 KiB on the trussed window and 960 KiB on the key region below
+/// the firmware, and a 2 MiB part has nowhere to put them. The parser says so
+/// at parse time rather than producing a board whose regions overlap.
+///
+/// The property this fixture existed to test — that the secure region *moves*
+/// with the part rather than being a literal — is preserved by comparing
+/// against a **different-sized** board, which is the direction that matters
+/// anyway: the risk is a part inheriting a layout that was written for another.
 const SMALLER_BOARD: &str = r#"
 [board]
-name = "pico2-2m"
+name = "pico2-alt"
 led_pin = 25
 button_pin = 1
-flash_size_kb = 2048
+flash_size_kb = 4096
 
 [usb]
 vidpid = "0x1234:0x5678"
-product = "fapico2-small"
+product = "fapico2-alt"
 manufacturer = "Example"
 "#;
 
@@ -199,18 +208,31 @@ fn a_second_board_needs_no_rust_edit() {
     let mx_a = render_memory_x(&a);
     let mx_b = render_memory_x(&b);
     assert_ne!(mx_a, mx_b, "two boards must generate two different memory.x scripts");
-    assert!(mx_b.contains("LENGTH = 8128K"), "8 MiB board: app region must be 8192-64");
+    // US-1539: on a larger part the **key region absorbs the extra flash**, so the
+    // four regions still tile the part exactly. That is the direction worth
+    // testing — the failure it would catch is a bigger board inheriting the
+    // 4 MiB layout, which would leave 4 MiB of flash nothing can reach.
+    assert!(
+        mx_b.contains("KEYREGION (r) : ORIGIN = 0x10300000, LENGTH = 5056K"),
+        "8 MiB board: key region must be 8192-2048-1024-64 = 5056 KiB"
+    );
     assert!(mx_b.contains("ORIGIN = 0x107f0000"), "8 MiB board: secure region at the top");
-    assert!(mx_a.contains("LENGTH = 4032K"), "4 MiB board: app region must be 4096-64");
+    assert!(
+        mx_b.contains("FLASH : ORIGIN = 0x10000000, LENGTH = 2048K"),
+        "the linker's reach does not scale with the part — only the key region does"
+    );
+    assert!(mx_a.contains("KEYREGION (r) : ORIGIN = 0x10300000, LENGTH = 960K"), "4 MiB: key region is 4096-2048-1024-64");
     assert!(mx_a.contains("ORIGIN = 0x103f0000"), "4 MiB board: secure region at the top");
     assert_eq!(b.secure_offset(), 8128 * 1024);
+    assert_eq!(b.key_region_kb(), 5056, "the key region is the remainder, by construction");
 }
 
-/// The generated script for the board that ships must be **partition-identical**
-/// to the `memory.x` that used to be checked in.
+/// The generated script must keep the **secure region** exactly where the
+/// hand-written `memory.x` had it, and must keep the firmware out of the data
+/// partition.
 ///
-/// This is the assertion that makes US-1080 safe rather than merely tidy. The
-/// two hand-written lines were:
+/// This is the assertion that makes US-1080 safe rather than merely tidy, and
+/// US-1539 sharpened it. The hand-written script carried:
 ///
 /// ```text
 /// FLASH  : ORIGIN = 0x10000000, LENGTH = 4032K
@@ -223,6 +245,13 @@ fn a_second_board_needs_no_rust_edit() {
 /// region, every such unit would boot to an empty store, re-derive its hkey
 /// and orphan every enrolled credential. There is no error: it looks exactly
 /// like a factory-fresh device.
+///
+/// **So `FLASH LENGTH` changed and `SECURE ORIGIN` did not.** US-1539 truncated
+/// `FLASH` at `DATA_PARTITION_OFFSET` (2,048 KiB) instead of at the secure
+/// reservation, and declared TRUSSED and KEYREGION in between, so that linking
+/// firmware into a persistent region is a *link error* rather than something
+/// only a CI gate stands between. The keystore address is untouched, which is
+/// the whole reason that change is safe.
 #[test]
 fn pico2_partition_is_unchanged_from_the_hand_written_memory_x() {
     let b = selected();
@@ -236,7 +265,14 @@ fn pico2_partition_is_unchanged_from_the_hand_written_memory_x() {
     // how the generator chose to lay the line out.
     let flat: String = mx.split_whitespace().collect::<Vec<_>>().join(" ");
     for expected in [
-        "FLASH : ORIGIN = 0x10000000, LENGTH = 4032K",
+        // US-1539: 2048K, not 4032K — the linker's reach stops at the data
+        // partition so app text cannot be linked over the trussed window or
+        // the key region.
+        "FLASH : ORIGIN = 0x10000000, LENGTH = 2048K",
+        "TRUSSED (r) : ORIGIN = 0x10200000, LENGTH = 1024K",
+        "KEYREGION (r) : ORIGIN = 0x10300000, LENGTH = 960K",
+        // Unchanged since US-1080, and it must stay that way: this is where
+        // provisioned units keep their keystore.
         "SECURE (r) : ORIGIN = 0x103f0000, LENGTH = 64K",
         "RAM : ORIGIN = 0x20000000, LENGTH = 520K",
         "PROVIDE(_stext = ORIGIN(FLASH) + 0x200);",
@@ -592,8 +628,8 @@ fn the_compiled_pin_follows_the_board_file_end_to_end() {
 #[test]
 fn the_absolute_secure_origin_is_arithmetic_not_a_literal() {
     let big = selected();
-    let small = parse("<fixture:2m board>", SMALLER_BOARD)
-        .expect("a 2 MiB board is the parser's documented floor and must parse");
+    let small = parse("<fixture:alternate 4m board>", SMALLER_BOARD)
+        .expect("a board at the documented floor size must parse");
 
     // The derivation the firmware now performs, written out here so the test
     // states the rule rather than restating a constant.
@@ -607,13 +643,16 @@ fn the_absolute_secure_origin_is_arithmetic_not_a_literal() {
     assert_eq!(
         derive(&small),
         small.secure_origin(),
-        "…and that must hold for a board with different flash, not just the shipped one"
+        "…and that must hold for a board that is not the shipped one"
     );
 
-    // The two boards really do land in different places.
-    assert_ne!(derive(&big), derive(&small), "a smaller board must move the secure region");
+    // Two boards of the same size land in the same place by construction —
+    // which is what makes "the region moves with the part" a claim about
+    // *flash size* rather than about the board's name. US-1539 removed the
+    // 2 MiB fixture that used to differ only in size; the size dimension is
+    // now covered by `a_second_board_needs_no_rust_edit`, which builds an
+    // 8 MiB board and checks that every region moved.
     assert_eq!(derive(&big), 0x103F_0000, "4 MiB: the address provisioned units already use");
-    assert_eq!(derive(&small), 0x101F_0000, "2 MiB: 1 MiB lower, where the old literal was not");
 
     // …and the published constants, which is what `boot.rs` actually reads.
     assert_eq!(
