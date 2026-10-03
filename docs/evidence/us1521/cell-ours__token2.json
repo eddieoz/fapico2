@@ -1,0 +1,75 @@
+{
+  "board": "ours",
+  "board_label": "OURS  (EddieOz, serial 94746395, bcdDevice 0010)",
+  "site": "token2",
+  "url": "https://www.token2.com/tools/fido2-demo",
+  "timeout_ms": 12000,
+  "started": "2026-10-03T09:29:59+0300",
+  "boot_fapico_entries": [
+    "USB device added: path=/dev/bus/usb/001/111 vendor=4176 \"EddieOz\", product=1031 \"Fapico2\", serial=\"94746395\", guid=0cb40722-4b6d-491e-a07c-d46ef99ff4f6"
+  ],
+  "final_url": "https://www.token2.com/tools/fido2-demo",
+  "env": "{\"href\":\"https://www.token2.com/tools/fido2-demo\",\"origin\":\"https://www.token2.com\",\"secureContext\":true,\"hasPublicKeyCredential\":true,\"createAllowlist\":[\"https://www.token2.com\"],\"getAllowlist\":[\"https://www.token2.com\"],\"capabilities\":{},\"ua\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36\",\"documentPermissionsPolicyType\":\"undefined\"}",
+  "inject": "installed",
+  "window": {
+    "id": "0x4c00004",
+    "geom": {
+      "x": 2884,
+      "y": 669,
+      "w": 952,
+      "h": 1050
+    }
+  },
+  "button_xy": [
+    91.1171875,
+    37
+  ],
+  "result": null,
+  "still_pending_at_s": 40,
+  "frames": [
+    "01.png",
+    "02.png",
+    "03.png",
+    "04.png",
+    "05.png",
+    "06.png",
+    "07.png",
+    "08.png",
+    "09.png",
+    "10.png",
+    "11.png",
+    "12.png",
+    "13.png",
+    "14.png",
+    "15.png",
+    "16.png",
+    "17.png",
+    "18.png",
+    "19.png",
+    "20.png",
+    "21.png",
+    "22.png",
+    "23.png",
+    "24.png",
+    "25.png",
+    "26.png",
+    "27.png",
+    "28.png",
+    "29.png",
+    "30.png",
+    "31.png",
+    "32.png",
+    "33.png",
+    "34.png",
+    "35.png",
+    "36.png",
+    "37.png",
+    "38.png",
+    "39.png",
+    "40.png"
+  ],
+  "post_fapico_entries": [
+    "USB device added: path=/dev/bus/usb/001/111 vendor=4176 \"EddieOz\", product=1031 \"Fapico2\", serial=\"94746395\", guid=0cb40722-4b6d-491e-a07c-d46ef99ff4f6"
+  ],
+  "finished": "2026-10-03T09:31:59+0300"
+}
