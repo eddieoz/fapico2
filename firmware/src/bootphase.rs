@@ -113,6 +113,10 @@ pub const PULSE_US: u32 = PULSE_ON_US + PULSE_OFF_US;
 /// a `const` rather than prose so a test can hold the *ordering* claim to
 /// account — an edit that moves a `mark!` site has to move it here too, or the
 /// ladder stops being monotone and the count stops meaning "how far".
+///
+/// That claim is enforced by [`tests::the_call_sites_in_main_agree_with_this_order`],
+/// which reads `main.rs` and checks both halves: every rung is marked exactly
+/// once, and the source order of those sites is this order.
 pub const RUNG_ORDER: [u8; RUNGS as usize] = [
     RUNG_HAL,
     RUNG_TRNG,
@@ -402,6 +406,76 @@ mod tests {
             assert_eq!(ladder.mark(rung), Mark::Silent(Silent::Released));
         }
         assert_eq!(ladder.reached(), 1, "release must not count as progress");
+    }
+
+    /// The whole point of [`RUNG_ORDER`]: the `mark!` sites in `main.rs` are
+    /// exactly these nine rungs, once each, in this order.
+    ///
+    /// This test exists because [`RUNG_ORDER`] is otherwise a table checked
+    /// against itself — `assert_eq!(*rung as usize, i)` is true of any
+    /// self-consistent array, so the eight other tests in this module stayed
+    /// green with a rung deleted from the shipped binary (verified: deleting
+    /// `mark!(RUNG_USB)` from `main.rs` left 93/93 green). `main.rs` is
+    /// arm-gated and compiled by no host test, so nothing else in the tree
+    /// could see that edit; this reads its source text instead — the same
+    /// source-pinning shape `status_table.rs`'s CTAP constant check uses for
+    /// `firmware/src/ctap_hid.rs`, and for the same reason.
+    ///
+    /// `include_str!` rather than a filesystem read: it resolves at compile
+    /// time, so a moved or deleted `main.rs` is a build error rather than a
+    /// runtime surprise, and it does not depend on the test's working
+    /// directory.
+    #[test]
+    fn the_call_sites_in_main_agree_with_this_order() {
+        let main = include_str!("main.rs");
+        // Each `mark!(...RUNG_X)` site, in source order. The match is
+        // anchored on the constant name after the `mark!(`, so a comment
+        // mentioning a rung is not counted as a call.
+        let mut marked: Vec<&str> = Vec::new();
+        for line in main.lines() {
+            let Some((_, args)) = line.split_once("mark!(") else {
+                continue;
+            };
+            let Some((args, close)) = args.split_once(')') else {
+                continue;
+            };
+            // A statement, not an expression: `mark!(RUNG_X);`. Without this
+            // a mention inside a larger expression would count as a call.
+            if !close.trim_start().starts_with(';') {
+                continue;
+            }
+            let args = args.trim();
+            if let Some(name) = args.rsplit("::").next().filter(|n| n.starts_with("RUNG_")) {
+                marked.push(name);
+            }
+        }
+        let expected: Vec<&str> = RUNG_ORDER.iter().map(|r| rung_const_name(*r)).collect();
+        assert_eq!(
+            marked, expected,
+            "the `mark!` sites in firmware/src/main.rs must be exactly the nine \
+             RUNG_* boundaries, once each, in RUNG_ORDER's sequence.\n  found in \
+             main.rs: {marked:?}\n  RUNG_ORDER claims: {expected:?}\nA rung that is \
+             missing, duplicated or out of order means the LED's pulse count no \
+             longer says how far boot got."
+        );
+    }
+
+    /// The `RUNG_*` constant name for a rung, so the test above names the same
+    /// nine constants `RUNG_ORDER` holds rather than a second hand-written
+    /// list that could drift.
+    fn rung_const_name(rung: u8) -> &'static str {
+        match rung {
+            RUNG_HAL => "RUNG_HAL",
+            RUNG_TRNG => "RUNG_TRNG",
+            RUNG_OTP => "RUNG_OTP",
+            RUNG_STORE => "RUNG_STORE",
+            RUNG_DRBG => "RUNG_DRBG",
+            RUNG_MIGRATION => "RUNG_MIGRATION",
+            RUNG_APPS => "RUNG_APPS",
+            RUNG_USB => "RUNG_USB",
+            RUNG_SERVING => "RUNG_SERVING",
+            other => panic!("rung {other} has no RUNG_* constant name"),
+        }
     }
 
     /// The frozen-board readings the docs promise, as an executable table.
