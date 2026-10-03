@@ -198,12 +198,6 @@ design is wrong.
 answer — `../pico-fido`, `../pico-openpgp`, `../pico-hsm` and `../RS-Key` all
 ship per-record flash storage with an OTP- or device-rooted key — but it is not
 a shortcut past measuring. They also each hold 256 credentials, which is the
-design is wrong.
-
-**Corollary for reviewers:** "this is how the reference does it" is a real
-answer — `../pico-fido`, `../pico-openpgp`, `../pico-hsm` and `../RS-Key` all
-ship per-record flash storage with an OTP- or device-rooted key — but it is not
-a shortcut past measuring. They also each hold 256 credentials, which is the
 part that makes their design the simpler one rather than merely a different one.
 
 ---
