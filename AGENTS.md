@@ -90,6 +90,63 @@ For the YubiOTP path, return the **bare** blob: `platform::otp_hid::set_report`
 already appends `!crc16(data)` (YubiKey convention, residue `0xF0B8`). Adding a
 second CRC gives `BadResponseError: Invalid checksum`.
 
+### 4. With a PIN set, the PIN and the button are **always** required. This is deliberate.
+
+On a PIN-set board every operation needs a token *and* a touch: registration
+prompts for the PIN, and authentication prompts for it again. Nothing in the
+WebAuthn options can switch either off. Read that as three separate decisions
+about what getInfo **advertises**, all derived from `pin_state` so they cannot
+lie about what the command paths do:
+
+| advertised | value | rule |
+|---|---|---|
+| `alwaysUv` | `pin_set \|\| config_0x02` | `ctap2::always_uv_advertised` |
+| `makeCredUvNotRqd` | `!pin_set && !always_uv` | `ctap2::make_cred_uv_not_rqd` |
+| `U2F_V2` in `versions` | `!pin_set` | `ctap2::u2f_v2_advertised` |
+
+**User presence (the touch) is not a function of `userVerification`.** UP is
+required for every `authenticatorMakeCredential` whatever `uv` says; both
+tweins reject `options.up = false` (`device_core.rs`, mirroring
+`cbor_make_credential.c:387`). CTAP 2.1 §6.1.3 step 7.2 only lets a client
+*skip UV*, never UP. So `userVerification: "discouraged"` must not remove the
+button.
+
+**UV (the PIN) is required too, because the device says so.** §6.1.3 makes a
+token-less makeCredential an error whenever `makeCredUvNotRqd` is `false`, and
+§6.2.2 does the same for getAssertion under `alwaysUv`. Both are derived from
+the PIN state for exactly that reason. The reference derives them the same way
+(`pico-fido2/src/fido/cbor_get_info.c:95-99`), and the two agree on the wire:
+
+```c
+bool alwaysUv = (get_opts() & FIDO2_OPT_AUV) || (file_has_data(ef_pin) && !keydev_unlocked);
+CBOR_CHECK(cbor_encoder_create_array(&mapEncoder, &arrayEncoder, 4 + !alwaysUv));
+if (!alwaysUv) { ... "U2F_V2" ... }
+```
+
+Why it is worth holding this line: **every relaxation we have tried has cost
+more than it bought.** Advertising `U2F_V2` on a PIN-set board made Chrome
+enter a U2F register and abandon the CTAP2 operation outright. Advertising
+`alwaysUv: false` while refusing token-less makeCredential, or while serving
+token-less assertions, is the same failure one level down — a wire claim the
+device does not honour. The rule that has survived is the one the reference
+uses: **derive each option from the state it describes, and let the gates and
+the advertisement come from the same accessor.** US-1529 and US-1533 are the
+two halves of it; the tests in `tests/make_cred_uv_not_rqd.rs`,
+`tests/u2f_v2_advertisement.rs` and `tests/uv.rs` exist to keep them so.
+
+Config `0x02` (toggleAlwaysUv) can force `alwaysUv` **on**. It cannot turn it
+off on a PIN-set device, and it cannot buy a UV-less assertion — a `false` here
+is the claim that no token is needed, and the only state in which that is true
+is no PIN. Clearing the PIN clears all three rows at once, coherently.
+
+**One known edge:** `u2f_v2_advertised` keys on `pin_set` alone, so a PIN-less
+board with Config `0x02` set would advertise `alwaysUv: true` *and*
+`U2F_V2`, where the reference would withhold the latter. It is unreachable
+through any client (the toggle needs a `PERM_ACFG` token, which needs a PIN),
+and CTAP1 is not servable over `CTAPHID_MSG` yet anyway
+(`tests/u2f_v2_advertisement.rs::ctap1_is_not_servable_yet`). Left as recorded
+rather than fixed, for the same reason.
+
 ---
 
 ## Layout
@@ -257,3 +314,90 @@ Drive it with python-xlib (`Xlib.ext.xtest.fake_input`) — there is no
   firmware agrees — signing with the HKDF key fails.
 - A PicoForge credMgmt request omits `subCommandParams` entirely for
   `enumerateRpsBegin` and signs the bare sub-command byte.
+
+## Debugging FIDO/CTAP in a real browser
+
+### `chrome://device-log/` is empty unless Chrome was launched for it
+
+The device log is written only with `--enable-logging`. **The chrome-devtools
+MCP browser is launched without it** (check `chrome://version` → Command Line),
+so `chrome://device-log/` is *always* empty there and will mislead you into
+thinking Chrome saw nothing. That is not evidence of anything.
+
+Launch your own Chrome with logging and drive it over CDP:
+
+```bash
+# scripts/drive_logging_chrome.py does exactly this and leaves the log behind.
+python3 scripts/drive_logging_chrome.py https://demo.yubico.com/webauthn-technical/registration 200
+tail -f /tmp/chrome-wa.log
+```
+
+Equivalent flags, if you are driving it yourself:
+
+```bash
+/opt/google/chrome/chrome --remote-debugging-port=9333 \
+  --user-data-dir=/tmp/chrome-wa-profile --no-first-run --no-default-browser-check \
+  --enable-logging --v=1 \
+  --vmodule=*/device/fido/*=3,*/webauthn*/*=3,*/web_auth*/*=3,*/authenticator*/*=3,\
+*/content/browser/webauth/*=3,*/device_event_log/*=1 \
+  --log-file=/tmp/chrome-wa.log --ozone-platform=x11
+```
+
+Drive it with a CDP client over the WebSocket (`websockets` is in the system
+python3, not the venv; there is no playwright/selenium here). `Page.addScriptToEvaluateOnNewDocument`
+installs a hook before page scripts, `Runtime.evaluate` clicks, `Runtime.consoleAPICalled`
+streams the hook's `console.log`. Do **not** open a second profile against a
+board a ceremony is already using — two Chromes on one key makes every reading
+ambiguous.
+
+### The lines that actually decide a FIDO bug
+
+```
+device_response_converter.cc:403 -> {1: ["U2F_V2", ...], 4: {...}}   what we advertised
+authenticator_request_dialog_model.cc:158 UI step: kCableV2QRCode     QR/hybrid fallback
+authenticator_request_dialog_model.cc:158 UI step: kClientPinEntry     PIN prompt shown
+ctap2_device_operation.h:91  <- 0x6 {1: 2, 2: 9, 9: 3, 10: "rp"}      PIN leg in flight
+ctap2_device_operation.h:188 -> {2: h'...'}                           pinUvAuthToken minted
+ctap2_device_operation.h:142 -> (CTAP2 error code 0x15 ...)           and the error, named
+make_credential_request_handler.cc:825 Ignoring status 1             CTAP2 abandoned
+u2f_register_operation.cc:195 Unexpected status 27264                 CTAP1 was tried (0x6A80)
+```
+
+`kCableV2QRCode` is the QR-code popup: it is the *cross-device* dialog step,
+not a distinct failure, but on a page that fails it is where the UI is left
+parked. `0x15 LIMIT_EXCEEDED` from makeCredential is nearly always a
+**parser capacity** bug, not a full store — see §1 on the twin trap and
+`apps/fido/src/device_core.rs` for the fixed capacities.
+
+### Hooking the page: observe, never interfere
+
+Hook `navigator.credentials.create`/`get` to capture what the RP asked — the
+`authenticatorSelection` and `residentKey` values are what separate a site that
+works from one that does not, and they are not visible anywhere else:
+
+```js
+console.log('[WA] create uv=' + opts.publicKey.authenticatorSelection.userVerification);
+```
+
+**The hook must not throw.** `navigator.credentials.create` returns the
+promise *the page itself awaits*, so an exception inside your `.then()`
+rejects it: the device succeeds, the authenticator is faultless, and the site
+reports "operation timed out or was aborted". This cost an hour once. Wrap the
+whole handler in `try/catch` and return the credential untouched. Related:
+`credential.response.authenticatorData` is an **ArrayBuffer**, not a view, so
+`ad.buffer` is `undefined` — use `new Uint8Array(ad)`.
+
+### What you cannot see from the page
+
+The PIN dialog is browser chrome, not DOM: a page screenshot shows nothing and
+`document.querySelector('dialog')` finds nothing. Either read the device log
+(`UI step: kClientPinEntry` is the proof the prompt appeared) or ask the person
+at the keyboard. The virtual authenticator in DevTools → More tools →
+WebAuthn is genuinely useful for isolating *Chrome's* behaviour from the
+device's — if it completes a ceremony your board cannot, the defect is yours.
+
+`scripts/probe_*.py` cover the non-browser half: `probe_uv_policy.py` (GetInfo
+A/B), `probe_mc_uv_ab.py` (token-less makeCredential and both clientPIN legs),
+`probe_clientpin_legs.py` (the real ECDH+PIN handshake, which is the only way to
+tell "0x14 MISSING_PARAMETER" from "the leg works"), `probe_u2f_path.py` (the
+CTAP1 framing gap).
