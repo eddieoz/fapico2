@@ -252,6 +252,12 @@ that already work with Yubico software.
 
 ## Build, flash, test
 
+**Tag convention ([ADR 0002](docs/adr/0002-provisioning-policy.md)):** release tags carry a `-release` suffix (`vX.Y.Z-release`).
+Alpha/beta images keep the debug port available and burn nothing irreversible; `-release` images
+are the boundary where the `DEBUG_DISABLE` closure will apply. The repository carries **no tags
+yet** — `git tag -l` returns empty as of 2026-10-04 — so the convention binds from the first
+one, and no tag is created by ADR 0002.
+
 ```bash
 ./build.sh                     # release UF2 for RP2350 -> firmware/fapico2.uf2
 cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
