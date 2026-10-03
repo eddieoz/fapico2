@@ -1240,6 +1240,11 @@ impl<K: Keystore> FidoApp<K> {
             "makeCredUvNotRqd",
             crate::ctap2::make_cred_uv_not_rqd(pin_set, pin_state.always_uv),
         );
+        // US-1531: the same rule the device twin applies — U2F_V2 is withheld
+        // whenever a PIN is set, because Chrome reads it as "this device also
+        // speaks CTAP1" and abandons the CTAP2 makeCredential when that path
+        // answers wrongly. See `ctap2::u2f_v2_advertised`.
+        info.set_u2f_v2(crate::ctap2::u2f_v2_advertised(pin_set));
         // Dynamic state fields.
         info.force_pin_change = pin_state.force_pin_change;
         info.pin_complexity_policy = Some(pin_state.pin_complexity_policy);

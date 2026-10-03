@@ -2098,6 +2098,14 @@ impl FidoApp {
                 self.keystore.pin_state.always_uv,
             ),
         );
+        // US-1531: U2F_V2 is withheld whenever a PIN is set. Chrome reads it
+        // as "this device also speaks CTAP1", enters a U2F register, and when
+        // that answers wrongly abandons the CTAP2 makeCredential it was
+        // actually asked for — the QR-popup / blinking-board report. See
+        // `ctap2::u2f_v2_advertised` for the capture and the reference rule.
+        info.set_u2f_v2(crate::ctap2::u2f_v2_advertised(
+            self.keystore.pin_state.pin_hash.is_some(),
+        ));
         // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
         // plaintext over the persisted device random (host parity).
         let mut iv = [0u8; 16];

@@ -261,6 +261,21 @@ impl Ctap2Info {
         }
     }
 
+    /// Withhold or restore the `U2F_V2` (CTAP1) entry in `versions`.
+    ///
+    /// Both twins reach getInfo through this, so the advertisement follows the
+    /// PIN state instead of a constant baked into [`Ctap2Info::default`].
+    /// The rule itself, and the browser evidence behind it, is in
+    /// [`u2f_v2_advertised`].
+    pub fn set_u2f_v2(&mut self, advertise: bool) {
+        self.versions.retain(|v| *v != crate::CTAP1_VERSION);
+        if advertise {
+            // Kept first, matching the reference's ordering
+            // (cbor_get_info.c:96-99 appends it before the FIDO_2_x entries).
+            self.versions.insert(0, crate::CTAP1_VERSION).ok();
+        }
+    }
+
     /// Look up one advertised option.
     pub fn option(&self, key: &str) -> Option<bool> {
         self.options
@@ -629,6 +644,67 @@ pub fn make_cred_uv_not_rqd(pin_set: bool, always_uv: bool) -> bool {
     !pin_set && !always_uv
 }
 
+/// US-1531: whether getInfo may advertise `U2F_V2` (CTAP1). One rule behind
+/// both twins, for the same twin-drift reason as [`make_cred_uv_not_rqd`].
+///
+/// # WHY THE PIN GATES THIS
+///
+/// The reference withholds `U2F_V2` whenever `alwaysUv` is true
+/// (`pico-fido2/src/fido/cbor_get_info.c:96-99`):
+///
+/// ```c
+/// bool alwaysUv = (get_opts() & FIDO2_OPT_AUV) || (file_has_data(ef_pin) && !keydev_unlocked);
+/// CBOR_CHECK(cbor_encoder_create_array(&mapEncoder, &arrayEncoder, 4 + !alwaysUv));
+/// if (!alwaysUv) {
+///     CBOR_CHECK(cbor_encoder_encode_text_stringz(&arrayEncoder, "U2F_V2"));
+/// }
+/// ```
+///
+/// `alwaysUv` is true whenever a PIN is set and the keydev is still locked,
+/// which is the state a PIN-set board boots into — so the reference stops
+/// advertising CTAP1 exactly when a PIN exists. This device twin has no
+/// `keydev_unlocked` concept, so `pin_set` is the faithful equivalent of the
+/// reference's condition.
+///
+/// # WHAT ADVERTISING IT COST US
+///
+/// Measured on hardware, `/dev/hidraw8`, against
+/// `demo.yubico.com/webauthn-technical/registration` (which asks for
+/// `userVerification:"discouraged"`, so Chrome sends makeCredential with no
+/// `pinUvAuthToken`). Chrome's own device log, captured by relaunching Chrome
+/// with `--enable-logging` (the DevTools MCP browser is launched without it,
+/// so `chrome://device-log/` is always empty):
+///
+/// ```text
+/// device_response_converter.cc:403 -> {1: ["U2F_V2","FIDO_2_0",...], ...}
+/// u2f_register_operation.cc:195       Unexpected status 27264 from U2F device
+/// fido_device_authenticator.cc:1505   CTAP error response code 127 from usb-1050:407
+/// make_credential_request_handler.cc:825 Ignoring status 1
+/// ```
+///
+/// 27264 == 0x6A80 == U2F `SW_WRONG_DATA`. Seeing `U2F_V2`, Chrome entered a
+/// U2F register; our U2F path answered wrongly; and Chrome abandoned the whole
+/// CTAP2 makeCredential, leaving the UI on
+/// `authenticator_request_dialog_model.cc:158 UI step: kCableV2QRCode` — which
+/// is the QR-code popup. The CTAP2 path was never broken and was never even
+/// reached; the `0x09` token leg behind `0x36 PUAT_REQUIRED` mints a token
+/// correctly, as does the legacy `0x05` leg.
+///
+/// # WHY "WITH A PIN SET" AND NOT "ONLY WHEN U2F WORKS"
+///
+/// Because CTAP1 is the *lower*-trust path: it has no PIN concept at all, so
+/// serving CTAP1 from a device that has a PIN configured is a downgrade the
+/// user never asked for. The reference reaches the same place by a different
+/// route (its presence gate is disarmed by default — `button_wait_start`
+/// returns early when `phy_data.up_btn == 0`). Matching the reference is both
+/// the smaller change and the safer one. The CTAP1 framing defect that makes
+/// this necessary in the first place is recorded, and characteristically
+/// pinned, by `tests/u2f_v2_advertisement.rs::ctap1_is_not_servable_yet`;
+/// fixing it is what would let CTAP1 be advertised honestly again.
+pub fn u2f_v2_advertised(pin_set: bool) -> bool {
+    !pin_set
+}
+
 /// US-1513: the budget `getUVRetries` (clientPIN sub-command `0x07`) reports.
 ///
 /// The constant 3 was never arbitrary — it is the `auth_failures` latch
@@ -693,8 +769,13 @@ impl Default for Ctap2Info {
         // never over-claim, so the seed is the direction that fails closed.
         options.push(("makeCredUvNotRqd", false)).ok();
 
+        // "U2F_V2" is deliberately NOT seeded here, for the same fail-closed
+        // reason as `makeCredUvNotRqd` above and with the same consequence: a
+        // bare `default()` must never claim a protocol the device cannot
+        // serve. Both twins put it back through `Ctap2Info::set_u2f_v2` with
+        // `u2f_v2_advertised`, so the advertisement follows the PIN state.
         let mut versions: HeaplessVec<&'static str, 8> = HeaplessVec::new();
-        for v in ["U2F_V2", "FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"] {
+        for v in ["FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"] {
             versions.push(v).ok();
         }
         let mut extensions: HeaplessVec<&'static str, 16> = HeaplessVec::new();

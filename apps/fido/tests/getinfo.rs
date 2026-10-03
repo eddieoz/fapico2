@@ -8,7 +8,18 @@ fn test_get_info_has_required_fields() {
     assert!(info.versions.contains(&"FIDO_2_0"));
     assert!(info.versions.contains(&"FIDO_2_1"));
     assert!(info.versions.contains(&"FIDO_2_3"));
-    assert!(info.versions.contains(&"U2F_V2"));
+    // US-1531: the seed must NOT claim CTAP1. Advertising `U2F_V2` made
+    // Chrome enter a U2F register and abandon the CTAP2 makeCredential the
+    // page actually asked for, which is the QR-popup / blinking-board report
+    // on demo.yubico.com, X.com and Proton. Both twins put it back through
+    // `Ctap2Info::set_u2f_v2` only when no PIN is set — see
+    // `ctap2::u2f_v2_advertised`. Asserted on the seed rather than on the
+    // wire in `u2f_v2_advertisement.rs`.
+    assert!(
+        !info.versions.contains(&"U2F_V2"),
+        "the bare seed must fail closed on CTAP1, exactly as it does for \
+         makeCredUvNotRqd"
+    );
     assert!(info.extensions.contains(&"hmac-secret"));
     assert!(info.extensions.contains(&"credBlob"));
     assert!(info.extensions.contains(&"largeBlobKey"));
