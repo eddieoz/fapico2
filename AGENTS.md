@@ -147,6 +147,65 @@ and CTAP1 is not servable over `CTAPHID_MSG` yet anyway
 (`tests/u2f_v2_advertisement.rs::ctap1_is_not_servable_yet`). Left as recorded
 rather than fixed, for the same reason.
 
+### 5. Simpler is better security. Unneeded complexity is the vulnerability.
+
+**State the rule plainly, because it is easy to agree with and hard to apply:
+when a design choice trades simplicity for protection, take the simpler one —
+unless you can name the attack the complexity stops.**
+
+The device's storage is where this bites hardest, and it has already cost real
+capability. Keys for FIDO and OATH share one 24-entry `Rp2350SecureStore`
+(`secure_store.rs`, `DEV_MAX_ENTRIES = 24`), so each applet gets roughly half
+what it needs: **4 resident FIDO credentials** on a device whose `text` is 800 KB
+of a 4 MiB chip. Every credential write rewrites every credential, one corrupt
+byte costs the whole set, and `DEVICE_MAX_CREDS = 12` was never reachable —
+`other_slots + 2 × parts ≤ 24`, not the 5,952 B payload the constant's own
+comment cites. None of that was a security decision. It was three storage
+backends accreted without a common shape.
+
+What the complexity bought, concretely: nothing — and it is not even consistent.
+`Rp2350SecureStore` seals its image under an OTP-derived root
+(`store_v3::derive_store_key(otp_key_1, chipid)`); the trussed littlefs2 at `0x102_000` is an
+**unencrypted** filesystem whose key wrapping is each applet's own affair; and the RAM
+`EFS`/`VFS` are formatted on every boot. Three backends, three protection stories, one of them
+already the thing the other two were built to avoid. One hierarchy was available
+from the start.
+
+**How to apply it, in order:**
+
+1. **One record format, one region, one key hierarchy** for every applet that
+   holds a key — present and future. A second backend for a new applet is a
+   decision that must be argued in writing, not inherited.
+2. **Name the attack before adding a mechanism.** "More secure" is not a reason.
+   "An attacker with a flash dump can enumerate the credential set without the
+   PIN" is a reason, and it is testable.
+3. **Prefer the boring mechanism.** One AEAD record with an AAD that binds
+   slot, generation and identity beats a bespoke blob format every time.
+4. **Complexity you cannot delete, at least measure.** We have shipped three
+   separate times now: a RAM filesystem formatted at every boot, an OTP-derived
+   store key behind a `fatal_boot` that parks the board, and a flash ratchet set
+   above the region where OpenPGP keys live.
+
+**The capacity floor is part of the security case, not a concession to it.** A
+design that is maximally secure and stores four keys is not secure, it is
+broken — and a user who cannot register a passkey has no reason to keep the
+device. Capacity is a security property: an unusable authenticator gets returned,
+resold, or left in a drawer. When choosing, name **both** the threat you stop
+and the credentials you can still hold, and if the second number is small, the
+design is wrong.
+
+**Corollary for reviewers:** "this is how the reference does it" is a real
+answer — `../pico-fido`, `../pico-openpgp`, `../pico-hsm` and `../RS-Key` all
+ship per-record flash storage with an OTP- or device-rooted key — but it is not
+a shortcut past measuring. They also each hold 256 credentials, which is the
+design is wrong.
+
+**Corollary for reviewers:** "this is how the reference does it" is a real
+answer — `../pico-fido`, `../pico-openpgp`, `../pico-hsm` and `../RS-Key` all
+ship per-record flash storage with an OTP- or device-rooted key — but it is not
+a shortcut past measuring. They also each hold 256 credentials, which is the
+part that makes their design the simpler one rather than merely a different one.
+
 ---
 
 ## Layout
