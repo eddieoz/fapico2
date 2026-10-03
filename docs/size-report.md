@@ -1,3 +1,38 @@
+**Date:** 2026-10-03 (**the `uv: false` MakeCredential gate fix on
+`fix/passkey-discovery`** — the PIN-set UV gate lifted itself for an explicit
+`uv: false`, so such a request skipped `CTAP2_ERR_PUAT_REQUIRED`, fell through
+to the presence gate and armed a touch with no PIN verified; wire-proven on
+serial 94746395 (`uv` absent → `0x36`, `uv: true` → `0x36`, `uv: false` →
+touch window closed with `0x2D`), fixed in both twins, regression-pinned in
+`apps/fido/tests/uv_false_gate.rs`. See `.superpowers/sdd/report-uv-false-gate.md`.)
+**Measured: `text` 818,424 → 818,436 B (**+12 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**). UF2 **3072 → 3072 blocks** (1 absolute preamble
++ 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping sha256
+`da884eb0398c…` → **`6590ef49748ff6c173c38eebbf60a5d5cf3cccf2d5dde92a7f9a451256792725`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+6590ef49748ff6c173c38eebbf60a5d5cf3cccf2d5dde92a7f9a451256792725  firmware/fapico2.uf2
+```
+
+**The +12 B is layout, not a new feature, and it did not move the block
+count.** The device-image edit removes a condition — the
+`(!req.options_present || req.uv != Some(false))` term in
+`device_core.rs::make_credential_inner` — so the honest expectation was ≤ 0 B;
+at this size, LTO and branch-layout shifts dominate, and +12 B is the same
+alignment-noise scale as the +24 B entry below. The 12 B landed inside the
+last block's slack: the image stays 3,072 blocks / 1,572,864 B against the
+**1536** KiB `FIRMWARE_FLASH_BUDGET_KIB`, so the ratchet passes with the same
+**zero blocks** of headroom it had — the number the next change has to beat.
+The `apps/fido/src/app.rs` half of the fix is the host twin, `#[cfg(feature =
+"host")]`, **0 B** in this image; the 8 tests in
+`apps/fido/tests/uv_false_gate.rs` are an integration-test binary, **0 B**.
+
+---
+
 **Date:** 2026-10-03 (**the `authenticatorSelection` presence gate on
 `fix/passkey-discovery`** — CTAP2 `0x0B` answered `CTAP2_OK` in ~14 ms without
 ever asking anybody, which claims "a user selected me" with no user involved;
@@ -1298,8 +1333,8 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,448 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb3f0` | no (flash) |
+| `.text` | 766,460 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb400` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
 | `.gnu.sgstubs` | 0 | `0x100bfde0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
@@ -1309,14 +1344,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,448 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 766,460 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,424**. That identity is stated so a reader can check
+the `X` flag) = **818,436**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,424 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,436 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 

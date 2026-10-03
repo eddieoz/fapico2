@@ -1362,12 +1362,17 @@ impl<K: Keystore> FidoApp<K> {
             uv = true;
         }
 
-        // 8.1 rule: if PIN set and no pinUvAuthParam and options.uv != false → PUAT_REQUIRED.
-        // US-1529: unchanged; the `makeCredUvNotRqd` advertisement was fixed
-        // to match it rather than the reverse. See the twin's copy in
-        // `device_core.rs::make_credential_inner` for the full argument.
-        if pin_set && req.pin_uv_auth_param.is_none()
-            && (!req.options.present || req.options.uv != Some(false)) {
+        // 8.1 rule: if PIN set and no pinUvAuthParam → PUAT_REQUIRED, for
+        // EVERY token-less shape. US-15xx: the old condition
+        // `(!req.options.present || req.options.uv != Some(false))` lifted
+        // the gate for an explicit `uv: false`, which then armed a touch /
+        // minted with no PIN verified — inverted from what
+        // `makeCredUvNotRqd: false` promises (§6.1.3: UV required
+        // "regardless of the parameters the platform supplies"). Wire-proven
+        // and fixed in both twins; see the full history on the device twin's
+        // copy in `device_core.rs::make_credential_inner`. The no-PIN state
+        // is untouched.
+        if pin_set && req.pin_uv_auth_param.is_none() {
                 return vec![Ctap2Response::PuatRequired.code()];
             }
 

@@ -852,14 +852,33 @@ impl FidoApp {
             }
         }
         // US-1529: this is the gate the `makeCredUvNotRqd` advertisement
-        // describes. It is deliberately UNCHANGED — the advertisement was
-        // fixed to match it, not the reverse (weakening the gate is US-907 /
-        // US-921's to make, not this story's). It is the reference's 8.1
-        // branch, `pico-fido/src/fido/cbor_make_credential.c:404`. Read
-        // together with `ctap2::make_cred_uv_not_rqd`: a client that sees
-        // `makeCredUvNotRqd: false` here knows to send `pinUvAuthParam`, and
-        // a client that does not is refused on purpose.
-        if pin_set && req.pin_uv_auth_param.is_none() && (!req.options_present || req.uv != Some(false)) {
+        // describes. It is the reference's UV-requirement branch,
+        // `pico-fido/src/fido/cbor_make_credential.c:393-407` — and it must
+        // hold for EVERY token-less shape, "regardless of the parameters the
+        // platform supplies" (CTAP 2.1 §6.1.3, quoted at
+        // `ctap2::make_cred_uv_not_rqd`).
+        //
+        // HISTORY, because the one-line term this replaces cost a wire bug:
+        // the gate used to read `(!req.options_present || req.uv !=
+        // Some(false))`, i.e. it lifted itself for an explicit `uv: false`.
+        // That followed the reference's 8.1 branch literally (which keys on
+        // `options.uv == pfalse` alone) — but with `makeCredUvNotRqd: false`
+        // advertised, an `uv: false` request is exactly a client trying to
+        // *bypass* the UV the advertisement promises, and §6.1.3 makes no
+        // exception for it. Wire-proven 2026-10-03 on serial 94746395 (PIN
+        // set, alwaysUv false): `uv` absent → `0x36`, `uv: true` → `0x36`,
+        // but `uv: false` skipped this gate, armed a touch window with no
+        // PIN verified, and the window closed with `0x2D` ~30 s later — the
+        // exact X.com report. The gate is now unconditional in the
+        // token-less case; the reference's AUV branch
+        // (`cbor_make_credential.c:393-397`,
+        // `pinUvAuthParam.present == false && options.uv != ptrue` →
+        // `CTAP2_ERR_PUAT_REQUIRED`) is the same rule. The no-PIN state is
+        // untouched (`pin_set == false` never enters; `makeCredUvNotRqd` is
+        // `true` there and a `uv: false` credential without a token is
+        // legal, up to presence — pinned in `tests/uv_false_gate.rs`).
+        // Tightening only; US-907/US-921 are untouched.
+        if pin_set && req.pin_uv_auth_param.is_none() {
             return Err(err(Ctap2Response::PuatRequired));
         }
 
