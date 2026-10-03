@@ -86,7 +86,28 @@ pub struct McReq {
     pub user_name: HeaplessVec<u8, TEXT_MAX>,
     pub user_display_name: HeaplessVec<u8, TEXT_MAX>,
     /// Requested algorithms (only type=="public-key" params).
-    pub algs: HeaplessVec<i32, 8>,
+    ///
+    /// US-1532: capacity was 8, and a conforming client is not limited to 8 —
+    /// CTAP 2.1 §6.1.2 sets no cap on `pubKeyCredParams`. Chrome sends ten:
+    ///
+    /// ```text
+    /// <- 0x1 (kAuthenticatorMakeCredential) {..., 4: [
+    ///   {"alg": -7}, {"alg": -8}, {"alg": -35}, {"alg": -36}, {"alg": -37},
+    ///   {"alg": -257}, {"alg": -47}, {"alg": -48}, {"alg": -49}, {"alg": -50}], ...}
+    /// -> (CTAP2 error code 0x15 (kCtap2ErrLimitExceeded))
+    /// ```
+    ///
+    /// The ninth push overflowed and `parse_mc` answered `LimitExceeded`
+    /// (device_core.rs:340), so every site whose browser sends its full
+    /// algorithm list could not register at all. Reproduced on hardware by
+    /// replaying Chrome's ten entries against `/dev/hidraw8`: `0x15`, no
+    /// keepalives; the same request with one algorithm arms normally.
+    ///
+    /// The host twin in `app.rs` holds this list in an unbounded `Vec`, which
+    /// is why the whole host suite was green throughout — the twin trap of
+    /// AGENTS.md §1, on the request parser rather than the command path.
+    /// 16 is comfortably above any browser's default list and costs 32 bytes.
+    pub algs: HeaplessVec<i32, 16>,
     pub exclude: HeaplessVec<HeaplessVec<u8, 64>, 8>,
     pub options_present: bool,
     pub rk: Option<bool>,
