@@ -1980,82 +1980,39 @@ impl FidoApp {
                 Ok(())
             }
             0x06 => {
-                // getPinUvAuthTokenUsingUvWithPermissions.
+                // getPinUvAuthTokenUsingUvWithPermissions — REFUSED.
                 //
-                // The no-PIN leg of the token exchange: the client proves
-                // nothing but a user-presence gesture, and this build's
-                // authenticator has no separate user-verification secret to
-                // check. It is what a client falls back to when the key has
-                // no PIN, so it has to answer rather than refuse, or the
-                // client has no way to obtain a pinUvAuthToken at all and the
-                // resident-credential screens never resolve.
+                // This sub-command is only applicable when the authenticator
+                // supports built-in user-verification methods (CTAP 2.2
+                // §6.5.5.7.3), and §5.4.6 grants it only when the `uv` option
+                // is present and true: "A device that can only do Client PIN
+                // will not return the `uv` option id." GetInfo here advertises
+                // exactly the Client-PIN-only shape — `clientPin` per state,
+                // `uv` absent, `pinUvAuthToken` true for the PIN-based legs
+                // `0x05`/`0x09` — so answering `0x06` contradicted our own
+                // advertisement. Worse, the arm below used to mint a token on
+                // a presence grant alone: a client following §6.5.5.7's
+                // "SHOULD first try `0x06`" armed the device for a 30 s touch
+                // with no PIN prompt, and the ceremony died in the window.
+                // Measured live: 0x01 PROCESSING, 0x02 UP NEEDED, 30.2 s,
+                // 0x2D KEEPALIVE_CANCEL, no PIN ever asked.
                 //
-                // US-1525: this comment used to justify the sub-command by
-                // claiming "GetInfo reports the `uv` option". It never did,
-                // and it still does not — `uv` is deliberately not
-                // advertised (see `ctap2::Ctap2Info::default`), because this
-                // build has nothing to verify against and promising a
-                // mechanism that does not exist would be the real lie. What
-                // is advertised is `pinUvAuthToken`, which claims the token
-                // *mechanism*, not a UV method; US-1512 sets its value to
-                // true except under the durable lockout — the same
-                // `blocked || needs_power_cycle` gate applied below — so the
-                // capability is advertised exactly when it is offered.
-                // `tests/pin_uv_advert.rs` asserts `uv` stays absent on both
-                // twins so this premise cannot be quietly reinstated.
-                // Fail-closed on presence: the grant is the only thing being
-                // asserted, so without a press this answers `UpRequired` and
-                // the transport opens a keepalive window and retries. A
-                // token is therefore never minted without a real touch.
-                let permissions = permissions.ok_or(err(Ctap2Response::MissingParameter))?;
-                let ka = key_agreement.ok_or(err(Ctap2Response::MissingParameter))?;
-                // US-1512: the durable lockout that every PIN leg already
-                // refuses. Without this gate `0x06` stayed the one token
-                // route that ignored it, so a locked-out device still
-                // minted a full-permission token while GetInfo — correctly —
-                // had stopped advertising that it could.
-                if self.keystore.pin_state.blocked || self.keystore.pin_state.needs_power_cycle {
-                    return Err(err(Ctap2Response::PinAuthBlocked));
-                }
-                let client_pub =
-                    crypto::parse_cose_ec2_p256_bytes(&ka[..32], &ka[32..]).ok_or(err(Ctap2Response::PinAuthInvalid))?;
-                if !self.user_present(crate::device_app::presence_tag_from_channel(
-                    self.current_channel,
-                )) {
-                    return Err(err(Ctap2Response::UpRequired));
-                }
-                let shared = self.derive_shared(protocol, &client_pub);
-                let mut enc_key = [0u8; 32];
-                enc_key.copy_from_slice(&shared[32..]);
-
-                let mut token = [0u8; 32];
-                self.draw_random(&mut token);
-                self.pin_token = Some(token);
-                self.token_permissions = permissions;
-                // A UV token is not bound to an rpId — the permission mask
-                // is the whole of its scope.
-                self.token_rp_id.clear();
-
-                let mut encrypted: HeaplessVec<u8, 96> = HeaplessVec::new();
-                if protocol == 1 {
-                    let mut buf = [0u8; 32];
-                    buf.copy_from_slice(&token);
-                    crypto::pin_cbc_encrypt_zero_iv(&enc_key, &mut buf).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
-                    encrypted.extend_from_slice(&buf).ok();
-                } else {
-                    let mut iv = [0u8; 16];
-                    self.draw_random(&mut iv);
-                    let mut buf = [0u8; 32];
-                    buf.copy_from_slice(&token);
-                    crypto::aes256_cbc_encrypt_into(&enc_key, &iv, &mut buf)
-                        .map_err(|_| err(Ctap2Response::KeyStoreFull))?;
-                    encrypted.extend_from_slice(&iv).ok();
-                    encrypted.extend_from_slice(&buf).ok();
-                }
-                no_heap::push_map_header(out, 1).ok();
-                no_heap::push_uint(out, 2).ok();
-                no_heap::push_bstr(out, &encrypted).ok();
-                Ok(())
+                // The C reference never implemented this leg at all —
+                // `pico-fido2/src/fido/cbor_client_pin.c` chains
+                // 0x01/0x02/0x03/0x04/0x09|0x05 and falls through to
+                // `CTAP2_ERR_INVALID_SUBCOMMAND` (line 909). We now answer
+                // the same way, immediately, with no presence window: the
+                // `UpRequired` this arm used to return is what
+                // `hid_serve.rs`'s `presence_windowed` parks and prompts on,
+                // so refusing with `InvalidSubcommand` means the client gets
+                // its error at once and falls through to the `0x09` PIN leg
+                // — the path every working site already drives.
+                //
+                // US-1512's `blocked || needs_power_cycle` gate lived inside
+                // this arm and is superseded by it: the refusal fires before
+                // any lockout state is consulted, and the lockout itself is
+                // still advertised honestly by `pin_uv_auth_token_available`.
+                Err(err(Ctap2Response::InvalidSubcommand))
             }
             _ => Err(err(Ctap2Response::InvalidParameter)),
         }
@@ -2253,10 +2210,14 @@ impl FidoApp {
     // extending the transport, which is exactly what was done:
     // `ctap_cmd == 0x0B` now joins `0x06` and `0x41` in `presence_windowed`
     // (`firmware/src/hid_serve.rs`). This is the same proven shape, not a new
-    // mechanism: `0x06`'s `getPinUvAuthTokenUsingUvWithPermissions` is
-    // already answered with `UpRequired` during Chrome's *discovery*, so a
-    // gated answer on a discovery-time command is a path this firmware has
-    // exercised against a real client.
+    // mechanism. (History: this paragraph once justified itself by claiming
+    // `0x06`'s `getPinUvAuthTokenUsingUvWithPermissions` was already answered
+    // with `UpRequired` during Chrome's discovery. Measurement refuted the
+    // premise — the working sites took the PIN leg and never called `0x06` —
+    // and the sub-command has since been removed entirely: it now refuses
+    // `InvalidSubcommand` with no presence window at all. `0x0B` stands on
+    // CTAP 2.1 §6.9's own "the authenticator will ask for user presence",
+    // not on `0x06`'s former behaviour.)
     //
     // The claim that "every non-zero answer is a `CtapError` at
     // `fido2`'s caller, so a gated selection reads as an exception rather than
@@ -2794,8 +2755,10 @@ impl FidoApp {
             // alone left such a key unable to use credentialManagement at all,
             // so the real requirement — a live token — is checked instead.
             // Nothing is weakened: the token below is still verified, and one
-            // can only exist if a token sub-command succeeded (0x06 only after
-            // a user-presence grant). With neither, this is still PinNotSet.
+            // can only exist if a PIN-based token sub-command succeeded
+            // (0x05/0x09 only after PIN verification — the no-PIN 0x06 leg
+            // was removed and now refuses InvalidSubcommand). With neither,
+            // this is still PinNotSet.
             if self.keystore.pin_state.pin_hash.is_none() && self.pin_token.is_none() {
                 return Err(err(Ctap2Response::PinNotSet));
             }

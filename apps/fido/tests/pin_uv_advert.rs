@@ -7,13 +7,15 @@
 //!
 //! The rule under test is `ctap2::pin_uv_auth_token_available`:
 //!
-//! * no PIN configured  → `true`. Sub-command `0x06` needs no PIN (it asserts
-//!   a presence grant and nothing else) and credentialManagement honours the
-//!   token it returns, so reporting `false` here would point a client away
-//!   from a path that answers.
-//! * PIN set, healthy    → `true`, via the `0x05`/`0x09` legs as well.
-//! * durable lockout     → `false`, because the token sub-command refuses
-//!   with it (the gate it is checked against lives in the test below).
+//! * no PIN configured  → `true`. The capability covers the PIN-based token
+//!   legs (`0x05`/`0x09`) per CTAP 2.2 §5.4.6; clientPIN sub-command `0x06`
+//!   (`getPinUvAuthTokenUsingUvWithPermissions`) is NOT part of the offer —
+//!   this build has no built-in UV method, `uv` is absent from GetInfo, and
+//!   the sub-command is refused `InvalidSubcommand` (0x3E) on both twins.
+//! * PIN set, healthy    → `true`, via the `0x05`/`0x09` legs.
+//! * durable lockout     → `false`, because a correct PIN is required before
+//!   any token is minted again (the `0x05`/`0x09` success path clears the
+//!   latch and mints together).
 //!
 //! `false` is a LOCKOUT, not a wall: the `0x05`/`0x09` legs carry no up-front
 //! gate on purpose and their success path clears the latch and mints the
@@ -196,21 +198,44 @@ fn a_correct_pin_restores_the_route_it_withdrew() {
     );
 }
 
+/// clientPIN sub-command `0x06` is refused `InvalidSubcommand` (0x3E) in
+/// every state — fresh, PIN-set, or durably locked out. This test used to
+/// pin the *opposite* on the locked-out side: it asserted `PinAuthBlocked`
+/// (0x34), i.e. that a token leg existed and merely honoured the lockout.
+/// The refusal is now unconditional — CTAP 2.2 §5.4.6 grants `0x06` only
+/// when the `uv` option is advertised, and it never is — so the lockout
+/// gate US-1512 put inside the arm is superseded, not preserved.
 #[test]
-fn host_uv_subcommand_is_refused_while_locked_out() {
-    let (mut app, client) = setup();
-    latch_host(&mut app, &client);
+fn host_uv_subcommand_is_refused_in_every_state() {
+    // Fresh, no PIN.
+    let mut fresh = FidoAppMem::with_keystore(fapico2_fido::keystore::MemoryKeystore::new());
+    let fresh_req = cbor::encode(&Value::M(vec![
+        (Value::U(0x01), Value::U(2)),
+        (Value::U(0x02), Value::U(0x06)),
+        (Value::U(0x03), Value::M(vec![])),
+        (Value::U(0x09), Value::U(0x04)),
+    ]));
+    let resp = fresh.process_ctap2(0x06, &fresh_req, [1, 2, 3, 4]);
+    assert_eq!(
+        resp[0], 0x3E,
+        "0x06 must be refused InvalidSubcommand on a fresh device, before any lockout state"
+    );
+
+    // Durably locked out.
+    let (mut locked, client) = setup();
+    latch_host(&mut locked, &client);
     let req = cbor::encode(&Value::M(vec![
         (Value::U(0x01), Value::U(2)),
         (Value::U(0x02), Value::U(0x06)),
-        (Value::U(0x03), client.client_cose()),
+        (Value::U(0x03), Value::M(vec![])),
         (Value::U(0x09), Value::U(0x04)),
     ]));
-    let resp = app.process_ctap2(0x06, &req, [1, 2, 3, 4]);
+    let resp = locked.process_ctap2(0x06, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x3E, "lockout or not, 0x06 has no leg here");
     assert_eq!(
-        resp[0],
-        0x34,
-        "a locked-out device must not mint a token it has stopped advertising"
+        resp.len(),
+        1,
+        "the refusal is a bare status byte — no CBOR body, no token"
     );
 }
 
@@ -225,8 +250,6 @@ mod device {
     use fapico2_platform::secure_store::HostSecureStore;
     use fapico2_platform::trng::HostTrng;
     use heapless::Vec as HV;
-
-    const PIN_AUTH_BLOCKED: u8 = 0x34;
 
     struct Device {
         app: FidoApp,
@@ -380,8 +403,11 @@ mod device {
             (status, body.len())
         }
 
-        /// getPinUvAuthTokenUsingUvWithPermissions (0x06) — no PIN leg.
-        fn uv_token_status(&mut self) -> u8 {
+        /// clientPIN sub-command `0x06` — refused, never minted. Returns the
+        /// status byte. The request is fully formed (keyAgreement +
+        /// permissions) so the refusal can only come from the sub-command
+        /// gate itself, not from a missing-parameter short-circuit.
+        fn uv_subcommand_status(&mut self) -> u8 {
             self.derive_keys();
             let mut req: HV<u8, 256> = HV::new();
             nh::push_map_header(&mut req, 4).unwrap();
@@ -408,13 +434,21 @@ mod device {
     }
 
     /// The pairing this story exists for, on the binary that actually ships.
+    /// The capability is advertised even with no PIN — it names the
+    /// `0x05`/`0x09` legs — while sub-command `0x06` is refused outright.
     #[test]
     fn device_fresh_still_advertises_the_token_route() {
         let mut d = Device::boot();
         let opts = d.options();
         super::assert_pin_pair(&opts, false, true);
-        // And the route is real: 0x06 answers a fresh, PIN-less device.
-        assert_eq!(d.uv_token_status(), 0x00);
+        // And 0x06 is refused with InvalidSubcommand on the same fresh
+        // device — the advertisement does not point at a UV leg, because
+        // there is no UV leg.
+        assert_eq!(
+            d.uv_subcommand_status(),
+            0x3E,
+            "0x06 must be refused on a fresh device, before any lockout state"
+        );
     }
 
     /// US-1525, device side: the comment above sub-command `0x06` must not
@@ -446,15 +480,19 @@ mod device {
         super::assert_pin_pair(&opts, true, false);
     }
 
-    /// The advertisement and the token sub-command must agree: advertising
-    /// `false` while `0x06` still mints is the incoherence, in either
-    /// direction.
+    /// Sub-command `0x06` is refused in every state on the shipping binary
+    /// too. This test used to pin coherence in the other direction — minting
+    /// `0x00` when the advert said `true`, `PIN_AUTH_BLOCKED` when it said
+    /// `false` — which pinned the non-conformant UV leg. The advertisement's
+    /// `pinUvAuthToken` bit now names the `0x05`/`0x09` legs only; `0x06`
+    /// answers `InvalidSubcommand` regardless of lockout, so the
+    /// advertisement cannot be read as promising it.
     #[test]
-    fn device_uv_subcommand_follows_the_advertisement() {
+    fn device_uv_subcommand_is_refused_in_every_state() {
         let mut fresh = Device::boot();
         let opts = fresh.options();
         assert_eq!(super::option_of(&opts, "pinUvAuthToken"), Some(true));
-        assert_eq!(fresh.uv_token_status(), 0x00);
+        assert_eq!(fresh.uv_subcommand_status(), 0x3E);
 
         let mut locked = Device::boot();
         locked.set_pin(b"1234");
@@ -464,9 +502,9 @@ mod device {
         let opts = locked.options();
         assert_eq!(super::option_of(&opts, "pinUvAuthToken"), Some(false));
         assert_eq!(
-            locked.uv_token_status(),
-            PIN_AUTH_BLOCKED,
-            "a locked-out device must not mint a token it has stopped advertising"
+            locked.uv_subcommand_status(),
+            0x3E,
+            "the refusal is unconditional — it must not depend on lockout state"
         );
     }
 
@@ -489,11 +527,14 @@ mod device {
         assert_eq!(status, 0x00, "a correct PIN must not be refused by the latch");
         assert!(body_len > 0, "the restored route must return a token body");
         super::assert_pin_pair(&d.options(), true, true);
-        // And the route really works afterwards, not merely advertised.
+        // The route the advertisement restored is the PIN leg, which the
+        // `0x00` above already proves end to end. Sub-command `0x06` stays
+        // refused — the restoration never re-opens the UV leg because there
+        // never was one to re-open.
         assert_eq!(
-            d.uv_token_status(),
-            0x00,
-            "the token sub-command must agree with the advertisement it restored"
+            d.uv_subcommand_status(),
+            0x3E,
+            "the refusal of 0x06 is independent of lockout state"
         );
     }
 }

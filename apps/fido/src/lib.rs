@@ -342,6 +342,10 @@ pub enum FidoError {
     UserPresenceRequired,
     /// User verification required.
     UserVerificationRequired,
+    /// Invalid sub-command (CTAP2 0x3E). The host twin's clientPIN handler
+    /// returns this for `getPinUvAuthTokenUsingUvWithPermissions` (0x06),
+    /// matching the device twin and the C reference.
+    InvalidSubcommand,
     /// Internal error.
     Internal,
 }
@@ -387,6 +391,7 @@ impl FidoError {
             FidoError::InvalidSeq => 0x04,
             FidoError::UserPresenceRequired => 0x3B,   // UP_REQUIRED
             FidoError::UserVerificationRequired => 0x3C, // UV_BLOCKED
+            FidoError::InvalidSubcommand => 0x3E,      // INVALID_SUBCOMMAND
             FidoError::Internal => 0x01,
         }
     }

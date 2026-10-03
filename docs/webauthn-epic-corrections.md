@@ -541,6 +541,51 @@ boot, real hardware) is human-gated and undelivered.
 
 ---
 
+### C12 — the plan's US-1512 premise inverted: clientPIN sub-command `0x06`
+**should never have existed on this device** (2026-10-03)
+
+**The plan said** (US-1512, and the epic's Phase C): the no-PIN token leg
+(`getPinUvAuthTokenUsingUvWithPermissions`) is legitimate and only needs a
+durable-lockout gate, because GetInfo advertises `pinUvAuthToken: true` and
+credentialManagement honours the token it mints. US-1512's fix added exactly
+that gate (`blocked || needs_power_cycle` → `PinAuthBlocked`).
+
+**What is true:** the sub-command itself is the defect. Three independent
+sources agree:
+
+- **The spec** (CTAP 2.2 §5.4.6, §6.5.5.7.3 — fetched and read in the
+  conformance review): `0x06` is granted **only when the `uv` option is
+  present and true**, and *"A device that can only do Client PIN will not
+  return the `uv` option id."* Our GetInfo is the canonical Client-PIN-only
+  shape (`clientPin` per state, `uv` absent, `pinUvAuthToken` true for the
+  `0x05`/`0x09` legs) — so answering `0x06` contradicted our own
+  advertisement, regardless of any lockout gate.
+- **The reference** (read): `../pico-fido2/src/fido/cbor_client_pin.c` has no
+  `0x06` branch at all — the chain is `0x01/0x02/0x03/0x04/0x09|0x05`, and the
+  fall-through answers `CTAP2_ERR_INVALID_SUBCOMMAND` (line 909). The C board
+  works on X.com / proton.me / demo.yubico.com partly because of this.
+- **The wire** (executed, live hardware, 2026-10-03): a `0x06` request to our
+  board answered `0x01 PROCESSING`, `0x02 UP NEEDED`, held a 30.2 s touch
+  window with **no PIN prompt**, and closed with `0x2D KEEPALIVE_CANCEL`. A
+  §6.5.5.7-conformant client ("SHOULD first try `0x06`") arms the device
+  without a PIN prompt — the reported symptom.
+
+**Where the correction lives:** the arm is removed from **both** twins —
+`device_core.rs::client_pin_inner` (`0x06` → `InvalidSubcommand`, 0x3E,
+immediately, no presence window) and `pin.rs` (new `FidoError::InvalidSubcommand`
+→ 0x3E). US-1512's lockout gate inside the arm is superseded, not preserved:
+the refusal fires before any lockout state is consulted, and
+`pin_uv_auth_token_available` still reports the lockout honestly for the legs
+that remain. GetInfo's advertisement is unchanged. Regression-pinned in
+`apps/fido/tests/clientpin_subcommand06_refusal.rs` (the presence-denied
+device run is the falsifiable test: under the removed arm that exact request
+answered `UpRequired` (0x3B) — the byte `hid_serve.rs` parks into the 30 s
+window — and now answers `0x3E`). The twins-disagreement the review found is
+also closed: the host twin's `get_pin_token_uv` had **no presence gate at
+all**, which is why no host test could ever observe the arming.
+
+---
+
 ## The audit — twelve claims that inverted
 
 Every one of these was a confident claim that came out **the other way** when it
@@ -656,6 +701,7 @@ durable — this document is not a substitute for it.**
 | C7 + C8 status and command tables | `apps/fido/tests/status_table.rs` | 12 tests, all green |
 | C9 `makeCredUvNotRqd` | `apps/fido/src/ctap2.rs` | `:628`, `:694`; `device_core.rs:2119` |
 | C10 `pinUvAuthToken` | `apps/fido/src/ctap2.rs` | `:491-560`; `tests/pin_uv_advert.rs` |
+| C12 `0x06` refusal | `apps/fido/src/device_core.rs`, `apps/fido/src/pin.rs` | `client_pin_inner` `0x06` arm; `tests/clientpin_subcommand06_refusal.rs` |
 | flash ratchet (epic US-1519) | `.github/workflows/ci.yml` | `:47-91` — `FIRMWARE_FLASH_BUDGET_KIB: 1536` |
 
 ---

@@ -1,3 +1,39 @@
+**Date:** 2026-10-03 (**the clientPIN sub-command `0x06` refusal on
+`fix/passkey-discovery`** — `getPinUvAuthTokenUsingUvWithPermissions` minted a
+pinUvAuthToken on a presence grant alone with no PIN, on a device whose GetInfo
+advertises no `uv` option; CTAP 2.2 §5.4.6 grants the sub-command only when
+`uv` is present and true, so a §6.5.5.7-conformant client armed a 30 s no-PIN
+touch window (measured: `0x01`/`0x02`/30.2 s/`0x2D`). The arm is removed in
+both twins and answers `InvalidSubcommand` (0x3E) immediately — no presence
+window — matching the C reference's fall-through at
+`pico-fido2/src/fido/cbor_client_pin.c:909`. GetInfo is unchanged. See
+`.superpowers/sdd/report-0x06-refusal.md`.)
+**Measured: `text` 818,436 → 817,960 B (**−476 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**). UF2 **3072 → 3070 blocks** (1 absolute preamble
++ 3069 ARM_S payload), 1,572,864 → **1,571,840 bytes**. Shipping sha256
+`6590ef49748f…` → **`f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3070 blocks (1 absolute preamble + 3069 ARM_S payload), 1571840 bytes
+f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da  firmware/fapico2.uf2
+```
+
+**The −476 B is the deleted arm, and the ratchet moved DOWN.** Removing the
+`0x06` token-mint leg (encipher, token storage, permission bookkeeping) from
+`device_core.rs::client_pin_inner` and `get_pin_token_uv` from `pin.rs` more
+than pays for the new `FidoError::InvalidSubcommand` variant and the two
+refusal arms. The UF2 shrank two blocks: 3070 of the 3072 that
+`FIRMWARE_FLASH_BUDGET_KIB: 1536` allows — the first slack on this branch, not
+a licence: the budget stays **1536** and the next change is measured against
+3070, not 3072. The host-twin tests
+(`apps/fido/tests/clientpin_subcommand06_refusal.rs`) are an integration-test
+binary, **0 B** in this image.
+
+---
+
 **Date:** 2026-10-03 (**the `uv: false` MakeCredential gate fix on
 `fix/passkey-discovery`** — the PIN-set UV gate lifted itself for an explicit
 `uv: false`, so such a request skipped `CTAP2_ERR_PUAT_REQUIRED`, fell through
@@ -1333,10 +1369,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,460 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb400` | no (flash) |
+| `.text` | 765,984 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb220` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfde0` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfc00` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1344,14 +1380,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,460 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 765,984 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,436**. That identity is stated so a reader can check
+the `X` flag) = **817,960**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,436 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 817,960 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
