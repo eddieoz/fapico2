@@ -1,0 +1,347 @@
+Device Log
+html {
+      height: 100%;
+    }
+
+    body {
+      height: 100%;
+      margin: 0;
+    }
+Add a query param in URL to auto-refresh the page: chrome://device-log/?refresh=<sec>
+Refresh
+Clear
+Log Level:
+Error
+User
+Event
+Debug
+File Info
+Detailed Timestamps
+Clear Types
+Bluetooth
+Camera
+Display
+Extensions
+FIDO
+Firmware
+Geolocation
+HID
+Login
+Memory
+Network
+Power
+Printer
+Serial
+USB
+Add a query param in the URL to select types on page load. Example: chrome://device-log/?types=Bluetooth,USB
+USB
+User
+[09:43:23]
+        
+        USB device added: path=/dev/bus/usb/001/112 vendor=10374 "Seeed Studio", product=5735 "Seeed Wio Tracker L1", serial="FEA064D14643E1FA", guid=ce54fbef-6d90-4939-a5d7-1b9c38aa5f1e
+FIDO
+Event
+[09:43:17]
+        
+        UI step: kTimedOut
+FIDO
+Debug
+[09:43:17]
+        
+        Advertisements stopped
+FIDO
+Debug
+[09:43:17]
+        
+        Stopping 0 caBLE advertisements
+FIDO
+Event
+[09:40:18]
+        
+        UI step: kClientPinEntry
+FIDO
+Debug
+[09:40:18]
+        
+        -> {3: 8}
+FIDO
+Debug
+[09:40:18]
+        
+        <- 0x6 (kAuthenticatorClientPin) {1: 2, 2: 1}
+FIDO
+Debug
+[09:40:18]
+        
+        The device supports the CTAP2 protocol.
+FIDO
+Debug
+[09:40:18]
+        
+        Unexpected protocol version received.
+FIDO
+Debug
+[09:40:18]
+        
+        -> {1: ["U2F_V2", "FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"], 2: ["credBlob", "credProtect", "hmac-secret", "largeBlobKey", "minPinLength"], 3: h'66617069636F32000000000000000002', 4: {"rk": true, "alwaysUv": false, "credMgmt": true, "authnrCfg": true, "clientPin": true, "largeBlobs": true, "pinUvAuthToken": true, "setMinPINLength": true, "makeCredUvNotRqd": false, "enterpriseAttestation": true}, 5: 7609, 6: [1, 2], 7: 19, 8: 128, 9: ["usb"], 10: [{"alg": -7, "type": "public-key"}, {"alg": -8, "type": "public-key"}, {"alg": -35, "type": "public-key"}, {"alg": -36, "type": "public-key"}], 11: 1024, 12: false, 13: 4, 14: 1, 15: 32, 16: 120, 21: [8055560605607898362, 8879174565946325320, 8550182048006734589, 2783008008553857119, 1377906609533693, 1572433893015801], 25: h'0A786CB95F6BCF8B26C1F431495BB357829904101E37120B4CE26DFD9B252B1C', 29: 63, 30: h'E5CFD64041ADC0F8C1DAF32FE2DFC7AF6B80BBFDBA23DFB6D50ED22D4E48B2C3', 31: [1, 2, 3, 255]}
+FIDO
+Debug
+[09:40:18]
+        
+        Sending CTAP2 AuthenticatorGetInfo request to authenticator.
+FIDO
+Event
+[09:40:18]
+        
+        UI step: kUsbInsertAndActivate
+FIDO
+Debug
+[09:40:18]
+        
+        Transport availability checks done
+FIDO
+Debug
+[09:40:18]
+        
+        Discovery started for transport 0
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=1267, productId=12458, name='MSNB0001:00 04F3:30AA', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:15.0/i2c_designware.0/i2c-0/i2c-MSNB0001:00/0018:04F3:30AA.0001/hidraw/hidraw0'], reportDescriptor='BQEJAqEBhQEJAaEABQkZASkCFQAlAXUBlQKBApUGgQMFAQkwCTEVgSV/dQiVAoEGdQiVBYEDwAYA/wkBhQ4JxRUAJv8AdQiVBLECwAYA/wkBoQGFXAkBlQt1CIEGhQ0JxRUAJv8AdQiVBLEChQwJxpagAnUIsQKFCwnHlUJ1CLECwAUNCQWhAYUECSKhAhUAJQEJRwlClQJ1AYECdQGVAoEDlQF1BCUPCVGBAgUBFQAmlAx1EFUOZRMJMDUARpIBlQGBAkb0ACagByagBwkxgQIFDRUAJWSVA8BVDGYBEEf//wAAJ///AAB1EJUBCVaBAglUJX+VAXUIgQIFCQkBJQF1AZUBgQKVB4EDCcV1CJUCgQMFDYUCCVUJWXUElQIlD7EChQcJYHUBlQEVACUBsQKVD7EDBgD/BgD/hQYJxRUAJv8AdQiWAAGxAsAFDQkOoQGFAwkioQAJUhUAJQp1EJUBsQLACSKhAIUFCVcJWHUBlQIlAbEClQ6xA8DA'
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=4057, productId=120, name='Elgato Elgato Facecam', serial='FW52K1A08349', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb2/2-3/2-3.1/2-3.1:1.2/0003:0FD9:0078.0008/hidraw/hidraw7'], reportDescriptor='BgD/CQGhARkBKQEVgCV/dQiWAASBAhkCKQJ1CJYABJECwA=='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=4057, productId=128, name='Elgato Stream Deck MK.2', serial='DL38K1A05797', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/0003:0FD9:0080.007F/hidraw/hidraw1'], reportDescriptor='BQwJAaEBCgD/FQAm/wB1CJb/A4UCkQIKAP8VACb/AHUIlv8BhQGBAgoA/xUAJv8AdQiWHwCFA7EECgD/FQAm/wB1CJYfAIUHsQQKAP8VACb/AHUIlh8AhQWxBAoA/xUAJv8AdQiWHwCFBLEECgD/FQAm/wB1CJYfAIUGsQQKAP8VACb/AHUIlh8AhQixBAoA/xUAJv8AdQiWHwCFCbEECgD/FQAm/wB1CJYfAIUKsQQKAP8VACb/AHUIlh8AhQuxBAoA/xUAJv8AdQiWHwCFDLEEwA=='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=5357, productId=4114, name='Shure Inc Shure MV7', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.3/1-4.3:1.4/0003:14ED:1012.0004/hidraw/hidraw3'], reportDescriptor='BQwJAaEBFQAlAXUBlQcJzQm1CbYJtwniCekJ6oEClQGBAcA='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=5357, productId=4114, name='Shure Inc Shure MV7', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.3/1-4.3:1.3/0003:14ED:1012.0003/hidraw/hidraw2'], reportDescriptor='BgD/CQGhARkAKUAVACb/AHUIlUCRAhkAKUAVACb/AHUIlUCBAsA='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=1133, productId=50495, name='Logitech USB Receiver', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.1/1-4.1.1/1-4.1.1:1.2/0003:046D:C53F.0007/hidraw/hidraw6'], reportDescriptor='BgD/CQGhAYUQlQZ1CBUAJv8ACQGBAAkBkQDABgD/CQKhAYURlRN1CBUAJv8ACQKBAAkCkQDABgD/CQShAYUgdQiVDhUAJv8ACUGBAAlBkQCFIZUfFQAm/wAJQoEACUKRAMA='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=1133, productId=16500, name='Logitech G305', serial='72-97-18-f7', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.1/1-4.1.1/1-4.1.1:1.2/0003:046D:C53F.0007/0003:046D:4074.000C/hidraw/hidraw11'], reportDescriptor='BQEJBqEBhQGVCHUBFQAlAQUHGeAp54EClQZ1CBUAJv8ABQcZACr/AIEAhQ4FCJUFdQEVACUBGQEpBZEClQF1A5EBwAUBCQKhAYUCCQGhAAUJGQEpEBUAJQGVEHUBgQIFARYBgCb/f3UQlQIJMAkxgQYVgSV/dQiVAQk4gQYFDAo4ApUBgQbAwAUMCQGhAYUDdRCVAhUBJv8CGQEq/wKBAMAGAP8JAaEBhRB1CJUGFQAm/wAJAYEACQGRAMAGAP8JAqEBhRF1CJUTFQAm/wAJAoEACQKRAMAGAP8JBKEBhSB1CJUOFQAm/wAJQYEACUGRAIUhlR8VACb/AAlCgQAJQpEAwA=='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=1133, productId=50495, name='Logitech USB Receiver', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.1/1-4.1.1/1-4.1.1:1.1/0003:046D:C53F.0006/hidraw/hidraw5'], reportDescriptor='BQEJAqEBhQIJAaEAlRB1ARUAJQEFCRkBKRCBApUCdRAWAYAm/38FAQkwCTGBBpUBdQgVgSV/CTiBBpUBBQwKOAKBBsDABQwJAaEBhQOVAnUQFQEm/wIZASr/AoEAwAUBCYChAYUElQF1AhUBJQMJggmBCYOBAHUGgQPABrz/CYihAYUIlQF1CBUBJv8AGQEp/4EAwA=='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=1133, productId=50495, name='Logitech USB Receiver', serial='', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.1/1-4.1.1/1-4.1.1:1.0/0003:046D:C53F.0005/hidraw/hidraw4'], reportDescriptor='BQEJBqEBBQcZ4CnnFQAlAXUBlQiBAoEDlQUFCBkBKQWRApUBdQORAZUGdQgVACb/AAUHGQAq/wCBAMA='
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=4176, productId=1031, name='EddieOz Fapico2', serial='94746395', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.2/0003:1050:0407.013B/hidraw/hidraw10'], reportDescriptor='BQEJBqEBBQYZACr/ABUAJv8AlQh1CLECBQcZ4CnnFQAlAXUBlQiBApUBdQiBAwUIGQEpBRUAJQF1AZUFkQKVAXUDkQPA'
+HID
+User
+[09:40:18]
+        
+        HID device detected: vendorId=4176, productId=1031, name='EddieOz Fapico2', serial='94746395', deviceIds=['/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.1/0003:1050:0407.013A/hidraw/hidraw9'], reportDescriptor='BtDxCQGhAQkgFQAm/wB1CJVAgQIJIRUAJv8AdQiVQJECwA=='
+FIDO
+Debug
+[09:40:17]
+        
+        Transport availability not yet ready
+FIDO
+Debug
+[09:40:17]
+        
+        Discovery started for transport 3
+FIDO
+Debug
+[09:40:17]
+        
+        No BLE adapter present
+FIDO
+Debug
+[09:40:17]
+        
+        Transport availability not yet ready
+FIDO
+Debug
+[09:40:17]
+        
+        Bluetooth status enumerated
+FIDO
+Debug
+[09:40:17]
+        
+        Bluetooth status: Off
+FIDO
+Debug
+[09:40:17]
+        
+        Transport availability not yet ready
+FIDO
+Debug
+[09:40:17]
+        
+        Discovery started for transport 3
+FIDO
+Debug
+[09:40:17]
+        
+        Transport availability not yet ready
+FIDO
+Debug
+[09:40:17]
+        
+        FidoRequestHandler observer set
+FIDO
+Event
+[09:40:17]
+        
+        Starting MakeCredential flow: {
+   "attestation": "none",
+   "challenge": "oURHZqAHjk1jO-RDHzRoxSEGiu6WIPUoGp9g3Yw8t-k",
+   "excludeCredentials": [  ],
+   "pubKeyCredParams": [ {
+      "alg": -7,
+      "type": "public-key"
+   }, {
+      "alg": -257,
+      "type": "public-key"
+   } ],
+   "rp": {
+      "id": "x.com",
+      "name": "x.com"
+   },
+   "timeout": 180000,
+   "user": {
+      "displayName": "probe",
+      "id": "dmj9Xc2PY6F5emchWxDq0xRWvVfi9OC4lvq2yTDpixc",
+      "name": "probe@example.invalid"
+   }
+}
+FIDO
+Debug
+[09:40:17]
+        
+        Transport availability not yet ready
+FIDO
+Debug
+[09:40:17]
+        
+        No need to check for biometrics on this platform
+FIDO
+Debug
+[09:40:17]
+        
+        Checking for bluetooth availability
+FIDO
+Debug
+[09:40:17]
+        
+        Adding discovery for transport 3
+FIDO
+Debug
+[09:40:17]
+        
+        Adding discovery for transport 0
+FIDO
+Debug
+[09:40:17]
+        
+        Initializing FIDO discoveries
+FIDO
+Event
+[09:40:17]
+        
+        Enclave authenticator disabled because no suitable account
+FIDO
+Event
+[09:40:16]
+        
+        Enclave authenticator disabled because no suitable account
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/002/008 vendor=3010 "Seagate", product=8986 "Expansion", serial="NAC2FYLF", guid=78da13c1-feef-4e12-9acb-b09f462f86d2
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/002/007 vendor=1921 "SanDisk", product=21934 "Extreme 55AE", serial="323132383838343033333135", guid=616866b6-de91-4072-9a64-ca26c494fe9a
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/002/005 vendor=4057 "Elgato", product=120 "Elgato Facecam", serial="FW52K1A08349", guid=2cef1a5b-f011-4697-9ad5-8e3f4efcd088
+USB
+Event
+[09:40:07]
+        
+        Failed to open /dev/bus/usb/002/005: Permission denied (13)
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/002/006 vendor=6121 "DisplayLink", product=17153 "USB3.0 UHD HDMI Adapter", serial="000100121040272", guid=158f41d1-de55-4bf0-a96d-f31939b14620
+USB
+Event
+[09:40:07]
+        
+        Failed to open /dev/bus/usb/002/006: Permission denied (13)
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/012 vendor=1921 "SanDisk", product=21934 "Extreme 55AE", serial="323232323843343031393233", guid=a4b22d61-385c-463b-a44d-3c5d04818b26
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/005 vendor=22918 "SunplusIT Inc", product=8475 "HD Webcam", serial="", guid=2fd1931a-4157-45ac-9d2f-e405bc47b8d8
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/092 vendor=4057 "Elgato", product=128 "Stream Deck MK.2", serial="DL38K1A05797", guid=31e79690-54d3-40c5-9f69-48ebdd40a4c8
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/006 vendor=5357 "Shure Inc", product=4114 "Shure MV7", serial="", guid=0dc18c71-f7b0-4b14-a0ca-152bc38cfe6b
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/013 vendor=6940 "Corsair", product=6957 "Corsair Gaming K95 RGB PLATINUM Keyboard", serial="12034011AF5810A65D468B65F5001BC6", guid=b51c5616-b812-406d-aed9-5fdc77d531f5
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/111 vendor=4176 "EddieOz", product=1031 "Fapico2", serial="94746395", guid=60c93152-4743-4ac1-88b9-a4cf3a88ff91
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/007 vendor=1133 "Logitech", product=50495 "USB Receiver", serial="", guid=32fce39f-0631-45b5-a11d-ecc20a329fe8
+USB
+User
+[09:40:07]
+        
+        USB device added: path=/dev/bus/usb/001/011 vendor=32903 "", product=38 "", serial="", guid=465d58e4-e9ff-4686-862a-6642b2977f0c

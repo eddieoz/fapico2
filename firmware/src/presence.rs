@@ -107,9 +107,55 @@ use fapico2_platform::presence::{PresenceService, PresenceSource};
 /// touch. Generous: CTAP2 spec suggests ≥ 30 s for user-action windows.
 pub const CTAP_TOUCH_WINDOW_MS: u64 = 30_000;
 
-/// US-921: the CTAPHID keepalive period the UpRequired loop streams
-/// (progress frames so the host knows the device is waiting for a touch).
-pub const CTAP_KEEPALIVE_PERIOD_MS: u64 = 100;
+/// US-921/US-1506: the CTAPHID progress-frame period for a live consent
+/// window, in milliseconds.
+///
+/// **US-1506 moved this from 100 ms to 250 ms.** Both the value and the
+/// reason it is a single constant are load-bearing:
+///
+/// * **250** is the reference's own gate —
+///   `pico-keys-sdk/src/usb/hid/hid.c:610-628`, `send_keepalive()`, which
+///   returns early `if (last_keepalive_time != 0 && now -
+///   last_keepalive_time < 250)`. One number on the reference and one
+///   number here, for the same reason: the serve loop bounds its
+///   OUT-endpoint read by this period while a window is live
+///   (`hid_serve::read_one`), so the period *is* the cadence rather than a
+///   knob sitting next to it.
+/// * One number governs both, deliberately. Splitting them would let the
+///   read bound and the emitted cadence disagree — and the read bound is
+///   the `+ CTAP_KEEPALIVE_PERIOD_MS` term in the published serve bound
+///   (`hid_serve::SERVE_BOUND_MS`). A cadence that moved without the read
+///   bound would silently make that bound a lie, which is exactly the
+///   class of unsound derivation the Phase C review caught once already.
+///
+/// ## The trade-off, stated rather than hidden
+///
+/// 301 keepalives in a 30 s window becomes ~121 — one `0x01` immediately,
+/// then one `0x02` per 250 ms — and the status bytes are now the two the
+/// spec names instead of 301 copies of `0x02`. The risk is real in
+/// principle: **a host may be less patient with 250 ms of silence than
+/// with 100 ms**, and this constant is the only thing between a waiting
+/// device and a host that concludes it is wedged.
+///
+/// What the measurements say about that risk:
+///
+/// * the A/B probe measured this board answering a `PING` at
+///   **30047.7 ms** — the window does run its full 30 s and then answer,
+///   so no host we have actually observed abandons us early. The risk is
+///   hypothetical, not observed;
+/// * the reference, which has shipped this cadence to the same hosts, uses
+///   250 ms.
+///
+/// The balance of evidence is that sparser, correctly-labelled frames win,
+/// and that is the call made here. What would reverse it: a host *observed*
+/// abandoning a window inside 250 ms of silence. The instrumentation to
+/// notice that is already here — US-1509's per-pass read count, and the
+/// keepalive counters in [`PresenceStats`] — so the question can be settled
+/// with data instead of re-argued. If such a host appears, the right
+/// response is a **per-status** period (fast `0x01` while the command is
+/// genuinely processing, slow `0x02` while a human is being waited on), not
+/// a return to ten identical `0x02`s a second.
+pub const CTAP_KEEPALIVE_PERIOD_MS: u64 = 250;
 
 /// US-921: the cross-call consent window for the CCID consumers (mgmt /
 /// OATH). It must stay under the host's T=1 transaction-abort ceiling
@@ -834,6 +880,28 @@ pub fn stats() -> PresenceStats {
     // SAFETY: as `request_grant` — init ran at boot; a pure read.
     unsafe { runtime().stats() }
 }
+
+/// US-1524: the one serialisation point for **every** test that touches the
+/// process-wide presence state — the pending-request slot, the press latch,
+/// the manual clock and the write-once touch-prompt hook.
+///
+/// It was two locks until US-1524: one here (`presence/tests.rs::TEST_LOCK`)
+/// and one in `hid_serve`'s harness (`SERVE_TEST_LOCK`). Two locks on one
+/// singleton serialise each suite against itself and against nothing else, so
+/// a consent window opened by one suite was still holding the single pending
+/// slot when the other suite started. That is how `emul_hid`'s parity suite
+/// first turned five `presence` tests and five `hid_serve` tests red in a
+/// single run.
+///
+/// A leaked slot is the symptom; the prompt hook is the sharper edge. It is
+/// write-once, so whichever test installs it turns every later
+/// `touch_prompt` — from any suite — into an append to its own log, and an
+/// assertion on "the last thing logged" is then a race against the rest of the
+/// test binary.
+///
+/// **A test that opens a window must close it before releasing this lock.**
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests;

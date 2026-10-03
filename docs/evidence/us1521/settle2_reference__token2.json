@@ -1,0 +1,20 @@
+{
+  "board": "reference",
+  "site": "token2",
+  "uv": "preferred",
+  "js_timeout_ms": 12000,
+  "attempts": [
+    {
+      "at_s": 13,
+      "action": "escape"
+    }
+  ],
+  "wallclock_s": 19.25,
+  "raw_res": "{\"outcome\":\"REJECTED\",\"name\":\"NotAllowedError\",\"ms\":14396,\"message\":\"The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/#sctn-privacy-considerations-client.\"}",
+  "result": {
+    "outcome": "REJECTED",
+    "name": "NotAllowedError",
+    "ms": 14396,
+    "message": "The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/#sctn-privacy-considerations-client."
+  }
+}

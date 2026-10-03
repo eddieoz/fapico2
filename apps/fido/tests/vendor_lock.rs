@@ -82,7 +82,10 @@ use vendor_lock::*;
 
 const OK: u8 = 0x00;
 const INVALID_PARAMETER: u8 = 0x02;
-const LOCK_REQUIRED: u8 = 0x07;
+/// US-1528: was `0x07`, which is `Ctap2Command::Reset` — a different layer's
+/// constant, and the collision is why the two tables were easy to confuse.
+/// `CtapError.ERR.LOCK_REQUIRED` and `CTAP1_ERR_LOCK_REQUIRED 0x0a` agree.
+const LOCK_REQUIRED: u8 = 0x0A;
 const INVALID_CBOR: u8 = 0x12;
 const MISSING_PARAMETER: u8 = 0x14;
 const OPERATION_DENIED: u8 = 0x27;
@@ -1255,7 +1258,7 @@ fn release_refuses_a_payload_and_an_unopened_lock() {
     // The client's own form: `{1: AUT_DISABLE}`, no payload.
     let plain = release_sub_params(AUT_DISABLE);
     let good = release_request(&plain, &plain);
-    // …but the lock has not been opened, so this is `0x07` and not `0x00`.
+    // …but the lock has not been opened, so this is `0x0A` and not `0x00`.
     with_ops(&mut ks, &mut session, |ops| {
         let outcome = lock_release(ops, &good, Some(acfg_token()));
         assert_eq!(outcome.status.code(), LOCK_REQUIRED);
@@ -1302,7 +1305,7 @@ fn release_refuses_a_payload_and_an_unopened_lock() {
         assert!(!ops.soft_lock().engaged());
         assert!(!ops.unlocked_this_power_cycle(), "a released lock is not an open one");
     });
-    // A second release is `0x07` again, not a `0x00` that did nothing.
+    // A second release is `0x0A` again, not a `0x00` that did nothing.
     with_ops(&mut ks, &mut session, |ops| {
         assert_eq!(lock_release(ops, &good, Some(acfg_token())).status.code(), LOCK_REQUIRED);
     });
@@ -1889,7 +1892,7 @@ fn host_a_valid_0d_engage_reaches_the_lock_and_state_says_so() {
 ///
 /// The release also has a precondition, `unlocked_this_power_cycle`, and
 /// driving the `UNLOCK` first is what satisfies it. A release without it is
-/// `0x07` `LockRequired`, which is asserted separately below — this test is
+/// `0x0A` `LockRequired`, which is asserted separately below — this test is
 /// the *happy* two-step, not the refusal.
 #[test]
 fn host_a_valid_0d_release_releases_it() {

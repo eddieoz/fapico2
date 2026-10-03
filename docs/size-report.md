@@ -1,3 +1,561 @@
+**Date:** 2026-10-03 (**the clientPIN sub-command `0x06` refusal on
+`fix/passkey-discovery`** — `getPinUvAuthTokenUsingUvWithPermissions` minted a
+pinUvAuthToken on a presence grant alone with no PIN, on a device whose GetInfo
+advertises no `uv` option; CTAP 2.2 §5.4.6 grants the sub-command only when
+`uv` is present and true, so a §6.5.5.7-conformant client armed a 30 s no-PIN
+touch window (measured: `0x01`/`0x02`/30.2 s/`0x2D`). The arm is removed in
+both twins and answers `InvalidSubcommand` (0x3E) immediately — no presence
+window — matching the C reference's fall-through at
+`pico-fido2/src/fido/cbor_client_pin.c:909`. GetInfo is unchanged. See
+`.superpowers/sdd/report-0x06-refusal.md`.)
+**Measured: `text` 818,436 → 817,960 B (**−476 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**). UF2 **3072 → 3070 blocks** (1 absolute preamble
++ 3069 ARM_S payload), 1,572,864 → **1,571,840 bytes**. Shipping sha256
+`6590ef49748f…` → **`f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3070 blocks (1 absolute preamble + 3069 ARM_S payload), 1571840 bytes
+f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da  firmware/fapico2.uf2
+```
+
+**The −476 B is the deleted arm, and the ratchet moved DOWN.** Removing the
+`0x06` token-mint leg (encipher, token storage, permission bookkeeping) from
+`device_core.rs::client_pin_inner` and `get_pin_token_uv` from `pin.rs` more
+than pays for the new `FidoError::InvalidSubcommand` variant and the two
+refusal arms. The UF2 shrank two blocks: 3070 of the 3072 that
+`FIRMWARE_FLASH_BUDGET_KIB: 1536` allows — the first slack on this branch, not
+a licence: the budget stays **1536** and the next change is measured against
+3070, not 3072. The host-twin tests
+(`apps/fido/tests/clientpin_subcommand06_refusal.rs`) are an integration-test
+binary, **0 B** in this image.
+
+---
+
+**Date:** 2026-10-03 (**the `uv: false` MakeCredential gate fix on
+`fix/passkey-discovery`** — the PIN-set UV gate lifted itself for an explicit
+`uv: false`, so such a request skipped `CTAP2_ERR_PUAT_REQUIRED`, fell through
+to the presence gate and armed a touch with no PIN verified; wire-proven on
+serial 94746395 (`uv` absent → `0x36`, `uv: true` → `0x36`, `uv: false` →
+touch window closed with `0x2D`), fixed in both twins, regression-pinned in
+`apps/fido/tests/uv_false_gate.rs`. See `.superpowers/sdd/report-uv-false-gate.md`.)
+**Measured: `text` 818,424 → 818,436 B (**+12 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**). UF2 **3072 → 3072 blocks** (1 absolute preamble
++ 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping sha256
+`da884eb0398c…` → **`6590ef49748ff6c173c38eebbf60a5d5cf3cccf2d5dde92a7f9a451256792725`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+6590ef49748ff6c173c38eebbf60a5d5cf3cccf2d5dde92a7f9a451256792725  firmware/fapico2.uf2
+```
+
+**The +12 B is layout, not a new feature, and it did not move the block
+count.** The device-image edit removes a condition — the
+`(!req.options_present || req.uv != Some(false))` term in
+`device_core.rs::make_credential_inner` — so the honest expectation was ≤ 0 B;
+at this size, LTO and branch-layout shifts dominate, and +12 B is the same
+alignment-noise scale as the +24 B entry below. The 12 B landed inside the
+last block's slack: the image stays 3,072 blocks / 1,572,864 B against the
+**1536** KiB `FIRMWARE_FLASH_BUDGET_KIB`, so the ratchet passes with the same
+**zero blocks** of headroom it had — the number the next change has to beat.
+The `apps/fido/src/app.rs` half of the fix is the host twin, `#[cfg(feature =
+"host")]`, **0 B** in this image; the 8 tests in
+`apps/fido/tests/uv_false_gate.rs` are an integration-test binary, **0 B**.
+
+---
+
+**Date:** 2026-10-03 (**the `authenticatorSelection` presence gate on
+`fix/passkey-discovery`** — CTAP2 `0x0B` answered `CTAP2_OK` in ~14 ms without
+ever asking anybody, which claims "a user selected me" with no user involved;
+CTAP2.1 §6.9 requires the authenticator to ask for user presence and answer
+`CTAP2_OK` *only* if it is received. The arm is gated on `user_present()` now,
+on both twins, and `0x0B` joined `presence_windowed` in
+`firmware/src/hid_serve.rs` so the `UpRequired` can actually open a window
+rather than leaving as a bare error frame.)
+**Measured: `text` 818,400 → 818,424 B (**+24 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); task-arena demand 21,944 B (**0** — no task
+future grew; the stamp moved `2ebb12bd8466…` → `1e0e4aef25e4…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3072 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping
+sha256 `a822ff6b44b1…` → **`da884eb0398c1b2b4a6cd2ef1c71f9011fc5d8ea85247dfb42eff174babdbf11`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+da884eb0398c1b2b4a6cd2ef1c71f9011fc5d8ea85247dfb42eff174babdbf11  firmware/fapico2.uf2
+```
+
+**The +24 B is all `.text`, and the block count did not move.** It is the gate
+itself: one `user_present(presence_tag_from_channel(current_channel))` call and
+one `0x0B` comparison in the `presence_windowed` predicate. There is no new
+function and no new table — the last UF2 block had slack, so 24 B landed inside
+it. That is luck, not headroom: the image is 3072 of 3072 blocks and the next
+block trips `FIRMWARE_FLASH_BUDGET_KIB`, so the 25 B version of this change
+would not have built.
+
+**This entry does not raise `FIRMWARE_FLASH_BUDGET_KIB`.** It stays **1536**,
+the image stays on 3072 of 3072 blocks, and the slack stays zero — the number
+the next change has to beat.
+
+---
+
+**Date:** 2026-10-03 (**the CTAPHID conformance fix on `fix/passkey-discovery`** —
+`tests/pico-fido/test_055_hid.py`, seven failures, bisected to `686c36b`. Three
+firmware corrections, all on the shipping CTAP-HID path: a `CTAPHID_INIT`
+handshake may now preempt an in-flight transaction instead of being answered
+`CHANNEL_BUSY` (which had no resynchronisation path out and wedged the channel
+for every later command), a zero-length CTAPHID CBOR message is answered with a
+CTAPHID ERROR frame carrying `INVALID_LEN` instead of a *successful* CBOR frame
+carrying `INVALID_COMMAND`, and the emulator finally models a touch landing
+inside the consent window. See `.superpowers/sdd/report-ctaphid-regression.md`.)
+**Measured: `text` 818,376 → 818,400 B (**+24 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); worst call chain 91,988 B (**0**, 6,316 B of
+margin against the 98,304 B ceiling); task-arena demand 21,944 B (**0** — no
+task future grew; the stamp moved `59c34a8dd4f7…` → `2ebb12bd8466…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3072 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping
+sha256 `306f5568f450…` → **`a822ff6b44b1077205587797b72d98723ff3716243c4b847787bd032c0c94d68`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+a822ff6b44b1077205587797b72d98723ff3716243c4b847787bd032c0c94d68  firmware/fapico2.uf2
+```
+
+**The +24 B is all `.text`, and the block count did not move.** Two of the three
+corrections are near-free by construction — an extra `cmd != CTAP_HID_INIT`
+comparison in the assembler, and one more constant on an existing reply — so
+the 24 B is alignment and register pressure, not a new function. The third
+correction is where the honesty is worth stating plainly: the natural place to
+fix the missing CTAPHID keepalive was the **device's** dispatch, which is what
+the C reference does (`pico-keys-sdk/src/usb/hid/hid.c:585-587` emits a
+`0x01 PROCESSING` for every accepted CTAP2 command). That was built and
+measured: **+164 B**, which is 1,572,864 → 1,573,376 B, i.e. **3,072 → 3,073
+blocks — the one thing the ratchet exists to refuse.** So the touch is modelled
+in the *emulator* instead (`firmware/src/emul_main.rs::emul_touch_lands_in_window`,
+with the gate it needs added to the host twin `apps/fido/src/app.rs`, which is
+`#[cfg(feature = "host")]` and contributes **0 B** to this image). The
+observable consequence is the same or better: the emulator's makeCredential now
+opens a **real** consent window and emits the board's own opening `0x01
+PROCESSING` frame, which is what `test_055_hid.py::test_keep_alive` asserts —
+whereas the device-side version would have satisfied the same assertion with a
+frame no board ever sends.
+
+**This entry does not raise `FIRMWARE_FLASH_BUDGET_KIB`.** It stays **1536**,
+the image stays on 3072 of 3072 blocks, and the slack stays zero — which is
+the number the next change has to beat, and is the reason a 164 B fix had to
+be routed through the test double rather than the firmware.
+
+---
+
+**Date:** 2026-10-02 (**the boot-phase LED diagnosability ladder** — commits
+`5b15f48`, `63c9009`, `d0a94ca`, `f96f3d7`. A post-mortem read channel for a
+board that flashes cleanly and then never re-enumerates: nine rungs driven on
+GPIO25, one short pulse per boundary crossed, released to the runtime before the
+executor is entered. This is a **re-stamp only** for the image, and it is the
+entry where the flash ratchet's last block of slack is spent — see "the slack is
+now zero" below before reading anything else in it.)
+**Measured: `text` 818,148 → 818,376 B (**+228 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); worst call chain 91,988 B (**0**, 6,316 B of
+margin against the 98,304 B ceiling); task-arena demand 21,944 B (**0** — no
+task future grew; the stamp moved `014837326a49…` → `59c34a8dd4f7…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3071 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), 1,572,352 → **1,572,864 bytes**. Shipping
+sha256 `3f46f624cc14…` → **`306f5568f4501f2039351c0f742ebe7dd67f2cfa87d4fc31ce6d35389be95448`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+306f5568f4501f2039351c0f742ebe7dd67f2cfa87d4fc31ce6d35389be95448  firmware/fapico2.uf2
+```
+
+**The +228 B is all `.text`, and it is one of three commits.** `5b15f48` is the
+pure half — `fapico2_firmware::bootphase`, the encoding, the rung table, the
+ordering contract and the release rule, in the *lib* rather than the bin so
+`cargo test --lib` reaches it. Most of that is `#[cfg(test)]` and tables that
+fold at compile time, so what it contributes to the shipping image is the
+encoding arithmetic and the rung lookup. `63c9009` is ~40 lines turning a
+`bootphase::Mark` into GPIO25 writes plus a local `busy_wait_us` (a copy, not a
+call into `dbg` — the `dbg` module is feature-gated out of the default build, so
+sharing it would un-gate the 12 KiB ring with it). `d0a94ca` is the nine
+`mark!` call sites and `release()`. `f96f3d7` is `docs/bootsel.md` prose:
+**0 B.**
+
+**`.bss` did not move, and that is the useful fact here.** The ladder is nine
+GPIO writes and a delay loop; it allocates nothing. A diagnosability feature
+that had cost RAM would have been bought out of the main stack zone, which on
+this build has 4 B of alignment slack and no unallocated SRAM at all — the same
+`ALIGN(4)` arithmetic the 2026-09-30 entry describes. Nothing was bought from
+anywhere, because nothing was needed.
+
+**The block count moved this time: 3,071 before, 3,072 after.** The prior
+re-stamp (US-1529, +164 B) did not cross a block boundary and the one before it
+did not either; this one does, because 3072 × 512 = **1,572,864 B**, and that is
+the first whole block above the old image. So unlike the last two entries the
+size itself changed, and the sha256 changed with it for the ordinary reason.
+
+**THE SLACK IS NOW ZERO. The last block of headroom was spent by the
+boot-phase LED.** `FIRMWARE_FLASH_BUDGET_KIB` is **1536**, i.e.
+`BUDGET_BYTES` = 1,572,864 B, and the shipping image is **1,572,864 B**. The
+gate compares `SHIPPING -gt BUDGET_BYTES`, so 1,572,864 is not greater than
+1,572,864 and **the ratchet passes — with nothing left over**. Write the
+arithmetic down rather than rounding it: 1536 KiB = 3072 blocks, the image is
+3072 blocks, the headroom is **0 blocks / 0 B**, and the very next block
+(3,073 blocks, 1,573,376 B) trips it.
+
+This matters more than the arithmetic suggests. The ratchet is a *regression*
+detector, and it now fires for a reason unrelated to whatever change caused the
+red. A maintainer who adds a string constant somewhere, or lets LTO land
+differently on a different toolchain, gets a CI failure that names the flash
+budget and offers exactly two readings — shrink it, or raise the number — when
+the honest third reading is "this was already at the wall". The US-1519 raise
+(1532 → 1536 KiB) bought one block and the epic said explicitly that one block
+was the most informative number the ratchet could carry; that block is now
+gone, spent on a diagnostic that a later author may not even know exists.
+
+**The ratchet is NOT raised by this entry, and per US-1519's own acceptance
+criterion it must not be unless the reason is written here.** The epic says:
+*"if the ratchet bites, shrink the implementation rather than raise the
+number — and if it must be raised, the reason is written in this document."*
+It has not bitten. The image is at the ceiling, not over it. Raising 1536 →
+1537 now would be spending a KiB of permanent, invisible budget to avoid a
+sentence in a file that already contains the sentence.
+
+**What the next growth costs, concretely.** The next 512 B of flash anywhere in
+the firmware — one string table, one new applet stub, one monomorph that LTO
+stops folding — makes the ratchet red. The response per US-1519 is to shrink,
+and the honest list of what can be shrunk is short: this file has already
+established that `emul_hid` is gated out (0 B to recover), that the `dbg` ring
+is feature-gated (0 B to recover), and that the two SHA-512 call sites cannot
+evict the stock `sha2` backend because `trussed`'s `hmac-sha512` mechanism still
+reaches it (8.9× of latent win that is not collectable without dropping a PIV
+algorithm attribute). There is one lever specific to this entry, and it is
+already measured: **`FAPICO2_BOOT_LED=0` produces text 818,148 B** — byte-for-byte
+the pre-LED baseline, which is the point, since the kill switch exists so a
+build that cannot afford the ladder can drop it without editing code. It is
+recorded here as a fact, not as a plan: setting it to make a gate green would
+ship a board whose dark-boot failure mode is undiagnosable again, which is the
+entire reason these +228 B were spent. `check_size_report.py` and the CI
+flash-budget job will not notice the difference; a person debugging at 2am
+will.
+
+**The one claim in the entries below that this entry supersedes.** US-1519's
+headroom paragraph and US-1529's restatement of it both say the headroom is one
+512-byte block. As of this build that is **zero blocks**, and both have been
+annotated in place below rather than silently rewritten — see the dated
+correction notes there.
+
+Prior header:
+
+**Date:** 2026-10-02 (**US-1529 — `makeCredUvNotRqd` was a hard-coded lie;
+derive it from PIN state.** The option was seeded `true` in
+`Ctap2Info::default`, so a PIN-set device advertised support for a
+non-discoverable-credential `makeCredential` with no UV — which the MC 8.1 gate
+refuses with `0x36`. It is now computed from the same two facts that gate
+reads. This is a **re-stamp only**: the ratchet is not touched, because the
+shipping UF2 did not grow.)
+**Measured: `text` 817,984 → 818,148 B (**+164 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); task-arena demand 21,944 B (**0**, stamp
+`014837326a490937…` still verifies against the current sources, so nothing was
+re-measured); UF2 **3071 blocks** (**unchanged**, 1 absolute preamble + 3070
+ARM_S payload), 1,572,352 bytes (**unchanged**). Shipping sha256
+`4349e0ad29c6…` → **`3f46f624cc14…`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes
+3f46f624cc1431222cdfb22afc95f80562cb9ca70b465d3cca46c30d9c026fde  firmware/fapico2.uf2
+```
+
+**The +164 B is all `.text`, and it is all in one place.** `.rodata` did not
+move, which is the useful fact: `"makeCredUvNotRqd"` was already a string
+literal in `Ctap2Info::default` and only its *value* changed (`true` → `false`),
+so no new key is emitted and the option map's footprint is unchanged. The
+whole delta is therefore the one device-image call site —
+`device_core.rs::handle_get_info` now does
+
+```rust
+info.set_option(
+    "makeCredUvNotRqd",
+    crate::ctap2::make_cred_uv_not_rqd(
+        self.keystore.pin_state.pin_hash.is_some(),
+        self.keystore.pin_state.always_uv,
+    ),
+);
+```
+
+`make_cred_uv_not_rqd(pin_set, always_uv) = !pin_set && !always_uv` has **no
+standalone symbol in the release ELF** — `arm-none-eabi-nm … | grep
+make_cred_uv_not_rqd` returns nothing — so it inlines at its call sites rather
+than adding a called function and a prologue/epilogue pair. What costs 164 B is
+the inlined body (two flag loads off `pin_state`, a second load to keep them
+live across the CBOR insert, the `!a && !b` reduction, and `Ctap2Info::set_option`
+— a 106 B out-of-line symbol — called one more time). That is the honest
+shape of it: **164 B to stop the wire claiming a capability the device refuses**,
+and to make the two twins unable to drift by construction.
+
+**164 B, and the UF2 block count did not move: 3,071 before, 3,071 after.**
+The UF2 grows in whole 512 B blocks, so a sub-block change cannot move the
+block count; this one landed inside the last already-allocated block and the
+image is byte-identical in length. The **sha256 did change**
+(`4349e0ad29c6…` → `3f46f624cc14…`) because the payload bytes changed even
+though the length did not — which is why this doc records the hash and not
+just the size. A reader diffing only the block count would wrongly conclude
+nothing was flashed.
+
+**The ratchet is untouched, and so is its slack.**
+`FIRMWARE_FLASH_BUDGET_KIB` stays at **1536**; this story does not raise it and
+does not need to. Against the budget the slack is unchanged at **512 B** — the
+same single 512-byte block of headroom US-1519's entry describes, since
+1,572,352 B measured against 1,572,864 B is exactly one block.
+> **Corrected 2026-10-02 by the boot-phase LED entry above.** The first two
+> sentences of this paragraph are about US-1529 and are still true *of US-1529*;
+> the 512 B figure is not true of the tree any more. The boot-phase LED spent
+> the last block: the image is 3072 blocks / 1,572,864 B against a 1,572,864 B
+> budget, so the slack is **0 B, zero blocks**, and the next block trips the
+> ratchet. The 512 B above is left as written because it is what the gate
+> compared against on that commit.
+
+**Which edits in this story cost 0 B, named so this re-stamp is not read as
+covering them.**
+
+* **`apps/fido/src/app.rs`** — the host twin's identical copy of the fix — is
+  `#[cfg(feature = "host")]`. Cost in the shipping image: **0 B.** Only
+  `device_core.rs` is compiled for the device.
+* The 8 tests in `apps/fido/tests/make_cred_uv_not_rqd.rs` are an integration
+  test binary; **0 B.**
+* The `docs/webauthn-discovery-ab.md` / `-baseline.md` updates are prose;
+  **0 B.**
+* **This document's re-stamp is 0 B**, including the ELF section table and the
+  ELF summary above: both are regenerated from the ELF by
+  `check_size_report.py`, so re-recording them is not an edit to the image.
+* The comment blocks added next to the unchanged 8.1 gate in
+  `device_core.rs` and `app.rs` cost **0 B**; the gate itself is byte-for-byte
+  the same branch, which is the point — the advertisement was fixed to match
+  the gate, not the reverse.
+
+**The US-1519 headroom paragraph is still accurate, and was checked rather than
+assumed.** It reads: *"The headroom is one 512-byte block, not zero… one more
+block lands the image on exactly 1,572,864 — which is not greater than the
+1,572,864 B ceiling, so it passes. Two blocks (1,573,376 B) is the first size
+that trips it."* Re-derived against this build: 3071 × 512 = 1,572,352 B
+measured; 1536 KiB = 1,572,864 B; the ratchet fires on `SHIPPING -gt
+BUDGET_BYTES` (`ci.yml`), so 1,572,864 B is **not** greater than 1,572,864 B and
+passes, while 1,573,376 B is. Every term in that paragraph is unchanged by
+US-1529, because US-1529 did not move the block count. The earlier,
+overstated phrasing ("the next ordinary growth is a red again, immediately")
+remains corrected in place and is **not** restored by this entry.
+> **Superseded 2026-10-02 by the boot-phase LED entry above.** The paragraph
+> quoted here is accurate *as of US-1529* and is left as written for that
+> reason, but it no longer describes the tree: the boot-phase LED took the
+> image from 3071 to 3072 blocks, so "one more block lands the image on exactly
+> 1,572,864" has already happened. The headroom is now **zero blocks**, and
+> 1,573,376 B is not a hypothetical size any more — it is the size of the next
+> 512 B of flash anyone adds.
+
+Prior header:
+
+**Date:** 2026-10-02 (**US-1519 — the passkey-discovery epic, merged.** The
+image grew, the ratchet bit, and the EPIC's acceptance criterion is "shrink the
+implementation rather than raise the number". Shrinking was attempted first and
+did not pay; the ratchet is raised 1532 → **1536 KiB** and the reason is below,
+feature by feature, with the zero-byte edits named so a later reader does not
+misattribute them to this raise.)
+**Measured: `text` 815,576 → 817,984 B (**+2,408 B**); Berkeley `.bss` 420,704 →
+421,768 B (**+1,064 B**); task-arena demand 21,976 → **21,944 B** (**−32 B**,
+re-measured, stamp re-stamped `897931090a328186…`); UF2 **3061 → 3071 blocks**
+(1 absolute preamble + 3070 ARM_S payload), 1,567,232 → **1,572,352 bytes**.
+Shipping sha256 `0f4e6189e4ea…` → **`4349e0ad29c6…`**.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes
+4349e0ad29c68d703e36beb32d2e698107aa999ef102f092d107b494f1f1a6b4  firmware/fapico2.uf2
+```
+
+**The baseline was rebuilt, not assumed.** The epic base `517529f` was checked
+out into a scratch worktree and built from scratch with this toolchain: it
+produces **1,567,232 B / 3061 blocks / sha256 `0f4e6189e4ea…`**, which is the
+2026-10-01 entry below, exactly. So the +2,408 B of `text` and the +10 blocks
+below are this epic's, not accumulated drift. The same worktree build is where
+the per-symbol attribution comes from (`arm-none-eabi-nm -S`, symbol-size delta
+base → head).
+
+**What the +2,408 B of `text` is, symbol by symbol.** Only the entries large
+enough to matter are listed; the remainder is `OUTLINED_FUNCTION_*` churn and
+`num-bigint-dig` monomorph renumbering that nets out under 100 B.
+
+| symbol | base | head | delta |
+|---|---:|---:|---:|
+| `tasks::__hid_task_task0::poll` (the monomorphised serve loop) | 4,888 | 6,548 | **+1,660** |
+| `fido::device_app::FidoApp::process_u2f_with_store` | 1,432 | 0 | **−1,432** |
+| `tasks::DeviceFido<hid_serve::FidoDispatch>::process_u2f` | 0 | 1,412 | **+1,412** |
+| `hid_serve::reply::<tasks::DeviceHid>` | 0 | 672 | +672 |
+| `tasks::reply_hid` | 498 | 0 | **−498** |
+| `fido::device_app::FidoApp::process_ctap2_with_store` | 25,696 | 25,868 | +172 |
+| `hid_serve::close_window` | 0 | 144 | +144 |
+| `tasks::HidInWriter<hid_reply>::sent_or_failed` | 0 | 76 | +76 |
+| `tasks::DeviceHid<hid_serve::HidIo>::read_report` | 0 | 80 | +80 |
+| `tasks::persist_hid` | 72 | 0 | **−72** |
+| `heapless::Vec<u8, 7609>::extend_from_slice` | 36 | 0 | **−36** |
+
+**The two ±1,4xx rows are a move, not a cost, and they are the single largest
+thing in this entry.** US-1524 put the emulator on the shipped serve loop, which
+meant the U2F dispatch had to stop being a method on `FidoApp` (reachable only
+from a `&mut FidoApp` the serve loop does not own) and become a method on the
+new `hid_serve::FidoDispatch` trait, implemented over `&mut FidoApp`. The work
+moved 1,432 B out of `process_u2f_with_store` and 1,412 B into the trait impl —
+**net −20 B** — and the same holds for the reply path: 672 B into
+`hid_serve::reply::<DeviceHid>` against 498 B out of `tasks::reply_hid`,
+**net +174 B** for the one that also grew a `HidNote::ReplyDropped` arm and a
+bounded write. Reading "+1,660 on the poll body" without the two removals beside
+it is how a move gets mistaken for a 2.4 KB feature.
+
+**What the remaining +1,660 B of `hid_task::poll` actually is.** `HidIo` and
+`FidoDispatch` are monomorphised exactly once for the device (`DeviceHid`,
+`DeviceFido`), so this is not duplicated monomorphisation — it is the serve loop
+itself, now carrying: the `redrive_window` pass (US-1509's non-blocking consent
+window), the CTAP2 **and** U2F park arms, `close_window`'s
+`end_window`/`touch_prompt`/release pairing, the keepalive rate limiter
+(US-1506), the `CTAPHID_CANCEL` arm (US-1505), the same-channel contention
+refusal (US-921), and the two deadline-bounded USB transfers (US-1504, whose
+`embassy_time::with_timeout` pulls its machinery into this path for the first
+time). None of it is on a path that existed before the epic.
+
+**What the +1,064 B of `.bss` is, exactly and only.** `boot::PENDING_UP`, and
+nothing else:
+
+```
+200004d0 00000428 b ...fapico2_firmware4boot10PENDING_UP...            # 1,064
+```
+
+1,064 = the pinned **1,024 B** `PENDING_UP_PAYLOAD_MAX` payload buffer + 40 B
+of slot state (`occupied`, the `WindowTicket`, `payload_len`, the two-byte
+refusal + its length, `last_keepalive_ms`, `keepalive_sent`, with the struct's
+alignment). `arm-none-eabi-nm -S` shows **exactly** 1,064 B of new `.bss` and
+the gate's `RAM statics` figure moved 420,904 → 421,968 B, also exactly +1,064:
+the entire RAM delta of this epic is that one static. The 1,024 B bound is
+pinned by `pending_up::tests::the_payload_bound_is_1024_and_is_never_parked_over`
+and is the mechanism that stops a hostile oversize request converting into a
+30 s wait (US-1510) — shrinking it would be removing a reviewed fix, so it was
+left alone. `hid_task`'s arena pool, `HID_RESP`, the app statics and the store
+buffers are all byte-identical to the base build.
+
+**RAM, which is the tighter constraint, absorbed the whole thing.** The **main
+stack zone fell 111,576 → 110,512 B** to make room; `bss + stack zone + .data
+= 532,476 B` against 532,480 B of SRAM either way. There is still **no
+unallocated SRAM**, so the 1,064 B was not free — it was bought out of the
+stack zone. The **worst call chain is 91,988 B against the 98,304 B ceiling
+(6,316 B of margin)**, which the `redrive_window` re-assert pass did not eat;
+it was 91,972 B at the base. `check_boot_chain.py` PASSes.
+
+**The task arena went *down*, by 32 B, and its stamp was re-measured.**
+`measure_task_arena.py` re-run under nightly over the merged tree:
+
+```
+measured 6 task pools, 21,944 B total, stamp 897931090a328186…
+  button_poll_task: 56      ccid_task: 8,600    embassy_main: 168
+  hid_task: 12,328           led_heartbeat_task: 56    usb_task: 736
+```
+
+21,944 B in a **32,772 B** arena = **1.49×** (floor 1.25×), against 21,976 B /
+1.50× at the base: `hid_task`'s future is **32 B smaller** even though its
+compiled poll body is 1,660 B larger. That is not a contradiction — the consent
+`loop` the epic removed was an `async` state machine whose frame was charged to
+the future, and the replacement parks its state in `boot::PENDING_UP` instead.
+**The growth was paid in `.bss` and traded back out of the arena.** The stamp
+is byte-exact over source text, so the 26 commits in the epic invalidated it
+regardless of whether any future grew; `check_boot_chain.py` failed closed on it
+until `measure_task_arena.py` was re-run, which is the guard working.
+
+**Shrinking was tried, and here is what it measured.** Three levers, in order
+of how promising they looked:
+
+1. **`emul_hid.rs` in the device image** — the obvious suspect, a 1,035-line
+   new module that exists for the emulator. **It was already gated out.**
+   `lib.rs:132` carries `#[cfg(feature = "emulation")]`, and
+   `arm-none-eabi-nm … | grep -c emul_hid` on the release ELF returns **0**.
+   Cost in the shipping image: **0 B.** Nothing to recover.
+2. **`#[cfg(test)]` instrumentation** — `HidServe::reads` and
+   `HidServe::blocked_live_passes` (US-1509's blackout detector) are both
+   `#[cfg(test)]` fields. Cost in the release image: **0 B.**
+3. **Outlining the loop's two big async helpers** — `#[inline(never)]` on
+   `hid_serve::redrive_window` and `hid_serve::dispatch`, on the theory that an
+   `async fn` inlined across many `.await`s duplicates its state machine at
+   `opt-level = "z"`. **Measured: 817,984 → 818,412 B, +428 B.** Worse, not
+   better, because both are reached from exactly one call site apiece and there
+   is no duplication to remove — only a prologue and an epilogue. Reverted;
+   the committed figure is the 817,984 B above.
+
+There is no fourth lever that is not "remove a reviewed fix". The capFlags
+change, the bounded HID reads and writes, Phase C's non-blocking consent
+window, `CTAPHID_CANCEL`, the keepalive protocol, the emulator parity
+migration and the error-table alignment were each reviewed and are each the
+subject of a US-number; **the only way to reach 1532 KiB from here is to undo
+one of them**, so the number is raised deliberately instead, which is what the
+EPIC asks for in that case.
+
+**Which edits in this epic cost 0 B, named so this raise is not read as
+covering them.**
+
+* The **emulator parity migration** (US-1524) — `emul_main.rs` dropping its
+  own assembler, reply framer, dispatcher and consent `loop` for
+  `hid_serve`'s — costs **0 B on the device image**. It removes code from a
+  binary that is not flashed.
+* `HidServe::reads` / `blocked_live_pass` / `blocked_live_passes` — the US-1509
+  blackout instrument — are `#[cfg(test)]` and cost **0 B**.
+* The task-arena **re-stamp** and this document re-stamp cost **0 B** of
+  `text`; the stamp is a byte-exact hash, not code.
+* `FidoApp::process_u2f_with_store` → `FidoDispatch::process_u2f` is **net
+  −20 B**, i.e. the largest single item in the epic is a move that came out
+  slightly ahead.
+
+**The raise, and what it buys.** `FIRMWARE_FLASH_BUDGET_KIB` **1532 → 1536**.
+1536 KiB = 1,572,864 B against a measured 1,572,352 B, so the slack this leaves
+is **512 B**. That is tighter than the ~1.5 KiB the previous two raises left,
+and deliberately so: 1536 is the smallest whole-KiB value the shipping image
+fits under, which is the most informative number this ratchet can carry.
+> **Spent 2026-10-02.** That 512 B was consumed in full by the boot-phase LED
+> entry at the top of this document. The ratchet was **not** raised to replace
+> it.
+
+**The headroom is one 512-byte block, not zero.** The ratchet fires on
+`SHIPPING -gt BUDGET_BYTES` (`ci.yml`), and one more block lands the image on
+exactly 1,572,864 — which is **not** greater than the 1,572,864 B ceiling, so
+it passes. Two blocks (1,573,376 B) is the first size that trips it. An
+earlier draft of this paragraph said the next ordinary growth is "a red again,
+immediately"; that is one block optimistic, and the block is the smallest unit
+the UF2 format can grow in, so it is the difference between "the next change
+trips this" and "the change after next does".
+> **Superseded 2026-10-02.** Written when the measured image was 3,071 blocks,
+> this said the headroom was one block and the block after that would be the
+> first to trip the ratchet. The **boot-phase LED entry** at the top of this
+> document is the "one more block": the image is now 3,072 blocks /
+> 1,572,864 B, exactly on the ceiling, so the headroom is **zero blocks** and
+> 1,573,376 B is the first size that trips it — which is what this paragraph
+> already predicted, one commit earlier than it expected it. The two earlier
+> corrections in this paragraph are a history of the same ratchet losing room;
+> this is the third and the last block.
+
+Prior header:
+
 **Date:** 2026-10-01 (**Re-measurement after the revert of the `cargo-deps` group
 PR #2.** No feature changed; the *resolved dependency closure* did, so every
 number below is re-taken rather than carried.)
@@ -811,27 +1369,27 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 763,608 | `0x10000200` | no (flash) |
-| `.rodata` | 18,708 | `0x100ba8d8` | no (flash) |
+| `.text` | 765,984 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb220` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bf2c0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 419,680 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20066828` | yes |
-| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfc00` | non-alloc, not in Berkeley `text` |
+| `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20066c50` | yes |
+| `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 763,608 (`.text`) + 18,708 (`.rodata`) + 276
+Berkeley `text` = 765,984 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **815,576**. That identity is stated so a reader can check
+the `X` flag) = **817,960**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 815,576 B** · **`.data` = 196 B** · **`.bss` = 420,704 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 817,960 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 420,900 B** (420,904 B address-to-address: `__sheap` `0x20066c28` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20066c28` → **main stack zone = 111,576 B** of 532,480 B of SRAM.
+**RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->

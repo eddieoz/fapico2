@@ -185,6 +185,43 @@ fn main() {
     if wipe {
         println!("cargo:rustc-cfg=FAPICO2_FOREIGN_IMAGE_WIPE");
     }
+
+    // The **boot-phase LED ladder** (`firmware/src/boot_led.rs` driving the
+    // pure `fapico2_firmware::bootphase` core). ON by default, in every
+    // profile, with no feature to remember: the failure it diagnoses — a
+    // board that flashes cleanly and then never re-enumerates — has no other
+    // read channel. No watchdog (one resets the board and destroys the
+    // evidence), no retained-RAM flag, no ring (the CTAP-HID ring needs the
+    // enumeration that failed), no `defmt` (a probe makes `OTP_DATA_RAW` read
+    // `0xFFFFFFFF`, which `read_otp_key_1()` reads as "no key", so the probe
+    // manufactures the very `fatal_boot` it would be there to localise). The
+    // whole cost is `bootphase::full_ladder_us()` — under a second, once per
+    // boot.
+    //
+    // An env var and not a feature, for the same reason
+    // `FAPICO2_FOREIGN_IMAGE_WIPE` is one: features are additive, so "in
+    // `default`" is a line in a manifest nobody reads at 2am with a dead
+    // board in front of them, and a feature can only be switched off by not
+    // passing it. Same yes/no parsing, and the same refusal to guess.
+    println!("cargo:rustc-check-cfg=cfg(FAPICO2_BOOT_LED)");
+    println!("cargo:rerun-if-env-changed=FAPICO2_BOOT_LED");
+    let boot_led = match std::env::var("FAPICO2_BOOT_LED").as_deref() {
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        Ok("0") | Ok("false") | Ok("no") | Ok("") => false,
+        Ok(other) => panic!(
+            "FAPICO2_BOOT_LED={other:?} is not a yes/no value; use 1/0 \
+             (true/false and yes/no are also accepted).\n\
+             This variable decides whether a device that hangs during boot can \
+             be diagnosed in the field by watching its LED, so it is not read \
+             with a permissive default."
+        ),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(e) => panic!("reading FAPICO2_BOOT_LED failed: {e}"),
+    };
+    if boot_led {
+        println!("cargo:rustc-cfg=FAPICO2_BOOT_LED");
+    }
+
     // Selection rules are duplicated from `platform/build.rs` rather than
     // imported, for the same reason `include!` cannot reach into another
     // crate's `main`: neither build script can call the other. Both must

@@ -242,6 +242,333 @@ fn test_get_uv_retries_returns_counter() {
 }
 
 // ---------------------------------------------------------------------------
+// US-1513: `getUVRetries` returns a real number.
+// ---------------------------------------------------------------------------
+
+/// getUVRetries (0x07) → (uvRetries, powerCycleState).
+fn get_uv_retries(app: &mut FidoApp<MemoryKeystore>) -> (u64, bool) {
+    let req = cbor::encode(&Value::M(vec![
+        (Value::U(0x01), Value::U(2)),
+        (Value::U(0x02), Value::U(0x07)),
+    ]));
+    let resp = app.process_ctap2(0x06, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "getUVRetries must succeed");
+    let (v, _) = cbor::decode(&resp[1..]).expect("valid CBOR");
+    let Value::M(m) = v else { panic!("map expected") };
+    let get = |key: u64| -> Option<&Value> {
+        m.iter().find(|(k, _)| matches!(k, Value::U(u) if *u == key)).map(|(_, v)| v)
+    };
+    let retries = match get(5) {
+        Some(Value::U(u)) => *u,
+        other => panic!("uvRetries in response, got {other:?}"),
+    };
+    let power = matches!(get(4), Some(Value::Bool(true)));
+    (retries, power)
+}
+
+/// Charge one `auth_failures` step: a makeCredential whose pinUvAuthParam
+/// MAC does not verify. This is the only event that moves the counter, and
+/// the whole point of US-1513 is that `uvRetries` now moves with it.
+/// Returns the CTAP2 status: the third consecutive failure latches and is
+/// answered with `PIN_AUTH_BLOCKED` rather than `PIN_AUTH_INVALID`.
+fn charge_auth_failure(app: &mut FidoApp<MemoryKeystore>, client: &PinClient) -> u8 {
+    let token = client.get_token(app, 0x09, Some(0x01), None).unwrap();
+    let mut wrong = token.clone();
+    wrong[0] ^= 0xff;
+    let req = make_mc_request(&[0x5au8; 32], "example.com", &wrong);
+    app.process_ctap2(0x01, &req, [1, 2, 3, 4])[0]
+}
+
+const PIN_AUTH_INVALID: u8 = 0x33;
+const PIN_AUTH_BLOCKED: u8 = 0x34;
+
+/// The regression: `uvRetries` was a hard-coded 3, so a client polling it
+/// learned nothing — it read 3 before three failures and 3 after a lockout.
+#[test]
+fn test_uv_retries_falls_with_the_auth_failure_streak() {
+    let (mut app, client) = setup();
+
+    assert_eq!(get_uv_retries(&mut app), (3, false), "fresh: the full budget");
+
+    charge_auth_failure(&mut app, &client);
+    assert_eq!(get_uv_retries(&mut app), (2, false), "one failure must cost one retry");
+
+    charge_auth_failure(&mut app, &client);
+    assert_eq!(get_uv_retries(&mut app), (1, false), "two failures must cost two retries");
+}
+
+#[test]
+fn test_uv_retries_reports_the_durable_lockout() {
+    let (mut app, client) = setup();
+    for expected in [2u64, 1] {
+        assert_eq!(charge_auth_failure(&mut app, &client), PIN_AUTH_INVALID);
+        assert_eq!(get_uv_retries(&mut app).0, expected);
+    }
+    // The third failure latches: budget spent, powerCycleState raised — the
+    // same pair of facts sub-command 0x01 reports for the PIN budget.
+    assert_eq!(charge_auth_failure(&mut app, &client), PIN_AUTH_BLOCKED);
+    assert_eq!(get_uv_retries(&mut app), (0, true));
+}
+
+/// A good MAC resets the counter, and the budget must come back with it.
+#[test]
+fn test_uv_retries_recovers_after_a_good_assertion() {
+    let (mut app, client) = setup();
+    charge_auth_failure(&mut app, &client);
+    assert_eq!(get_uv_retries(&mut app).0, 2);
+
+    let token = client.get_token(&mut app, 0x09, Some(0x01), None).unwrap();
+    let req = make_mc_request(&[0x5bu8; 32], "example.com", &token);
+    let resp = app.process_ctap2(0x01, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "a correctly signed MC must succeed");
+
+    assert_eq!(get_uv_retries(&mut app), (3, false), "a success restores the budget");
+}
+
+/// The device command path is the binary that ships; the host twin above is
+/// not it. Same three states, driven through `device_core.rs`.
+mod device_uv_retries {
+    use fapico2_fido::cbor::no_heap::{self as nh, Item, Parser};
+    use fapico2_fido::crypto;
+    use fapico2_fido::device_app::FidoApp;
+    use fapico2_platform::secure_store::HostSecureStore;
+    use fapico2_platform::trng::HostTrng;
+    use heapless::Vec as HV;
+
+    const PIN_AUTH_INVALID: u8 = 0x33;
+    const PIN_AUTH_BLOCKED: u8 = 0x34;
+
+    struct Device {
+        app: FidoApp,
+        hmac_key: [u8; 32],
+        enc_key: [u8; 32],
+    }
+
+    impl Device {
+        fn boot() -> Self {
+            let mut trng = HostTrng::new();
+            let mut store = HostSecureStore::new();
+            Self {
+                app: FidoApp::boot(&mut trng, &mut store).unwrap(),
+                hmac_key: [0; 32],
+                enc_key: [0; 32],
+            }
+        }
+
+        fn call(&mut self, cmd: u8, payload: &[u8]) -> (u8, Vec<u8>) {
+            let mut out: HV<u8, { fapico2_fido::CTAP2_MAX_MSG }> = HV::new();
+            let n = self.app.process_ctap2(cmd, payload, [1, 2, 3, 4], &mut out);
+            let resp = out.as_slice()[..n].to_vec();
+            (resp[0], resp[1..].to_vec())
+        }
+
+        fn push_client_key_agreement(&self, out: &mut HV<u8, 256>) {
+            let sk = p256::SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+            let bytes = crypto::public_key_bytes(&sk.public_key());
+            let mut x = [0u8; 32];
+            let mut y = [0u8; 32];
+            x.copy_from_slice(&bytes[1..33]);
+            y.copy_from_slice(&bytes[33..65]);
+            nh::push_map_header(out, 5).unwrap();
+            nh::push_uint(out, 1).unwrap();
+            nh::push_uint(out, 2).unwrap();
+            nh::push_uint(out, 3).unwrap();
+            nh::push_neg(out, -25).unwrap();
+            nh::push_neg(out, -1).unwrap();
+            nh::push_uint(out, 1).unwrap();
+            nh::push_neg(out, -2).unwrap();
+            nh::push_bstr(out, &x).unwrap();
+            nh::push_neg(out, -3).unwrap();
+            nh::push_bstr(out, &y).unwrap();
+        }
+
+        fn derive_keys(&mut self) {
+            let mut req: HV<u8, 64> = HV::new();
+            nh::push_map_header(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            let (status, cbor) = self.call(0x06, req.as_slice());
+            assert_eq!(status, 0x00, "getKeyAgreement failed");
+            let mut p = Parser::new(&cbor);
+            assert!(matches!(p.next(), Ok(Item::Map(1))));
+            assert_eq!(p.next().unwrap(), Item::U(1));
+            let mut x = [0u8; 32];
+            let mut y = [0u8; 32];
+            let Item::Map(n) = p.next().unwrap() else { panic!() };
+            for _ in 0..n {
+                let key = match p.next().unwrap() {
+                    Item::U(u) => u as i64,
+                    Item::N(v) => v,
+                    _ => panic!(),
+                };
+                match key {
+                    -2 => match p.next().unwrap() {
+                        Item::B(b) => x.copy_from_slice(b),
+                        _ => panic!(),
+                    },
+                    -3 => match p.next().unwrap() {
+                        Item::B(b) => y.copy_from_slice(b),
+                        _ => panic!(),
+                    },
+                    _ => p.skip().unwrap(),
+                }
+            }
+            let sk = p256::SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+            let device_pub = crypto::parse_cose_ec2_p256_bytes(&x, &y).expect("device pubkey");
+            let raw = crypto::ecdh_shared_secret(&sk, &device_pub);
+            self.hmac_key = crypto::derive_shared_secret_v1(&raw);
+            self.enc_key = crypto::derive_shared_secret_v1(&raw);
+        }
+
+        fn v1_encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+            let mut padded = plaintext.to_vec();
+            while !padded.len().is_multiple_of(16) {
+                padded.push(0);
+            }
+            let mut buf = [0u8; 96];
+            buf[..padded.len()].copy_from_slice(&padded);
+            crypto::aes256_cbc_encrypt_into(&self.enc_key, &[0u8; 16], &mut buf[..padded.len()]).unwrap();
+            buf[..padded.len()].to_vec()
+        }
+
+        fn set_pin(&mut self, pin: &[u8]) {
+            self.derive_keys();
+            let pin_enc = self.v1_encrypt(pin);
+            let mut req: HV<u8, 256> = HV::new();
+            nh::push_map_header(&mut req, 5).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            self.push_client_key_agreement(&mut req);
+            nh::push_uint(&mut req, 5).unwrap();
+            nh::push_bstr(&mut req, &pin_enc).unwrap();
+            nh::push_uint(&mut req, 4).unwrap();
+            let tag = crypto::hmac_sha256(&self.hmac_key, &pin_enc)[..16].to_vec();
+            nh::push_bstr(&mut req, &tag).unwrap();
+            let (status, _) = self.call(0x06, req.as_slice());
+            assert_eq!(status, 0x00, "setPIN failed");
+        }
+
+        /// getPinToken (0x05), v1 → raw 32-byte token.
+        fn get_pin_token(&mut self, pin: &[u8]) -> [u8; 32] {
+            let enc = self.v1_encrypt(&crypto::pin_hash(pin));
+            let mut req: HV<u8, 256> = HV::new();
+            nh::push_map_header(&mut req, 4).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 5).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            self.push_client_key_agreement(&mut req);
+            nh::push_uint(&mut req, 6).unwrap();
+            nh::push_bstr(&mut req, &enc).unwrap();
+            let (status, cbor) = self.call(0x06, req.as_slice());
+            assert_eq!(status, 0x00, "getPinToken failed");
+            let mut p = Parser::new(&cbor);
+            assert!(matches!(p.next(), Ok(Item::Map(1))));
+            assert_eq!(p.next().unwrap(), Item::U(2));
+            let Item::B(ct) = p.next().unwrap() else { panic!() };
+            let mut buf = [0u8; 96];
+            buf[..ct.len()].copy_from_slice(ct);
+            crypto::aes256_cbc_decrypt_into(&self.enc_key, &[0u8; 16], &mut buf[..ct.len()]).unwrap();
+            let mut token = [0u8; 32];
+            token.copy_from_slice(&buf[..32]);
+            token
+        }
+
+        /// makeCredential with a pinUvAuthParam that will not verify.
+        fn bad_mc(&mut self, challenge: &[u8; 32]) -> u8 {
+            let mut r: HV<u8, 512> = HV::new();
+            nh::push_map_header(&mut r, 6).unwrap();
+            nh::push_uint(&mut r, 1).unwrap();
+            nh::push_bstr(&mut r, challenge).unwrap();
+            nh::push_uint(&mut r, 2).unwrap();
+            nh::push_map_header(&mut r, 1).unwrap();
+            nh::push_tstr(&mut r, "id").unwrap();
+            nh::push_tstr(&mut r, "example.com").unwrap();
+            nh::push_uint(&mut r, 3).unwrap();
+            nh::push_map_header(&mut r, 1).unwrap();
+            nh::push_tstr(&mut r, "id").unwrap();
+            nh::push_bstr(&mut r, b"user").unwrap();
+            nh::push_uint(&mut r, 4).unwrap();
+            nh::push_array_header(&mut r, 1).unwrap();
+            nh::push_map_header(&mut r, 2).unwrap();
+            nh::push_tstr(&mut r, "type").unwrap();
+            nh::push_tstr(&mut r, "public-key").unwrap();
+            nh::push_tstr(&mut r, "alg").unwrap();
+            nh::push_neg(&mut r, -7).unwrap();
+            nh::push_uint(&mut r, 8).unwrap();
+            nh::push_bstr(&mut r, &[0u8; 16]).unwrap();
+            nh::push_uint(&mut r, 9).unwrap();
+            nh::push_uint(&mut r, 2).unwrap();
+            self.call(0x01, r.as_slice()).0
+        }
+
+        /// getUVRetries (0x07) → (uvRetries, powerCycleState).
+        fn uv_retries(&mut self) -> (u64, bool) {
+            let mut req: HV<u8, 64> = HV::new();
+            nh::push_map_header(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 7).unwrap();
+            let (status, cbor) = self.call(0x06, req.as_slice());
+            assert_eq!(status, 0x00, "getUVRetries must succeed");
+            let mut p = Parser::new(&cbor);
+            let Item::Map(nm) = p.next().unwrap() else { panic!() };
+            let (mut retries, mut power) = (u64::MAX, false);
+            for _ in 0..nm {
+                let Item::U(k) = p.next().unwrap() else { panic!() };
+                match k {
+                    4 => match p.next().unwrap() {
+                        Item::Bool(b) => power = b,
+                        _ => panic!(),
+                    },
+                    5 => match p.next().unwrap() {
+                        Item::U(u) => retries = u,
+                        _ => panic!(),
+                    },
+                    _ => p.skip().unwrap(),
+                }
+            }
+            (retries, power)
+        }
+    }
+
+    #[test]
+    fn device_uv_retries_tracks_the_failure_streak() {
+        let mut d = Device::boot();
+        d.set_pin(b"1234");
+        // A live token has to exist first: `verify_token` returns
+        // PIN_AUTH_INVALID *without* charging the streak when it is missing,
+        // which is not the event under test.
+        d.get_pin_token(b"1234");
+        assert_eq!(d.uv_retries(), (3, false), "fresh: the full budget");
+
+        for expected in [2u64, 1] {
+            assert_eq!(d.bad_mc(&[0x5au8; 32]), PIN_AUTH_INVALID);
+            assert_eq!(d.uv_retries(), (expected, false));
+        }
+    }
+
+    #[test]
+    fn device_uv_retries_reports_the_durable_lockout() {
+        let mut d = Device::boot();
+        d.set_pin(b"1234");
+        d.get_pin_token(b"1234");
+        for _ in 0..2 {
+            assert_eq!(d.bad_mc(&[0x5au8; 32]), PIN_AUTH_INVALID);
+        }
+        assert_eq!(d.bad_mc(&[0x5au8; 32]), PIN_AUTH_BLOCKED, "the third failure latches");
+        assert_eq!(d.uv_retries(), (0, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // US-120 (EPIC `PICOForge-COMPAT`): PicoForge compatibility of the COSE
 // key-agreement map.
 //

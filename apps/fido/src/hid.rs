@@ -1,20 +1,68 @@
 //! CTAP2 HID transport.
 
 /// CTAP HID commands.
+///
+/// US-1528 follow-up: `Keepalive` and `Msg` were transposed here — `0x03`
+/// and `0x10` — which is the same class of transcription error US-1528 fixed
+/// in the two tables below, in a third private copy of the same data. The
+/// correction, from the constants `fido2` 2.2.1 actually decodes
+/// (`fido2.hid.CTAPHID`, verified by running the enum rather than by reading
+/// a header):
+///
+/// | command | value | note |
+/// |---|---|---|
+/// | `PING` | `0x01` | |
+/// | `MSG` | `0x03` | CTAP1/U2F APDU over HID — was `0x10` here |
+/// | `CBOR` | `0x10` | CTAP2 — was `Keepalive` here |
+/// | `INIT` | `0x06` | |
+/// | `WINK` | `0x08` | |
+/// | `CANCEL` | `0x11` | |
+/// | `ERROR` | `0x3F` | |
+/// | `VENDOR_FIRST` | `0x40` | |
+///
+/// **`KEEPALIVE` is deliberately not a member of this enum.** There is no
+/// CTAPHID keepalive *command*: `0x3B` is a CTAP2 *status byte* the
+/// authenticator puts in a CBOR response while a consent window is open
+/// (`firmware/src/ctap_hid.rs:28`, `CTAP_HID_KEEPALIVE = 0x3B`, and
+/// `CTAPHID_KEEPALIVE_PROCESSING`/`_UPNEEDED` for its two values). Having it
+/// here as `0x03` alongside a real command is how the transposition survived
+/// review: an enum of "commands" containing an entry that is not one reads as
+/// a complete list of commands, and the value looked plausible beside `0x03`.
+///
+/// Dead code today — nothing outside this file names `CtapHidCommand`, and
+/// the firmware's own live constants are in `firmware/src/ctap_hid.rs`. It is
+/// kept because it is a public type of a published crate, and it is now pinned
+/// by `tests/ctap_hid_tables.rs` so a future edit cannot silently re-transpose
+/// it the way three tables in this repo already managed to do to each other.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum CtapHidCommand {
     Ping = 0x01,
-    Keepalive = 0x03,
-    Msg = 0x10,
+    Msg = 0x03,
     Init = 0x06,
     Wink = 0x08,
+    Cbor = 0x10,
     Cancel = 0x11,
     Error = 0x3F,
     VendorFirst = 0x40,
 }
 
 /// CTAP HID error codes.
+///
+/// US-1528: the last two were `0x07`/`0x08` and are now `0x0A`/`0x0B`. Same
+/// transcription error as [`crate::ctap2::Ctap2Response`], and it is recorded
+/// here because the two tables used to agree with each other and disagree with
+/// the reference together — which is what made it invisible. `fido2` 2.2.1
+/// `CtapError.ERR` has `LOCK_REQUIRED = 0x0A` / `INVALID_CHANNEL = 0x0B`; the
+/// C SDK agrees at `pico-keys-sdk/src/usb/hid/ctap_hid.h:157-158`
+/// (`CTAP1_ERR_LOCK_REQUIRED 0x0a`, `CTAP1_ERR_INVALID_CHANNEL 0x0b`).
+/// `firmware/src/ctap_hid.rs:37` in the firmware worktree already emits `0x0B`
+/// for the same condition, so the `0x08` here was a third, private spelling of
+/// a value two other files in this project had already got right.
+///
+/// `Unknown` (`0x0F`) is not a CTAP HID code; it is this crate's catch-all for
+/// a byte it does not recognise, deliberately outside the reference range so it
+/// cannot be mistaken for one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum CtapHidError {
@@ -24,8 +72,8 @@ pub enum CtapHidError {
     InvalidSeq = 0x04,
     Timeout = 0x05,
     ChannelBusy = 0x06,
-    LockRequired = 0x07,
-    InvalidChannel = 0x08,
+    LockRequired = 0x0A,
+    InvalidChannel = 0x0B,
     Unknown = 0x0F,
 }
 
@@ -44,8 +92,8 @@ impl From<u8> for CtapHidError {
             0x04 => CtapHidError::InvalidSeq,
             0x05 => CtapHidError::Timeout,
             0x06 => CtapHidError::ChannelBusy,
-            0x07 => CtapHidError::LockRequired,
-            0x08 => CtapHidError::InvalidChannel,
+            0x0A => CtapHidError::LockRequired,
+            0x0B => CtapHidError::InvalidChannel,
             0x0F => CtapHidError::Unknown,
             _ => CtapHidError::Unknown,
         }

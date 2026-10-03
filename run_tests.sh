@@ -3,6 +3,38 @@
 
 set -e
 
+# `set -e` alone does NOT make a pipeline report its producer's status: in
+# `cargo test … | tail -3` the status the shell sees is *tail's*, so 25 failing
+# tests printed a `FAILED. 68 passed; 25 failed` summary and this script still
+# exited 0. That is the one guarantee this file exists to give — a local run
+# reproducing the CI gate — and CI only caught it because CI runs the same
+# command unpiped.
+#
+# `set -o pipefail` would fix that globally, but it would also reach the one
+# pipeline whose last element is `grep -q` (`grep` exits at the first match, so
+# its producer can die of SIGPIPE and turn a *true* condition into a false
+# one). So instead: every step that trims output goes through `step`, which
+# reads PIPESTATUS[0] — the producer's real status — and re-raises it.
+# It is worth noting which failure mode this is: a gate that cannot go red is
+# worse than no gate, because its green is indistinguishable from a working
+# one's.
+step() {
+    local lines=$1
+    shift
+    local rc
+    # `set +e` only around the pipeline: with `set -e` the pipeline's own
+    # status would be checked before PIPESTATUS could be read.
+    set +e
+    "$@" 2>&1 | tail -"$lines"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: '$*' exited $rc. Only its last $lines lines are shown above;" >&2
+        echo "       rerun it unpiped for the full log. Aborting." >&2
+    fi
+    return "$rc"
+}
+
 # The code under test is the tree this script lives in. Derive it from
 # BASH_SOURCE (not `git rev-parse`: in a worktree .git is a file, and the parent
 # of that file is the worktree root) so running this from a worktree or any
@@ -73,11 +105,32 @@ python3 tests/scripts/check_rng_path.py
 # if the sink ever loses its compare-then-write, not only if the prose drifts.
 python3 tests/scripts/check_erase_budget.py
 
+# Acceptance exit-code contract gate (US-1518): `run_acceptance.py` needs a
+# board, a browser and a finger, so nothing here can run it end to end — which
+# is how its exit code came to be `1 if machine_fail else 0` while the README
+# told callers to gate on it, and a browser-less run reported success over two
+# machine-gated cases that never executed. This gate imports the pure
+# `classify_cases` the contract now lives in and pins every branch, including
+# that one.
+python3 tests/scripts/check_acceptance_exit_code.py
+
 # Red-team regression suite (US-923, Phase F): passed as a tests/harness/
 # path below, or runs as part of the default pytest discovery.
 
+# US-1524 emulator/board parity, as a TEST rather than only a build. The
+# build below links the emulator; nothing above ever RAN the six parity
+# tests in `emul_hid`, because `lib.rs` gates that module on
+# `feature = "emulation"` and every other firmware `--lib` invocation in
+# this tree (and in CI, until 2026-10-02) used `default = ["device"]`.
+# Mirrors the CI step of the same name so a local run reproduces the gate.
+# `--test-threads=1` for the `ccid_reasm::tests` shared-clock reason.
+# `step`, not a bare pipeline: see the note on `step` — a bare
+# `… | tail -3` reports TAIL's status, and this step was observed printing
+# `FAILED. 68 passed; 25 failed` while the script exited 0.
+step 3 cargo test -p fapico2-firmware --lib --features device,emulation --target x86_64-unknown-linux-gnu -- --test-threads=1
+
 # Build the emulator
-cargo build -p fapico2-firmware --bin fapico2-emulation --no-default-features --features emulation --target x86_64-unknown-linux-gnu 2>&1 | tail -3
+step 3 cargo build -p fapico2-firmware --bin fapico2-emulation --no-default-features --features emulation --target x86_64-unknown-linux-gnu
 
 # Tests under tests/harness/ (test_restart.py, test_boot_refuse.py, ...)
 # manage their OWN relay + emulator instances on DEDICATED ports (see the

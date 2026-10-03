@@ -19,7 +19,9 @@ Case           Attack (report table #)     Finding(s)             Emulation
 dump           #2 OATH unauth LIST +       R2 (session            active
                CALC_ALL                    self-grant)
 tamper         #4 PUT overwrite, #5        R1 (unauth RESET),     active
-               DELETE, #6 unauth RESET     R2
+               DELETE, #6 RESET w/o magic   R2
+oath-presence  #6 RESET with the magic but  R1 (presence is now   active
+               no user-presence grant      the only wipe gate)
 ga-no-pin      #12 raw-CBOR GA without     R3 (UP stub),          active
                the PIN token + wave-2      R10 (PIN verifier
                forged pinUvAuthParam       budget)
@@ -33,6 +35,17 @@ forged-slot    #17 forged format-v2 slot   R6 (plaintext store,   active
                with attacker ``fido.hkey`` CRC-only)
 =============  ==========================  =====================  ============
 
+**A note on row #6, because its fix changed shape.** US-903 gated the
+OATH wipe on the session, so #6 used to answer 6982 here. US-132
+(PICOForge-COMPAT, owner-approved 2026-09-27) removed that gate so the
+reference client's bare ``00 04 DE AD`` can reach the applet; the surviving
+gates are the magic and user presence, and nothing else. `tamper` therefore
+pins the magic (the half the auto-acking emulator can reach) and
+`oath-presence` pins the presence grant over the same CCID wire, which is
+possible because the emulator grew an opt-in
+``FAPICO2_OATH_PRESENCE=deny`` injection (``firmware/src/emul_main.rs``)
+for exactly this applet. See the two docstrings for the full argument.
+
 The three skipped cases cannot be replayed as refusals against the
 emulation binary *by construction* — not because the fixes regressed:
 
@@ -45,6 +58,10 @@ emulation binary *by construction* — not because the fixes regressed:
   minting) and ``apps/mgmt/src/lib.rs`` (US-906/US-921 bound presence
   service); their unit tests cover the refusal. Physical-presence attacks
   are the US-924 hardware BDD run's scope (the RP2350 has the button).
+  OATH is deliberately *not* in this list: its presence source is
+  injectable (`FAPICO2_OATH_PRESENCE=deny`), so ``oath-presence`` runs
+  for real. Wiring the same injection into FIDO/MGMT would need the same
+  treatment per applet and is not done here.
 - **ccid-wedge**: the US-920 reassembler + park timeout are wired only in
   the device serve loop (``firmware/src/tasks.rs``); the emulation binary's
   TCP CCID path (``platform/src/emulation.rs`` ``read_ccid`` +
@@ -66,6 +83,8 @@ discovery, where the shared relay already holds the harness ports
 """
 
 import contextlib
+import hashlib
+import hmac
 import os
 import signal
 import socket
@@ -95,8 +114,11 @@ DEAD_CCID_PORT = 35973
 HID_PORT_DUMP = 35967
 HID_PORT_TAMPER = 35968
 HID_PORT_GA = 35969
+HID_PORT_PRESENCE = 36121  # free; see the port map in ccid_relay.py
 
 SW_SEC_STATUS = b"\x69\x82"  # 0x6982 SECURITY_STATUS_NOT_SATISFIED
+SW_CONDITIONS = b"\x69\x85"  # 0x6985 CONDITIONS_NOT_SATISFIED (no presence)
+SW_INCORRECT_P2 = b"\x6a\x86"  # 0x6A86 INCORRECT_P1P2 (RESET magic)
 SW_OK = b"\x90\x00"
 
 
@@ -125,6 +147,16 @@ ATTACKER_SECRET = b"attacker-planted-key-123456"  # 26 bytes
 # key TLV value: 0x21 = TOTP | SHA-1, 0x06 = 6 digits, then the secret.
 VICTIM_KEY = b"\x21\x06" + b"\x0b" * 20
 
+INS_SET_CODE = 0x03
+INS_VALIDATE = 0xA3
+TAG_RESPONSE = 0x75
+ACCESS_CODE = b"kaka blahonga"  # alg byte | secret
+# Emulation-only (firmware/src/emul_main.rs): the host build of OATH
+# auto-acks user presence, so the surviving RESET gate was unreachable from
+# this suite. `deny` injects `|| false` — what a device's fail-closed
+# default already does — and nothing else about the emulator changes.
+OATH_PRESENCE_DENY = {"FAPICO2_OATH_PRESENCE": "deny"}
+
 
 def _oath_apdu(ins, p1=0, p2=0, data=b""):
     """Short-APDU OATH command (harness framing, tests/harness parity)."""
@@ -133,6 +165,40 @@ def _oath_apdu(ins, p1=0, p2=0, data=b""):
 
 def _put_tlv(name, key):
     return bytes([TAG_NAME, len(name)]) + name + bytes([TAG_KEY, len(key)]) + key
+
+
+def _tlv(body, tag):
+    """First value of `tag` in a concatenated TLV `body` (no status word)."""
+    i = 0
+    while i + 1 < len(body):
+        if body[i] == tag:
+            return body[i + 2:i + 2 + body[i + 1]]
+        i += 2 + body[i + 1]
+    return None
+
+
+def _set_code_tlv(code=ACCESS_CODE, chal=bytes(range(1, 9))):
+    """SET_CODE body: key TLV (alg|SHA-1 byte + secret) + proof over `chal`."""
+    key = b"\x21" + code  # 0x21 = TOTP(0x20) | SHA-1(0x01)
+    proof = hmac.new(code, chal, hashlib.sha1).digest()[:20]
+    return (
+        bytes([TAG_KEY, len(key)])
+        + key
+        + bytes([TAG_CHALLENGE, len(chal)])
+        + chal
+        + bytes([TAG_RESPONSE, len(proof)])
+        + proof
+    )
+
+
+def _validate_tlv(code, chal):
+    proof = hmac.new(code, chal, hashlib.sha1).digest()[:20]
+    return (
+        bytes([TAG_CHALLENGE, len(chal)])
+        + chal
+        + bytes([TAG_RESPONSE, len(proof)])
+        + proof
+    )
 
 
 SELECT_OATH = bytes([0x00, 0xA4, 0x04, 0x00, len(OATH_AID)]) + OATH_AID
@@ -200,8 +266,14 @@ class _Relay:
 
 
 @contextlib.contextmanager
-def _redteam_device(tmp_path, monkeypatch, tag, hid_port):
-    """Private relay + emulator + relayed CCID client for one case."""
+def _redteam_device(tmp_path, monkeypatch, tag, hid_port, env=None):
+    """Private relay + emulator + relayed CCID client for one case.
+
+    ``env`` is an optional extra environment for the emulator only; it is
+    applied after the private-path defaults so a case can opt the emulated
+    build into a non-default stance (see ``FAPICO2_OATH_PRESENCE`` below)
+    without those settings leaking into the shared pair.
+    """
     monkeypatch.setenv("FAPICO2_KEYSTORE", str(tmp_path / f"{tag}_keystore.cbor"))
     monkeypatch.setenv(
         "FAPICO2_SECURE_PARTITION", str(tmp_path / f"{tag}_partition.bin")
@@ -210,6 +282,8 @@ def _redteam_device(tmp_path, monkeypatch, tag, hid_port):
     # Dedicated CCID dial-in (Emu.start copies os.environ): the private
     # relay holds RELAY_CCID_PORT, not the shared harness dial-in 35963.
     monkeypatch.setenv("FAPICO2_CCID_PORT", str(RELAY_CCID_PORT))
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
     relay = _Relay()
     client = None
     emu = Emu(tmp_path / f"{tag}_keystore.cbor", hid_port=hid_port)
@@ -272,7 +346,7 @@ def test_oath_unauth_dump_refused(tmp_path, monkeypatch):
 
 
 def test_oath_unauth_tamper_refused(tmp_path, monkeypatch):
-    """R1 + R2 — OATH overwrite, DELETE and unauthenticated RESET refused.
+    """R1 + R2 — OATH overwrite and DELETE refused from an unvalidated session.
 
     Attacks (report rows #4/#5/#6, ``oath_storage2.py``/``oath_storage.py``):
     from the self-granted session the attacker overwrote a credential's
@@ -281,9 +355,31 @@ def test_oath_unauth_tamper_refused(tmp_path, monkeypatch):
     (SW=9000; all credentials destroyed, user-authorized destructive test).
 
     Red: report R1 (``cmd_reset`` missing the validated gate) + rows
-    #4/#5/#6. Green: US-902/US-901 keep the fresh session unvalidated and
-    US-903 gates RESET on the session BEFORE presence, so all three must
-    answer 6982 and nothing may be erased or rewritten.
+    #4/#5/#6. Green: US-902/US-901 keep the fresh session unvalidated, so
+    PUT and DELETE must answer 6982 and nothing may be erased or rewritten.
+
+    **RESET, and why the third row no longer asserts 6982.** Row #6 is the
+    worst of the three, but its *fix* changed shape. US-903 gated the wipe
+    on the session first; US-132 (PICOForge-COMPAT, owner-approved,
+    2026-09-27, ``apps/oath/src/oath_core.rs::cmd_reset``) deliberately
+    removed that gate so the reference client — picoforge, whose
+    ``reset()`` sends a bare, unlocked ``00 04 DE AD`` — could reach its
+    Reset button. The rule that survives is now exactly **two** gates, and
+    only two: the ``0xDE``/``0xAD`` magic and a user-presence grant. On
+    hardware the second gate is a physical button press, so a bare APDU
+    with nobody touching the token still cannot wipe anything.
+
+    The emulator auto-acks user presence (``oath_core::default_user_present``
+    returns ``true`` off the ``device`` feature), which is why the correct
+    magic answers 9000 here. That makes the magic the **only** half of the
+    two-gate rule this suite can reach, so it is what is asserted below —
+    and it is asserted in both directions (0xDE/0x00 and 0x00/0xAD), not
+    merely dropped. The presence half is asserted for real, over the same
+    CCID wire, in ``test_oath_reset_without_presence_refused`` below.
+
+    Note what is deliberately NOT asserted: a 6982 on the correct magic.
+    That would be the US-903 behaviour US-132 removed, and pinning it here
+    would make this suite green for a gate that no longer exists.
     """
     with _redteam_device(tmp_path, monkeypatch, "rt_tamper", HID_PORT_TAMPER) as client:
         _plant_victim_credential(client)
@@ -298,10 +394,83 @@ def test_oath_unauth_tamper_refused(tmp_path, monkeypatch):
         )
         assert _sw(resp) == SW_SEC_STATUS, f"unauth DELETE destroyed a credential: {resp.hex()}"
         # Wipe — the single worst APDU of the assessment. The session gate
-        # fires before the presence gate, so this is a pure-session refusal
-        # even though the emulation presence source would auto-ack.
+        # it used to trip is gone (US-132); the magic is the gate that is
+        # left, and this emulator's presence source would auto-ack the
+        # other one anyway, so the magic is the half reachable from here.
+        for p1, p2 in ((0xDE, 0x00), (0x00, 0xAD), (0x00, 0x00), (0xFF, 0xFF)):
+            resp = _ccid(client, _oath_apdu(INS_RESET, p1=p1, p2=p2))
+            assert _sw(resp) == SW_INCORRECT_P2, (
+                f"RESET without the 0xDE/0xAD magic was not refused as a "
+                f"magic error (P1={p1:#04x} P2={p2:#04x}): {resp.hex()}"
+            )
+
+
+def test_oath_reset_without_presence_refused(tmp_path, monkeypatch):
+    """R1 — the surviving RESET consent gate: no touch, no wipe.
+
+    ``test_oath_unauth_tamper_refused`` covers the magic half of the
+    two-gate rule, because the emulation build auto-acks presence. This
+    case covers the other half by launching the emulator with
+    ``FAPICO2_OATH_PRESENCE=deny`` (``firmware/src/emul_main.rs``), which
+    injects ``|| false`` — the same refusal a device's fail-closed default
+    produces when nobody presses the button.
+
+    Red: report row #6 (unauthenticated wipe). Green: US-903/US-921 with
+    US-132 — the presence grant is the ONLY consent gate left on the wipe,
+    so a correct-magic RESET with the grant withheld must answer 6985.
+
+    The load-bearing half of the assertion is the table afterwards. A
+    status word on its own cannot distinguish "refused, nothing happened"
+    from "wiped, then reported 6985" — the exact bug shape US-132's
+    mutation N5 hunted (``reset_gates_are_the_magic_and_the_touch_and_
+    nothing_else`` in ``apps/oath/tests/device_oath.rs``). So the case
+    commissions the applet, re-validates, and reads the table back on both
+    sides of the refused RESET.
+    """
+    with _redteam_device(
+        tmp_path, monkeypatch, "rt_nopresence", HID_PORT_PRESENCE,
+        env=OATH_PRESENCE_DENY,
+    ) as client:
+        # Virgin session: an app with nothing on file is grantable (US-901),
+        # so the setup below is a legitimate provisioning run, not a bypass.
+        assert _sw(_ccid(client, SELECT_OATH)) == SW_OK
+        put = _oath_apdu(INS_PUT, data=_put_tlv(VICTIM_NAME, VICTIM_KEY))
+        assert _sw(_ccid(client, put)) == SW_OK, "setup: the victim PUT failed"
+        # Commission the applet. SET_CODE locks the session by design, so the
+        # re-SELECT + VALIDATE handshake below is what re-grants read access.
+        set_code = _oath_apdu(INS_SET_CODE, data=_set_code_tlv())
+        assert _sw(_ccid(client, set_code)) == SW_OK, "setup: SET_CODE failed"
+
+        resp = _ccid(client, SELECT_OATH)
+        assert _sw(resp) == SW_OK, f"re-SELECT failed: {resp.hex()}"
+        chal = _tlv(resp[:-2], TAG_CHALLENGE)
+        assert chal is not None and len(chal) == 8, (
+            f"SELECT served no VALIDATE challenge: {resp.hex()}"
+        )
+        validate = _oath_apdu(INS_VALIDATE, data=_validate_tlv(ACCESS_CODE, chal))
+        assert _sw(_ccid(client, validate)) == SW_OK, "setup: VALIDATE failed"
+
+        before = _ccid(client, _oath_apdu(INS_LIST))
+        assert _sw(before) == SW_OK and VICTIM_NAME in before, (
+            f"precondition: the victim credential is not readable: {before.hex()}"
+        )
+
+        # The attack, unchanged from report row #6, against a store nobody
+        # can see: correct magic, no presence grant.
         resp = _ccid(client, _oath_apdu(INS_RESET, p1=0xDE, p2=0xAD))
-        assert _sw(resp) == SW_SEC_STATUS, f"unauth RESET wiped the store: {resp.hex()}"
+        assert _sw(resp) == SW_CONDITIONS, (
+            f"RESET without a user-presence grant was not refused with 6985: "
+            f"{resp.hex()}"
+        )
+
+        after = _ccid(client, _oath_apdu(INS_LIST))
+        assert _sw(after) == SW_OK, (
+            f"the refused RESET left the session unusable, so survival cannot "
+            f"be shown: {after.hex()}"
+        )
+        assert VICTIM_NAME in after, (
+            f"a refused RESET still wiped the store: {after.hex()}"
+        )
 
 
 def test_forged_v2_slot_refused(tmp_path, monkeypatch):

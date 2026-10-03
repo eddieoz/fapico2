@@ -1,3 +1,46 @@
+# DISABLED — 2026-10-02. This file is inert: GitHub reads `.github/dependabot.yml`
+# or `.github/dependabot.yaml` and nothing else, so the `.disabled` suffix
+# stops all version-update PRs without deleting the reasoning below.
+#
+# WHY
+#
+# Dependabot's cargo bumps do not fail here, they fail AFTER the merge is
+# already a green CI run. PR #2 (cargo-deps-3f020ecc6e, 23 updates) merged
+# green and had to be reverted: the bumps cross trait generations that
+# `trussed` 0.2 / `trussed-core` 0.2 have not moved to, so they cannot be
+# adopted in fapico2 alone. The `ignore` block below was written to encode that
+# — eight pinned entries, each naming the exact jump that breaks — and it did
+# not hold. A bump that RECOMPILES is, for this dependency set, evidence of
+# nothing: the breakage is in trait identity, which surfaces as a compile error
+# in a *consumer* crate rather than in the bumped crate.
+#
+# So the version-update half is off. Dependency VULNERABILITY updates are a
+# different mechanism and stay ON (see "what is still on" below) — a CVE in a
+# transitive crate is worth knowing about even when the fix cannot be adopted
+# in isolation.
+#
+# WHAT IS STILL ON
+#
+# `dependabot_security_updates` remains enabled on the repository
+# (`security_and_analysis`). It opens a PR only for a known vulnerability, not
+# for routine version drift, and it is the part with actual security value
+# here. Verify with:
+#
+#   gh api repos/eddieoz/fapico2 --jq '.security_and_analysis'
+#
+# WHAT THIS DOES NOT DO
+#
+# Nothing below now watches upstream for new versions. Staying current on
+# `trussed`, the RustCrypto crates, and the pinned `actions/*` SHAs is now a
+# manual chore. The actions are pinned to commit SHAs (v7.0.1 checkout,
+# v7.0.0 setup-python, v4.4.3 upload-artifact) rather than tags — that is the
+# supply-chain control that matters for a repo whose release workflow signs
+# artefacts, so an action bump is a path to a signing key and should stay
+# deliberate rather than automated.
+#
+# To re-enable: rename this file back to `dependabot.yml`.
+#
+# ---------------------------------------------------------------------------
 version: 2
 updates:
   # The workspace itself: crates.io dependencies for the firmware, platform,

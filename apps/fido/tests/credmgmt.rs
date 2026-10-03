@@ -229,9 +229,18 @@ fn test_u2f_registration_not_discoverable() {
     assert_eq!(resp[0], 0x2E, "U2F registrations must not be enumerable");
 
     // Discoverable getAssertion must not return it either.
+    //
+    // US-1533: this carries a real pinUvAuthParam. A PIN is set in this
+    // fixture, so `alwaysUv` now holds and a token-less assertion is answered
+    // 0x36 PUAT_REQUIRED before it reaches the store — which would have left
+    // this test passing for the wrong reason, no longer testing the
+    // discoverability claim at all. PERM_GA (0x02) scopes the token.
+    let cdh: Vec<u8> = crypto::sha256(b"client").to_vec();
+    let ga_token = client.get_token(&mut app, 0x09, Some(0x02), None).unwrap();
     let ga_req = cbor::encode(&Value::M(vec![
         (Value::U(0x01), Value::T("u2f.example.com".to_string())),
-        (Value::U(0x02), Value::B(crypto::sha256(b"client").to_vec())),
+        (Value::U(0x02), Value::B(cdh.clone())),
+        (Value::U(0x06), Value::B(crypto::pin_uv_auth_param(2, &ga_token.try_into().unwrap(), &cdh))),
     ]));
     let resp = app.process_ctap2(0x02, &ga_req, [1, 2, 3, 4]);
     assert_eq!(resp[0], 0x2E, "U2F registrations must not be discoverable");

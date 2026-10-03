@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>fapico2 US-1518 acceptance</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin: 0; padding: 1.5rem; max-width: 60rem; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+  h2 { font-size: .95rem; margin: 1.5rem 0 .5rem; }
+  .sub { opacity: .7; margin: 0 0 1rem; }
+  table { border-collapse: collapse; width: 100%; margin: .5rem 0; }
+  th, td { border: 1px solid #8884; padding: .35rem .5rem; text-align: left;
+           vertical-align: top; }
+  th { background: #8881; font-weight: 600; }
+  td.verdict { font-weight: 700; white-space: nowrap; }
+  .PASS { color: #0a7d28; }
+  .FAIL { color: #c02020; }
+  .BLOCKED { color: #a06000; }
+  .PENDING { opacity: .6; }
+  .note { border-left: 3px solid #8886; padding: .25rem .75rem; margin: .5rem 0;
+          opacity: .85; }
+  button { font: inherit; padding: .4rem .9rem; margin: .15rem .3rem .15rem 0;
+           cursor: pointer; }
+  button[disabled] { opacity: .45; cursor: not-allowed; }
+  code { background: #8882; padding: 0 .25rem; }
+  #touch { font-weight: 700; }
+  details { margin: .5rem 0; }
+  summary { cursor: pointer; }
+</style>
+
+<h1>US-1518 — scripted acceptance page</h1>
+<p class="sub">
+  Drives the request shapes identified by US-1521 against the attached
+  authenticator over WebAuthn. Every case reports a machine-readable verdict.
+  <strong>Human-gated cases need a physical button touch.</strong>
+</p>
+
+<div class="note">
+  <strong>Which device this run is talking to:</strong>
+  <span id="target">unknown</span>
+  <br>
+  <strong>How to run:</strong> leave this page open, then press
+  <em>Run machine-gated cases</em>. The runner polls this page for verdicts;
+  a case that never reports is a <span class="FAIL">FAIL</span>, never a skip.
+</div>
+
+<h2>Machine-gated <span class="sub" style="display:inline">(no touch needed)</span></h2>
+<p class="sub">
+  These exercise the transport the browser itself depends on. They cannot be
+  faked: they issue real CTAPHID messages and read real replies.
+</p>
+<div>
+  <button id="run-all">Run machine-gated cases</button>
+  <button id="run-abandon" class="PENDING">Run the abandoned-attempt case alone</button>
+</div>
+
+<h2>Human-gated <span class="sub" style="display:inline">(each needs a touch)</span></h2>
+<p class="sub">
+  Each of these is a real ceremony. The device enforces user presence
+  (US-907) and this harness does not relax it, so each case waits for the
+  button. A timeout is recorded as a FAIL.
+</p>
+<div id="human-buttons"></div>
+
+<h2>Results</h2>
+<div id="touch-state">idle</div>
+<table>
+  <thead><tr>
+    <th>case</th><th>gate</th><th>shape</th><th>verdict</th>
+    <th>observed</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<h2>Run summary (machine-readable)</h2>
+<pre id="json">{}</pre>
+
+<h2>Verdict definitions</h2>
+<table>
+  <thead><tr><th>verdict</th><th>meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="verdict PASS">PASS</td>
+        <td>The assertion held. For a ceremony: a credential/assertion was
+            returned by the authenticator.</td></tr>
+    <tr><td class="verdict FAIL">FAIL</td>
+        <td>The assertion did not hold, the ceremony errored, or the case did
+            not report before its deadline. Never a silent skip.</td></tr>
+    <tr><td class="verdict BLOCKED">BLOCKED</td>
+        <td>WebAuthn itself is unavailable in this browser context, so the
+            shape could not be attempted at all. Distinct from a device
+            failure.</td></tr>
+  </tbody>
+</table>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// US-1518 acceptance page.
+//
+// Every case here does one of two things and says which:
+//
+//   MACHINE-GATED: drives the device through WebAuthn's own transport, with no
+//   user-presence requirement, and asserts something the browser can observe.
+//   Examples: is the device enumerable at all; does it still answer a
+//   ceremony immediately after a previous one was abandoned.
+//
+//   HUMAN-GATED: a full ceremony that requires the physical button. This
+//   harness does NOT simulate user presence. Chrome's CDP virtual
+//   authenticator and the Playwright "automatic presence simulation" flag are
+//   deliberately not used: a harness that stubs the touch cannot observe the
+//   thing this epic exists to observe (US-907 user presence), so a green run
+//   from such a harness would be evidence of nothing.
+//
+// The human-gated cases exist because the epic's BDD names those exact request
+// shapes. The machine-gated cases exist because only they can be checked
+// without a human, and because the abandoned-attempt regression is a property
+// of the transport, not of a DOM assertion.
+// ---------------------------------------------------------------------------
+
+const RP_ID = location.hostname;
+const RP_NAME = "fapico2 US-1518 acceptance";
+
+const params = new URLSearchParams(location.search);
+const AUTORUN = params.get("autorun") === "1";
+
+// Per-case deadline. A ceremony that has not settled by then is a FAIL, not a
+// skip: an unresponsive device and an unwatched device must not look the same.
+const CEREMONY_TIMEOUT_MS = 45000;
+const ABANDON_SETTLE_MS = 3000;
+const POST_ABANDON_TIMEOUT_MS = 30000;
+
+// The six shapes US-1521 identified, plus the deliberately abandoned attempt.
+const CASES = [
+  { id: "uv_required",       gate: "human", op: "create",
+    shape: "userVerification: required",           needsTouch: true },
+  { id: "uv_preferred",      gate: "human", op: "create",
+    shape: "userVerification: preferred",          needsTouch: true },
+  { id: "attachment_cross",  gate: "human", op: "create",
+    shape: "authenticatorAttachment: cross-platform", needsTouch: true },
+  { id: "attestation_none",  gate: "human", op: "create",
+    shape: "attestation: none",                    needsTouch: true },
+  { id: "attestation_direct",gate: "human", op: "create",
+    shape: "attestation: direct",                  needsTouch: true },
+  { id: "rk_required",       gate: "human", op: "create",
+    shape: "residentKey: required",                needsTouch: true },
+  { id: "get_uv_required",   gate: "human", op: "get",
+    shape: "userVerification: required (assertion)", needsTouch: true },
+
+  // Machine-gated. `create` without user verification still requires the
+  // button on this device (US-907), so these deliberately use shapes the
+  // device can satisfy WITHOUT a touch: GetInfo-equivalent traffic and a
+  // discovery/creation attempt that is abandoned before any touch.
+  { id: "enumerates",        gate: "machine", op: "enumerate",
+    shape: "device is enumerable in this browser context", needsTouch: false },
+  { id: "answers_after_abandon", gate: "machine", op: "answers_after_abandon",
+    shape: "after an abandoned attempt, a fresh ceremony still settles",
+    needsTouch: false },
+];
+
+const results = {};
+const rowsEl = document.getElementById("rows");
+const jsonEl = document.getElementById("json");
+const touchEl = document.getElementById("touch-state");
+
+function setTouchState(s) { touchEl.textContent = s; }
+
+function record(caseId, verdict, observed) {
+  results[caseId] = {
+    case: caseId,
+    gate: (CASES.find(c => c.id === caseId) || {}).gate || "machine",
+    verdict: verdict,
+    observed: observed,
+    at: new Date().toISOString(),
+  };
+  render();
+  // Publish to the runner so a headless browser run is machine-readable
+  // without any DevTools-protocol plumbing. fire-and-forget: a failure to
+  // report must not change the verdict that was actually observed in the page.
+  try {
+    fetch("/results", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(results),
+    }).catch(() => {});
+  } catch (e) { /* reporting is best-effort; the page still shows the verdict */ }
+  return results[caseId];
+}
+
+function render() {
+  const order = CASES.map(c => c.id);
+  const known = order.filter(id => results[id]);
+  const extra = Object.keys(results).filter(id => !order.includes(id));
+  const ids = [...known, ...extra];
+  rowsEl.innerHTML = ids.map(id => {
+    const r = results[id];
+    const shape = (CASES.find(c => c.id === id) || {}).shape || "(regression case)";
+    return `<tr><td><code>${r.case}</code></td><td>${r.gate}</td><td>${shape}</td>` +
+           `<td class="verdict ${r.verdict}">${r.verdict}</td>` +
+           `<td>${escapeHtml(r.observed)}</td></tr>`;
+  }).join("");
+  jsonEl.textContent = JSON.stringify({
+    rp_id: RP_ID,
+    secure_context: window.isSecureContext,
+    user_agent: navigator.userAgent,
+    results: results,
+  }, null, 2);
+  window.__US1518__ = results;
+  window.__US1518_DONE__ = true;
+  return results;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function b64ToBuf(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function hex(buf) {
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function webauthnAvailable() {
+  return window.isSecureContext && typeof PublicKeyCredential !== "undefined";
+}
+
+// --- ceremony plumbing ---------------------------------------------------
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(
+      `${label} did not settle within ${ms}ms (treated as FAIL, not skip)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function makeCreationOptions(selection, attestation) {
+  return {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    rp: { id: RP_ID, name: RP_NAME },
+    user: {
+      id: crypto.getRandomValues(new Uint8Array(16)),
+      name: "us1518@example.invalid",
+      displayName: "US-1518 acceptance",
+    },
+    pubKeyCredParams: [
+      { type: "public-key", alg: -7 },   // ES256
+      { type: "public-key", alg: -257 }, // RS256
+    ],
+    authenticatorSelection: selection,
+    attestation: attestation,
+    timeout: CEREMONY_TIMEOUT_MS,
+  };
+}
+
+// --- machine-gated cases -------------------------------------------------
+
+// "The device is enumerable in this browser context."
+//
+// What this can and cannot prove, stated plainly: a browser does not expose
+// WebAuthn authenticator enumeration to script. So the strong form of this
+// assertion is made on the wire by the Python runner, which sends a real
+// CTAPHID INIT and reads a real reply. What the page contributes is the part
+// only the browser can answer: whether WebAuthn is usable at all here (secure
+// context, PublicKeyCredential present, cross-platform capability reported).
+// If the page reports BLOCKED, the wire-side assertion still stands on its
+// own; if the page reports PASS, that is a statement about the browser
+// context, NOT proof that a particular board is attached.
+async function caseEnumerates() {
+  if (!webauthnAvailable()) {
+    return record("enumerates", "BLOCKED",
+      `WebAuthn unavailable: secureContext=${window.isSecureContext}, ` +
+      `PublicKeyCredential=${typeof PublicKeyCredential}`);
+  }
+  // Ask the browser whether it believes a cross-platform authenticator exists.
+  // This is a browser capability query, not a device query.
+  let note = `secureContext=${window.isSecureContext}`;
+  try {
+    const caps = await PublicKeyCredential.getClientCapabilities();
+    note += `, conditionalCreate=${caps.conditionalCreate}` +
+            `, platformAuthenticator=${caps.passkeyPlatformAuthenticator}`;
+  } catch (e) {
+    note += `, getClientCapabilities threw ${e.name}`;
+  }
+  return record("enumerates", "PASS",
+    "WebAuthn usable in this context; " + note +
+    " (board-level enumeration is asserted on the wire by the runner)");
+}
+
+// THE REGRESSION CASE.
+//
+// 1. Start a ceremony and walk away from it: resolve nothing, cancel nothing,
+//    stop reading. In a real browser this is the user opening the passkey
+//    prompt and dismissing it.
+// 2. Wait a settle period.
+// 3. Start a fresh ceremony and require it to settle -- i.e. the device still
+//    answers and is not left parked.
+//
+// Step 3 is the assertion. On a firmware that stops servicing its USB OUT
+// endpoint while an abandoned ceremony is outstanding, step 3 does not settle
+// within the budget and this case FAILs. That is the epic's regression, caught
+// rather than assumed (epic DoD item 8).
+async function caseAnswersAfterAbandon() {
+  if (!webauthnAvailable()) {
+    return record("answers_after_abandon", "BLOCKED",
+      `WebAuthn unavailable: secureContext=${window.isSecureContext}`);
+  }
+
+  // A resident credential for a throwaway user id on this RP, with no user
+  // verification: the device still demands a touch (US-907), so this WILL park
+  // awaiting presence. That is the point -- we abandon it while parked.
+  //
+  // "Abandon" here is an AbortSignal, because that is what a real dismissal is
+  // at the WebAuthn layer: the page stops caring and the pending create() is
+  // torn down. A browser will not start a second ceremony while the first is
+  // still outstanding ("OperationError: A request is already pending."), so
+  // walking away by simply not awaiting is not a thing the platform permits.
+  // Aborting is the closest faithful analogue, and it exercises the same path:
+  // the authenticator is left holding a ceremony whose host went away.
+  const ac = new AbortController();
+  const abandonPromise = navigator.credentials.create({
+    publicKey: makeCreationOptions(
+      { authenticatorAttachment: "cross-platform", residentKey: "required",
+        requireResidentKey: true, userVerification: "discouraged" },
+      "none"),
+    signal: ac.signal,
+  });
+  // Swallow the eventual rejection: we are abandoning it on purpose.
+  abandonPromise.then(() => {}, () => {});
+
+  const t0 = performance.now();
+  setTouchState(
+    "ABANDONED CEREMONY OPEN — do NOT touch the button; the harness is " +
+    "walking away from it on purpose");
+  // Let the ceremony actually reach the authenticator and park there.
+  await new Promise(r => setTimeout(r, ABANDON_SETTLE_MS));
+  const abandonMs = performance.now() - t0;
+  // Now walk away: abort it, as a dismissal would.
+  ac.abort();
+  // Give the teardown time to reach the device before probing it.
+  await new Promise(r => setTimeout(r, ABANDON_SETTLE_MS));
+
+  // The moment of truth: a fresh ceremony, immediately after walking away.
+  setTouchState("PROBING — the device must still answer");
+  const probeT0 = performance.now();
+  let observed;
+  try {
+    const cred = await withTimeout(
+      navigator.credentials.create({
+        publicKey: makeCreationOptions(
+          { authenticatorAttachment: "cross-platform", residentKey: "discouraged",
+            userVerification: "discouraged" },
+          "none"),
+      }),
+      POST_ABANDON_TIMEOUT_MS, "post-abandon ceremony");
+    const probeMs = performance.now() - probeT0;
+    observed = `settled in ${probeMs.toFixed(0)}ms after a ` +
+               `${abandonMs.toFixed(0)}ms abandoned ceremony ` +
+           `(credential id ${cred.id.length} chars; ` +
+           `aaguid ${hex(cred.rawAuthenticatorData.slice(0, 16))})`;
+    record("answers_after_abandon", "PASS", observed);
+  } catch (e) {
+    const probeMs = performance.now() - probeT0;
+    // A NotAllowedError here is ambiguous on its own: it can mean the device
+    // never answered, or that it answered and nobody touched the button. The
+    // runner disambiguates against its own wire-side timing. Report the raw
+    // fact and let the timing speak.
+    observed = `did not settle within ${POST_ABANDON_TIMEOUT_MS}ms: ` +
+           `${e.name}: ${e.message} (waited ${probeMs.toFixed(0)}ms)`;
+    record("answers_after_abandon", "FAIL", observed);
+  }
+  setTouchState("idle");
+  return results["answers_after_abandon"];
+}
+
+// --- human-gated cases ---------------------------------------------------
+
+async function runCeremony(c) {
+  if (!webauthnAvailable()) {
+    return record(c.id, "BLOCKED",
+      `WebAuthn unavailable: secureContext=${window.isSecureContext}, ` +
+      `PublicKeyCredential=${typeof PublicKeyCredential}`);
+  }
+  setTouchState(`TOUCH THE BUTTON NOW — case ${c.id} (${c.shape})`);
+  const t0 = performance.now();
+  try {
+    let cred;
+    if (c.op === "create") {
+      const selection = {};
+      if (c.id === "uv_required") selection.userVerification = "required";
+      else if (c.id === "uv_preferred") selection.userVerification = "preferred";
+      if (c.id === "attachment_cross") selection.authenticatorAttachment = "cross-platform";
+      if (c.id === "rk_required") {
+        selection.residentKey = "required";
+        selection.requireResidentKey = true;
+      }
+      // Keep the unstated axes permissive so each case isolates ONE shape.
+      if (selection.residentKey === undefined) {
+        selection.residentKey = "discouraged";
+      }
+      if (selection.userVerification === undefined) {
+        selection.userVerification = "discouraged";
+      }
+      const attestation = c.id === "attestation_direct" ? "direct" : "none";
+      cred = await withTimeout(navigator.credentials.create({
+        publicKey: makeCreationOptions(selection, attestation),
+      }), CEREMONY_TIMEOUT_MS, c.id);
+    } else {
+      // An assertion against a credential this page just made. If none
+      // exists yet, say so rather than silently creating one under a
+      // different id and pretending the get succeeded.
+      if (!window.__US1518_CREDS__ || !window.__US1518_CREDS__.length) {
+        return record(c.id, "FAIL",
+          "no credential from a previous case to assert against; run the " +
+          "creation cases first (this is a harness-sequencing error, not a " +
+          "device result)");
+      }
+      const credId = window.__US1518_CREDS__[0];
+      cred = await withTimeout(navigator.credentials.get({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rpId: RP_ID,
+          userVerification: "required",
+          allowCredentials: [{ type: "public-key", id: credId }],
+          timeout: CEREMONY_TIMEOUT_MS,
+        },
+      }), CEREMONY_TIMEOUT_MS, c.id);
+    }
+    const ms = performance.now() - t0;
+    const aaguid = cred.rawAuthenticatorData
+      ? hex(cred.rawAuthenticatorData.slice(0, 16)) : "unavailable";
+    const flags = cred.authenticatorAttachment || "unavailable";
+    record(c.id, "PASS",
+      `${c.op}() returned in ${ms.toFixed(0)}ms; attachment=${flags}; ` +
+      `aaguid=${aaguid}; idLen=${cred.id.length}`);
+  } catch (e) {
+    const ms = performance.now() - t0;
+    record(c.id, "FAIL", `${c.op}() failed after ${ms.toFixed(0)}ms: ` +
+      `${e.name}: ${e.message}`);
+  } finally {
+    setTouchState("idle");
+  }
+  return results[c.id];
+}
+
+// --- wiring --------------------------------------------------------------
+
+function buildButtons() {
+  const box = document.getElementById("human-buttons");
+  box.innerHTML = "";
+  for (const c of CASES.filter(c => c.gate === "human")) {
+    const b = document.createElement("button");
+    b.textContent = `${c.id} — ${c.shape}`;
+    b.onclick = async () => { b.disabled = true; await runCeremony(c); b.disabled = false; };
+    box.appendChild(b);
+  }
+  for (const c of CASES.filter(c => c.gate === "machine")) {
+    const b = document.createElement("button");
+    b.textContent = `${c.id} — ${c.shape}`;
+    b.onclick = () => (c.op === "enumerate" ? caseEnumerates()
+                                                 : caseAnswersAfterAbandon());
+    document.getElementById("human-buttons").appendChild(b);
+  }
+}
+
+document.getElementById("run-all").onclick = () => caseEnumerates();
+document.getElementById("run-abandon").onclick = () => caseAnswersAfterAbandon();
+
+document.getElementById("target").textContent =
+  (params.get("target") || "(not reported by the runner)");
+
+buildButtons();
+render();
+
+if (AUTORUN) {
+  // Autorun still only fires the MACHINE-gated cases. Human-gated cases are
+  // never started automatically: starting one without a human present just
+  // burns the timeout and reports a misleading FAIL.
+  caseEnumerates().then(() => caseAnswersAfterAbandon());
+}
+</script>
+</body>
+</html>

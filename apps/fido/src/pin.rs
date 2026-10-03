@@ -112,7 +112,16 @@ impl<'a> PinProtocol<'a> {
             0x03 => self.set_pin(params),
             0x04 => self.change_pin(params),
             0x05 | 0x09 => self.get_pin_token(params),
-            0x06 => self.get_pin_token_uv(params),
+            // getPinUvAuthTokenUsingUvWithPermissions — REFUSED, matching the
+            // device twin (`device_core.rs`) and the C reference
+            // (`pico-fido2/src/fido/cbor_client_pin.c`, which has no `0x06`
+            // branch and falls through to CTAP2_ERR_INVALID_SUBCOMMAND).
+            // CTAP 2.2 §5.4.6 grants this sub-command only when the `uv`
+            // option is present and true; we advertise the Client-PIN-only
+            // shape (`uv` absent), and the arm used to mint a token on a
+            // presence grant alone — the no-PIN arm-without-PIN-prompt
+            // symptom. See the device twin's `0x06` arm for the full record.
+            0x06 => Err(FidoError::InvalidSubcommand),
             0x07 => self.get_uv_retries(),
             _ => Err(FidoError::InvalidParameter),
         }
@@ -161,16 +170,20 @@ impl<'a> PinProtocol<'a> {
         })
     }
 
-    /// getUVRetries (0x07). UV is not implemented in this build, so a
-    /// constant retry budget is reported (the counter never decrements).
+    /// getUVRetries (0x07). US-1513: the budget was a hard-coded 3 that no test
+    /// could observe. It now tracks the same `auth_failures` counter the
+    /// latch in `note_pin_auth_failure` uses, and reports the durable
+    /// lockout as `powerCycleState` — the same pair of keys CTAP2.1 §6.5.5.4
+    /// defines and the device twin writes at `device_core.rs:1558`.
     fn get_uv_retries(&self) -> Result<PinProtocolOutput, FidoError> {
+        let state = self.keystore.get_pin_state();
         Ok(PinProtocolOutput {
             response: ClientPinResponse {
                 key_agreement: None,
                 pin_token: None,
                 retries: None,
-                power_cycle_state: false,
-                uv_retries: Some(3),
+                power_cycle_state: state.blocked || state.needs_power_cycle,
+                uv_retries: Some(crate::ctap2::uv_retries(state.auth_failures)),
             },
             raw_pin_token: None,
         })
@@ -555,39 +568,6 @@ impl<'a> PinProtocol<'a> {
                 key_agreement: None,
                 pin_token: Some(encrypted_token),
                 retries: Some(MAX_PIN_RETRIES),
-                power_cycle_state: false,
-                uv_retries: None,
-            },
-            raw_pin_token: Some(pin_token),
-        })
-    }
-
-    /// `getPinUvAuthTokenUsingUvWithPermissions` (sub-command `0x06`).
-    ///
-    /// The no-PIN leg of the token exchange. A client whose key has no PIN
-    /// still needs a pinUvAuthToken before it may call credentialManagement
-    /// — without this sub-command there is no way to obtain one, and the
-    /// resident-credential screens (Slots, Passkeys) never resolve. The
-    /// device twin gates it on a user-presence grant; the host twin has no
-    /// presence probe and auto-acks, matching the rest of the host stack
-    /// (US-908).
-    fn get_pin_token_uv(&mut self, params: ClientPinParams) -> Result<PinProtocolOutput, FidoError> {
-        let permissions = params.permissions.ok_or(FidoError::MissingParameter)?;
-        if permissions & 0x08 != 0 && params.pin_uv_auth_protocol != 2 {
-            return Err(FidoError::PinAuthInvalid);
-        }
-        let client_pub = params.key_agreement.ok_or(FidoError::MissingParameter)?;
-        let protocol = params.pin_uv_auth_protocol;
-        let shared = self.derive_shared_secret(protocol, &client_pub);
-        let mut enc_key = [0u8; 32];
-        enc_key.copy_from_slice(&shared[32..]);
-        let pin_token = crypto::random_vec(32);
-        let encrypted_token = crypto::pin_encrypt(protocol, &enc_key, &pin_token);
-        Ok(PinProtocolOutput {
-            response: ClientPinResponse {
-                key_agreement: None,
-                pin_token: Some(encrypted_token),
-                retries: None,
                 power_cycle_state: false,
                 uv_retries: None,
             },

@@ -157,38 +157,18 @@ fn make_resident_for(
     assert_eq!(resp[0], 0x00, "makeCredential must succeed");
 }
 
-/// Ask for a token with `getPinUvAuthTokenUsingUvWithPermissions`
-/// (clientPIN sub-command `0x06`) — the no-PIN leg, which proves user
-/// presence instead of a PIN. Returns the decrypted 32-byte token.
-fn get_uv_token(
-    app: &mut FidoApp<MemoryKeystore>,
-    client: &PinClient,
-    permissions: u8,
-) -> Vec<u8> {
-    let req = cbor::encode(&Value::M(vec![
+/// Send `getPinUvAuthTokenUsingUvWithPermissions` (clientPIN sub-command
+/// `0x06`) with a well-formed request. The sub-command used to be answered
+/// on this exact shape — a presence grant minted a full-permission token
+/// with no PIN — which is the non-conformant behaviour the fix removes.
+/// Now refused, unconditionally.
+fn uv_token_request(client: &PinClient, permissions: u8) -> Vec<u8> {
+    cbor::encode(&Value::M(vec![
         (Value::U(0x01), Value::U(2)),
         (Value::U(0x02), Value::U(0x06)),
         (Value::U(0x03), client.client_cose()),
         (Value::U(0x09), Value::U(permissions as u64)),
-    ]));
-    let resp = app.process_ctap2(0x06, &req, [1, 2, 3, 4]);
-    assert_eq!(
-        resp[0], 0x00,
-        "getPinUvAuthTokenUsingUvWithPermissions must be answered, not refused"
-    );
-    let encrypted = match cbor::decode(&resp[1..]).unwrap().0 {
-        Value::M(m) => m
-            .iter()
-            .find_map(|(k, v)| match (k, v) {
-                (Value::U(0x02), Value::B(b)) => Some(b.clone()),
-                _ => None,
-            })
-            .expect("pinUvAuthToken (0x02) in the clientPIN response"),
-        other => panic!("expected map, got {:?}", other),
-    };
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(&encrypted[..16]);
-    crypto::pin_decrypt_v2(&client.enc_key, &encrypted).expect("decrypt the UV token")
+    ]))
 }
 
 /// The regression this whole file guards: a spec-layout request used to be
@@ -366,24 +346,25 @@ fn dialect_discriminator_is_the_type_of_key_0x02() {
 }
 
 /// `getPinUvAuthTokenUsingUvWithPermissions` (clientPIN sub-command `0x06`)
-/// is the only way a client on a PIN-less key can obtain a pinUvAuthToken,
-/// and GetInfo advertises `uv` — so it must be answered, not refused. Before
-/// this it fell through to `InvalidParameter`.
+/// is REFUSED with `InvalidSubcommand` (0x3E). This test used to assert the
+/// opposite — that the sub-command "must be answered, not refused" — which
+/// pinned the bug: a token minted on a presence grant alone, on a device
+/// whose GetInfo advertises no `uv` option. CTAP 2.2 §5.4.6 grants `0x06`
+/// only when `uv` is present and true; §6.5.5.7.3 restricts it to
+/// authenticators with built-in user verification. The C reference never
+/// implemented it (`cbor_client_pin.c` falls through to
+/// `CTAP2_ERR_INVALID_SUBCOMMAND`), and neither do we now.
 #[test]
-fn clientpin_uv_token_subcommand_is_implemented() {
+fn clientpin_uv_token_subcommand_is_refused() {
     let (mut app, client) = setup();
     make_resident(&mut app, &client, "example.com");
 
-    // Minted last: every get_token call replaces the app's single pinUvAuth
-    // token slot, so the UV token has to be the one in hand at the credMgmt
-    // call below. No PIN is involved in this leg — it proves presence only.
-    let token = get_uv_token(&mut app, &client, 0x04);
-
-    let resp = app.process_ctap2(0x0A, &cm_req_ctap2(CTAP2_ENUMERATE_RPS_BEGIN, &token, &[]), [1, 2, 3, 4]);
-    assert_eq!(
-        resp[0], 0x00,
-        "a UV-issued token with the cm permission must authorise credMgmt"
-    );
+    // A fully-formed request — keyAgreement present, permissions present —
+    // so the refusal comes from the sub-command gate and not from a
+    // missing-parameter short-circuit.
+    let resp = app.process_ctap2(0x06, &uv_token_request(&client, 0x04), [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x3E, "0x06 has no leg on a Client-PIN-only device");
+    assert_eq!(resp.len(), 1, "the refusal is a bare status byte: no token, no CBOR");
 }
 /// The same spec behaviour, driven through `device_core.rs`.
 ///
@@ -519,24 +500,62 @@ mod device_twin {
             out[..n].to_vec()
         }
 
-        /// clientPIN getPinUvAuthTokenUsingUvWithPermissions (sub 0x06) —
-        /// no PIN involved, so the token path stays independent of setPIN.
-        fn uv_token(&mut self, permissions: u8) -> Vec<u8> {
+        /// clientPIN setPIN (v1): raw PIN, zero-padded to the 16-byte block,
+        /// authenticated with HMAC-SHA256(k, pinEnc) truncated to 16 bytes.
+        fn set_pin(&mut self, pin: &[u8]) {
+            let mut padded = pin.to_vec();
+            while !padded.len().is_multiple_of(16) || padded.len() < 16 {
+                padded.push(0);
+            }
+            let mut buf = [0u8; 96];
+            buf[..padded.len()].copy_from_slice(&padded);
+            crypto::aes256_cbc_encrypt_into(&self.k, &[0u8; 16], &mut buf[..padded.len()]).unwrap();
+            let pin_enc = buf[..padded.len()].to_vec();
+            let tag = crypto::hmac_sha256(&self.k, &pin_enc)[..16].to_vec();
             let mut req: HV<u8, 256> = HV::new();
-            nh::push_map_header(&mut req, 4).unwrap();
+            nh::push_map_header(&mut req, 5).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
             nh::push_uint(&mut req, 2).unwrap();
-            nh::push_uint(&mut req, 6).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
             nh::push_uint(&mut req, 3).unwrap();
             push_client_cose(&mut req, &self.x, &self.y);
+            nh::push_uint(&mut req, 5).unwrap();
+            nh::push_bstr(&mut req, &pin_enc).unwrap();
+            nh::push_uint(&mut req, 4).unwrap();
+            nh::push_bstr(&mut req, &tag).unwrap();
+            let resp = self.call(0x06, req.as_slice());
+            assert_eq!(resp[0], 0x00, "setPIN failed on the device twin");
+        }
+
+        /// clientPIN getPinUvAuthTokenUsingPinWithPermissions (sub 0x09) —
+        /// the PIN leg with permissions. This replaces the removed UV leg
+        /// (sub 0x06) as the token route: it is the path every working site
+        /// drives, and the only one CTAP 2.2 §5.4.6 grants a
+        /// Client-PIN-only device.
+        fn pin_token(&mut self, pin: &[u8], permissions: u8) -> Vec<u8> {
+            let pin_hash = crypto::pin_hash(pin);
+            let mut padded = pin_hash.to_vec();
+            while !padded.len().is_multiple_of(16) {
+                padded.push(0);
+            }
+            let mut buf = [0u8; 96];
+            buf[..padded.len()].copy_from_slice(&padded);
+            crypto::aes256_cbc_encrypt_into(&self.k, &[0u8; 16], &mut buf[..padded.len()]).unwrap();
+            let mut req: HV<u8, 256> = HV::new();
+            nh::push_map_header(&mut req, 5).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 9).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            push_client_cose(&mut req, &self.x, &self.y);
+            nh::push_uint(&mut req, 6).unwrap();
+            nh::push_bstr(&mut req, &buf[..padded.len()]).unwrap();
             nh::push_uint(&mut req, 9).unwrap();
             nh::push_uint(&mut req, permissions as u64).unwrap();
             let resp = self.call(0x06, req.as_slice());
-            assert_eq!(
-                resp[0], 0x00,
-                "getPinUvAuthTokenUsingUvWithPermissions must be answered, not refused"
-            );
+            assert_eq!(resp[0], 0x00, "the 0x09 PIN token leg must still work");
             let mut p = Parser::new(&resp[1..]);
             let Item::Map(nm) = p.next().unwrap() else {
                 panic!("map")
@@ -557,8 +576,24 @@ mod device_twin {
                 }
             }
             let token = crypto::pin_decrypt_v1(&self.k, &enc).expect("decrypt token");
-            assert_eq!(token.len(), 32, "the UV token must be 32 bytes");
+            assert_eq!(token.len(), 32, "the PIN token must be 32 bytes");
             token
+        }
+
+        /// clientPIN sub-command 0x06 with a fully-formed request — refused
+        /// InvalidSubcommand (0x3E) on the shipping command path.
+        fn uv_token_is_refused(&mut self) -> u8 {
+            let mut req: HV<u8, 256> = HV::new();
+            nh::push_map_header(&mut req, 4).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 2).unwrap();
+            nh::push_uint(&mut req, 6).unwrap();
+            nh::push_uint(&mut req, 3).unwrap();
+            push_client_cose(&mut req, &self.x, &self.y);
+            nh::push_uint(&mut req, 9).unwrap();
+            nh::push_uint(&mut req, 4).unwrap();
+            self.call(0x06, req.as_slice())[0]
         }
 
         /// No PIN is set on this device, so makeCredential must NOT carry a
@@ -619,7 +654,21 @@ mod device_twin {
         let mut dev = Dev::boot();
         dev.make_resident("example.com");
 
-        let cm_token = dev.uv_token(0x04);
+        // The UV leg is gone: sub-command 0x06 refuses InvalidSubcommand on
+        // the shipping path, before any PIN state is consulted.
+        assert_eq!(
+            dev.uv_token_is_refused(),
+            0x3E,
+            "0x06 must be refused InvalidSubcommand on the device twin"
+        );
+
+        // The PIN leg is the token route that replaces it: setPIN after the
+        // credential exists (the credential predates the PIN, so its
+        // makeCredential carried no pinUvAuthParam), then a 0x09 token with
+        // the cm permission authorises credMgmt exactly as the UV token
+        // used to.
+        dev.set_pin(b"1234");
+        let cm_token = dev.pin_token(b"1234", 0x04);
         let resp = dev.enumerate_rps_begin(&cm_token);
         assert_ne!(
             resp[0], 0x12,

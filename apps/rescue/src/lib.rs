@@ -136,7 +136,8 @@
 //! `PresenceTimeout` (`0x08`), `UsbProduct` (`0x09`), `LedDriver` (`0x0C`),
 //! `LedOrder` (`0x0D`), `LedNum` (`0x0E`), `UsbManufacturer` (`0x0F`). The
 //! `0x41` path already refuses exactly that group with
-//! `CTAP2_ERR_UNSUPPORTED_OPTION` (`0x2A`,
+//! `CTAP2_ERR_UNSUPPORTED_OPTION` (`0x2B` — US-1528 corrected this from the
+//! `0x2A` this comment used to quote, which is a code the spec withdrew),
 //! `apps/fido/src/vendor41.rs:1680-1687`), and the threat model §10.3 records
 //! that **accepted-and-ignored is not available**: the client's reader skips a
 //! tag it does not know with a `_ => {}` arm

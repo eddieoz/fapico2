@@ -1,0 +1,103 @@
+{
+  "started": 1791014095.8696773,
+  "serial": "94746395",
+  "path": "/dev/hidraw9",
+  "arms": [
+    {
+      "arm": "press",
+      "path": "/dev/hidraw9",
+      "serial": "94746395",
+      "cid_a": "00000034",
+      "cid_b": "00000035",
+      "expect_completion": true,
+      "cid_b_alloc_s": 0.016,
+      "xtalk_schedule": [
+        {
+          "t_rel_cue_s": 0.1,
+          "step": "mc_b",
+          "what": "MakeCredential on channel B (up_request) -- US-1510"
+        },
+        {
+          "t_rel_cue_s": 0.25,
+          "step": "pin_b",
+          "what": "the same 0x06 on channel B -- US-1510 tag/occupancy"
+        },
+        {
+          "t_rel_cue_s": 0.4,
+          "step": "getinfo_b",
+          "what": "authenticatorGetInfo on channel B (NOT windowed)"
+        },
+        {
+          "t_rel_cue_s": 0.55,
+          "step": "ping_b",
+          "what": "PING on channel B -- is the bus still alive?"
+        },
+        {
+          "t_rel_cue_s": 0.7,
+          "step": "ping_a",
+          "what": "PING back on channel A -- is the parked channel alive?"
+        }
+      ],
+      "done_reason": "answer on channel A",
+      "window_open_to_end_s": 0.216,
+      "cross_channel_events": [
+        {
+          "t_rel_cue_s": 0.108,
+          "step": "mc_b",
+          "what": "MakeCredential on channel B (up_request) -- US-1510",
+          "sent_on": "00000035",
+          "kind": "cbor",
+          "cmd": 16,
+          "sent_payload_hex": "01a501747573313530332d70726573732e696e76616c696402a2626964747573313530332d70726573732e696e76616c6964646e616d65667573313530330381a263616c672664747970656a7075626c69632d6b657904a266666f726d6174667061636b656468617574684461746158250000000000000000000000000000000000000000000000000000000000000000000000000005a2613158200000000000000000000000000000000000000000000000000000000000000000613258200000000000000000000000000000000000000000000000000000000000000000",
+          "result": "written, awaiting reply"
+        }
+      ],
+      "write_stalls": 0,
+      "write_failures": [],
+      "answer": {
+        "status": "0x00",
+        "status_name": "CTAP2_OK",
+        "len": 53,
+        "body_hex": "(withheld: pinUvAuthToken bytes are not committed)",
+        "description": "status 0x00 (CTAP2_OK) + 2: bstr(48) [not printed]",
+        "cue_to_answer_s": 0.216,
+        "body_len": 53
+      },
+      "cbor_frames_on_other_channels": [],
+      "answer_leaked_to_other_channel": false,
+      "competing_pin_on_channel_b": [],
+      "tokens_minted_on_channel_b": false,
+      "keepalives_on_a": [
+        "0x01"
+      ],
+      "keepalive_count_a": 1,
+      "all_frames": [
+        {
+          "t_rel_cue_s": 0.008,
+          "cid": "00000034",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x01"
+        },
+        {
+          "t_rel_cue_s": 0.216,
+          "cid": "00000034",
+          "cmd": "0x10",
+          "len": 53,
+          "first_byte": "0x00"
+        }
+      ],
+      "selftest_cid": "00000034",
+      "cancel_sent": "written, drained 2.0s for a reply (none is owed: the firmware answers a cancelled command's refusal, not an ack)"
+    }
+  ],
+  "final": {
+    "init_ok": true,
+    "new_channel": "00000036",
+    "init_reply_hex": "83f0abb101876794000000360205040005",
+    "ping_ok": true,
+    "ping_latency_ms": 15.9,
+    "ping_echo_hex": "55532d313530332d46494e414c2d50494e47"
+  },
+  "finished": 1791014123.301602
+}

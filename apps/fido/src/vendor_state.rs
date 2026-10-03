@@ -2,9 +2,15 @@
 //! [`crate::vendor41::PENDING`] arms need, and the implementations of
 //! [`crate::vendor41::VendorOps`] that reach it.
 //!
-//! This is the **Phase I foundation**: no sub-command is implemented here, and
-//! [`crate::vendor41::PENDING`] still holds all twelve. What lands is the
-//! storage, the codec and both command paths' implementations, so the six
+//! This is the **Phase I foundation**: no sub-command is implemented here.
+//!
+//! US-1516 corrects one sentence of the original, which read "[`crate::vendor41::PENDING`]
+//! still holds all twelve". It held all twelve when this module landed; it has
+//! held none since US-170 … US-175 wrote the arms against this storage. "No
+//! sub-command is implemented here" remains true and is the half worth keeping
+//! — this module is storage and codec, and the protocol belongs to
+//! [`crate::vendor41`]. What lands is
+//! the storage, the codec and both command paths' implementations, so the six
 //! Phase I stories (US-170 … US-175) are protocol work with the storage
 //! already done.
 //!

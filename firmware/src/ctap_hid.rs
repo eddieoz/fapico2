@@ -29,6 +29,180 @@ pub const CTAP_HID_KEEPALIVE: u8 = 0x3B;
 pub const CTAP_HID_ERROR: u8 = 0x3F;
 const TYPE_INIT: u8 = 0x80;
 
+/// US-1505: `CTAPHID_CANCEL` (`0x11`) — CTAPHID §11.2.9, the host's "abandon
+/// this request".
+///
+/// The value is not in dispute: `fido2/hid/__init__.py:79` declares
+/// `CANCEL = 0x11` and `fido2/hid/__init__.py:158` puts
+/// `TYPE_INIT | CTAPHID.CANCEL` straight into the report it writes, and
+/// `pico-keys-sdk/src/usb/hid/ctap_hid.h:90` has
+/// `#define CTAPHID_CANCEL (TYPE_INIT | 0x11)`. What §11.2.9 does **not**
+/// require is a reply frame, and this firmware deliberately sends none —
+/// see [`CTAP2_ERR_KEEPALIVE_CANCEL`] and the note on the dispatch arm in
+/// `hid_serve`.
+pub const CTAP_HID_CANCEL: u8 = 0x11;
+
+/// `CTAPHID_KEEPALIVE` payload byte 1: PROCESSING (0x01).
+///
+/// `fido2/ctap.py:37-41` declares `class STATUS(IntEnum): PROCESSING = 1;
+/// UPNEEDED = 2` and `fido2/hid/__init__.py:225` does
+/// `STATUS(struct.unpack_from(">B", recv)[0])` inside a `try` whose
+/// `ValueError` arm raises `ConnectionFailure("Invalid keepalive status")`.
+///
+/// That is the whole reason there are exactly two constants here and no
+/// third: a status byte outside `{0x01, 0x02}` is not "a keepalive the host
+/// ignores", it is a **transport failure** in the host, and the connection
+/// dies rather than the ceremony.
+pub const CTAPHID_KEEPALIVE_PROCESSING: u8 = 0x01;
+
+/// `CTAPHID_KEEPALIVE` payload byte 1: UP_NEEDED (0x02) — the device is
+/// waiting for a touch. See [`CTAPHID_KEEPALIVE_PROCESSING`].
+pub const CTAPHID_KEEPALIVE_UPNEEDED: u8 = 0x02;
+
+/// US-1505/US-1506: the byte a cancelled or expired CTAP2 consent window
+/// answers with — `CTAP2_ERR_KEEPALIVE_CANCEL`, **0x2D**.
+///
+/// ## Why 0x2D and not this crate's own `Ctap2Response::KeepAliveCancel`
+///
+/// `fapico2_fido::ctap2::Ctap2Response::KeepAliveCancel` is declared
+/// `= 0x2C` (`apps/fido/src/ctap2.rs:69`), and that value is the odd one
+/// out. Every implementation and, more to the point, every *client* in
+/// this ecosystem puts the code at `0x2D`:
+///
+/// * `fido2/ctap.py:144-147` (the `fido2` 2.2.1 this repository is built
+///   against — AGENTS.md §2) — `UNSUPPORTED_OPTION = 0x2B`,
+///   `INVALID_OPTION = 0x2C`, **`KEEPALIVE_CANCEL = 0x2D`**,
+///   `NO_CREDENTIALS = 0x2E`;
+/// * `pico-fido/src/fido/ctap.h:176` and `pico-fido2/src/fido/ctap.h:176`
+///   — `#define CTAP2_ERR_KEEPALIVE_CANCEL 0x2D`;
+/// * `RS-Key/crates/rsk-fido/src/error.rs:31` — `KeepAliveCancel = 0x2d`,
+///   and its emulator drives that literal byte
+///   (`RS-Key/tools/emu/src/hid_tests.rs:207` answers `vec![0x2d]`).
+///
+/// Reproduce with the installed client:
+///
+/// ```text
+/// $ python -c "import fido2.ctap as c; print(hex(c.CtapError.ERR.KEEPALIVE_CANCEL))"
+/// 0x2d
+/// ```
+///
+/// The consequence of emitting `0x2C` is not cosmetic. `fido2` decodes a
+/// CTAP2 answer with `status = response[0]; if status != 0x00: raise
+/// CtapError(status)` (`fido2/ctap2/base.py:285-287`), so a `0x2C` arrives
+/// as `ERR.INVALID_OPTION` and `fido2/client/__init__.py:114-135` maps that
+/// to `ClientError.ERR.BAD_REQUEST` — a client-side complaint about the
+/// *request* — instead of `ClientError.ERR.TIMEOUT`, which is what
+/// `KEEPALIVE_CANCEL` is mapped to at `client/__init__.py:105-110`. The
+/// story this byte exists for is "the ceremony was abandoned, not that your
+/// request was malformed", and only one of the two spellings says that.
+///
+/// US-1505/1506 are confined to `firmware/src/`, so the enum is left alone
+/// and the corrected byte is stated here. Renumbering
+/// `Ctap2Response::KeepAliveCancel` to `0x2D` (which would also leave
+/// `0x2D` free of the current `InvalidOption`/`KeepAliveCancel` shift) is
+/// the follow-up, and it is safe: `KeepAliveCancel` had no producer anywhere
+/// in the tree until this story, so the only thing the old value ever did
+/// was mislead a reader.
+pub const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
+
+/// `capFlags` byte of the CTAPHID_INIT reply — **0x05, both bits, on purpose.
+///
+/// Two incompatible bit assignments for this one byte are live at once, and
+/// they disagree about what `0x04` means:
+///
+/// | bit | CTAP 2.1 spec §11.2.1.1 | pico-keys-sdk / Yubico `fido2` (de facto) |
+/// |---|---|---|
+/// | `0x01` | **CBOR** | **WINK** |
+/// | `0x02` | NMSG | LOCK (unused) |
+/// | `0x04` | **WINK** | **CBOR** |
+///
+/// (Evidence for the right-hand column: `pico-keys-sdk/src/usb/hid/ctap_hid.h`
+/// `CAPFLAG_WINK 0x01` / `CAPFLAG_CBOR 0x04`, and `fido2/hid/__init__.py`
+/// `class CAPABILITY(IntFlag): WINK = 0x01; CBOR = 0x04`. The C reference sends
+/// exactly this pair — `resp->capFlags = CAPFLAG_WINK | CAPFLAG_CBOR` at
+/// `pico-keys-sdk/src/usb/hid/hid.c:451`.)
+///
+/// So `0x04` alone is a trap **under the spec column only**: a spec reader
+/// calls it "WINK yes, **CBOR no**" — the device announces it has no CTAP2
+/// while serving CTAP2 happily. Under the de-facto column it reads as "CBOR
+/// supported", which is the right answer by accident.
+///
+/// ## How strong that claim is — measured, and weaker than it reads
+///
+/// An earlier version of this paragraph said flatly that "a spec-reading host
+/// never offers the key as a passkey authenticator at all — the US-1507
+/// discovery symptom". **That was not established**, and the A/B probe in
+/// `docs/webauthn-discovery-ab.md` is what says so:
+///
+/// * the differing bit is **`0x01`**, and `0x01` is **WINK under every
+///   convention verifiable on this machine**. The de-facto column is verified
+///   by *executing* `fido2.hid.CAPABILITY`; the spec column could not be
+///   verified here at all (the reference fetch was rejected). The whole claim
+///   rests on the unverified column;
+/// * the CBOR bit **`0x04` is set on both boards**. Our pre-fix board sent
+///   `0x04`, the C reference sends `0x05`, and both therefore already read as
+///   "CBOR supported" under the de-facto convention — the one every
+///   first-party tool actually uses;
+/// * so `0x05` is **reference parity, not a demonstrated fix**. The probe
+///   proves which bytes differ between two boards. It does not prove which
+///   byte a browser acts on, and it did not observe a browser at all.
+///
+/// The value stays `0x05` because that is what the reference sends and because
+/// it is harmless under the convention that *is* verified — not because it has
+/// been shown to repair discovery. Do **not** "simplify" this back to a single
+/// `0x04` on the strength of the reasoning the earlier draft gave: that byte is
+/// the regression this constant exists to prevent, and the argument that
+/// actually keeps it is parity with the C reference.
+///
+/// The device serves both capabilities, which is what makes `0x05` honest
+/// rather than merely safe: CBOR on `CTAP_HID_CBOR` and WINK acknowledged on
+/// `CTAP_HID_WINK`, both arms in `firmware/src/hid_serve.rs`'s `dispatch`.
+/// `init_reply_advertises_cbor_and_wink_under_both_conventions` decodes the
+/// reply under each assignment and fails if either reader could conclude
+/// "no CTAP2".
+pub const CTAPHID_INIT_CAP_FLAGS: u8 = 0x05;
+
+/// Length of the CTAPHID_INIT reply payload: nonce(8) + cid(4) +
+/// versionInterface(1) + versionMajor(1) + versionMinor(1) + versionBuild(1) +
+/// capFlags(1).
+pub const CTAPHID_INIT_REPLY_LEN: usize = 17;
+
+/// Build the 17-byte CTAPHID_INIT reply payload.
+///
+/// US-1507: extracted verbatim from the INIT arm of `dispatch` in
+/// `firmware/src/hid_serve.rs` (it was `dispatch_hid_cmd` in
+/// `firmware/src/tasks.rs` before the serve loop moved out). The construction
+/// is pure stack work with no I/O, so the one byte that decides whether a host
+/// discovers this key as a CTAP2 authenticator (see [`CTAPHID_INIT_CAP_FLAGS`])
+/// is reachable from this module's unit tests. The firmware builds its reply
+/// through *this* function, so the test covers the shipped bytes rather than a
+/// copy of them.
+///
+/// `version_major` / `version_minor` / `version_build` are the **YubiKey**
+/// firmware version bytes, not the CTAPHID protocol version: `yubikit` reads
+/// INIT bytes 13..15 as `device_version` (`_ManagementCtapBackend`) and gates
+/// `read_device_info` on `>= 4.1`. The caller passes the management applet's
+/// `VERSION_MAJOR`/`VERSION_MINOR` (the same pair `TAG_VERSION` publishes).
+/// `nonce` is truncated to the 8-byte INIT nonce size.
+pub fn init_reply(
+    nonce: &[u8],
+    new_channel: &[u8; 4],
+    version_major: u8,
+    version_minor: u8,
+    version_build: u8,
+) -> [u8; CTAPHID_INIT_REPLY_LEN] {
+    let mut inner = [0u8; CTAPHID_INIT_REPLY_LEN];
+    let n = nonce.len().min(8);
+    inner[..n].copy_from_slice(&nonce[..n]);
+    inner[8..12].copy_from_slice(new_channel);
+    inner[12] = 0x02; // versionInterface (2 = CTAP HID v2)
+    inner[13] = version_major;
+    inner[14] = version_minor;
+    inner[15] = version_build;
+    inner[16] = CTAPHID_INIT_CAP_FLAGS;
+    inner
+}
+
 // CTAPHID error codes (CTAP spec §11.2.4).
 pub const HID_ERR_INVALID_CMD: u8 = 0x01;
 pub const HID_ERR_INVALID_SEQ: u8 = 0x04;
@@ -150,11 +324,26 @@ impl HidAssembler {
                 return HidFeed::Err(channel, HID_ERR_INVALID_CHANNEL);
             }
 
-            if self.expecting_cont && channel != self.channel {
+            if self.expecting_cont && channel != self.channel && cmd != CTAP_HID_INIT {
                 // US-705.1: any INIT-packet-shaped frame from a *different*
                 // channel while a transaction is in flight is rejected with
                 // CHANNEL_BUSY — a second INIT (broadcast or not) must never
                 // silently preempt the in-flight transaction.
+                //
+                // **Except `CTAPHID_INIT` itself**, which the exemption is
+                // keyed on. The handshake is the host's resynchronisation
+                // primitive: CTAPHID §11.2.1 has it allocate a fresh channel
+                // and reset the reassembly state, and the reference does
+                // exactly that — `pico-keys-sdk/src/usb/hid/hid.c:403-424`
+                // skips the whole busy guard when
+                // `ctap_req->init.cmd != CTAPHID_INIT` is false, then
+                // `hid.c:455-458` runs `msg_packet.len = msg_packet.current_len = 0`
+                // for an INIT. Without the exemption a host whose
+                // transaction was abandoned mid-flight has **no way back**:
+                // every INIT it sends is answered CHANNEL_BUSY, and the only
+                // thing that clears `expecting_cont` is the 500 ms
+                // transaction timeout, so `test_ping_abort_from_different_cid`
+                // wedges the channel for every later test.
                 return HidFeed::Err(channel, HID_ERR_CHANNEL_BUSY);
             }
             if self.expecting_cont && channel == self.channel && cmd != CTAP_HID_INIT {
@@ -308,6 +497,23 @@ mod tests {
         f
     }
 
+    /// The same, for an arbitrary CTAPHID command (an INIT-packet whose
+    /// command is not `CTAPHID_INIT`) — the shape a second host uses to try
+    /// to preempt a transaction in flight.
+    fn cmd_init_frame(
+        channel: [u8; 4],
+        cmd: u8,
+        payload: &[u8],
+        total_len: u16,
+    ) -> [u8; HID_REPORT_SIZE] {
+        let mut f = [0u8; HID_REPORT_SIZE];
+        f[..4].copy_from_slice(&channel);
+        f[4] = cmd | TYPE_INIT;
+        f[5..7].copy_from_slice(&total_len.to_be_bytes());
+        f[7..7 + payload.len()].copy_from_slice(payload);
+        f
+    }
+
     fn cont_frame(channel: [u8; 4], seq: u8, bytes: &[u8]) -> [u8; HID_REPORT_SIZE] {
         let mut f = [0u8; HID_REPORT_SIZE];
         f[..4].copy_from_slice(&channel);
@@ -393,9 +599,10 @@ mod tests {
         }
     }
 
-    /// US-705.1: an INIT from another (or the broadcast) channel while a
-    /// transaction is in flight is refused with CHANNEL_BUSY and the
-    /// in-flight transaction survives.
+    /// US-705.1: an init-packet from another channel while a transaction is
+    /// in flight is refused with CHANNEL_BUSY and the in-flight transaction
+    /// survives — **unless the command is `CTAPHID_INIT`**, the handshake,
+    /// which preempts by design (see `feed`).
     #[test]
     fn init_from_other_channel_mid_transaction_is_busy() {
         let mut asm = HidAssembler::new(fake_now);
@@ -406,15 +613,24 @@ mod tests {
             asm.feed(&init_frame(host, &[9; 8], 100)),
             HidFeed::NeedMore
         ));
-        // A second INIT — broadcast or any other channel — cannot preempt.
-        for chan in [HID_CID_BROADCAST, [0x55, 0x66, 0x77, 0x88]] {
-            match asm.feed(&init_frame(chan, &[1; 8], 8)) {
-                HidFeed::Err(c, code) => {
-                    assert_eq!(c, chan);
-                    assert_eq!(code, HID_ERR_CHANNEL_BUSY);
-                }
-                other => panic!("expected CHANNEL_BUSY for {chan:?}, got {other:?}"),
+        // A second INIT *packet* — any other channel — cannot preempt.
+        let other: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+        match asm.feed(&cmd_init_frame(other, CTAP_HID_PING, &[1; 4], 4)) {
+            HidFeed::Err(c, code) => {
+                assert_eq!(c, other);
+                assert_eq!(code, HID_ERR_CHANNEL_BUSY);
             }
+            other => panic!("expected CHANNEL_BUSY for {other:?}, got {other:?}"),
+        }
+        // The broadcast channel refuses every non-INIT command outright, and
+        // that rule is checked first (it is the channel rule, not the
+        // transaction rule) — so this is INVALID_CHANNEL, not CHANNEL_BUSY.
+        match asm.feed(&cmd_init_frame(HID_CID_BROADCAST, CTAP_HID_PING, &[1; 4], 4)) {
+            HidFeed::Err(c, code) => {
+                assert_eq!(c, HID_CID_BROADCAST);
+                assert_eq!(code, HID_ERR_INVALID_CHANNEL);
+            }
+            other => panic!("expected INVALID_CHANNEL on broadcast, got {other:?}"),
         }
         // The original transaction still completes on its own channel
         // (57 first-report bytes + 43 continuation bytes = the 100 announced).
@@ -425,6 +641,46 @@ mod tests {
             }
             other => panic!("in-flight transaction preempted: {other:?}"),
         }
+    }
+
+    /// US-1524: `CTAPHID_INIT` **preempts** an in-flight transaction from
+    /// another channel and is answered on the requesting channel — it is the
+    /// host's resynchronisation primitive, so it must never be answered
+    /// CHANNEL_BUSY.
+    ///
+    /// Reference: `pico-keys-sdk/src/usb/hid/hid.c:403-424` skips the busy
+    /// guard when the incoming command is `CTAPHID_INIT`, and `hid.c:455-458`
+    /// clears `msg_packet` for an INIT. CTAPHID §11.2.1 has the handshake
+    /// allocate a fresh channel.
+    #[test]
+    fn ctaphid_init_preempts_an_in_flight_transaction() {
+        let mut asm = HidAssembler::new(fake_now);
+        let host: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let other: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+
+        assert!(matches!(
+            asm.feed(&init_frame(host, &[9; 8], 100)),
+            HidFeed::NeedMore
+        ));
+        // A handshake on another channel mid-transaction: Ready, on `other`.
+        match asm.feed(&init_frame(other, &[1; 8], 8)) {
+            HidFeed::Ready(cmd) => {
+                assert_eq!(cmd, CTAP_HID_INIT);
+                assert_eq!(asm.channel(), other, "the reply goes to the requester's channel");
+            }
+            other => panic!("CTAPHID_INIT must preempt, got {other:?}"),
+        }
+        // The aborted transaction no longer holds the assembler: the old
+        // channel's continuation is a stray and is dropped, not an error.
+        assert!(matches!(
+            asm.feed(&cont_frame(host, 0, &[0xAA; 43])),
+            HidFeed::NeedMore
+        ));
+        // …and `other` can still run a fresh transaction.
+        assert!(matches!(
+            asm.feed(&cmd_init_frame(other, CTAP_HID_PING, &[], 4)),
+            HidFeed::Ready(CTAP_HID_PING)
+        ));
     }
 
     /// The injected clock drives the transaction timeout (unchanged
@@ -441,5 +697,56 @@ mod tests {
         let (chan, code) = asm.check_timeout().expect("timeout after 600 ms idle");
         assert_eq!(chan, HID_CID_BROADCAST);
         assert_eq!(code, HID_ERR_TIMEOUT);
+    }
+
+    // The two live `capFlags` decoders, spelled out here so the test carries
+    // them itself rather than trusting the constant under test. See
+    // `CTAPHID_INIT_CAP_FLAGS` for why both exist.
+    //
+    // CTAP 2.1 spec §11.2.1.1.
+    const SPEC_CBOR: u8 = 0x01;
+    const SPEC_WINK: u8 = 0x04;
+    // pico-keys-sdk `ctap_hid.h` / Yubico `fido2` `CAPABILITY` (de facto).
+    const DEFACTO_CBOR: u8 = 0x04;
+    const DEFACTO_WINK: u8 = 0x01;
+
+    /// US-1507: the INIT reply's `capFlags` byte must read as **CBOR + WINK
+    /// under both live bit assignments**, because a host that reads it under
+    /// the spec assignment concludes the device has no CTAP2 support —
+    /// `fido2` 2.2.1 raises `ValueError("Device does not support CTAP2.")`
+    /// (`fido2/ctap2/base.py`) and the key is never offered as a passkey
+    /// authenticator. That is the discovery symptom this story fixes, so the
+    /// test asserts the *decode*, not just the literal: `0x04` would pass a
+    /// `== 0x04` check and still fail a spec reader.
+    #[test]
+    fn init_reply_advertises_cbor_and_wink_under_both_conventions() {
+        // Built through the same code path the firmware uses (the INIT
+        // handshake's own channel allocation, then `init_reply`, which is
+        // what `dispatch_hid_cmd` sends).
+        let nonce: [u8; 8] = [0xA0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let mut alloc = CidAllocator::new();
+        let channel = alloc.allocate(&nonce);
+        assert_ne!(channel, HID_CID_BROADCAST, "INIT must not answer on the broadcast CID");
+
+        let inner = init_reply(&nonce, &channel, 5, 4, 0);
+
+        // The echoed nonce, the freshly allocated CID, the interface version.
+        // (The payload *length* needs no assert: `init_reply` returns
+        // `[u8; CTAPHID_INIT_REPLY_LEN]`, so the const is what pins it, and an
+        // `inner.len() == 17` check would be comparing the const to itself.)
+        assert_eq!(&inner[..8], &nonce[..]);
+        assert_eq!(&inner[8..12], &channel[..]);
+        assert_eq!(inner[12], 0x02, "versionInterface must be 2 (CTAP HID v2)");
+
+        let cap = inner[16];
+        assert_eq!(cap, 0x05, "capFlags must be CBOR|WINK, not a single bit");
+
+        // Decoder 1 — CTAP 2.1 spec §11.2.1.1 (0x01 CBOR, 0x04 WINK).
+        assert_ne!(cap & SPEC_CBOR, 0, "spec reader concluded: no CTAP2 support");
+        assert_ne!(cap & SPEC_WINK, 0, "spec reader concluded: no WINK");
+
+        // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04 CBOR).
+        assert_ne!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: no CTAP2 support");
+        assert_ne!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: no WINK");
     }
 }

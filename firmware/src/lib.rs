@@ -31,13 +31,13 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 168 |
-/// | `hid_task` | 12,224 |
+/// | `hid_task` | 12,328 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **21,840** |
+/// | **total** | **21,944** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
-/// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.50x** this demand (floor
+/// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.49x** this demand (floor
 /// 1.25x). The feature was `task-arena-size-65536` until US-956, at 3.7x —
 /// 46 KiB of a 532,480 B part spent on a reservoir that is 84 % empty, out of
 /// a boot path whose statics already claimed 527,420 B.
@@ -83,23 +83,62 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 21_840;
+pub const TASK_ARENA_DEMAND_B: usize = 21_944;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "26d25236d5f2065b8ca480a07f51730db25d53bf922a3d80eb5f85ef7a9a38e5";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "1e0e4aef25e44044481e6ae1be1ddca0fd5e834c15f401de0f28e3dab3606822";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
 pub mod ccid_reasm;
+/// The **boot-phase LED ladder** — the pure, host-tested core of the "power
+/// cycle it and watch one LED" instrument for a board that flashes but never
+/// re-enumerates. Ungated and device-independent on purpose: the whole point
+/// is that the next person does not have to rebuild, and a feature-gated
+/// instrument is a rebuild. The LED driver is the device bin's
+/// (`boot_led.rs`); this module owns the encoding, the ordering contract and
+/// the release/pin-handover rule, all of which are testable without hardware.
+pub mod bootphase;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
 pub mod ctap_hid;
+/// US-1504: the CTAPHID reply-write park guard — the deadline-bounded reply
+/// framing, with the "write one report" step behind a trait so the deadline
+/// is testable on the host against a writer that never ACKS.
+pub mod hid_reply;
 /// US-921: the presence-latch anti-harvest wiring (shared presence runtime).
 pub mod presence;
+/// US-1509: the parked user-presence consent window — the single-occupancy
+/// slot that replaces the serve loop's nested consent `loop`.
+///
+/// **Ungated and dependency-free on purpose.** US-1524 has to migrate
+/// `emul_main.rs` onto this policy, and that binary builds with `emulation`
+/// and without `device`, so anything this module needed from the app crates
+/// (or from `embassy_time`) would have pushed the emulator's parity work
+/// behind a device-only feature. Pure methods, injected clock, no USB — see
+/// the module docs.
+pub mod pending_up;
+/// US-1509: the CTAP-HID serve loop and FIDO dispatch, extracted from
+/// `tasks.rs` behind [`hid_serve::HidIo`] / [`hid_serve::FidoDispatch`] so
+/// the consent-window behaviour is host-testable. Gated because the app
+/// dispatch reaches `fapico2-fido` / `fapico2-mgmt`, which only the device and
+/// emulation builds pull in.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod hid_serve;
+/// US-1524: the **emulation binary's** half of the CTAP-HID seam — the
+/// `HidLink`/`HidIo` transport adapter and one iteration of the shared serve
+/// loop — so `emul_main.rs` no longer carries its own assembler, reply framer,
+/// dispatcher or consent `loop`.
+///
+/// Gated on `emulation`, not on `device or emulation` like [`hid_serve`]:
+/// `serve_pass` needs a `block_on`, and a `std` dependency must never reach
+/// the `thumbv8m` release image. Nothing on the device path imports this.
+#[cfg(feature = "emulation")]
+pub mod emul_hid;
 
 /// US-130 (PICOForge-COMPAT): the OATH applet's SELECT `TAG_NAME` device-id —
 /// the per-unit PBKDF2 salt for the OATH access key.

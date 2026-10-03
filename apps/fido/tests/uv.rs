@@ -99,6 +99,27 @@ fn make_resident_credential(
     assert_eq!(resp[0], 0x00, "makeCredential with credProtect must succeed");
 }
 
+
+/// Pull one boolean option out of a getInfo response.
+fn advertised_option(resp: &[u8], key: &str) -> Option<bool> {
+    let (decoded, _) = fapico2_fido::cbor::decode(&resp[1..]).expect("getInfo body");
+    let fapico2_fido::cbor::Value::M(map) = decoded else { panic!("getInfo map") };
+    let opts = map
+        .iter()
+        .find_map(|(k, v)| match k {
+            fapico2_fido::cbor::Value::U(0x04) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("options (key 0x04)");
+    let fapico2_fido::cbor::Value::M(opts) = opts else { panic!("options map") };
+    opts.iter().find_map(|(k, v)| match (k, v) {
+        (fapico2_fido::cbor::Value::T(n), fapico2_fido::cbor::Value::Bool(b)) if n == key => {
+            Some(*b)
+        }
+        _ => None,
+    })
+}
+
 #[test]
 fn test_ga_uv_true_without_param_is_puat_required() {
     let (mut app, _client) = setup();
@@ -134,7 +155,17 @@ fn test_ga_up_false_uv_true_is_not_invalid_option() {
         ),
     ]));
     let resp = app.process_ctap2(0x02, &req, [1, 2, 3, 4]);
-    assert_ne!(resp[0], 0x2B, "up=false+uv=true must not be InvalidOption");
+    // US-1528: INVALID_OPTION is 0x2C. This used to read `assert_ne!(resp[0],
+    // 0x2B, ...)` — after the table fix that asserted nothing at all, because
+    // the rejection it guards against had simply moved one byte along and
+    // 0x2B is now UNSUPPORTED_OPTION. Both neighbours are excluded so the
+    // guard cannot be satisfied by either.
+    assert_ne!(resp[0], 0x2C, "up=false+uv=true must not be InvalidOption");
+    assert_ne!(
+        resp[0], 0x2B,
+        "…nor UNSUPPORTED_OPTION, which is exactly what this assertion \
+         silently degraded into"
+    );
     assert_eq!(resp[0], 0x36, "uv=true must demand a PUAT");
 }
 
@@ -195,10 +226,79 @@ fn test_always_uv_gates_mc_and_ga() {
     );
     assert_eq!(resp[0], 0x00, "alwaysUv getAssertion with UV must succeed");
 
-    // Toggle alwaysUv off; GA without UV works again (empty store → 0x2E).
+    // US-1533: toggling alwaysUv OFF no longer un-gates this device. With a
+    // PIN set, alwaysUv is derived from the PIN state (the reference's
+    // cbor_get_info.c:95) and the Config 0x02 bit is only the first term of
+    // the OR, so the gate keeps holding. The bit is a way to turn alwaysUv ON
+    // for a device without a PIN, never a way to turn it off on one that has
+    // it — which is why the observed symptom was a PIN-free assertion on a
+    // PIN-set board.
     toggle_always_uv(&mut app, &client);
     let resp = app.process_ctap2(0x02, &ga_request(&hash, "example.com", None, None), [1, 2, 3, 4]);
-    assert_ne!(resp[0], 0x36, "alwaysUv off must not gate");
+    assert_eq!(resp[0], 0x36, "alwaysUv must stay in force while a PIN is set");
+}
+
+/// US-1533: the advertisement itself. Everything else in this story follows
+/// from what a platform reads here — CTAP 2.1 6.2.2 makes a client that sees
+/// `alwaysUv: true` acquire a token before an assertion, which is what puts
+/// the PIN prompt in front of `demo.yubico.com/webauthn-technical/login`. The
+/// gate tests prove the refusal; this proves the claim that causes it, with no
+/// Config 0x02 toggle involved, exactly as the reference computes it
+/// (`pico-fido2/src/fido/cbor_get_info.c:95`).
+#[test]
+fn always_uv_is_advertised_true_when_a_pin_is_set() {
+    let (mut app, _client) = setup();
+
+    let resp = app.process_ctap2(0x04, &[], [1, 2, 3, 4]);
+    let always_uv = advertised_option(&resp, "alwaysUv");
+    assert_eq!(
+        always_uv,
+        Some(true),
+        "a PIN-set device must advertise alwaysUv=true. Reading false is what \
+         made a platform send a token-less getAssertion and get a \
+         presence-only assertion, with no PIN prompt anywhere in the flow."
+    );
+    // And the two UV options must not contradict it: 6.1.3 requires
+    // makeCredUvNotRqd false whenever alwaysUv is true.
+    assert_eq!(
+        advertised_option(&resp, "makeCredUvNotRqd"),
+        Some(false),
+        "CTAP2.1 6.1.3: alwaysUv=true forces makeCredUvNotRqd=false"
+    );
+}
+
+/// With no PIN the PIN-state term cannot fire, so `alwaysUv` reads false and a
+/// token-less assertion is served. That is the only configuration in which the
+/// Config 0x02 toggle has anything to add, since the command itself needs a
+/// PERM_ACFG token and therefore a PIN.
+#[test]
+fn always_uv_is_false_without_a_pin() {
+    let mut app = fapico2_fido::app::FidoApp::with_keystore(MemoryKeystore::new());
+    let hash = [0x77u8; 32];
+
+    let resp = app.process_ctap2(0x02, &ga_request(&hash, "example.com", None, None), [1, 2, 3, 4]);
+    assert_ne!(resp[0], 0x36, "no PIN: alwaysUv must not gate");
+
+    let resp = app.process_ctap2(0x04, &[], [1, 2, 3, 4]);
+    let (decoded, _) = fapico2_fido::cbor::decode(&resp[1..]).expect("getInfo body");
+    let fapico2_fido::cbor::Value::M(map) = decoded else { panic!("getInfo map") };
+    let opts = map
+        .iter()
+        .find_map(|(k, v)| match k {
+            fapico2_fido::cbor::Value::U(0x04) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("options");
+    let fapico2_fido::cbor::Value::M(opts) = opts else { panic!("options map") };
+    let always_uv = opts.iter().find_map(|(k, v)| match (k, v) {
+        (fapico2_fido::cbor::Value::T(n), fapico2_fido::cbor::Value::Bool(b))
+            if n == "alwaysUv" =>
+        {
+            Some(*b)
+        }
+        _ => None,
+    });
+    assert_eq!(always_uv, Some(false), "no PIN: alwaysUv must read false");
 }
 
 #[test]
@@ -207,10 +307,16 @@ fn test_discoverable_skips_cred_protect_2_without_uv() {
     // Resident credential with credProtect=2.
     make_resident_credential(&mut app, &client, 2);
 
-    // Discoverable GA without UV must NOT return it.
+    // US-1533: with a PIN set, alwaysUv now holds, so a token-less assertion
+    // is answered 0x36 PUAT_REQUIRED before the credProtect filter is ever
+    // reached. The claim under test is "credProtect=2 is skipped when UV was
+    // not performed", and with alwaysUv effective UV is always performed on a
+    // PIN-set device — so the assertion below would have passed for the wrong
+    // reason. Assert the gate here, and the filter itself below on a PIN-less
+    // device where UV really can be absent.
     let hash = [0x62u8; 32];
     let resp = app.process_ctap2(0x02, &ga_request(&hash, "example.com", None, None), [1, 2, 3, 4]);
-    assert_eq!(resp[0], 0x2E, "credProtect=2 must be skipped without UV");
+    assert_eq!(resp[0], 0x36, "a PIN-set device gates the assertion on UV first");
 
     // With UV it is returned.
     let token = client.get_token(&mut app, 0x09, Some(0x02), None).unwrap();

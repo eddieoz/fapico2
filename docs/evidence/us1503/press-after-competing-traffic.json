@@ -1,0 +1,1042 @@
+{
+  "started": 1791013966.2968826,
+  "serial": "94746395",
+  "path": "/dev/hidraw9",
+  "arms": [
+    {
+      "arm": "control",
+      "path": "/dev/hidraw9",
+      "serial": "94746395",
+      "cid_a": "0000002e",
+      "cid_b": "0000002f",
+      "expect_completion": false,
+      "cid_b_alloc_s": 0.016,
+      "xtalk_schedule": [
+        {
+          "t_rel_cue_s": 0.1,
+          "step": "mc_b",
+          "what": "MakeCredential on channel B (up_request) -- US-1510"
+        },
+        {
+          "t_rel_cue_s": 0.25,
+          "step": "pin_b",
+          "what": "the same 0x06 on channel B -- US-1510 tag/occupancy"
+        },
+        {
+          "t_rel_cue_s": 0.4,
+          "step": "getinfo_b",
+          "what": "authenticatorGetInfo on channel B (NOT windowed)"
+        },
+        {
+          "t_rel_cue_s": 0.55,
+          "step": "ping_b",
+          "what": "PING on channel B -- is the bus still alive?"
+        },
+        {
+          "t_rel_cue_s": 0.7,
+          "step": "ping_a",
+          "what": "PING back on channel A -- is the parked channel alive?"
+        }
+      ],
+      "done_reason": "answer on channel A",
+      "window_open_to_end_s": 25.36,
+      "cross_channel_events": [
+        {
+          "t_rel_cue_s": 0.108,
+          "step": "mc_b",
+          "what": "MakeCredential on channel B (up_request) -- US-1510",
+          "sent_on": "0000002f",
+          "kind": "cbor",
+          "cmd": 16,
+          "sent_payload_hex": "01a501747573313530332d70726573732e696e76616c696402a2626964747573313530332d70726573732e696e76616c6964646e616d65667573313530330381a263616c672664747970656a7075626c69632d6b657904a266666f726d6174667061636b656468617574684461746158250000000000000000000000000000000000000000000000000000000000000000000000000005a2613158200000000000000000000000000000000000000000000000000000000000000000613258200000000000000000000000000000000000000000000000000000000000000000",
+          "result": "answered status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+          "answer": {
+            "status": "0x24",
+            "status_name": "CTAP2_ERR_OPERATION_PENDING",
+            "len": 1,
+            "description": "status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+            "t_rel_s": 0.144
+          }
+        },
+        {
+          "t_rel_cue_s": 0.294,
+          "step": "pin_b",
+          "what": "the same 0x06 on channel B -- US-1510 tag/occupancy",
+          "sent_on": "0000002f",
+          "kind": "cbor",
+          "cmd": 16,
+          "sent_payload_hex": "06a40102020603a5010203381820012158206b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2962258204fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f50904",
+          "result": "answered status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+          "answer": {
+            "status": "0x24",
+            "status_name": "CTAP2_ERR_OPERATION_PENDING",
+            "len": 1,
+            "description": "status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+            "t_rel_s": 0.312
+          }
+        },
+        {
+          "t_rel_cue_s": 0.412,
+          "step": "getinfo_b",
+          "what": "authenticatorGetInfo on channel B (NOT windowed)",
+          "sent_on": "0000002f",
+          "kind": "cbor",
+          "cmd": 16,
+          "sent_payload_hex": "04",
+          "result": "answered status 0x00 (CTAP2_OK) + 1: ['U2F_V2', 'FIDO_2_0', 'FIDO_2_1', 'FIDO_2_2', 'FIDO_2_3'], 2: ['credBlob', 'credProtect', 'hmac-secret', 'largeBlobKey', 'minPinLength'], 3: bstr(16) [not printed], 4: map(['alwaysUv', 'authnrCfg', 'clientPin', 'credMgmt', 'enterpriseAttestation', 'largeBlobs', 'makeCredUvNotRqd', 'pinUvAuthToken', 'rk', 'setMinPINLength']), 5: 7609, 6: [1, 2], 7: 19, 8: 128, 9: ['usb'], 10: [{'alg': -7, 'type': 'public-key'}, {'alg': -8, 'type': 'public-key'}, {'alg': -35, 'type': 'public-key'}, {'alg': -36, 'type': 'public-key'}], 11: 1024, 12: False, 13: 4, 14: 1, 15: 32, 16: 120, 21: [8055560605607898362, 8879174565946325320, 8550182048006734589, 2783008008553857119, 1377906609533693, 1572433893015801], 25: bstr(32) [not printed], 29: 63, 30: bstr(32) [not printed], 31: [1, 2, 3, 255]",
+          "answer": {
+            "status": "0x00",
+            "status_name": "CTAP2_OK",
+            "len": 527,
+            "description": "status 0x00 (CTAP2_OK) + 1: ['U2F_V2', 'FIDO_2_0', 'FIDO_2_1', 'FIDO_2_2', 'FIDO_2_3'], 2: ['credBlob', 'credProtect', 'hmac-secret', 'largeBlobKey', 'minPinLength'], 3: bstr(16) [not printed], 4: map(['alwaysUv', 'authnrCfg', 'clientPin', 'credMgmt', 'enterpriseAttestation', 'largeBlobs', 'makeCredUvNotRqd', 'pinUvAuthToken', 'rk', 'setMinPINLength']), 5: 7609, 6: [1, 2], 7: 19, 8: 128, 9: ['usb'], 10: [{'alg': -7, 'type': 'public-key'}, {'alg': -8, 'type': 'public-key'}, {'alg': -35, 'type': 'public-key'}, {'alg': -36, 'type': 'public-key'}], 11: 1024, 12: False, 13: 4, 14: 1, 15: 32, 16: 120, 21: [8055560605607898362, 8879174565946325320, 8550182048006734589, 2783008008553857119, 1377906609533693, 1572433893015801], 25: bstr(32) [not printed], 29: 63, 30: bstr(32) [not printed], 31: [1, 2, 3, 255]",
+            "t_rel_s": 0.488
+          }
+        },
+        {
+          "t_rel_cue_s": 0.588,
+          "step": "ping_b",
+          "what": "PING on channel B -- is the bus still alive?",
+          "sent_on": "0000002f",
+          "kind": "ping",
+          "cmd": 1,
+          "sent_payload_hex": "7573313530332d7874616c6b",
+          "result": "PING echoed",
+          "answer": {
+            "echo_ok": true,
+            "t_rel_s": 0.6
+          }
+        },
+        {
+          "t_rel_cue_s": 0.708,
+          "step": "ping_a",
+          "what": "PING back on channel A -- is the parked channel alive?",
+          "sent_on": "0000002e",
+          "kind": "ping",
+          "cmd": 1,
+          "sent_payload_hex": "7573313530332d7061726b",
+          "result": "PING echoed",
+          "answer": {
+            "echo_ok": true,
+            "t_rel_s": 0.72
+          }
+        }
+      ],
+      "write_stalls": 0,
+      "write_failures": [],
+      "answer": {
+        "status": "0x00",
+        "status_name": "CTAP2_OK",
+        "len": 53,
+        "body_hex": "(withheld: pinUvAuthToken bytes are not committed)",
+        "description": "status 0x00 (CTAP2_OK) + 2: bstr(48) [not printed]",
+        "cue_to_answer_s": 25.36,
+        "body_len": 53
+      },
+      "cbor_frames_on_other_channels": [
+        {
+          "cid": "0000002f",
+          "cmd": 16,
+          "len": 1,
+          "first_byte": "0x24",
+          "t_rel_cue_s": 0.144,
+          "description": "status 0x24 (CTAP2_ERR_OPERATION_PENDING)"
+        },
+        {
+          "cid": "0000002f",
+          "cmd": 16,
+          "len": 1,
+          "first_byte": "0x24",
+          "t_rel_cue_s": 0.312,
+          "description": "status 0x24 (CTAP2_ERR_OPERATION_PENDING)"
+        },
+        {
+          "cid": "0000002f",
+          "cmd": 16,
+          "len": 527,
+          "first_byte": "0x00",
+          "t_rel_cue_s": 0.488,
+          "description": "status 0x00 (CTAP2_OK) + 1: ['U2F_V2', 'FIDO_2_0', 'FIDO_2_1', 'FIDO_2_2', 'FIDO_2_3'], 2: ['credBlob', 'credProtect', 'hmac-secret', 'largeBlobKey', 'minPinLength'], 3: bstr(16) [not printed], 4: map(['alwaysUv', 'authnrCfg', 'clientPin', 'credMgmt', 'enterpriseAttestation', 'largeBlobs', 'makeCredUvNotRqd', 'pinUvAuthToken', 'rk', 'setMinPINLength']), 5: 7609, 6: [1, 2], 7: 19, 8: 128, 9: ['usb'], 10: [{'alg': -7, 'type': 'public-key'}, {'alg': -8, 'type': 'public-key'}, {'alg': -35, 'type': 'public-key'}, {'alg': -36, 'type': 'public-key'}], 11: 1024, 12: False, 13: 4, 14: 1, 15: 32, 16: 120, 21: [8055560605607898362, 8879174565946325320, 8550182048006734589, 2783008008553857119, 1377906609533693, 1572433893015801], 25: bstr(32) [not printed], 29: 63, 30: bstr(32) [not printed], 31: [1, 2, 3, 255]"
+        }
+      ],
+      "answer_leaked_to_other_channel": false,
+      "competing_pin_on_channel_b": [
+        {
+          "t_rel_cue_s": 0.294,
+          "step": "pin_b",
+          "what": "the same 0x06 on channel B -- US-1510 tag/occupancy",
+          "sent_on": "0000002f",
+          "kind": "cbor",
+          "cmd": 16,
+          "sent_payload_hex": "06a40102020603a5010203381820012158206b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2962258204fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f50904",
+          "result": "answered status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+          "answer": {
+            "status": "0x24",
+            "status_name": "CTAP2_ERR_OPERATION_PENDING",
+            "len": 1,
+            "description": "status 0x24 (CTAP2_ERR_OPERATION_PENDING)",
+            "t_rel_s": 0.312
+          }
+        }
+      ],
+      "tokens_minted_on_channel_b": false,
+      "keepalives_on_a": [
+        "0x01",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02",
+        "0x02"
+      ],
+      "keepalive_count_a": 100,
+      "all_frames": [
+        {
+          "t_rel_cue_s": 0.008,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x01"
+        },
+        {
+          "t_rel_cue_s": 0.144,
+          "cid": "0000002f",
+          "cmd": "0x10",
+          "len": 1,
+          "first_byte": "0x24"
+        },
+        {
+          "t_rel_cue_s": 0.304,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 0.312,
+          "cid": "0000002f",
+          "cmd": "0x10",
+          "len": 1,
+          "first_byte": "0x24"
+        },
+        {
+          "t_rel_cue_s": 0.488,
+          "cid": "0000002f",
+          "cmd": "0x10",
+          "len": 527,
+          "first_byte": "0x00"
+        },
+        {
+          "t_rel_cue_s": 0.6,
+          "cid": "0000002f",
+          "cmd": "0x01",
+          "len": 12,
+          "first_byte": "0x75"
+        },
+        {
+          "t_rel_cue_s": 0.608,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 0.72,
+          "cid": "0000002e",
+          "cmd": "0x01",
+          "len": 11,
+          "first_byte": "0x75"
+        },
+        {
+          "t_rel_cue_s": 0.968,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 1.216,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 1.472,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 1.72,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 1.968,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 2.216,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 2.472,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 2.72,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 2.968,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 3.224,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 3.472,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 3.72,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 3.976,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 4.224,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 4.472,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 4.728,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 4.976,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 5.224,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 5.48,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 5.728,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 5.976,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 6.232,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 6.48,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 6.728,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 6.976,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 7.232,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 7.48,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 7.728,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 7.984,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 8.232,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 8.48,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 8.736,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 8.984,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 9.232,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 9.488,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 9.736,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 9.984,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 10.24,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 10.488,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 10.736,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 10.992,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 11.24,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 11.488,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 11.736,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 11.992,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 12.24,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 12.488,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 12.744,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 12.992,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 13.24,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 13.496,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 13.744,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 13.992,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 14.248,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 14.496,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 14.744,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 15.0,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 15.248,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 15.496,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 15.752,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 16.0,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 16.248,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 16.496,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 16.752,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 17.0,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 17.248,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 17.504,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 17.752,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 18.0,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 18.256,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 18.504,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 18.752,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 19.008,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 19.256,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 19.504,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 19.76,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 20.008,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 20.256,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 20.512,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 20.76,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 21.008,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 21.256,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 21.512,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 21.76,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 22.008,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 22.264,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 22.512,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 22.76,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 23.016,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 23.264,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 23.512,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 23.768,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 24.016,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 24.264,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 24.52,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 24.768,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 25.016,
+          "cid": "0000002e",
+          "cmd": "0x3b",
+          "len": 1,
+          "first_byte": "0x02"
+        },
+        {
+          "t_rel_cue_s": 25.36,
+          "cid": "0000002e",
+          "cmd": "0x10",
+          "len": 53,
+          "first_byte": "0x00"
+        }
+      ],
+      "selftest_cid": "0000002e",
+      "cancel_sent": "written, drained 2.0s for a reply (none is owed: the firmware answers a cancelled command's refusal, not an ack)"
+    }
+  ],
+  "final": {
+    "init_ok": true,
+    "new_channel": "00000030",
+    "init_reply_hex": "afdbba38f1d7209c000000300205040005",
+    "ping_ok": true,
+    "ping_latency_ms": 15.9,
+    "ping_echo_hex": "55532d313530332d46494e414c2d50494e47"
+  },
+  "finished": 1791013993.8546247
+}

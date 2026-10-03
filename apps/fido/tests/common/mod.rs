@@ -245,6 +245,13 @@ impl PinClient {
 
     /// getPinToken (0x05) or getPinUvAuthTokenUsingPinWithPermissions (0x09).
     /// Returns the raw 32-byte token.
+    ///
+    /// `dead_code` is allowed because `tests/common/` is compiled into *every*
+    /// test binary in this crate and a shared helper is not called by all of
+    /// them. The clippy gate in `run_tests.sh` runs `--all-targets -D
+    /// warnings`, so a helper only `pin_perms.rs` calls is dead in
+    /// `pin_uv_advert.rs` — a gate failure, not a defect.
+    #[allow(dead_code)]
     pub fn get_token<K: Keystore>(
         &self,
         app: &mut FidoApp<K>,

@@ -53,7 +53,10 @@ Units flashed before the manufacturer rename (2026-09-28) still enumerate as
 AAGUID, USB manufacturer/product and VID:PID are one build-time block
 (`platform/src/identity.rs`), each with a published default and a
 `FAPICO2_*` override; a malformed override is a **hard build failure**, never a
-silent fallback. The AAGUID default is fapico2's own; the RS-Key borrow,
+silent fallback. Every build script in this repository sets none of those
+variables, so the defaults are the identity this repository builds; an override
+additionally requires `FAPICO2_IDENTITY_OVERRIDE_ACK=1` or the build fails
+(US-1517). The AAGUID default is fapico2's own; the RS-Key borrow,
 the override procedure, the one-way-door warning, and
 `FAPICO2_FOREIGN_IMAGE_WIPE` (default: the secure store **survives** a reflash)
 are all in [`docs/identity.md`](docs/identity.md).
@@ -75,8 +78,11 @@ ASCII `fapico2`) rather than the borrowed RS-Key
 `2479C7BF6B3056839EC80E8171A918B7` (risk R-3's borrow is over) — but until
 PicoForge adds it to `firmwares/mod.rs`, a default build is **unclassifiable by
 the app** and lands on the pico-fido profile. Flash with
-`FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7` to test PicoForge
-features. The block's `DEFAULT_AAGUID` rules, the one-way-door warning and the
+`FAPICO2_IDENTITY_OVERRIDE_ACK=1 FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7`
+to test PicoForge features — the acknowledgement is **required** (US-1517), so
+an override cannot arrive by accident and quietly make one image serve a
+different identity from every other build of this checkout. The block's
+`DEFAULT_AAGUID` rules, the one-way-door warning and the
 runtime name path live in `platform/src/identity.rs` and
 [`docs/identity.md`](docs/identity.md).
 

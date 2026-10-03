@@ -1,0 +1,75 @@
+{
+  "board": "reference",
+  "board_label": "REFERENCE (Pol Henarejos, serial 7C36644DFF8A74C7, bcdDevice 0900)",
+  "site": "x",
+  "url": "https://x.com/",
+  "timeout_ms": 12000,
+  "started": "2026-10-03T09:27:53+0300",
+  "boot_fapico_entries": [
+    "USB device added: path=/dev/bus/usb/001/099 vendor=4176 \"Pol Henarejos\", product=1031 \"Fapico2\", serial=\"7C36644DFF8A74C7\", guid=d88128b0-5b20-422e-a8cb-449f84fca916"
+  ],
+  "final_url": "https://x.com/",
+  "env": "{\"href\":\"https://x.com/\",\"origin\":\"https://x.com\",\"secureContext\":true,\"hasPublicKeyCredential\":true,\"createAllowlist\":[\"https://x.com\"],\"getAllowlist\":[\"https://x.com\"],\"capabilities\":{},\"ua\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36\",\"documentPermissionsPolicyType\":\"undefined\"}",
+  "inject": "installed",
+  "window": {
+    "id": "0x9c00004",
+    "geom": {
+      "x": 3204,
+      "y": 669,
+      "w": 632,
+      "h": 1050
+    }
+  },
+  "button_xy": [
+    84.1328125,
+    38.5
+  ],
+  "result": null,
+  "still_pending_at_s": 40,
+  "frames": [
+    "01.png",
+    "02.png",
+    "03.png",
+    "04.png",
+    "05.png",
+    "06.png",
+    "07.png",
+    "08.png",
+    "09.png",
+    "10.png",
+    "11.png",
+    "12.png",
+    "13.png",
+    "14.png",
+    "15.png",
+    "16.png",
+    "17.png",
+    "18.png",
+    "19.png",
+    "20.png",
+    "21.png",
+    "22.png",
+    "23.png",
+    "24.png",
+    "25.png",
+    "26.png",
+    "27.png",
+    "28.png",
+    "29.png",
+    "30.png",
+    "31.png",
+    "32.png",
+    "33.png",
+    "34.png",
+    "35.png",
+    "36.png",
+    "37.png",
+    "38.png",
+    "39.png",
+    "40.png"
+  ],
+  "post_fapico_entries": [
+    "USB device added: path=/dev/bus/usb/001/099 vendor=4176 \"Pol Henarejos\", product=1031 \"Fapico2\", serial=\"7C36644DFF8A74C7\", guid=d88128b0-5b20-422e-a8cb-449f84fca916"
+  ],
+  "finished": "2026-10-03T09:29:54+0300"
+}

@@ -215,12 +215,27 @@ _B_ATTESTATION = Break(
 
 _B_DBG_RELEASE = Break(
     "firmware/Cargo.toml",
-    'dbg-log = []\n',
-    'dbg-log = []\n# US-1041 nominated break: dbg-log becomes an ordinary release feature.\n'
-    'foreign-image-wipe = ["dbg-log"]\n',
-    "`dbg-log` becomes an implicit member of a feature an ordinary release "
-    "invocation turns on (US-922: the fixed-channel CTAP-HID log drain ships "
-    "in a production binary)",
+    'default = ["device"]\n',
+    'default = ["device", "dbg-log"]\n',
+    "`dbg-log` becomes an implicit member of the `default` feature set — which is "
+    "what `device`, and therefore every ordinary release invocation, turns on "
+    "(US-922: the fixed-channel CTAP-HID log drain ships in a production "
+    "binary).\n"
+    "\n"
+    "    RE-NOMINATED 2026-10-02 (falsifiability audit F3). The previous anchor "
+    "added `foreign-image-wipe = [\"dbg-log\"]`, and that feature was deleted by "
+    "US-919 — the foreign-image wipe became the build PARAMETER "
+    "`FAPICO2_FOREIGN_IMAGE_WIPE`, not a cargo feature. So the break had "
+    "nothing to attach to: `check_dbg_release_gate.py` only ever looks at "
+    "`default` / `device` / `emulation`, so the harness correctly reported "
+    "BREAK-INEFFECTIVE (baseline 0, broken 0) rather than a false MUTATED. "
+    "That is this branch's own doing — `c63a5b8` rewrote the gate's drain "
+    "detection and left this break pointing at the old manifest. Re-nominated "
+    "against the manifest as it stands.\n"
+    "\n"
+    "    The gate's LOGIC was never the problem and is not touched here: "
+    "dropping `apdu-trace` from the drain's `#[cfg]` still makes it exit 1 "
+    "with \"the RAM ring and its drain are gated on different features\".",
 )
 
 _B_DEBUG_STRIP = Break(
@@ -267,13 +282,16 @@ _B_US413 = Break(
 
 _B_WRAPUP = Break(
     "docs/bootsel.md",
-    "**no rescue APDU in v1.0.0**",
-    "**rescue APDU works in v1.0.0**",
-    "docs/bootsel.md claims the C firmware's rescue APDU works on the Rust "
-    "build — it does not (the C firmware entered BOOTSEL with no button "
-    "press, verified 2026-09-08; the Rust build is physical BOOTSEL+RESET "
-    "only), and the claim is the one an operator acts on while holding a "
-    "dark board (US-392)",
+    "**same AID, same APDU, same script** (`apps/rescue`)",
+    "**no rescue applet — physical BOOTSEL+RESET only**",
+    "docs/bootsel.md's table stops claiming the Rust build speaks the rescue "
+    "APDU — the page is what a maintainer reads while planning a re-flash, "
+    "and until 2026-10-02 it said the opposite, sending them to hold BOOTSEL "
+    "by hand on a board they cannot reach. The anchor is a single-occurrence "
+    "phrase on purpose: gating on the substring 'apps/rescue' also matches "
+    "'apps/rescue/src/lib.rs', so that version of the check passed with the "
+    "claim deleted. NOTE the direction flip: this break used to pin the FALSE "
+    "claim in place; a gate that requires a lie is not a safety net",
 )
 
 _B_ASYNC_FRAME = Break(
@@ -340,8 +358,16 @@ _B_SIZE_REPORT = Break(
     # edit here is a gate weakening, which is the one outcome to avoid.
     # Re-nominating is the honest cost; the harness says so out loud rather
     # than passing quietly.
-    "| `.text` | 759,928 | `0x10000200` | no (flash) |",
-    "| `.text` | 759,929 | `0x10000200` | no (flash) |",
+    #
+    # 5. 2026-10-02 (falsifiability audit F3) — the fifth re-nomination, for
+    #    the same reason as 1-4 and with the same lesson: the anchor tracks a
+    #    *measured* number, and `84e38e7`/`0efed50`/`1b12d8e` re-stamped
+    #    `docs/size-report.md` three times (boot-phase LED: text 817,984 ->
+    #    818,376 B), moving the `.text` row out from under it. Re-stamping the
+    #    report and re-nominating the anchor are the same chore for the same
+    #    reason, which is the recurrence this comment exists to keep visible.
+    "| `.text` | 766,400 | `0x10000200` | no (flash) |",
+    "| `.text` | 766,401 | `0x10000200` | no (flash) |",
     "the generated ELF section table in docs/size-report.md is one byte out — "
     "the interior was hand-copied and re-measured without the headline, so the "
     "gate passed over a stale detail. The report is the RAM/flash argument; a "
@@ -521,6 +547,26 @@ _B_AGREEMENT = Break(
     "them describing a build that was never signed",
 )
 
+# The US-1518 exit-code contract, re-broken at the line the story is about.
+# `run_acceptance.py` needs a board, a browser and a finger, so the gate
+# imports the pure `classify_cases` the contract now lives in — which is what
+# makes it mutation-testable at all. The break reintroduces the pre-US-1518
+# defect verbatim: `complete = not machine_fail`, i.e. a machine-gated case
+# that never executed is not counted, so a browser-less run reports SUCCESS
+# over cases that were never measured and exits 0.
+_B_ACCEPTANCE_EXIT = Break(
+    "scripts/acceptance/run_acceptance.py",
+    "    complete = not machine_fail and not machine_notrun\n",
+    "    complete = not machine_fail  # US-1041 nominated break (US-1518): the\n"
+    "    # pre-fix contract — a machine case with no verdict is not a failure.\n",
+    "the acceptance exit code stops counting in-scope machine cases that never "
+    "executed. This is the US-1518 defect itself: the README tells callers to "
+    "gate on `run_acceptance.py`'s exit code, and with `complete` reading "
+    "`not machine_fail` a machine-less run reports SUCCESS over two "
+    "machine-gated cases and exits 0. The gate goes red with "
+    "\"an unexecuted case reported SUCCESS\".",
+)
+
 GATES: tuple[Gate, ...] = (
     Gate(
         "check_persist_gate.py",
@@ -651,6 +697,15 @@ GATES: tuple[Gate, ...] = (
         "check_artefact_agreement.py",
         breaks=(_B_AGREEMENT,),
         note="UF2 / SBOM / attestation agreement against fixtures (US-1064)",
+    ),
+    Gate(
+        "check_acceptance_exit_code.py",
+        breaks=(_B_ACCEPTANCE_EXIT,),
+        note="exit-code contract over the pure `classify_cases` (US-1518). It "
+        "is mutation-testable only because the contract was extracted from "
+        "the hardware-requiring runner; that is the note the next reader needs, "
+        "since the gate's subject (`run_acceptance.py`) otherwise looks "
+        "untestable here.",
     ),
 )
 

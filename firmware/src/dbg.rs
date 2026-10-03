@@ -219,8 +219,20 @@ pub fn channel() -> [u8; 4] {
 /// * `[0x01]` → `[count_le32, entries u8, entry_size u8]` (6 bytes)
 /// * `[0x02, off_le32]` → raw ring bytes from `off`, ≤ 57 bytes
 /// * `[0x03]` → clear (`COUNT = 0`), one ack byte
-pub async fn handle_dbg<'d>(
-    hid_in: &mut Endpoint<'d, USB, In>,
+///
+/// US-1504: the endpoint parameter is `'static` (it always was — `hid_task`
+/// owns the only CTAPHID IN endpoint) because [`send_hid_report`] takes
+/// `&mut Endpoint<'static, USB, In>`: the endpoint borrow now lives inside
+/// the writer adapter for the whole, deadline-bounded reply. The drain
+/// answer is at most [`HID_FIRST_PAYLOAD`] bytes, so it is a single report
+/// and never fragments — but it went through the same unbounded
+/// `EndpointIn::write` as every other reply, and a host that had stopped
+/// polling the IN endpoint would have parked the serve loop here too, on the
+/// one path an operator uses *after* the device has already gone wrong. It is
+/// bounded now, and a `false` is simply dropped: the drain is
+/// best-effort by construction (the operator re-issues it).
+pub async fn handle_dbg(
+    hid_in: &mut Endpoint<'static, USB, In>,
     channel: &[u8; 4],
     payload: &[u8],
 ) {
@@ -263,6 +275,9 @@ pub async fn handle_dbg<'d>(
         _ => 0,
     };
     if n > 0 {
+        // US-1504: `send_hid_report` now answers `true`/`false`; both the
+        // refused write and the un-ACKed timeout are already logged there, and
+        // there is nothing to retry — the drain is re-issued by the operator.
         let _ = send_hid_report(hid_in, channel, DBG_CMD, &out[..n]).await;
     }
 }

@@ -289,6 +289,20 @@ pub struct FidoApp<K: Keystore = MemoryKeystore> {
     /// When enabled, makeCredential uses enterprise attestation. Stored in
     /// keystore pin state for persistence across reboot.
     enterprise_attestation: bool,
+    /// US-1524 follow-up: the user-presence source for the **host** twin.
+    ///
+    /// `None` is the build default — grant immediately — so every existing
+    /// host suite is untouched. `Some(f)` makes a presence-gated command
+    /// answer `CTAP2 UpRequired` while `f()` says the touch has not landed,
+    /// which is what turns the shipped serve loop's consent window on.
+    ///
+    /// The device twin has its own, richer version of this
+    /// (`device_app.rs::FidoApp::with_user_presence`, feeding the shared
+    /// presence runtime); this one exists because the *emulator* runs the host
+    /// twin, and an emulator that grants presence before the command has run
+    /// can never answer the CTAPHID question a real authenticator answers
+    /// every time: does a makeCredential report progress?
+    presence: Option<fn() -> bool>,
 }
 
 /// Holds the credentials matched by a getAssertion so getNextAssertion can
@@ -421,6 +435,26 @@ impl<K: Keystore> FidoApp<K> {
             lb_pending: None,
             vault_pending: None,
             enterprise_attestation: false,
+            presence: None,
+        }
+    }
+
+    /// US-1524 follow-up: attach the user-presence source (see the field).
+    /// `None` (the default) grants immediately; the emulator attaches a
+    /// source whose touch lands inside the consent window, which is the only
+    /// way the emulator's CTAPHID frames can be the board's frames.
+    pub fn with_user_presence(mut self, f: fn() -> bool) -> Self {
+        self.presence = Some(f);
+        self
+    }
+
+    /// The user-presence answer for a presence-gated command. `false` means
+    /// "the touch has not landed", i.e. answer `UpRequired` and let the
+    /// transport open a consent window.
+    fn user_present(&mut self) -> bool {
+        match self.presence {
+            Some(f) => f(),
+            None => true,
         }
     }
 
@@ -596,8 +630,14 @@ impl<K: Keystore> FidoApp<K> {
     pub fn process_u2f(&mut self, apdu: &[u8]) -> Vec<u8> {
         // US-908: the host/emulation default presence source auto-acks
         // (parity with the device build default), keeping the existing
-        // suites green; the gate itself lives in the U2F twins.
-        let (data, status) = match crate::u2f::process_u2f_apdu(apdu, &mut self.keystore, || true, &self.attestation) {
+        // suites green; the gate itself lives in the U2F twins. With a
+        // source attached (`with_user_presence`) the refusal is real and the
+        // transport turns it into a consent window, exactly as on the board.
+        let poll = || match self.presence {
+            Some(f) => f(),
+            None => true,
+        };
+        let (data, status) = match crate::u2f::process_u2f_apdu(apdu, &mut self.keystore, poll, &self.attestation) {
             Ok(data) => (data, crate::u2f::U2fStatus::NoError.code()),
             Err(status) => (vec![], status.code()),
         };
@@ -636,17 +676,34 @@ impl<K: Keystore> FidoApp<K> {
             // vault below: that one is reached through the CTAPHID frame CMD
             // byte in `firmware/src/tasks.rs`, a different frame and a
             // different field, so the two cannot alias (its sub-command `1` is
-            // STATUS here, whereas `1` is MSE in RS-Key). Every sub-command is
-            // a NOT_ALLOWED stub until Phase I implements it; `vendor41` owns
-            // both the sub-command set and the shrink-to-empty discipline.
+            // STATUS here, whereas `1` is MSE in RS-Key). `vendor41` owns
+            // the sub-command set and the shrink-to-empty discipline.
             //
             // US-112: the caller's pinUvAuth token is handed down as
             // `TokenAuth`, and the outcome can ask this app to charge a
-            // rejected MAC against its three-strike counter. Neither is
-            // consulted while every sub-command is still a stub — this arm
-            // still answers `0x30` to every request, and
-            // `tests/vendor41.rs::vendor41_permission_gate_is_not_yet_wired_into_the_stubs`
-            // pins that with a real `0x20` token in hand.
+            // rejected MAC against its three-strike counter.
+            //
+            // US-1516 replaces two sentences this comment used to carry. It
+            // said "every sub-command is a NOT_ALLOWED stub until Phase I
+            // implements it" and that the token "is not consulted while every
+            // sub-command is still a stub — this arm still answers `0x30` to
+            // every request". Both were true when written and outlived the
+            // stubs: `PENDING` drained across US-170 … US-175 and **all
+            // fourteen sub-commands now have real arms**. Per arm, gate and
+            // tokenless authority are written down in `vendor41::decision`.
+            //
+            // The gate is **per arm**, not per dispatch: `CONFIG_READ` is
+            // ungated by protocol, `CONFIG_WRITE` consults the token for its
+            // identity tier only, and the twelve token-optional rows call
+            // `authorize` from inside their own gate helpers so a bare request
+            // is answered with a touch rather than refused for want of a
+            // token.
+            //
+            // This twin and `device_app` must keep saying the same thing: the
+            // board runs `device_app`, so a comment or an arm that is honest
+            // here and stale there is a green suite over a broken device.
+            // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
+            // is the check that the device twin agrees.
             crate::vendor41::CMD => {
                 // US-114: the `0x41` response is `status || CBOR`, so this
                 // arm has somewhere to put a body.
@@ -925,12 +982,30 @@ impl<K: Keystore> FidoApp<K> {
         }
     }
 
-    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). The reference C
-    /// firmware auto-accepts selection in emulation, so the command returns
-    /// CTAP2_OK immediately here; a hardware build gates this on the board
-    /// button (30 s timeout → ACTION_TIMEOUT) behind US-324.
+    /// authenticatorSelection (CTAP2.1 §6.9, FX-415 / US-1514). Gated on user
+    /// presence: `CTAP2_OK` **only** once a touch has landed, `UpRequired`
+    /// (0x3B) otherwise.
+    ///
+    /// US-1514 shipped this as an unconditional `CTAP2_OK` on the argument
+    /// that the reference "auto-accepts selection in its default build". That
+    /// described one `#ifdef`'s accident, not the command: CTAP2.1 §6.9 says
+    /// in both the PS and the 2.2 RD that the command "has no input
+    /// parameters" and that the authenticator "will ask for user presence",
+    /// answering `CTAP2_OK` **if** presence is received. Answering `OK`
+    /// without asking is a claim about a human that was never made.
+    ///
+    /// The full reasoning — including why there is no `up`/`uv` matrix to
+    /// implement and why the `0x0B` arm can be gated at all — is in
+    /// `device_core::handle_authenticator_selection`. This twin must agree
+    /// with that arm byte for byte (AGENTS.md §1): `app.rs` is not the
+    /// shipped firmware, and a gate added here alone would be a test that
+    /// passes while the board says something else.
     fn authenticator_selection(&mut self) -> Vec<u8> {
-        vec![Ctap2Response::Ok.code()]
+        if self.user_present() {
+            vec![Ctap2Response::Ok.code()]
+        } else {
+            vec![Ctap2Response::UpRequired.code()]
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1136,14 +1211,46 @@ impl<K: Keystore> FidoApp<K> {
         let pin_state = self.keystore.get_pin_state();
         let pin_set = pin_state.pin_hash.is_some();
         info.set_option("clientPin", pin_set);
+        // US-1512: the capability half of the PIN/UV pair, set from the same
+        // shared helper the device twin uses so the two cannot drift — the
+        // rule is at `ctap2::pin_uv_auth_token_available`.
+        info.set_option(
+            "pinUvAuthToken",
+            crate::ctap2::pin_uv_auth_token_available(pin_state.blocked, pin_state.needs_power_cycle),
+        );
         // authnrCfg is advertised by the reference firmware.
         info.set_option("authnrCfg", true);
         // Enterprise attestation is implemented (FX-408): Config 0x01 enables
         // it, MC key 0x0A requests it, setEnterpriseRPIDList (Config 0x04)
         // manages the list.
         info.set_option("enterpriseAttestation", true);
-        // alwaysUv reflects the current config state (toggled by Config 0x02).
-        info.set_option("alwaysUv", pin_state.always_uv);
+        // US-1533: alwaysUv follows the PIN state, as the reference derives it
+        // (cbor_get_info.c:95), with the Config 0x02 toggle as the first term.
+        // Advertising it only when explicitly configured meant a PIN-set board
+        // claimed `false` and a platform sent a token-less getAssertion.
+        info.set_option(
+            "alwaysUv",
+            crate::ctap2::always_uv_advertised(pin_set, pin_state.always_uv),
+        );
+        // US-1529: makeCredUvNotRqd is DERIVED, never hard-coded. The host
+        // twin had its own hard-coded `true` (via `Ctap2Info::default`) and
+        // the device twin inherited it the same way — the twin trap in its
+        // plainest form: a wire claim that was false on hardware and merely
+        // untested on the host. Both now call the one shared helper
+        // (`ctap2::make_cred_uv_not_rqd`, same pattern as
+        // `pin_uv_auth_token_available` above) with the same two facts the
+        // MC UV gate reads, so the two cannot drift and cannot contradict
+        // `alwaysUv`, which §6.1.3 requires to be `false` whenever this is
+        // `true`.
+        info.set_option(
+            "makeCredUvNotRqd",
+            crate::ctap2::make_cred_uv_not_rqd(pin_set, pin_state.always_uv),
+        );
+        // US-1531: the same rule the device twin applies — U2F_V2 is withheld
+        // whenever a PIN is set, because Chrome reads it as "this device also
+        // speaks CTAP1" and abandons the CTAP2 makeCredential when that path
+        // answers wrongly. See `ctap2::u2f_v2_advertised`.
+        info.set_u2f_v2(crate::ctap2::u2f_v2_advertised(pin_set));
         // Dynamic state fields.
         info.force_pin_change = pin_state.force_pin_change;
         info.pin_complexity_policy = Some(pin_state.pin_complexity_policy);
@@ -1266,9 +1373,17 @@ impl<K: Keystore> FidoApp<K> {
             uv = true;
         }
 
-        // 8.1 rule: if PIN set and no pinUvAuthParam and options.uv != false → PUAT_REQUIRED.
-        if pin_set && req.pin_uv_auth_param.is_none()
-            && (!req.options.present || req.options.uv != Some(false)) {
+        // 8.1 rule: if PIN set and no pinUvAuthParam → PUAT_REQUIRED, for
+        // EVERY token-less shape. US-15xx: the old condition
+        // `(!req.options.present || req.options.uv != Some(false))` lifted
+        // the gate for an explicit `uv: false`, which then armed a touch /
+        // minted with no PIN verified — inverted from what
+        // `makeCredUvNotRqd: false` promises (§6.1.3: UV required
+        // "regardless of the parameters the platform supplies"). Wire-proven
+        // and fixed in both twins; see the full history on the device twin's
+        // copy in `device_core.rs::make_credential_inner`. The no-PIN state
+        // is untouched.
+        if pin_set && req.pin_uv_auth_param.is_none() {
                 return vec![Ctap2Response::PuatRequired.code()];
             }
 
@@ -1294,7 +1409,16 @@ impl<K: Keystore> FidoApp<K> {
         }
 
         // 4) User presence. In emulation we always succeed; set UP flag.
-        // options.up handling: if up==false → INVALID_OPTION (per spec 5.6).
+        // US-1526: MC `up:false` → INVALID_OPTION. The decision, the
+        // argument and what would have to change to relax it are written out
+        // in full on the device twin's copy of this check
+        // (`device_core.rs`, `make_credential_inner`, "THE `up` POLICY,
+        // decided" — reference C parity at
+        // `pico-fido/src/fido/cbor_make_credential.c:387`). This is the
+        // second copy of one policy in two files; the full text lives on the
+        // twin that actually ships, and this line says where. The pair must
+        // not be relaxed independently — that is the defect US-1514 was
+        // filed for.
         if req.options.present
             && req.options.up == Some(false) {
                 return vec![Ctap2Response::InvalidOption.code()];
@@ -1306,8 +1430,26 @@ impl<K: Keystore> FidoApp<K> {
         }
         // alwaysUv (Config 0x02): UV is mandatory for makeCredential even
         // when the client did not request it.
-        if !uv && self.keystore.get_pin_state().always_uv {
+        // US-1533: same derived value getInfo advertises. Reading only the
+        // Config 0x02 bit let a PIN-set device advertise `alwaysUv: false`
+        // while this gate stayed dormant, so a platform read false, sent a
+        // token-less getAssertion, and got a presence-only assertion.
+        if !uv
+            && crate::ctap2::always_uv_advertised(
+                pin_set,
+                self.keystore.get_pin_state().always_uv,
+            )
+        {
             return vec![Ctap2Response::PuatRequired.code()];
+        }
+        // US-1524 follow-up: the touch. The device twin gates here too
+        // (`device_core.rs::make_credential_inner`, the `user_present(tag)`
+        // check); this twin had none, which is why the emulator's
+        // `process_ctap2` could never answer `UpRequired`, no consent window
+        // ever opened, and no CTAPHID keepalive was ever emitted — see the
+        // `presence` field's doc comment.
+        if req.options.up != Some(false) && !self.user_present() {
+            return vec![Ctap2Response::UpRequired.code()];
         }
 
         // 5) Generate a keypair for the requested algorithm.
@@ -1611,10 +1753,27 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // alwaysUv (Config 0x02): UV is mandatory for getAssertion.
-        if !uv && self.keystore.get_pin_state().always_uv {
+        // US-1533: same derived value getInfo advertises. Reading only the
+        // Config 0x02 bit let a PIN-set device advertise `alwaysUv: false`
+        // while this gate stayed dormant, so a platform read false, sent a
+        // token-less getAssertion, and got a presence-only assertion.
+        if !uv
+            && crate::ctap2::always_uv_advertised(
+                pin_set,
+                self.keystore.get_pin_state().always_uv,
+            )
+        {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // hmac-secret with silent authentication is not allowed (C parity).
+        // US-1526: the device twin has this same check
+        // (`device_core.rs`, `handle_get_assertion`, under "US-1526:
+        // getAssertion `up:false` is SERVED"), and the reasoning — the
+        // reference's one rejected combination, at
+        // `pico-fido/src/fido/cbor_get_assertion.c:324` — is written out
+        // there. The brief for this story suggested only the host twin had
+        // it; it does not, and `tests/up_policy.rs` pins the agreement so the
+        // question does not reopen.
         if req.options.up == Some(false) && req.extensions.hmac_secret_input.is_some() {
             return vec![Ctap2Response::InvalidOption.code()];
         }
@@ -1694,6 +1853,15 @@ impl<K: Keystore> FidoApp<K> {
 
         if matched.is_empty() {
             return vec![Ctap2Response::NoCredentials.code()];
+        }
+
+        // US-1524 follow-up: the touch, gated the same way makeCredential
+        // gates it and at the same point in the decision order — after the
+        // credential lookup, so a request with nothing to assert is still
+        // answered `NO_CREDENTIALS` and never parks a consent window. The
+        // device twin's equivalent is `device_core.rs:1237`.
+        if do_up && !self.user_present() {
+            return vec![Ctap2Response::UpRequired.code()];
         }
 
         if !req.allow_list.is_empty() {

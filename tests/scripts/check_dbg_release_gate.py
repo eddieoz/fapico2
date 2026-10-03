@@ -96,13 +96,36 @@ def cargo(args: list[str]) -> tuple[bool, str]:
 
 RING_MOD_RE = re.compile(
     r'#\[cfg\((any\()([^\]]*?)\)\)\]\s*\n\s*mod\s+dbg\s*;')
-DRAIN_RE = re.compile(
-    r'#\[cfg\((any\()([^\]]*?)\)\)\]\s*\n\s*if\s+cmd\s*==\s*'
-    r'crate::dbg::DBG_CMD')
+# Every `#[cfg((any(...)))]` attribute in a file, in source order. The gate no
+# longer requires the drain attribute to be textually adjacent to the
+# comparison: US-1509 moved the drain into `HidIo::debug_drain`, so the
+# attribute now sits above an `async fn` signature and a doc comment rather
+# than above the `if`. What the check is *about* is unchanged and is stated
+# below — the attribute and the comparison must be in the same gated block.
+CFG_ATTR_RE = re.compile(r'#\[cfg\((any\()([^\]]*?)\)\)\]')
+DBG_CMD_NEEDLE = 'if cmd == crate::dbg::DBG_CMD'
 
 
 def _cfg_features(blob: str) -> set[str]:
     return set(re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', blob))
+
+
+def _drain_blocks(src: str) -> list[str]:
+    """The feature lists of every cfg-gated block that contains the drain.
+
+    A "block" is the text from one `#[cfg(...)]` attribute up to the next
+    attribute or the end of the file. This is deliberately structural rather
+    than a single regex over the whole file: the defect the gate exists for is
+    a drain reachable in a build that has no ring (or the reverse), and that
+    is a property of *which* attribute governs the comparison.
+    """
+    blocks: list[str] = []
+    attrs = list(CFG_ATTR_RE.finditer(src))
+    for i, m in enumerate(attrs):
+        end = attrs[i + 1].start() if i + 1 < len(attrs) else len(src)
+        if DBG_CMD_NEEDLE in src[m.end():end]:
+            blocks.append(m.group(2))
+    return blocks
 
 
 def check_ring_is_drainable(root: Path) -> None:
@@ -115,14 +138,19 @@ def check_ring_is_drainable(root: Path) -> None:
              " this gate cannot verify the ring is drainable, and a gate that"
              " cannot check its own subject is not a gate")
         return
-    d = DRAIN_RE.search(tasks_rs)
-    if not d:
+    blocks = _drain_blocks(tasks_rs)
+    if not blocks:
         fail("could not find the `DBG_CMD` dispatch in firmware/src/tasks.rs —"
              " same reason: the check below would be vacuous")
         return
+    if len(blocks) > 1:
+        fail(f"found {len(blocks)} cfg-gated `DBG_CMD` dispatches in"
+             " firmware/src/tasks.rs; this gate compares one drain against one"
+             " ring and will not guess which is the real one")
+        return
 
     ring = _cfg_features(m.group(2))
-    drain = _cfg_features(d.group(2))
+    drain = _cfg_features(blocks[0])
     if ring == drain:
         ok(f"ring features == drain features ({', '.join(sorted(ring))}) —"
            " every feature that allocates the ring can also read it back")
