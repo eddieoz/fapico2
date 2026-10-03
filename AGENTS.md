@@ -106,7 +106,7 @@ lie about what the command paths do:
 
 **User presence (the touch) is not a function of `userVerification`.** UP is
 required for every `authenticatorMakeCredential` whatever `uv` says; both
-tweins reject `options.up = false` (`device_core.rs`, mirroring
+twins reject `options.up = false` (`device_core.rs`, mirroring
 `cbor_make_credential.c:387`). CTAP 2.1 §6.1.3 step 7.2 only lets a client
 *skip UV*, never UP. So `userVerification: "discouraged"` must not remove the
 button.
