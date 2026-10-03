@@ -99,6 +99,27 @@ fn make_resident_credential(
     assert_eq!(resp[0], 0x00, "makeCredential with credProtect must succeed");
 }
 
+
+/// Pull one boolean option out of a getInfo response.
+fn advertised_option(resp: &[u8], key: &str) -> Option<bool> {
+    let (decoded, _) = fapico2_fido::cbor::decode(&resp[1..]).expect("getInfo body");
+    let fapico2_fido::cbor::Value::M(map) = decoded else { panic!("getInfo map") };
+    let opts = map
+        .iter()
+        .find_map(|(k, v)| match k {
+            fapico2_fido::cbor::Value::U(0x04) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("options (key 0x04)");
+    let fapico2_fido::cbor::Value::M(opts) = opts else { panic!("options map") };
+    opts.iter().find_map(|(k, v)| match (k, v) {
+        (fapico2_fido::cbor::Value::T(n), fapico2_fido::cbor::Value::Bool(b)) if n == key => {
+            Some(*b)
+        }
+        _ => None,
+    })
+}
+
 #[test]
 fn test_ga_uv_true_without_param_is_puat_required() {
     let (mut app, _client) = setup();
@@ -215,6 +236,35 @@ fn test_always_uv_gates_mc_and_ga() {
     toggle_always_uv(&mut app, &client);
     let resp = app.process_ctap2(0x02, &ga_request(&hash, "example.com", None, None), [1, 2, 3, 4]);
     assert_eq!(resp[0], 0x36, "alwaysUv must stay in force while a PIN is set");
+}
+
+/// US-1533: the advertisement itself. Everything else in this story follows
+/// from what a platform reads here — CTAP 2.1 6.2.2 makes a client that sees
+/// `alwaysUv: true` acquire a token before an assertion, which is what puts
+/// the PIN prompt in front of `demo.yubico.com/webauthn-technical/login`. The
+/// gate tests prove the refusal; this proves the claim that causes it, with no
+/// Config 0x02 toggle involved, exactly as the reference computes it
+/// (`pico-fido2/src/fido/cbor_get_info.c:95`).
+#[test]
+fn always_uv_is_advertised_true_when_a_pin_is_set() {
+    let (mut app, _client) = setup();
+
+    let resp = app.process_ctap2(0x04, &[], [1, 2, 3, 4]);
+    let always_uv = advertised_option(&resp, "alwaysUv");
+    assert_eq!(
+        always_uv,
+        Some(true),
+        "a PIN-set device must advertise alwaysUv=true. Reading false is what \
+         made a platform send a token-less getAssertion and get a \
+         presence-only assertion, with no PIN prompt anywhere in the flow."
+    );
+    // And the two UV options must not contradict it: 6.1.3 requires
+    // makeCredUvNotRqd false whenever alwaysUv is true.
+    assert_eq!(
+        advertised_option(&resp, "makeCredUvNotRqd"),
+        Some(false),
+        "CTAP2.1 6.1.3: alwaysUv=true forces makeCredUvNotRqd=false"
+    );
 }
 
 /// With no PIN the PIN-state term cannot fire, so `alwaysUv` reads false and a

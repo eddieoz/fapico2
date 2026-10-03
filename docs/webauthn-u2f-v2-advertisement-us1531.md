@@ -1,6 +1,7 @@
-# US-1531 / US-1532 — why browser registration failed, and what fixed it
+# US-1531 / US-1532 / US-1533 — why browser registration failed, and what fixed it
 
-**Status:** both fixed and verified on hardware (`8853f88`, `b807547`).
+**Status:** all three fixed and verified on hardware (`8853f88`, `b807547`,
+`f5910d0`).
 **Devices:** fapico2 `/dev/hidraw8` (serial `94746395`), pico-fido2 reference `/dev/hidraw10`.
 
 ## The report
@@ -189,6 +190,61 @@ and UV was not performed. So when a site asks for
 `userVerification: "discouraged"`, one touch is enough with no PIN, on both
 devices. token2's demo differs only in asking for `required`.
 
+## US-1533 — `alwaysUv` must follow the PIN state, or authentication skips the PIN
+
+With US-1532 shipped, registration prompted for the PIN and succeeded, but
+`demo.yubico.com/webauthn-technical/login` still authenticated on presence
+alone: no PIN prompt, LED armed, touch, done. The reference prompts there.
+
+The gate was never the problem. Both twins already refused a token-less
+`getAssertion` when `alwaysUv` was set (`app.rs:1741`,
+`device_core.rs:1245`) — but `alwaysUv` was read **only** from the Config `0x02`
+toggle, which defaults off. So a PIN-set device advertised `alwaysUv: false`, a
+platform read false, sent a token-less assertion, and got served on presence
+alone. We were refusing token-less makeCredential while advertising `false`:
+the same advertisement-does-not-match-implementation class as US-1529, one
+level down.
+
+The reference derives it (`pico-fido2/src/fido/cbor_get_info.c:95`):
+
+```c
+bool alwaysUv = (get_opts() & FIDO2_OPT_AUV) || (file_has_data(ef_pin) && !keydev_unlocked);
+```
+
+— true from boot on a PIN-set device, from the same branch that drops
+`U2F_V2` (US-1531). This twin has no `keydev_unlocked` concept, so `pin_set` is
+the faithful second term and the Config bit stays as the first: a way to force
+`alwaysUv` **on** for a PIN-less device, never to turn it **off** on one that
+has a PIN. `getInfo` and the gate now read one accessor (`always_uv_effective`)
+so they cannot drift again.
+
+After flashing, the login trace on the same page:
+
+```text
+{1: 2, 2: 1}    getPINRetries
+{1: 2, 2: 2}    getKeyAgreement
+{1: 2, 2: 9}    getPinUvAuthTokenUsingPinWithPermissions
+authenticator_request_dialog_model.cc:158 UI step: kClientPinEntry
+authenticator_request_dialog_model.cc:158 UI step: kClientPinTapAgain
+```
+
+Three tests asserted the old behaviour and now state the new — two of them had
+started passing **for the wrong reason**, reaching their subject through a
+token-less request that is now gated earlier:
+
+* `uv.rs::always_uv_is_advertised_true_when_a_pin_is_set` (new) — the
+  advertisement itself, with no toggle involved. Without it nothing asserted
+  the claim Chrome actually reads.
+* `uv.rs::test_always_uv_gates_mc_and_ga` — "alwaysUv off must not gate" was
+  only ever true for a PIN-less device.
+* `uv.rs::test_discoverable_skips_cred_protect_2_without_uv` and
+  `credmgmt.rs::test_u2f_registration_not_discoverable` — both reached their
+  real subject through a token-less request; they now carry a properly scoped
+  `pinUvAuthParam` (key `0x06`, which both twins use — `0x04` is `extensions`).
+
+Falsified by reverting `always_uv_advertised` to the config bit alone: three
+of them fail, including the advertisement test.
+
 ## Verification
 
 | | result |
@@ -197,6 +253,9 @@ devices. token2's demo differs only in asking for `required`.
 | demo.yubico.com authentication | succeeds — touch only, authenticated |
 | token2.com registration | succeeds — `User verification: required`, AAGUID `66617069-...` |
 | token2.com login | **"Login successful v"**, "Credential matched the registered key" |
+| demo.yubico.com end-to-end | registration > PIN > touch > authentication > **PIN** > touch > authenticated |
+| token2.com under US-1533 | registers and logs in; "Login successful v" |
+| `alwaysUv` on hardware | `true`; a token-less `getAssertion` answers `0x36` |
 | authData from demo.yubico.com | `rpIdHash` = SHA-256("demo.yubico.com"), flags `0x45` (UP+UV+AT), signCount 328 |
 | Chrome's U2F lines after the fix | zero `u2f_register` / `Ignoring status` |
 | wrong PIN | refused `0x31`; empty PIN refused `0x31` |
@@ -213,5 +272,7 @@ devices. token2's demo differs only in asking for `required`.
   assigns that key to `remainingDiscoverableCredentials`. A conformant client
   reads 63 free discoverable slots where the device holds 12. Same
   advertisement-does-not-match-implementation class as `makeCredUvNotRqd`.
-* **`alwaysUv: true`** (Config `0x02`) is advertised but not enforced by
-  GetAssertion, which is the opposite-direction version of the same class.
+* **`u2f_v2_advertised` keys on `pin_set` alone**, so a PIN-less board with
+  Config `0x02` set would advertise `alwaysUv: true` *and* `U2F_V2`, where the
+  reference withholds the latter. Unreachable through any client (the toggle
+  needs a `PERM_ACFG` token, which needs a PIN).
