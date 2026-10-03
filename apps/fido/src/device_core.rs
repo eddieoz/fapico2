@@ -797,6 +797,16 @@ impl FidoApp {
         self.token_rp_id.is_empty() || self.token_rp_id.as_slice() == rp_id
     }
 
+    /// US-1533: the `alwaysUv` value getInfo advertises and getAssertion
+    /// enforces. One accessor so the two cannot drift — the whole point of
+    /// this story, and the failure US-1529 recorded when they did.
+    fn always_uv_effective(&self) -> bool {
+        crate::ctap2::always_uv_advertised(
+            self.keystore.pin_state.pin_hash.is_some(),
+            self.keystore.pin_state.always_uv,
+        )
+    }
+
     pub(crate) fn note_pin_auth_failure(&mut self) -> Err {
         self.auth_failures = self.auth_failures.saturating_add(1);
         if self.auth_failures >= 3 {
@@ -1242,7 +1252,7 @@ impl FidoApp {
             if req.uv == Some(true) && !uv {
                 return Err(err(Ctap2Response::PuatRequired));
             }
-            if !uv && self.keystore.pin_state.always_uv {
+            if !uv && self.always_uv_effective() {
                 return Err(err(Ctap2Response::PuatRequired));
             }
             // US-1526: getAssertion `up:false` is SERVED (a silent assertion, no UP
@@ -2104,7 +2114,7 @@ impl FidoApp {
         // S-701-5: the full command set is served on device.
         info.set_option("authnrCfg", true);
         info.set_option("enterpriseAttestation", true);
-        info.set_option("alwaysUv", self.keystore.pin_state.always_uv);
+        info.set_option("alwaysUv", self.always_uv_effective());
         // US-1529: derived, not hard-coded — see `ctap2::make_cred_uv_not_rqd`
         // for the spec text, the client-side decision it feeds, and the
         // measured per-state behaviour. Both UV options are read from the same

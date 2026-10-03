@@ -1224,8 +1224,14 @@ impl<K: Keystore> FidoApp<K> {
         // it, MC key 0x0A requests it, setEnterpriseRPIDList (Config 0x04)
         // manages the list.
         info.set_option("enterpriseAttestation", true);
-        // alwaysUv reflects the current config state (toggled by Config 0x02).
-        info.set_option("alwaysUv", pin_state.always_uv);
+        // US-1533: alwaysUv follows the PIN state, as the reference derives it
+        // (cbor_get_info.c:95), with the Config 0x02 toggle as the first term.
+        // Advertising it only when explicitly configured meant a PIN-set board
+        // claimed `false` and a platform sent a token-less getAssertion.
+        info.set_option(
+            "alwaysUv",
+            crate::ctap2::always_uv_advertised(pin_set, pin_state.always_uv),
+        );
         // US-1529: makeCredUvNotRqd is DERIVED, never hard-coded. The host
         // twin had its own hard-coded `true` (via `Ctap2Info::default`) and
         // the device twin inherited it the same way — the twin trap in its
@@ -1424,7 +1430,16 @@ impl<K: Keystore> FidoApp<K> {
         }
         // alwaysUv (Config 0x02): UV is mandatory for makeCredential even
         // when the client did not request it.
-        if !uv && self.keystore.get_pin_state().always_uv {
+        // US-1533: same derived value getInfo advertises. Reading only the
+        // Config 0x02 bit let a PIN-set device advertise `alwaysUv: false`
+        // while this gate stayed dormant, so a platform read false, sent a
+        // token-less getAssertion, and got a presence-only assertion.
+        if !uv
+            && crate::ctap2::always_uv_advertised(
+                pin_set,
+                self.keystore.get_pin_state().always_uv,
+            )
+        {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // US-1524 follow-up: the touch. The device twin gates here too
@@ -1738,7 +1753,16 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // alwaysUv (Config 0x02): UV is mandatory for getAssertion.
-        if !uv && self.keystore.get_pin_state().always_uv {
+        // US-1533: same derived value getInfo advertises. Reading only the
+        // Config 0x02 bit let a PIN-set device advertise `alwaysUv: false`
+        // while this gate stayed dormant, so a platform read false, sent a
+        // token-less getAssertion, and got a presence-only assertion.
+        if !uv
+            && crate::ctap2::always_uv_advertised(
+                pin_set,
+                self.keystore.get_pin_state().always_uv,
+            )
+        {
             return vec![Ctap2Response::PuatRequired.code()];
         }
         // hmac-secret with silent authentication is not allowed (C parity).

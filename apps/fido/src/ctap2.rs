@@ -644,6 +644,38 @@ pub fn make_cred_uv_not_rqd(pin_set: bool, always_uv: bool) -> bool {
     !pin_set && !always_uv
 }
 
+/// US-1533: the `alwaysUv` option getInfo must advertise.
+///
+/// The reference derives it from the PIN state, not from a config bit alone
+/// (`pico-fido2/src/fido/cbor_get_info.c:95`):
+///
+/// ```c
+/// bool alwaysUv = (get_opts() & FIDO2_OPT_AUV) || (file_has_data(ef_pin) && !keydev_unlocked);
+/// ```
+///
+/// so a PIN-set board advertises `true` from the moment it boots — the
+/// keydev is locked until a PIN has been verified. Measured against the
+/// reference: `alwaysUv: true`, alongside `makeCredUvNotRqd: false` and no
+/// `U2F_V2` in `versions`.
+///
+/// We read only the Config `0x02` toggle (`FIDO2_OPT_AUV`), which defaults
+/// off, so we advertised `alwaysUv: false` **while refusing token-less
+/// makeCredential** — the advertisement and the gate disagreeing in the
+/// opposite direction to US-1529, and with the same consequence: CTAP 2.1
+/// §6.2.2 makes a platform that reads `alwaysUv: true` acquire a token before
+/// an assertion, which is what puts the PIN prompt in front of
+/// `demo.yubico.com/webauthn-technical/login`. Reading `false`, it sent a
+/// token-less `authenticatorGetAssertion`, and the assertion was served on
+/// presence alone.
+///
+/// This device twin has no `keydev_unlocked` concept, so `pin_set` is the
+/// faithful equivalent of the reference's second term. The Config `0x02` bit
+/// stays as the first term: it can still force `true` on, which is what the
+/// reference's `FIDO2_OPT_AUV` does.
+pub fn always_uv_advertised(pin_set: bool, configured: bool) -> bool {
+    pin_set || configured
+}
+
 /// US-1531: whether getInfo may advertise `U2F_V2` (CTAP1). One rule behind
 /// both twins, for the same twin-drift reason as [`make_cred_uv_not_rqd`].
 ///
