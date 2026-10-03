@@ -2170,53 +2170,113 @@ impl FidoApp {
         out.len()
     }
 
-    // ------------------------------------------------------------------
-    // authenticatorSelection (0x0B) — US-1514
+// ------------------------------------------------------------------
+    // authenticatorSelection (0x0B) — US-1514, corrected by US-1514-bis
     // ------------------------------------------------------------------
     //
-    // Deliberately NOT gated on user presence, and the reasoning is in the
-    // commit message rather than being a summary of it:
+    // ## What the command actually is
     //
-    // * `fido2`'s `Ctap2.selection()` (ctap2/base.py:575) calls
-    //   `send_cbor(Ctap2.CMD.SELECTION, ...)` with no data, and `send_cbor`
-    //   (`:286`) does `status = response[0]; if status != 0x00: raise
-    //   CtapError(status)`. So *any* non-zero answer — `UpRequired` (0x3B),
-    //   `UserActionTimeout` (0x2F), `ActionTimeout` (0x3A) — is an exception
-    //   at the caller, not a wait. There is no wire shape in which a gated
-    //   selection reads as a successful selection to this client.
-    // * The `UpRequired` → keepalive → retry loop that turns a bare `0x3B`
-    //   into a touch prompt lives in the *transport*, not here, and its
-    //   predicate does not include `0x0B`:
-    //   `presence_windowed = up_request || ctap_cmd == vendor41::CMD ||
-    //   ctap_cmd == 0x06` (with `up_request = ctap_cmd == 0x01 ||
-    //   ctap_cmd == 0x02`) in `firmware/src/hid_serve.rs`. There is no
-    //   separate emulator copy of the predicate to drift from — US-1524 made
-    //   `emul_hid::serve_pass` call the same `serve_once`, so both paths
-    //   evaluate this one expression.
-    //   So gating here would answer a bare 0x3B that never opens a window,
-    //   never prompts and never retries — a deadlock, not a prompt.
-    // * The reference C firmware gates too (`pico-fido/src/fido/
-    //   cbor_selection.c` calls `wait_button_pressed()`), but the gate is
-    //   disarmed by default: it resolves through
-    //   `button_wait_start()` (pico-keys-sdk/src/button.c:113), which
-    //   auto-queues `EV_BUTTON_PRESSED` when `up_btn` is unset AND
-    //   `force_button_wait` is false — and `cbor_selection.c`'s
-    //   `force_button_wait = true` is inside `#ifdef FORCE_BUTTON_WAIT`,
-    //   a CMake option that is off unless requested. fapico2's
-    //   `vendorff::PhyConfig` has no `up_btn` field either, so the other
-    //   disarm is unreachable here. The reference's *default build* answer is
-    //   therefore `CTAP2_OK` with no touch, which is what this returns and
-    //   what the host twin returns.
-    // * `Ctap2Response::ActionTimeout` (0x3A) stays unproduced. The
-    //   reference does not use it here either: on a real timeout
-    //   `cbor_selection.c` returns `CTAP2_ERR_USER_ACTION_TIMEOUT` = 0x2F,
-    //   not 0x3A. The old host comment cited 0x3A and was wrong.
+    // US-1514 shipped an unconditional `CTAP2_OK`, on the argument that the
+    // reference C firmware "auto-accepts selection in its default build". That
+    // argument described an accident of one `#ifdef`, not the command, and it
+    // is wrong on the wire: this arm claims **"a user selected me"** while
+    // never asking anybody. Measured on the attached board before this change,
+    // for every payload shape including the bare byte:
+    //
+    //     0x0B                     -> 00   13.9 ms
+    //     0x0B + {1:false,2:false} -> 00   13.8 ms
+    //     0x0B + {1:true,2:true}    -> 00   13.9 ms
+    //
+    // 14 ms is a round trip, not a human being asked.
+    //
+    // CTAP2.1 §6.9 (PS-20210615) and CTAP 2.2 §6.9 (RD-20241003), verbatim
+    // and identical in both revisions:
+    //
+    //   "This command allows the platform to let a user select a certain
+    //    authenticator by asking for user presence. **The command has no
+    //    input parameters.** When the authenticatorSelection command is
+    //    received, the authenticator will ask for user presence:
+    //      - If User Presence is received, … return CTAP2_OK.
+    //      - If User Presence is explicitly denied by the user, … return
+    //        CTAP2_ERR_OPERATION_DENIED. …
+    //      - If a user action timeout occurs, … return
+    //        CTAP2_ERR_USER_ACTION_TIMEOUT."
+    //
+    // ## There is no `up`/`uv` map, and no `INVALID_OPTION` to answer with
+    //
+    // This matters because the bug report for this regression specified a
+    // `up`/`uv` decision matrix and `CTAP2_ERR_INVALID_OPTION`. Neither exists:
+    //
+    // * the spec says the command has **no input parameters**, in both
+    //   revisions;
+    // * Chromium's request struct is empty —
+    //   `struct CtapAuthenticatorSelectionRequest {};` and
+    //   `AsCTAPRequestValuePair` returns `std::nullopt` as the payload
+    //   (`device/fido/ctap_authenticator_selection_request.{h,cc}`);
+    // * `fido2` 2.2.1's `Ctap2.selection()` (ctap2/base.py:576-591) calls
+    //   `send_cbor(CMD.SELECTION)` with `data=None`, and `send_cbor` only
+    //   appends `cbor.encode(data)` when `data is not None`, so the frame is
+    //   the bare opcode byte;
+    // * the reference, `pico-fido2/src/fido/cbor_selection.c`, ignores its
+    //   payload entirely — `cbor.c:74` dispatches `cbor_selection()` with no
+    //   argument.
+    //
+    // So no client can be sending `up`/`uv`, and implementing that matrix
+    // would be inventing a protocol. The one dimension the command really has
+    // is **has the user touched the key**, and that is what is answered here.
+    //
+    // ## How the gate is delivered
+    //
+    // US-1514's dead-end objection — "the transport's `presence_windowed`
+    // predicate does not name `0x0B`, so a bare `0x3B` would never open a
+    // window" — was correct about the machinery and wrong about the
+    // conclusion. That objection says the gate cannot be added *without also*
+    // extending the transport, which is exactly what was done:
+    // `ctap_cmd == 0x0B` now joins `0x06` and `0x41` in `presence_windowed`
+    // (`firmware/src/hid_serve.rs`). This is the same proven shape, not a new
+    // mechanism: `0x06`'s `getPinUvAuthTokenUsingUvWithPermissions` is
+    // already answered with `UpRequired` during Chrome's *discovery*, so a
+    // gated answer on a discovery-time command is a path this firmware has
+    // exercised against a real client.
+    //
+    // The claim that "every non-zero answer is a `CtapError` at
+    // `fido2`'s caller, so a gated selection reads as an exception rather than
+    // a selection" is true of `fido2`'s `Ctap2.selection()` and only of it.
+    // It is a statement about one test library's error handling, not about
+    // the protocol, and it does not survive contact with the transport: the
+    // `UpRequired` this returns is consumed by `serve_once`/`redrive_window`
+    // and never reaches the host until the window closes.
+    //
+    // ## Two behaviours this deliberately does not have
+    //
+    // * **`CTAP2_ERR_OPERATION_DENIED` (0x27) on explicit denial.** The spec
+    //   asks for it, and the reference returns it from `cbor_selection.c`.
+    //   This firmware's presence model has no third state: `user_present` is
+    //   a bool, and `firmware/src/presence.rs` has no denial channel at all
+    //   (grep: no `denied`/`Denied`). A user who does not want to be selected
+    //   simply does not press, which the transport reports as a window close —
+    //   `CTAP2_ERR_KEEPALIVE_CANCEL` (0x2D), US-1505/US-1506 — rather than as
+    //   a denial. Inventing a denial signal is a separate story.
+    // * **`CTAP2_ERR_USER_ACTION_TIMEOUT` (0x2F) on timeout.** Same reason,
+    //   one level up: the window's deadline is the transport's, and it closes
+    //   every CTAP2 window with 0x2D. Changing that is a transport-wide change
+    //   and would move `0x01`/`0x02`/`0x06`/`0x41` with it.
+    //
+    // Both are recorded in `docs/known-gate-divergences.md`'s sibling note in
+    // the commit message; neither is reachable from `process_ctap2` alone.
     pub(crate) fn handle_authenticator_selection(
         &mut self,
         out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
     ) -> usize {
         out.clear();
-        out.push(Ctap2Response::Ok.code()).ok();
+        // CTAP2.1 §6.9: presence received → `CTAP2_OK`, and *only* then.
+        if self.user_present(crate::device_app::presence_tag_from_channel(
+            self.current_channel,
+        )) {
+            out.push(Ctap2Response::Ok.code()).ok();
+        } else {
+            out.push(Ctap2Response::UpRequired.code()).ok();
+        }
         out.len()
     }
 }

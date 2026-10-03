@@ -982,33 +982,30 @@ impl<K: Keystore> FidoApp<K> {
         }
     }
 
-    /// authenticatorSelection (CTAP2.1 §6.3 / FX-415). Returns CTAP2_OK
-    /// immediately, with no touch.
+    /// authenticatorSelection (CTAP2.1 §6.9, FX-415 / US-1514). Gated on user
+    /// presence: `CTAP2_OK` **only** once a touch has landed, `UpRequired`
+    /// (0x3B) otherwise.
     ///
-    /// US-1514 corrected the comment that used to sit here, which was wrong
-    /// in both halves. It said "the reference C firmware auto-accepts
-    /// selection **in emulation**" — the reference's gate is disarmed in its
-    /// *default build*, not only under emulation: `cbor_selection.c` does call
-    /// `wait_button_pressed()`, but the `force_button_wait = true` that
-    /// disarms `button_wait_start()`'s auto-complete branch
-    /// (`pico-keys-sdk/src/button.c:113`) sits inside
-    /// `#ifdef FORCE_BUTTON_WAIT`, a CMake option that is off unless
-    /// requested. And it said a hardware build would time out to
-    /// `ACTION_TIMEOUT` (0x3A) — the reference returns
-    /// `CTAP2_ERR_USER_ACTION_TIMEOUT` = **0x2F** on timeout and
-    /// `CTAP2_ERR_OPERATION_DENIED` = 0x27 on cancel. 0x3A is not what a
-    /// gated selection answers anywhere, and `Ctap2Response::ActionTimeout`
-    /// is accordingly still produced nowhere in this tree.
+    /// US-1514 shipped this as an unconditional `CTAP2_OK` on the argument
+    /// that the reference "auto-accepts selection in its default build". That
+    /// described one `#ifdef`'s accident, not the command: CTAP2.1 §6.9 says
+    /// in both the PS and the 2.2 RD that the command "has no input
+    /// parameters" and that the authenticator "will ask for user presence",
+    /// answering `CTAP2_OK` **if** presence is received. Answering `OK`
+    /// without asking is a claim about a human that was never made.
     ///
-    /// The gate is still worth having and is still not implemented; see
-    /// `device_core::handle_authenticator_selection` for why it cannot be
-    /// added to this twin alone, and note that adding it would need the
-    /// transport (`firmware/src/tasks.rs`) to put `0x0B` in
-    /// `presence_windowed` — otherwise the `UpRequired` this returns would
-    /// never open a window and would go out as a bare error to a client
-    /// that turns every non-zero status into a `CtapError`.
+    /// The full reasoning — including why there is no `up`/`uv` matrix to
+    /// implement and why the `0x0B` arm can be gated at all — is in
+    /// `device_core::handle_authenticator_selection`. This twin must agree
+    /// with that arm byte for byte (AGENTS.md §1): `app.rs` is not the
+    /// shipped firmware, and a gate added here alone would be a test that
+    /// passes while the board says something else.
     fn authenticator_selection(&mut self) -> Vec<u8> {
-        vec![Ctap2Response::Ok.code()]
+        if self.user_present() {
+            vec![Ctap2Response::Ok.code()]
+        } else {
+            vec![Ctap2Response::UpRequired.code()]
+        }
     }
 
     // ------------------------------------------------------------------

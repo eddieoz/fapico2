@@ -793,8 +793,27 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         // all. The window is entered on the *answer*, so the PIN-based
         // sub-commands (0x05/0x09), which never answer `UpRequired`, are
         // unaffected and send no keepalive.
-        let presence_windowed =
-            up_request || ctap_cmd == fapico2_fido::vendor41::CMD || ctap_cmd == 0x06;
+        //
+        // authenticatorSelection (0x0B) joins them for the same structural
+        // reason, and CTAP2.1 §6.9 requires it: "When the
+        // authenticatorSelection command is received, the authenticator will
+        // ask for user presence … If User Presence is received, the
+        // authenticator will return CTAP2_OK." Its arm
+        // (`device_core::handle_authenticator_selection`) answers
+        // `UpRequired` until a touch lands, so without this leg that `0x3B`
+        // would go straight out as a bare error frame — the exact dead end
+        // US-1514 cited to justify *not* gating. The gate and the transport
+        // leg ship together or neither; `tests/selection.rs` asserts both.
+        //
+        // Deliberately **not** in `up_request`: like `0x06` and `0x41`, a
+        // second selection on a *different* tag is not refused outright —
+        // only one contending for the same tag is (US-1510's rule below). A
+        // platform that probes every connected authenticator concurrently
+        // must not have one probe cancel another's.
+        let presence_windowed = up_request
+            || ctap_cmd == fapico2_fido::vendor41::CMD
+            || ctap_cmd == 0x06
+            || ctap_cmd == 0x0B;
         // US-921 review (P0-1): the tag is domain-separated into the HID
         // space (bit 31 set) — a raw CID would eventually equal a CCID
         // presence tag and the same-tag join would let a CCID command consume
@@ -1850,6 +1869,11 @@ pub(crate) mod tests {
             "ctap_cmd == 0x01 || ctap_cmd == 0x02",
             "fapico2_fido::vendor41::CMD",
             "ctap_cmd == 0x06",
+            // authenticatorSelection answers `UpRequired` until a touch
+            // lands (CTAP2.1 §6.9), so it needs this leg as much as `0x06`
+            // does. Without it the `0x3B` leaves as a bare error frame and
+            // the command dead-ends instead of prompting.
+            "ctap_cmd == 0x0B",
         ] {
             assert!(
                 preds.contains(covered),

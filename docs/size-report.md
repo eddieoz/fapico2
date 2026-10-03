@@ -1,3 +1,41 @@
+**Date:** 2026-10-03 (**the `authenticatorSelection` presence gate on
+`fix/passkey-discovery`** — CTAP2 `0x0B` answered `CTAP2_OK` in ~14 ms without
+ever asking anybody, which claims "a user selected me" with no user involved;
+CTAP2.1 §6.9 requires the authenticator to ask for user presence and answer
+`CTAP2_OK` *only* if it is received. The arm is gated on `user_present()` now,
+on both twins, and `0x0B` joined `presence_windowed` in
+`firmware/src/hid_serve.rs` so the `UpRequired` can actually open a window
+rather than leaving as a bare error frame.)
+**Measured: `text` 818,400 → 818,424 B (**+24 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); task-arena demand 21,944 B (**0** — no task
+future grew; the stamp moved `2ebb12bd8466…` → `1e0e4aef25e4…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3072 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping
+sha256 `a822ff6b44b1…` → **`da884eb0398c1b2b4a6cd2ef1c71f9011fc5d8ea85247dfb42eff174babdbf11`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+da884eb0398c1b2b4a6cd2ef1c71f9011fc5d8ea85247dfb42eff174babdbf11  firmware/fapico2.uf2
+```
+
+**The +24 B is all `.text`, and the block count did not move.** It is the gate
+itself: one `user_present(presence_tag_from_channel(current_channel))` call and
+one `0x0B` comparison in the `presence_windowed` predicate. There is no new
+function and no new table — the last UF2 block had slack, so 24 B landed inside
+it. That is luck, not headroom: the image is 3072 of 3072 blocks and the next
+block trips `FIRMWARE_FLASH_BUDGET_KIB`, so the 25 B version of this change
+would not have built.
+
+**This entry does not raise `FIRMWARE_FLASH_BUDGET_KIB`.** It stays **1536**,
+the image stays on 3072 of 3072 blocks, and the slack stays zero — the number
+the next change has to beat.
+
+---
+
 **Date:** 2026-10-03 (**the CTAPHID conformance fix on `fix/passkey-discovery`** —
 `tests/pico-fido/test_055_hid.py`, seven failures, bisected to `686c36b`. Three
 firmware corrections, all on the shipping CTAP-HID path: a `CTAPHID_INIT`
@@ -1260,10 +1298,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,424 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb3d8` | no (flash) |
+| `.text` | 766,448 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb3f0` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfdc0` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfde0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1271,14 +1309,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,424 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 766,448 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,400**. That identity is stated so a reader can check
+the `X` flag) = **818,424**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,400 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,424 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
