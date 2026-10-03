@@ -40,6 +40,7 @@ CLIENT_PORT = 35970  # shared relay: tests connect here
 #   36007/36008     test_rescue_reboot.py private relay (US-163)
 #   36009/36010     test_paging.py private relay (US-180)
 #   36109           test_paging.py private HID port (US-180)
+#   36121           test_redteam.py OATH-presence private HID port (US-132)
 #   36011/36012     test_openpgp_chaining.py private relay (US-181)
 #   36111           test_openpgp_chaining.py private HID port (US-181)
 #   35973           dead dial port for direct-spawn FIDO-only emulators

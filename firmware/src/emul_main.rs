@@ -482,6 +482,27 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // US-132 harness hook: withhold the OATH user-presence grant.
+    //
+    // `oath_core::default_user_present()` returns `true` on a host build
+    // (`#[cfg(not(feature = "device"))]`), so the emulator's presence source
+    // auto-acks and the one consent gate that survives US-132 is
+    // un-exercisable here — the exact hole US-923 left for the
+    // `u2f-presence`/`mgmt-presence` cases. This env var closes it for OATH:
+    // `FAPICO2_OATH_PRESENCE=deny` injects `|| false`, which is what the
+    // device's fail-closed default already does, so a harness case can drive
+    // the real 0x6985 refusal over CCID instead of asserting it in prose.
+    //
+    // Emulation-only: `emul_main` is a `required-features = ["emulation"]`
+    // binary and is never part of the UF2, so this cannot weaken a device.
+    // Unset (the default, and every value other than "deny") leaves the
+    // auto-ack stand-in exactly as it was.
+    if let Ok(v) = std::env::var("FAPICO2_OATH_PRESENCE") {
+        if v == "deny" {
+            oath_app = oath_app.with_user_presence(|| false);
+            eprintln!("oath presence: denied (FAPICO2_OATH_PRESENCE=deny)");
+        }
+    }
     let mut otp_app = OtpApp::boot(&mut store);
     // US-423: persist boot-time store changes (device parity; idempotent).
     let mut boot_sink = FileImageSink::new(partition_path.clone());
