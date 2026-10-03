@@ -38,7 +38,6 @@ use trussed::types::CoreContext;
 use trussed::{ClientImplementation, Service};
 use trussed_core::types::reboot;
 
-use crate::cflash;
 use crate::trng::DrbgTrng;
 
 use super::dispatch::OpcardDispatch;
@@ -48,50 +47,21 @@ use super::runner::{Backends, Client, SyscallRunner};
 // Flash region (controller decision D3)
 // ---------------------------------------------------------------------------
 
-/// Start of the trussed internal-FS window, flash-relative (embassy-rp
-/// offsets are relative to 0x10000000).
-pub const TRUSSED_FS_OFFSET: u32 = 0x102_000;
-/// Blocks in the trussed internal-FS window: 256 × 4 KiB = 1 MiB, i.e.
-/// flash-relative `0x102_000 .. 0x202_000` — the front of the C data
-/// partition (partition 1 = `0x102_000 .. 0x400_000`, see
-/// [`crate::cflash`]), well clear of the secure image slots.
-pub const TRUSSED_FS_BLOCKS: usize = 256;
-/// NOR erase granularity (RP2350 QSPI flash).
-pub const BLOCK_SIZE: usize = 4096;
+// US-1536: the window's offset, length and the budget it must stay clear of
+// are owned by [`crate::flashmap`] now. They used to be literals here, which is
+// how the CI flash budget came to sit 504 KiB *above* this window's start with
+// nothing relating the two — a firmware image the ratchet accepted could link
+// over the front of this filesystem. Re-exported here because `device` is where
+// the window is actually used and `platform/src/trusted_backend/host.rs`
+// documents itself against `device::TRUSSED_FS_BLOCKS`.
+pub use crate::flashmap::{BLOCK_SIZE, TRUSSED_FS_BLOCKS, TRUSSED_FS_END, TRUSSED_FS_OFFSET};
+
 /// littlefs2 read quantum.
 pub const READ_SIZE: usize = 256;
 /// littlefs2 write quantum: a multiple of the flash program (page) size
 /// (embassy-rp `PAGE_SIZE = 256`), so the driver never receives a smaller
 /// write than the flash accepts.
 pub const WRITE_SIZE: usize = 256;
-/// The secure image-slot window starts here (flash-relative). Mirrors
-/// `firmware/src/boot.rs` `SECURE_PRIMARY_OFFSET` / the generated `memory.x`
-/// `SECURE @ 0x103F0000` (the firmware crate cannot be referenced from
-/// platform, so the boundary is encoded here and checked in the anonymous
-/// const assertion below).
-const SECURE_SLOT_OFFSET: u32 = 0x3F_0000;
-
-// Compile-time boundary check (decision D3): the trussed FS window must fit
-// inside the C data partition and must not overlap the secure-slot window.
-// Anonymous so there is no dead-code name surface; the asserts are
-// evaluated at compile time either way (an unused named const with a
-// failing assert still fails the build with E0080 — rustc const-checks
-// all const items).
-const _: () = {
-    let end = TRUSSED_FS_OFFSET + (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32;
-    assert!(
-        TRUSSED_FS_OFFSET >= cflash::PT_JSON_DATA_START,
-        "trussed FS window starts before the C data partition"
-    );
-    assert!(
-        end <= cflash::PT_JSON_DATA_START + cflash::PT_JSON_DATA_SIZE,
-        "trussed FS window exceeds the C data partition"
-    );
-    assert!(
-        end <= SECURE_SLOT_OFFSET,
-        "trussed FS window overlaps the secure image-slot window"
-    );
-};
 
 /// QSPI flash size, from the selected board file's `flash_size_kb` (4 MiB on
 /// the `pico2` board) — the same `Flash` instance the firmware boot path wraps
@@ -304,11 +274,19 @@ impl CryptoRng for Rp2350Rng {}
 /// by value (constructed at boot from `p.FLASH`; S-721-2 passes it in).
 pub struct DevFlashStorage {
     flash: DevFlash,
+    /// Flash-relative base this storage window covers. US-1536: this became a
+    /// field because the relocation reads the legacy window at one offset while
+    /// programming the current one at another, through the same flash handle.
+    offset: u32,
 }
 
 impl DevFlashStorage {
+    /// The live trussed window, at [`TRUSSED_FS_OFFSET`].
     pub fn new(flash: DevFlash) -> Self {
-        Self { flash }
+        Self {
+            flash,
+            offset: TRUSSED_FS_OFFSET,
+        }
     }
 }
 
@@ -324,14 +302,14 @@ impl Storage for DevFlashStorage {
 
     fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
         self.flash
-            .blocking_read(TRUSSED_FS_OFFSET + off as u32, buf)
+            .blocking_read(self.offset + off as u32, buf)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(buf.len())
     }
 
     fn write(&mut self, off: usize, data: &[u8]) -> littlefs2::io::Result<usize> {
         self.flash
-            .blocking_write(TRUSSED_FS_OFFSET + off as u32, data)
+            .blocking_write(self.offset + off as u32, data)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(data.len())
     }
@@ -339,8 +317,8 @@ impl Storage for DevFlashStorage {
     fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
         self.flash
             .blocking_erase(
-                TRUSSED_FS_OFFSET + off as u32,
-                TRUSSED_FS_OFFSET + (off + len) as u32,
+                self.offset + off as u32,
+                self.offset + (off + len) as u32,
             )
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(len)
@@ -456,6 +434,7 @@ impl DeviceFsStore {
             (*core::ptr::addr_of_mut!(IFS_ALLOC)).write(Allocation::new());
             let storage = (*core::ptr::addr_of_mut!(IFS_STORAGE)).as_mut_ptr();
             let alloc = (*core::ptr::addr_of_mut!(IFS_ALLOC)).as_mut_ptr();
+            relocate_legacy_window(&mut *storage);
             if !Filesystem::is_mountable(&mut *storage) {
                 defmt::info!("trussed: formatting internal FS (first boot)");
                 Filesystem::format(&mut *storage).expect("trussed: format internal FS");
@@ -483,6 +462,113 @@ impl DeviceFsStore {
         }
     }
 }
+
+/// One-shot relocation of the trussed window from its pre-US-1536 offset.
+///
+/// The window moved from `0x102_000` to `0x200_000` so the CI flash-budget
+/// ratchet can no longer reach it. A unit provisioned before that move has a
+/// populated littlefs2 volume at the old offset, and this is what carries it
+/// across — otherwise the move is a silent wipe of every OpenPGP and PIV key.
+///
+/// # Why it is safe to run on every boot
+///
+/// The legacy window is **read-only** here and never written. So the decision
+/// tree is naturally idempotent, with no marker record to keep in sync:
+///
+/// 1. the current window mounts → nothing to do (the normal case, including
+///    every boot after a successful relocation);
+/// 2. the current window is empty **and** the legacy window mounts → copy,
+///    then let the caller's `is_mountable` check confirm the result;
+/// 3. neither mounts → the caller's first-boot format, i.e. an unprovisioned
+///    unit starting empty at the new offset.
+///
+/// A power cut mid-copy therefore leaves the source intact and the destination
+/// un-mountable, which lands on arm 2 again next boot. There is no state in
+/// which the relocation has to be "told" to run.
+///
+/// # Why failure falls through to a format rather than halting
+///
+/// A copy that fails still leaves the caller's `is_mountable` false, which is
+/// the first-boot path: the unit comes up empty and reachable rather than
+/// parked. The legacy window is left intact for recovery. Halting here would
+/// trade a recoverable, loudly-logged empty device for an unreachable one, and
+/// the boot path's whole discipline is that the board always reaches USB.
+fn relocate_legacy_window(storage: &mut DevFlashStorage) {
+    if Filesystem::is_mountable(&mut *storage) {
+        return;
+    }
+    // Probe the legacy window by pointing this storage at it for the duration
+    // of the check and restoring the live offset immediately after. A second
+    // `DevFlashStorage` would need a second `Flash` handle, and `Flash` is not
+    // `Copy` — so this is the one arrangement that needs no aliasing.
+    let legacy_offset = crate::flashmap::LEGACY_TRUSSED_FS_OFFSET;
+    let live_offset = storage.offset;
+    storage.offset = legacy_offset;
+    let legacy_mounts = Filesystem::is_mountable(&mut *storage);
+    storage.offset = live_offset;
+    if !legacy_mounts {
+        defmt::info!("trussed: no legacy window; starting empty at the new offset");
+        return;
+    }
+
+    defmt::info!("trussed: relocating the internal FS to the new offset");
+    let window = (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32;
+    if let Err(e) = relocate_copy(storage, legacy_offset, window) {
+        defmt::error!("trussed: relocation failed ({=u8}); the legacy window is intact", e);
+        return;
+    }
+    if Filesystem::is_mountable(&mut *storage) {
+        defmt::info!("trussed: relocation complete");
+    } else {
+        defmt::error!("trussed: relocated window does not mount; starting empty");
+    }
+}
+
+/// Stream the legacy window into the current one.
+///
+/// Erase-then-program in [`WRITE_SIZE`]-aligned chunks — NOR flash cannot
+/// rewrite programmed bytes, and `WRITE_SIZE` is the flash page size, so a
+/// chunk is the largest unit that is always program-safe.
+///
+/// `Result<(), u8>` rather than `littlefs2::io::Result` because the error is
+/// only logged: the caller decides what an unmountable window means, and it is
+/// the first-boot path.
+fn relocate_copy(
+    storage: &mut DevFlashStorage,
+    legacy_offset: u32,
+    window: u32,
+) -> Result<(), u8> {
+    let mut buf = [0u8; RELOCATE_CHUNK];
+    for off in (0..window as usize).step_by(BLOCK_SIZE) {
+        storage
+            .flash
+            .blocking_erase(
+                TRUSSED_FS_OFFSET + off as u32,
+                TRUSSED_FS_OFFSET + (off + BLOCK_SIZE) as u32,
+            )
+            .map_err(|_| 1u8)?;
+    }
+    let mut copied = 0usize;
+    while copied < window as usize {
+        let flash = &mut storage.flash;
+        flash
+            .blocking_read(legacy_offset + copied as u32, &mut buf)
+            .map_err(|_| 2u8)?;
+        flash
+            .blocking_write(TRUSSED_FS_OFFSET + copied as u32, &buf)
+            .map_err(|_| 3u8)?;
+        copied += RELOCATE_CHUNK;
+    }
+    Ok(())
+}
+
+/// Chunk size for the relocation copy: one flash page (`embassy-rp`
+/// `PAGE_SIZE = 256`, which is also this driver's [`WRITE_SIZE`]).
+///
+/// Deliberately a small **stack** buffer. The relocation runs on the boot path
+/// before any task exists, where the main stack zone is 5,056 B — a large
+/// buffer here would be a stack overflow found only on hardware.
+const RELOCATE_CHUNK: usize = WRITE_SIZE;
 
 /// Format + mount one RAM-backed filesystem into its static triple.
 ///

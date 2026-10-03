@@ -153,6 +153,11 @@ pub mod store_v3;
 pub mod cflash;
 pub mod cfs;
 
+/// The flash map: one owner for every persistent region's offset, and the
+/// compile-time proof that the CI flash budget cannot reach any of them
+/// (US-1536).
+pub mod flashmap;
+
 /// C-firmware key hierarchy derivation (US-413 S-413-4).
 pub mod ckey;
 
