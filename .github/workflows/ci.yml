@@ -649,11 +649,17 @@ jobs:
         run: |
           set -uo pipefail
           echo "--- structural gates with no workflow of their own (US-1042) ---"
+          # US-1534: check_flash_budget.py joins this list rather than
+          # check_size_report.py's step on purpose. It parses two text files,
+          # so it can run here and fail a pull request in seconds; inside the
+          # device-build job it would run only after a full release build of
+          # the ELF, which is minutes per raise of the budget.
           rc=0
           for g in \
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \
+            tests/scripts/check_flash_budget.py \
             tests/scripts/check_otp_provisioning_precondition.py \
             tests/scripts/check_picoforge_compat_docs.py \
             tests/scripts/check_readme.py \
