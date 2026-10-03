@@ -445,6 +445,42 @@ mod tests {
         );
     }
 
+    /// The deadline's **value**, not only its relationship to the ceiling.
+    ///
+    /// Every other test here is written in terms of
+    /// [`HID_REPLY_WRITE_TIMEOUT_MS`], so each is satisfied by any value: the
+    /// `500`→`50` mutation left all six green. That is the direction the
+    /// constant's own doc cares about, because it is matched against
+    /// `CCID_REPLY_WRITE_TIMEOUT_MS` (`firmware/src/tasks.rs:200`), the CTAP
+    /// twin this path was modelled on — and, more sharply, because
+    /// [`crate::hid_serve::SERVE_BOUND_MS`] is *derived* from it as
+    /// `3 x HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS` and
+    /// published as a number a host is told to wait. Silently shrinking the
+    /// deadline to 50 ms would republish a 400 ms bound with no test anywhere
+    /// objecting. So the value is asserted directly, and so is the derivation,
+    /// so the published bound cannot drift silently.
+    #[test]
+    fn the_deadline_is_the_published_500_ms_and_bounds_the_serve_bound() {
+        assert_eq!(
+            HID_REPLY_WRITE_TIMEOUT_MS, 500,
+            "the CTAPHID reply-write deadline is matched to CCID_REPLY_WRITE_TIMEOUT_MS \
+             (firmware/src/tasks.rs), and SERVE_BOUND_MS is derived from it"
+        );
+        // The published bound, restated from its own term list (three replies
+        // + one keepalive period). If either input moves, the number hosts are
+        // told to wait moves with it — which is why the sum is asserted and
+        // not just the result.
+        assert_eq!(
+            crate::hid_serve::SERVE_BOUND_MS,
+            3 * HID_REPLY_WRITE_TIMEOUT_MS + crate::presence::CTAP_KEEPALIVE_PERIOD_MS
+        );
+        assert_eq!(
+            crate::hid_serve::SERVE_BOUND_MS, 1_750,
+            "500 + 500 + 500 + 250: the published serve bound"
+        );
+    }
+
+    /// A refused write is reported, not retried.
     #[test]
     fn a_refused_write_is_reported_not_retried() {
         /// A writer whose endpoint refuses every report.

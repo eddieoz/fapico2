@@ -397,8 +397,25 @@ mod tests {
     /// US-1510: the pinned 1024 B bound. A request above it is refused and
     /// leaves the slot empty, so it can never become a 30 s wait; one exactly
     /// at the bound is parked.
+    ///
+    /// The `assert_eq!` on the constant is the point of this test, not
+    /// decoration. The rest of the body is written in terms of
+    /// `PENDING_UP_PAYLOAD_MAX`, so on its own it is satisfied by *any* value:
+    /// halving the bound to 512 leaves every assertion here green. A smaller
+    /// slot is the dangerous direction — the spec's
+    /// `authenticatorMakeCredential` / `authenticatorGetAssertion` requests
+    /// must fit, and a bound below that refuses real ceremonies. Only *raising*
+    /// it was caught, and only by a different test
+    /// (`hid_serve::tests::us1510_an_oversize_request_is_refused_with_request_too_large`).
+    /// So the value the test is named for is pinned here directly.
     #[test]
     fn the_payload_bound_is_1024_and_is_never_parked_over() {
+        assert_eq!(
+            PENDING_UP_PAYLOAD_MAX, 1024,
+            "the bound is part of the contract, not an implementation detail: a real \
+             MakeCredential/GetAssertion must fit, and a hostile one must not be \
+             able to turn the slot into a memory-growth lever"
+        );
         let mut slot = PendingUp::new();
         let at_bound = [0x5Au8; PENDING_UP_PAYLOAD_MAX];
         assert_eq!(slot.park(ticket(1, 30_000), &at_bound), Ok(()));

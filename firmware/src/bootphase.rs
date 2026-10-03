@@ -478,6 +478,36 @@ mod tests {
         }
     }
 
+    /// PULSE_ON_US is a **short** pulse — it must not be mistaken for the
+    /// heartbeat's 500 ms on-time.
+    ///
+    /// `the_documented_readings_hold` pins the *total* (80 ms), so shrinking
+    /// the pulse is caught; but moving the on/off split within that total was
+    /// not: `PULSE_ON_US` 25 ms → 51 ms (and `PULSE_OFF_US` 55 → 29) left all
+    /// eight tests green. That matters because the on/off ratio is what makes
+    /// consecutive pulses countable by eye — a 51 ms-on pulse reads as a much
+    /// longer flash than the 25 ms the module's prose promises — and because
+    /// the module's stated reason for the value is that it must not be
+    /// confused with the heartbeat's 500 ms on-time. So both halves are pinned
+    /// here, to the values, not just to their relationship.
+    #[test]
+    fn the_pulse_is_a_short_flash_and_the_split_is_pinned() {
+        assert_eq!(PULSE_ON_US, 25_000, "the documented on-time, 25 ms");
+        assert_eq!(PULSE_OFF_US, 55_000, "the documented off-time, 55 ms");
+        assert_eq!(PULSE_US, 80_000);
+        // The load-bearing relationship: a ladder pulse must stay far below the
+        // 500 ms heartbeat on-time, or "parked before USB" and "alive but
+        // USB-dead" stop being one glance apart.
+        assert!(
+            PULSE_ON_US < 500_000,
+            "a pulse must not be mistakable for the heartbeat's 500 ms on-time"
+        );
+        assert!(
+            PULSE_ON_US * 4 < 500_000,
+            "and must stay well clear of it, not merely under it"
+        );
+    }
+
     /// The frozen-board readings the docs promise, as an executable table.
     #[test]
     fn the_documented_readings_hold() {
