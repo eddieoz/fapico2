@@ -1,3 +1,55 @@
+**Date:** 2026-10-03 (**the CTAPHID conformance fix on `fix/passkey-discovery`** —
+`tests/pico-fido/test_055_hid.py`, seven failures, bisected to `686c36b`. Three
+firmware corrections, all on the shipping CTAP-HID path: a `CTAPHID_INIT`
+handshake may now preempt an in-flight transaction instead of being answered
+`CHANNEL_BUSY` (which had no resynchronisation path out and wedged the channel
+for every later command), a zero-length CTAPHID CBOR message is answered with a
+CTAPHID ERROR frame carrying `INVALID_LEN` instead of a *successful* CBOR frame
+carrying `INVALID_COMMAND`, and the emulator finally models a touch landing
+inside the consent window. See `.superpowers/sdd/report-ctaphid-regression.md`.)
+**Measured: `text` 818,376 → 818,400 B (**+24 B**); `.rodata` 18,716 B
+(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
+stack zone 110,512 B (**0**); worst call chain 91,988 B (**0**, 6,316 B of
+margin against the 98,304 B ceiling); task-arena demand 21,944 B (**0** — no
+task future grew; the stamp moved `59c34a8dd4f7…` → `2ebb12bd8466…` because the
+fingerprint covers `firmware/src`, and it was re-measured with
+`measure_task_arena.py`, the authority). UF2 **3072 → 3072 blocks** (1 absolute
+preamble + 3071 ARM_S payload), **1,572,864 bytes, unchanged**. Shipping
+sha256 `306f5568f450…` → **`a822ff6b44b1077205587797b72d98723ff3716243c4b847787bd032c0c94d68`.**
+Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
+`measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
+
+```
+firmware/fapico2.uf2: 3072 blocks (1 absolute preamble + 3071 ARM_S payload), 1572864 bytes
+a822ff6b44b1077205587797b72d98723ff3716243c4b847787bd032c0c94d68  firmware/fapico2.uf2
+```
+
+**The +24 B is all `.text`, and the block count did not move.** Two of the three
+corrections are near-free by construction — an extra `cmd != CTAP_HID_INIT`
+comparison in the assembler, and one more constant on an existing reply — so
+the 24 B is alignment and register pressure, not a new function. The third
+correction is where the honesty is worth stating plainly: the natural place to
+fix the missing CTAPHID keepalive was the **device's** dispatch, which is what
+the C reference does (`pico-keys-sdk/src/usb/hid/hid.c:585-587` emits a
+`0x01 PROCESSING` for every accepted CTAP2 command). That was built and
+measured: **+164 B**, which is 1,572,864 → 1,573,376 B, i.e. **3,072 → 3,073
+blocks — the one thing the ratchet exists to refuse.** So the touch is modelled
+in the *emulator* instead (`firmware/src/emul_main.rs::emul_touch_lands_in_window`,
+with the gate it needs added to the host twin `apps/fido/src/app.rs`, which is
+`#[cfg(feature = "host")]` and contributes **0 B** to this image). The
+observable consequence is the same or better: the emulator's makeCredential now
+opens a **real** consent window and emits the board's own opening `0x01
+PROCESSING` frame, which is what `test_055_hid.py::test_keep_alive` asserts —
+whereas the device-side version would have satisfied the same assertion with a
+frame no board ever sends.
+
+**This entry does not raise `FIRMWARE_FLASH_BUDGET_KIB`.** It stays **1536**,
+the image stays on 3072 of 3072 blocks, and the slack stays zero — which is
+the number the next change has to beat, and is the reason a 164 B fix had to
+be routed through the test double rather than the firmware.
+
+---
+
 **Date:** 2026-10-02 (**the boot-phase LED diagnosability ladder** — commits
 `5b15f48`, `63c9009`, `d0a94ca`, `f96f3d7`. A post-mortem read channel for a
 board that flashes cleanly and then never re-enumerates: nine rungs driven on
@@ -1208,10 +1260,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,400 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb3c0` | no (flash) |
+| `.text` | 766,424 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb3d8` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfda0` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfdc0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1219,14 +1271,14 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
 
-Berkeley `text` = 766,400 (`.text`) + 18,716 (`.rodata`) + 276
+Berkeley `text` = 766,424 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,376**. That identity is stated so a reader can check
+the `X` flag) = **818,400**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,376 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,400 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 

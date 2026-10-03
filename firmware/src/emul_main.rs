@@ -46,6 +46,46 @@ use fapico2_fido::CTAP2_MAX_MSG;
 /// acted on".
 static EMUL_RESET_GENERATION: AtomicU32 = AtomicU32::new(0);
 
+/// The emulation's FIDO user-presence source: a touch that lands **during**
+/// the consent window, not one already down when the command arrives.
+///
+/// US-1524 follow-up. Until this the host twin's `FidoApp` had no presence
+/// gate at all (`apps/fido/src/app.rs`, the `presence` field), so
+/// `process_ctap2` could never answer `UpRequired`, `hid_serve` never parked,
+/// and the emulator put **no CTAPHID keepalive on the wire, ever** — not for
+/// `makeCredential`, not for anything.
+///
+/// That is not a neutral simplification. On the board a `makeCredential`
+/// with no touch pending answers `UpRequired`, parks, and emits a
+/// `0x01 PROCESSING` keepalive before it can answer. So the double refuses
+/// the **first** poll and grants the second: park, `0x01 PROCESSING`,
+/// re-drive, grant, answer — the board's frame sequence minus the human.
+/// `fetch_not` alternates rather than latching, so *every* presence-gated
+/// command takes that shape and not merely the first one after boot; a
+/// latching version would make the answer depend on how many commands
+/// happened to precede it, which is the order-dependence this removes.
+///
+/// It lives here, in the emulation binary, rather than in the shared serve
+/// loop on purpose: it is a property of the test double, not of the
+/// firmware. Putting the equivalent frame in the device's dispatch instead
+/// was measured at +164 B of `.text`, which is more than the flash ratchet
+/// has left (the image already sits on 3072 of 3072 blocks), so the honest
+/// place to stand in for a missing human is the emulator.
+///
+/// Consequences, both matching the board:
+/// * U2F `REGISTER`/`AUTHENTICATE` also park for one pass. The MSG arm sends
+///   no frame at the park (deliberately, US-1506 — a `PROCESSING` ahead of a
+///   quick U2F response desyncs U2FHID hosts), so their observable frames
+///   are unchanged; only one extra serve pass is added.
+/// * Any command that consults presence more than once per call is granted
+///   on the later poll, which is the old instant-grant behaviour.
+static EMUL_TOUCH_LATE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn emul_touch_lands_in_window() -> bool {
+    EMUL_TOUCH_LATE.fetch_not(Ordering::Relaxed)
+}
+
 /// US-711 emulation parity: the emulation stand-in for the device's
 /// `DeviceFactoryResetHandler`. The device handler additionally deletes the
 /// FIDO/OpenPGP secure-store slots so a power cut mid-reset boots
@@ -418,7 +458,8 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut fido_app = FidoApp::with_keystore(keystore);
+    let mut fido_app =
+        FidoApp::with_keystore(keystore).with_user_presence(emul_touch_lands_in_window);
 
     // US-423: canonical post-load image (device parity) — the boot persist
     // gate compares the post-boot store against this.

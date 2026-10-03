@@ -324,11 +324,26 @@ impl HidAssembler {
                 return HidFeed::Err(channel, HID_ERR_INVALID_CHANNEL);
             }
 
-            if self.expecting_cont && channel != self.channel {
+            if self.expecting_cont && channel != self.channel && cmd != CTAP_HID_INIT {
                 // US-705.1: any INIT-packet-shaped frame from a *different*
                 // channel while a transaction is in flight is rejected with
                 // CHANNEL_BUSY — a second INIT (broadcast or not) must never
                 // silently preempt the in-flight transaction.
+                //
+                // **Except `CTAPHID_INIT` itself**, which the exemption is
+                // keyed on. The handshake is the host's resynchronisation
+                // primitive: CTAPHID §11.2.1 has it allocate a fresh channel
+                // and reset the reassembly state, and the reference does
+                // exactly that — `pico-keys-sdk/src/usb/hid/hid.c:403-424`
+                // skips the whole busy guard when
+                // `ctap_req->init.cmd != CTAPHID_INIT` is false, then
+                // `hid.c:455-458` runs `msg_packet.len = msg_packet.current_len = 0`
+                // for an INIT. Without the exemption a host whose
+                // transaction was abandoned mid-flight has **no way back**:
+                // every INIT it sends is answered CHANNEL_BUSY, and the only
+                // thing that clears `expecting_cont` is the 500 ms
+                // transaction timeout, so `test_ping_abort_from_different_cid`
+                // wedges the channel for every later test.
                 return HidFeed::Err(channel, HID_ERR_CHANNEL_BUSY);
             }
             if self.expecting_cont && channel == self.channel && cmd != CTAP_HID_INIT {
@@ -482,6 +497,23 @@ mod tests {
         f
     }
 
+    /// The same, for an arbitrary CTAPHID command (an INIT-packet whose
+    /// command is not `CTAPHID_INIT`) — the shape a second host uses to try
+    /// to preempt a transaction in flight.
+    fn cmd_init_frame(
+        channel: [u8; 4],
+        cmd: u8,
+        payload: &[u8],
+        total_len: u16,
+    ) -> [u8; HID_REPORT_SIZE] {
+        let mut f = [0u8; HID_REPORT_SIZE];
+        f[..4].copy_from_slice(&channel);
+        f[4] = cmd | TYPE_INIT;
+        f[5..7].copy_from_slice(&total_len.to_be_bytes());
+        f[7..7 + payload.len()].copy_from_slice(payload);
+        f
+    }
+
     fn cont_frame(channel: [u8; 4], seq: u8, bytes: &[u8]) -> [u8; HID_REPORT_SIZE] {
         let mut f = [0u8; HID_REPORT_SIZE];
         f[..4].copy_from_slice(&channel);
@@ -567,9 +599,10 @@ mod tests {
         }
     }
 
-    /// US-705.1: an INIT from another (or the broadcast) channel while a
-    /// transaction is in flight is refused with CHANNEL_BUSY and the
-    /// in-flight transaction survives.
+    /// US-705.1: an init-packet from another channel while a transaction is
+    /// in flight is refused with CHANNEL_BUSY and the in-flight transaction
+    /// survives — **unless the command is `CTAPHID_INIT`**, the handshake,
+    /// which preempts by design (see `feed`).
     #[test]
     fn init_from_other_channel_mid_transaction_is_busy() {
         let mut asm = HidAssembler::new(fake_now);
@@ -580,15 +613,24 @@ mod tests {
             asm.feed(&init_frame(host, &[9; 8], 100)),
             HidFeed::NeedMore
         ));
-        // A second INIT — broadcast or any other channel — cannot preempt.
-        for chan in [HID_CID_BROADCAST, [0x55, 0x66, 0x77, 0x88]] {
-            match asm.feed(&init_frame(chan, &[1; 8], 8)) {
-                HidFeed::Err(c, code) => {
-                    assert_eq!(c, chan);
-                    assert_eq!(code, HID_ERR_CHANNEL_BUSY);
-                }
-                other => panic!("expected CHANNEL_BUSY for {chan:?}, got {other:?}"),
+        // A second INIT *packet* — any other channel — cannot preempt.
+        let other: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+        match asm.feed(&cmd_init_frame(other, CTAP_HID_PING, &[1; 4], 4)) {
+            HidFeed::Err(c, code) => {
+                assert_eq!(c, other);
+                assert_eq!(code, HID_ERR_CHANNEL_BUSY);
             }
+            other => panic!("expected CHANNEL_BUSY for {other:?}, got {other:?}"),
+        }
+        // The broadcast channel refuses every non-INIT command outright, and
+        // that rule is checked first (it is the channel rule, not the
+        // transaction rule) — so this is INVALID_CHANNEL, not CHANNEL_BUSY.
+        match asm.feed(&cmd_init_frame(HID_CID_BROADCAST, CTAP_HID_PING, &[1; 4], 4)) {
+            HidFeed::Err(c, code) => {
+                assert_eq!(c, HID_CID_BROADCAST);
+                assert_eq!(code, HID_ERR_INVALID_CHANNEL);
+            }
+            other => panic!("expected INVALID_CHANNEL on broadcast, got {other:?}"),
         }
         // The original transaction still completes on its own channel
         // (57 first-report bytes + 43 continuation bytes = the 100 announced).
@@ -599,6 +641,46 @@ mod tests {
             }
             other => panic!("in-flight transaction preempted: {other:?}"),
         }
+    }
+
+    /// US-1524: `CTAPHID_INIT` **preempts** an in-flight transaction from
+    /// another channel and is answered on the requesting channel — it is the
+    /// host's resynchronisation primitive, so it must never be answered
+    /// CHANNEL_BUSY.
+    ///
+    /// Reference: `pico-keys-sdk/src/usb/hid/hid.c:403-424` skips the busy
+    /// guard when the incoming command is `CTAPHID_INIT`, and `hid.c:455-458`
+    /// clears `msg_packet` for an INIT. CTAPHID §11.2.1 has the handshake
+    /// allocate a fresh channel.
+    #[test]
+    fn ctaphid_init_preempts_an_in_flight_transaction() {
+        let mut asm = HidAssembler::new(fake_now);
+        let host: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let other: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+
+        assert!(matches!(
+            asm.feed(&init_frame(host, &[9; 8], 100)),
+            HidFeed::NeedMore
+        ));
+        // A handshake on another channel mid-transaction: Ready, on `other`.
+        match asm.feed(&init_frame(other, &[1; 8], 8)) {
+            HidFeed::Ready(cmd) => {
+                assert_eq!(cmd, CTAP_HID_INIT);
+                assert_eq!(asm.channel(), other, "the reply goes to the requester's channel");
+            }
+            other => panic!("CTAPHID_INIT must preempt, got {other:?}"),
+        }
+        // The aborted transaction no longer holds the assembler: the old
+        // channel's continuation is a stray and is dropped, not an error.
+        assert!(matches!(
+            asm.feed(&cont_frame(host, 0, &[0xAA; 43])),
+            HidFeed::NeedMore
+        ));
+        // …and `other` can still run a fresh transaction.
+        assert!(matches!(
+            asm.feed(&cmd_init_frame(other, CTAP_HID_PING, &[], 4)),
+            HidFeed::Ready(CTAP_HID_PING)
+        ));
     }
 
     /// The injected clock drives the transaction timeout (unchanged

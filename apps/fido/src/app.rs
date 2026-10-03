@@ -289,6 +289,20 @@ pub struct FidoApp<K: Keystore = MemoryKeystore> {
     /// When enabled, makeCredential uses enterprise attestation. Stored in
     /// keystore pin state for persistence across reboot.
     enterprise_attestation: bool,
+    /// US-1524 follow-up: the user-presence source for the **host** twin.
+    ///
+    /// `None` is the build default — grant immediately — so every existing
+    /// host suite is untouched. `Some(f)` makes a presence-gated command
+    /// answer `CTAP2 UpRequired` while `f()` says the touch has not landed,
+    /// which is what turns the shipped serve loop's consent window on.
+    ///
+    /// The device twin has its own, richer version of this
+    /// (`device_app.rs::FidoApp::with_user_presence`, feeding the shared
+    /// presence runtime); this one exists because the *emulator* runs the host
+    /// twin, and an emulator that grants presence before the command has run
+    /// can never answer the CTAPHID question a real authenticator answers
+    /// every time: does a makeCredential report progress?
+    presence: Option<fn() -> bool>,
 }
 
 /// Holds the credentials matched by a getAssertion so getNextAssertion can
@@ -421,6 +435,26 @@ impl<K: Keystore> FidoApp<K> {
             lb_pending: None,
             vault_pending: None,
             enterprise_attestation: false,
+            presence: None,
+        }
+    }
+
+    /// US-1524 follow-up: attach the user-presence source (see the field).
+    /// `None` (the default) grants immediately; the emulator attaches a
+    /// source whose touch lands inside the consent window, which is the only
+    /// way the emulator's CTAPHID frames can be the board's frames.
+    pub fn with_user_presence(mut self, f: fn() -> bool) -> Self {
+        self.presence = Some(f);
+        self
+    }
+
+    /// The user-presence answer for a presence-gated command. `false` means
+    /// "the touch has not landed", i.e. answer `UpRequired` and let the
+    /// transport open a consent window.
+    fn user_present(&mut self) -> bool {
+        match self.presence {
+            Some(f) => f(),
+            None => true,
         }
     }
 
@@ -596,8 +630,14 @@ impl<K: Keystore> FidoApp<K> {
     pub fn process_u2f(&mut self, apdu: &[u8]) -> Vec<u8> {
         // US-908: the host/emulation default presence source auto-acks
         // (parity with the device build default), keeping the existing
-        // suites green; the gate itself lives in the U2F twins.
-        let (data, status) = match crate::u2f::process_u2f_apdu(apdu, &mut self.keystore, || true, &self.attestation) {
+        // suites green; the gate itself lives in the U2F twins. With a
+        // source attached (`with_user_presence`) the refusal is real and the
+        // transport turns it into a consent window, exactly as on the board.
+        let poll = || match self.presence {
+            Some(f) => f(),
+            None => true,
+        };
+        let (data, status) = match crate::u2f::process_u2f_apdu(apdu, &mut self.keystore, poll, &self.attestation) {
             Ok(data) => (data, crate::u2f::U2fStatus::NoError.code()),
             Err(status) => (vec![], status.code()),
         };
@@ -1380,6 +1420,15 @@ impl<K: Keystore> FidoApp<K> {
         if !uv && self.keystore.get_pin_state().always_uv {
             return vec![Ctap2Response::PuatRequired.code()];
         }
+        // US-1524 follow-up: the touch. The device twin gates here too
+        // (`device_core.rs::make_credential_inner`, the `user_present(tag)`
+        // check); this twin had none, which is why the emulator's
+        // `process_ctap2` could never answer `UpRequired`, no consent window
+        // ever opened, and no CTAPHID keepalive was ever emitted — see the
+        // `presence` field's doc comment.
+        if req.options.up != Some(false) && !self.user_present() {
+            return vec![Ctap2Response::UpRequired.code()];
+        }
 
         // 5) Generate a keypair for the requested algorithm.
         // US-1007: a source that cannot produce entropy now answers here
@@ -1773,6 +1822,15 @@ impl<K: Keystore> FidoApp<K> {
 
         if matched.is_empty() {
             return vec![Ctap2Response::NoCredentials.code()];
+        }
+
+        // US-1524 follow-up: the touch, gated the same way makeCredential
+        // gates it and at the same point in the decision order — after the
+        // credential lookup, so a request with nothing to assert is still
+        // answered `NO_CREDENTIALS` and never parks a consent window. The
+        // device twin's equivalent is `device_core.rs:1237`.
+        if do_up && !self.user_present() {
+            return vec![Ctap2Response::UpRequired.code()];
         }
 
         if !req.allow_list.is_empty() {

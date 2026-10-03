@@ -59,7 +59,7 @@ use crate::ctap_hid::{
     init_reply, CidAllocator, HidAssembler, HidFeed, HID_REPORT_SIZE, CTAP2_ERR_KEEPALIVE_CANCEL,
     CTAP_HID_CANCEL, CTAP_HID_CBOR, CTAP_HID_ERROR, CTAP_HID_INIT, CTAP_HID_KEEPALIVE,
     CTAP_HID_MSG, CTAP_HID_PING, CTAP_HID_WINK, CTAPHID_KEEPALIVE_PROCESSING,
-    CTAPHID_KEEPALIVE_UPNEEDED, HID_ERR_INVALID_CMD,
+    CTAPHID_KEEPALIVE_UPNEEDED, HID_ERR_INVALID_CMD, HID_ERR_INVALID_LEN,
 };
 use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
 use crate::presence::{self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, TouchWindow};
@@ -726,7 +726,27 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         reply(io, channel, cmd, tlv.as_slice()).await;
     } else if cmd == CTAP_HID_CBOR {
         if payload.is_empty() {
-            reply(io, channel, CTAP_HID_CBOR, &[HID_ERR_INVALID_CMD]).await;
+            // A CTAPHID CBOR message with a zero-length payload is a
+            // **framing** refusal, not a CTAP2 answer: there is no CTAP2
+            // opcode byte to read, so it can never reach `process_ctap2`.
+            // The reference answers it with a CTAPHID ERROR frame carrying
+            // `CTAP1_ERR_INVALID_LEN` —
+            // `pico-fido2/src/fido/cbor.c:44-46`
+            // (`if (len == 0 && cmd == CTAPHID_CBOR) return CTAP1_ERR_INVALID_LEN;`)
+            // turned into an error frame by
+            // `pico-keys-sdk/src/usb/hid/hid.c:632-633`
+            // (`if (thread_type == 2 && apdu.sw != 0) ctap_error(apdu.sw & 0xff);`),
+            // the frame itself written by `ctap_error` at `hid.c:305-313`
+            // (`CTAPHID_ERROR` / `bcntl = 1`).
+            //
+            // This used to answer `CTAP_HID_CBOR` / `0x01 INVALID_COMMAND`,
+            // which is wrong twice over: the frame reads as a *successful*
+            // CBOR response to the host's eyes (`fido2/hid/__init__.py:219-222`
+            // matches `TYPE_INIT | cmd` and returns the body, raising
+            // nothing), and `0x01` is not the code the spec has for a length
+            // error. `tests/pico-fido/test_055_hid.py::test_cbor_no_payload`
+            // is the conformance witness for both halves.
+            reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_LEN]).await;
             return;
         }
         let ctap_cmd = payload[0];

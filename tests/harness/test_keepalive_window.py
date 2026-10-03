@@ -7,13 +7,18 @@ than a second implementation's.
 
 The observable sequence is the device's:
 
-  - makeCredential/getAssertion: the CBOR answer and nothing else. The
-    unconditional pre-dispatch `0x02` keepalive US-1506 removed from the
-    board is gone here too — it claimed "waiting for your touch" before the
-    command had been run. The host FIDO app auto-acks presence, so no
-    consent window opens at all and there is no frame to put in one.
+  - makeCredential/getAssertion: the consent window really opens, so the
+    window's opening `0x01 PROCESSING` keepalive goes out, then the CBOR
+    answer — and **never** `0x02`. The unconditional pre-dispatch `0x02`
+    keepalive US-1506 removed from the board is gone here too: it claimed
+    "waiting for your touch" before the command had run. A later change
+    (US-1524's follow-up) gave the emulator a touch that lands *during* the
+    window, so the window exists and the `0x01` that opens it is the board's
+    own frame rather than an emulator invention.
   - U2F register: a direct MSG reply (SW 0x9000), no keepalive, fragmented
     into one INIT report plus continuations when it does not fit in one.
+    (It parks for one pass too; the MSG arm sends no frame at the park, by
+    US-1506.)
 
 Before US-1524 this suite asserted "exactly one 0x3B/0x02 keepalive before
 the CBOR reply" — the emulator's own dispatcher emitted that frame and the
@@ -173,16 +178,30 @@ def emu(tmp_path):
         e.stop()
 
 
-def test_mc_answers_cbor_with_no_keepalive(emu):
-    """makeCredential: the CBOR success and nothing else.
+def test_mc_answers_cbor_after_the_window_opens(emu):
+    """makeCredential: `0x01 PROCESSING`, then the CBOR success. Never `0x02`.
 
-    The emulator's FIDO app auto-acks presence, so `process_ctap2` never
-    answers `UpRequired` and the shared serve loop never parks a consent
-    window — which means there is no frame a keepalive could legitimately
-    precede. US-1506 removed the unconditional pre-dispatch `0x02` from the
-    board for exactly that reason (it emitted 301 of them in a 30 s window);
-    US-1524 removed the emulator's remaining copy of it. A keepalive here
-    would be the divergence returning.
+    This is the board's sequence, and after US-1524's follow-up it is the
+    emulator's too. The emulator's FIDO app used to auto-ack presence, so
+    `process_ctap2` never answered `UpRequired`, the shared serve loop never
+    parked a consent window, and no CTAPHID keepalive was emitted at all —
+    which meant the emulator could not answer a question the board answers on
+    every single makeCredential: *does this command report progress?*
+    `tests/pico-fido/test_055_hid.py::test_keep_alive` is the conformance
+    witness, and it was red against the emulator.
+
+    The touch is now modelled where it actually happens — in the double
+    (`firmware/src/emul_main.rs::emul_touch_lands_in_window`), which refuses
+    the first poll and grants the second, so the command parks for exactly
+    one serve pass. The keepalive therefore comes out of a **real** consent
+    window, byte for byte what `hid_serve` puts on the board.
+
+    US-1506's `0x02` ban is unchanged and is now asserted directly rather
+    than inferred from an absence: `0x02 UP_NEEDED` claims a human's
+    attention is owed, and the reference only makes it
+    (`is_req_button_pending() ? 2 : 1`, `pico-keys-sdk/src/usb/hid/hid.c:622`)
+    while a button wait is genuinely pending. The window here is granted on
+    the next pass, so it never is, and `0x01` is the only honest status.
     """
     req = cbor_encode(
         {
@@ -195,10 +214,18 @@ def test_mc_answers_cbor_with_no_keepalive(emu):
     emu.send_cbor(0x01, req)
     first = emu.recv_frame()
     # Reply command bytes carry the CTAPHID type bit (0x80|cmd).
-    assert first[4] == 0x80 | 0x10, (
-        f"expected the CBOR reply first, got {first[4]:02x}"
+    assert first[4] == 0x80 | 0x3B, (
+        f"expected the window's PROCESSING keepalive first, got {first[4]:02x}"
     )
-    resp = emu.recv_cbor(first)
+    assert bytes(first[7:8]) == b"\x01", (
+        "the window's opening keepalive is 0x01 PROCESSING — never the 0x02 "
+        f"UP_NEEDED US-1506 removed, got {bytes(first[7:8])!r}"
+    )
+    second = emu.recv_frame()
+    assert second[4] == 0x80 | 0x10, (
+        f"expected the CBOR reply second, got {second[4]:02x}"
+    )
+    resp = emu.recv_cbor(second)
     assert resp[0] == 0x00, f"makeCredential failed: {resp[0]:02x}"
 
 
