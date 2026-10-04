@@ -1640,7 +1640,21 @@ impl OathApp {
                 None
             }
         };
-        self.refresh_session_grant();
+        // **The session grant is deliberately not recomputed here.**
+        //
+        // This used to end with `refresh_session_grant()`, which was a
+        // category error: the function reconciles **one slot** against the
+        // medium, and medium-vs-RAM agreement says nothing about whether the
+        // current session was authenticated. Its only effect was to log the user
+        // out — on any device with an access code or PIN the grant is derived
+        // false, so a single transient flash failure during a write flipped
+        // `validated` from true (a completed VALIDATE) to false, and the next
+        // command answered 0x6982 with no explanation.
+        //
+        // The two states are genuinely independent: a session can be
+        // authenticated while a commit is in doubt, and the correct answer to
+        // "I do not know what this slot holds" is to stop serving *that slot*,
+        // which `self.slots[index] = None` above already does.
     }
 
     /// US-1553: rebuild a `Cred` from a region record by opening its
@@ -2499,7 +2513,10 @@ impl OathApp {
                 return SW_CONDITIONS_NOT_SATISFIED;
             }
             self.access_code = None;
-            // Removing the code does not re-grant a non-virgin app (US-901).
+            // Removing the access code **re-grants**, because the grant is
+            // "there is no secret to authenticate with" — and after this line
+            // there is none. (This comment previously claimed the opposite, on
+            // the virginity rule; see [`Self::refresh_session_grant`].)
             self.refresh_session_grant();
             self.dirty = true;
             return SW_OK;

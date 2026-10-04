@@ -1402,3 +1402,119 @@ fn a_rebooted_region_device_with_no_access_code_still_lists_its_credentials() {
         "the credential committed before the reboot must still be listed after it"
     );
 }
+
+/// **One undecodable record does not brick PUT.**
+///
+/// `attach_region` deliberately leaves a slot whose record will not decode as
+/// an **empty** table slot rather than reserving it forever against a
+/// credential this firmware can never serve — and its comment claims "the next
+/// PUT overwrites it at a strictly higher generation". That claim is the
+/// load-bearing part, because the two layers could easily disagree: the applet
+/// offers the slot as free (its RAM entry is `None`), while the store still
+/// holds bytes there.
+///
+/// They do agree, and this is why: `OathStore::current_generation` answers `0`
+/// for a slot whose record fails to decode — the same value an empty slot
+/// returns — so `next_generation` yields 1, which *does* advance past what the
+/// commit path re-reads, and the commit is allowed.
+///
+/// An earlier review claimed this path was a permanent brick, on the reasoning
+/// that `OathStore::write` refuses to overwrite an unreadable slot. It does not:
+/// that refusal is about a slot the *allocator* must not hand out, and the
+/// allocator here is the applet's RAM table. The property is worth pinning
+/// because the reasoning is genuinely easy to get wrong in the other direction —
+/// "reserve the slot" is the other defensible answer, and it would leak the slot
+/// against a credential nobody can use.
+#[test]
+fn one_undecodable_record_does_not_brick_put() {
+    let temp = TempRegion::new("undecodable-reuse");
+    // Garbage that is neither erased nor a decodable record: the header CRC
+    // cannot pass, so `record::decode` reports a fault for this slot alone.
+    {
+        let mut r = open_region(temp.path());
+        r.program(Slot::new(0).expect("slot 0"), 0, &[0xABu8; 256])
+            .expect("plant junk");
+    }
+
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    assert_eq!(
+        app.attach_region(OathRegion::new(
+            Box::new(FileKeyRegion::open(temp.path()).expect("reopen")),
+            payload_key(),
+        )),
+        RegionStatus::Mounted { live: 0, imported: 0 },
+        "one undecodable record must not stop the mount"
+    );
+
+    // The new credential takes the lowest free slot — the poisoned one.
+    assert_eq!(
+        put_cred(&mut app, b"fresh", &[0x21, 6, b's', b'e', b'c', b'r', b'e', b't']),
+        0x9000,
+        "a PUT into a slot holding an undecodable record must succeed"
+    );
+    let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "LIST after recovering a poisoned slot");
+    assert!(
+        !body.is_empty(),
+        "the recovered credential must be listed: a PUT that answers 0x9000 and writes nothing \
+         would be the real brick"
+    );
+}
+
+/// **A failed commit does not log the user out mid-session.**
+///
+/// `region_reconcile` — the path taken after a refused commit — used to end
+/// with `refresh_session_grant()`. That is a category error: the function
+/// reconciles **one slot** against the medium, and medium-vs-RAM agreement says
+/// nothing about whether the session was authenticated.
+///
+/// The effect was a self-inflicted logout. On any device with an access code or
+/// PIN the grant is *derived* false, so a single transient flash failure during
+/// a write flipped `validated` from true (a VALIDATE had completed) to false,
+/// and the next command answered 0x6982 with nothing to explain it. The applet
+/// could not recover without the owner re-entering their password.
+///
+/// Set up here with a **PIN** rather than an access code: it is the same
+/// derived-false shape, and it avoids needing the full SET_CODE challenge
+/// handshake, so the test isolates the reconcile behaviour.
+#[test]
+fn a_failed_commit_does_not_ungrant_an_authenticated_session() {
+    let (probe, _temp) = Probe::new("reconcile-no-ungrant");
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    probe.mount(&mut app);
+
+    // Authenticate with the OTP PIN, so `validated` is true and the grant is
+    // *derived* false (a PIN exists) — exactly the shape that used to break.
+    let pin = b"123456";
+    assert_eq!(
+        drive(&mut app, &apdu(0xB4, 0, 0, &[0x80, pin.len() as u8].into_iter().chain(pin.iter().copied()).collect::<Vec<u8>>())).1,
+        0x9000,
+        "SET_PIN"
+    );
+    assert_eq!(
+        drive(&mut app, &apdu(0xB2, 0, 0, &[0x80, pin.len() as u8].into_iter().chain(pin.iter().copied()).collect::<Vec<u8>>())).1,
+        0x9000,
+        "VERIFY_PIN grants the session"
+    );
+    let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "precondition: the session is authenticated");
+
+    // A commit that fails at the live erase, which routes through
+    // `region_reconcile`.
+    probe.set_faults(F_ERASES);
+    let name = maximal_name(0);
+    let sw = put_cred(&mut app, &name, &[0x5Au8; MAXIMAL_SECRET]);
+    probe.clear_faults();
+    assert_ne!(
+        sw, 0x9000,
+        "precondition: the faulted commit must be refused, or nothing is being tested"
+    );
+
+    // The session must survive it. Before the fix this answered 0x6982.
+    let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(
+        sw, 0x9000,
+        "a failed commit must not un-grant an authenticated session — the reconcile is about \
+         one slot, not about who is logged in"
+    );
+}
