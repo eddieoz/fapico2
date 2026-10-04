@@ -572,6 +572,22 @@ class CcidEmu:
 
 
 OATH_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
+
+# Mirrors the client handshake: SELECT carries a challenge, VALIDATE answers it
+# with HMAC-SHA1 of the access code. Needed since the device provisions a
+# default one on boot, so a bare SELECT leaves the session unvalidated.
+OATH_DEFAULT_ACCESS_CODE = b"123456"
+
+
+def _authenticate_oath(client, code: bytes = OATH_DEFAULT_ACCESS_CODE) -> None:
+    body = _ccid_select(client, OATH_AID)
+    i = body.find(bytes([0x74, 8]))
+    assert i >= 0, f"OATH SELECT served no 74 challenge: {body.hex()}"
+    chal = body[i + 2:i + 10]
+    mac = hmac.new(code, chal, hashlib.sha1).digest()
+    data = bytes([0x74, 8]) + chal + bytes([0x75, len(mac)]) + mac
+    _, sw = client.apdu(0x00, 0xA3, 0x00, 0x00, data=data)
+    assert sw == 0x9000, f"OATH VALIDATE failed: SW={sw:04x}"
 OTP_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01]
 MGMT_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17]
 
@@ -635,7 +651,10 @@ def _run_oath(paths: dict):
     emu = CcidEmu(paths, MATRIX_HID_PORT)
     emu.start()
     try:
-        _ccid_select(emu.client, OATH_AID)
+        # Authenticate first: the device provisions a default access code, so
+        # a bare SELECT would leave this session unvalidated and the PUT below
+        # would be refused 6982.
+        _authenticate_oath(emu.client)
         # PUT one credential: name "kaka" + a 22-byte HMAC-SHA1 key.
         key = bytes([0x21, 0x06]) + bytes([0x0B] * 20)
         put_data = bytes([0x71, 0x04, 0x6B, 0x61, 0x6B, 0x61, 0x73, 0x16]) + key

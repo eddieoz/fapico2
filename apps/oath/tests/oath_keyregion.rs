@@ -1310,9 +1310,10 @@ fn a_device_with_no_access_code_is_usable_on_both_paths() {
     let (mut region, _probe, _temp) = mounted("compat-region");
 
     for (path, app) in [("legacy", &mut legacy), ("region", &mut region)] {
-        let app = app;
-        // 1. REGISTER. No VALIDATE first — there is no access code, and a
-        //    client cannot know that without a SELECT it has not sent yet.
+        // 1. REGISTER with no prior VALIDATE. These applets are built with
+        //    `OathApp::new`, which does not provision the default access code,
+        //    so there is genuinely nothing to authenticate against. That is the
+        //    escape hatch a device reaches after its owner clears the code.
         assert_eq!(
             put_cred(app, b"GitHub:eddieoz", &[0x21, 6, b's', b'e', b'c', b'r', b'e', b't']),
             0x9000,

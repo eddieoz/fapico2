@@ -150,6 +150,9 @@ fn reselect_after_put_keeps_the_session_usable() {
     )
     .expect("boot");
     let _ = select(&mut booted);
+    // The applet came up (or was reset) with the default access code, so
+    // it must be authenticated before it will list anything.
+    authenticate_with_default(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000, "a booted applet with no access code must serve LIST");
     assert!(
@@ -181,6 +184,9 @@ fn boot_restore_of_a_non_virgin_app_with_no_access_code_is_usable() {
     )
     .expect("boot");
     select(&mut booted);
+    // The applet came up (or was reset) with the default access code, so
+    // it must be authenticated before it will list anything.
+    authenticate_with_default(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(
         sw, 0x9000,
@@ -259,6 +265,9 @@ fn boot_with_only_access_code_is_locked() {
     )
     .expect("boot");
     let _ = select(&mut booted);
+    // This test provisioned **its own** access code, so the default must not
+    // be used to authenticate — and the session must still be unvalidated,
+    // which is the property being asserted.
     let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x6982, "access-code-only app boots locked");
 }
@@ -387,6 +396,41 @@ fn validate_data(challenge: &[u8], response: &[u8]) -> Vec<u8> {
     data
 }
 
+/// SELECT then VALIDATE with the documented default access code.
+///
+/// **This is the picoforge / ykman flow.** A device ships with an access code
+/// ([`fapico2_oath::oath_core::DEFAULT_ACCESS_CODE`]), SELECT therefore
+/// advertises a `74` challenge, and the client authenticates with the password
+/// it already knows — the same `123456` the owner types for OpenPGP's user
+/// PIN. Without this the applet is locked, which is correct (an unauthenticated
+/// session must not dump credentials) and useless (no client can get in).
+fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
+    let sel = select(app);
+    let chal = challenge_of(&sel);
+    let mac = hmac_sha1(fapico2_oath::oath_core::DEFAULT_ACCESS_CODE, &chal);
+    let mut data = vec![0x74, 8];
+    data.extend_from_slice(&chal);
+    data.extend_from_slice(&[0x75, mac.len() as u8]);
+    data.extend_from_slice(&mac);
+    let (body, sw) = drive(app, &apdu(0xA3, 0, 0, &data));
+    assert_eq!(
+        sw, 0x9000,
+        "VALIDATE with the default access code must grant — this is the flow both clients run"
+    );
+    body
+}
+
+/// The 8-byte challenge from a SELECT response's `74` TLV.
+fn challenge_of(sel: &[u8]) -> [u8; 8] {
+    let at = sel
+        .windows(2)
+        .position(|w| w == [0x74, 8])
+        .expect("a device with an access code must advertise a 74 challenge TLV");
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&sel[at + 2..at + 10]);
+    out
+}
+
 fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha1::Sha1;
@@ -436,16 +480,24 @@ fn reset_without_prior_validate_succeeds_with_presence_and_wipes() {
         "US-132: a bare 00 04 DE AD with a touch must succeed (picoforge Reset)"
     );
 
-    // The table really is gone: the app is virgin again, so LIST is granted
-    // and empty.
+    // The table really is gone. A reset re-provisions the **default access
+    // code**, so the emptied applet is locked rather than open — which is the
+    // point of provisioning one. Authenticate, then require an empty LIST.
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(sw, 0x9000, "the wipe left a virgin app");
+    assert_eq!(
+        sw, 0x9000,
+        "the wipe left an applet that authenticates with the default code"
+    );
     assert!(body.is_empty(), "the credential table was wiped");
 
     // And the wipe is durable: persist + boot yields a token with no
     // credentials, i.e. the store no longer holds the entry.
     let mut booted = boot_after_persist(&mut app);
     let _ = select(&mut booted);
+    // The applet came up (or was reset) with the default access code, so
+    // it must be authenticated before it will list anything.
+    authenticate_with_default(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the wipe survived persist + boot");
@@ -529,6 +581,9 @@ fn reset_validated_with_presence_wipes_and_persists_empty() {
     )
     .expect("boot");
     let _ = select(&mut booted);
+    // The applet came up (or was reset) with the default access code, so
+    // it must be authenticated before it will list anything.
+    authenticate_with_default(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "wiped app lists no credentials");
@@ -554,7 +609,9 @@ fn reset_presence_grant_binds_to_the_reset_tag() {
     let (_, sw) = drive(&mut app, &apdu(0x04, 0xDE, 0xAD, &[]));
     assert_eq!(sw, 0x9000, "RESET consumes the grant armed for its own tag");
 
-    // The wipe ran: the app is virgin again, LIST is granted and empty.
+    // The wipe ran. The reset re-provisioned the default access code, so the
+    // applet is locked until it is authenticated — as any provisioned device is.
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "wiped app lists no credentials");
@@ -611,6 +668,9 @@ fn reset_wrong_p1p2_is_parse_error_first() {
 /// app answered `0x6982` — but that only established the app was non-virgin,
 /// never that *the credential* was still there. It now says what it means.
 fn assert_credential_survives(app: &mut OathApp, after: &str) {
+    // A booted device carries the default access code, so it must be
+    // authenticated before it will list anything — which is the point.
+    authenticate_with_default(app);
     let (body, sw) = drive(app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(
         sw, 0x9000,
@@ -1034,6 +1094,7 @@ fn set_code_clear_without_presence_is_refused() {
     // the VALIDATE handshake is still required (LIST refuses until granted).
     let sel = select(&mut app);
     assert!(sel.contains(&0x74), "access code survived the refusal");
+    // As above: this applet has its own access code, not the default.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x6982, "session is still unvalidated after the refusal");
 }
@@ -1189,6 +1250,9 @@ fn oath_reset_granted_on_second_call_wipes_once() {
     // The wipe ran exactly once: the app is virgin again.
     let mut booted = boot_after_persist(&mut app);
     let _ = select(&mut booted);
+    // The applet came up (or was reset) with the default access code, so
+    // it must be authenticated before it will list anything.
+    authenticate_with_default(&mut booted);
     let (body, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "wiped app lists no credentials");

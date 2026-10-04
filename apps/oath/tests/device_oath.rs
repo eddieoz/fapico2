@@ -7,7 +7,7 @@
 //! stream reproduces the C device's OUTPUTS byte for byte.
 
 use fapico2_oath::oath_core::{
-    device_id_from_chipid, OathApp, DEVICE_ID_LEN, EMULATION_CHIPID, OATH_AID,
+    device_id_from_chipid, OathApp, DEFAULT_ACCESS_CODE, DEVICE_ID_LEN, EMULATION_CHIPID, OATH_AID,
 };
 use fapico2_oath::OathSeal;
 use fapico2_platform::dispatch::{App, MAX_RESPONSE};
@@ -124,6 +124,33 @@ fn select_with_chipid(chipid: Option<u64>) -> Vec<u8> {
     let device_id = device_id_from_chipid(chipid.unwrap_or(EMULATION_CHIPID));
     let mut app = OathApp::new(&mut HostTrng::new(), device_id, OathSeal::emul());
     select(&mut app)
+}
+
+/// SELECT, then VALIDATE with the documented default access code
+/// ([`DEFAULT_ACCESS_CODE`]).
+///
+/// This is the picoforge / ykman flow, and the only way into an applet that
+/// `boot` or `reset_state` provisioned. It is setup, not a claim: the
+/// access code is `123456`, and the point of provisioning one is that
+/// "unauthenticated" is never "open" — so every test that authenticates
+/// here still has to earn its `0x9000` on the other side.
+fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
+    let sel = select(app);
+    let chal = tlv_find(&sel, 0x74)
+        .expect("an app carrying an access code must advertise a 74 challenge TLV");
+    assert_eq!(chal.len(), 8, "the 74 challenge is 8 bytes");
+    let mac = hmac_sha1(DEFAULT_ACCESS_CODE, &chal);
+    let mut data = vec![0x74, 8];
+    data.extend_from_slice(&chal);
+    data.extend_from_slice(&[0x75, mac.len() as u8]);
+    data.extend_from_slice(&mac);
+    let (body, sw) = drive(app, &apdu(0xA3, 0, 0, &data));
+    assert_eq!(
+        sw, 0x9000,
+        "VALIDATE with the documented default access code must grant — this is the \
+         flow both first-party clients run"
+    );
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +554,10 @@ fn reboot_preserves_creds_and_access_code() {
         OathSeal::emul(),
     )
     .expect("boot fresh");
+
+    // `boot` provisioned the default access code, so this session starts
+    // unvalidated and every PUT below would answer 0x6982.
+    authenticate_with_default(&mut app);
 
     // 20 TOTP creds + 1 HOTP with IMF — large enough to span two chunked
     // parts, so the reboot crosses a multi-part set.
@@ -957,24 +988,23 @@ fn select_returns_version_deviceid_and_challenge() {
 
     // The trigger is the OATH *access code*, not the OTP PIN. A PIN-only
     // applet must still report `password_set() == false`, or a host prompts
-    // for a password that was never set. Boot one from a stream carrying a
-    // well-formed salted PIN record (49 B: counter, 16-byte salt, 32-byte
-    // verifier) and nothing else.
-    let mut pin_store = HostSecureStore::new();
-    write_migration_stream(&mut pin_store, &record(0xBA44, &[0x09u8; 49]));
-    let mut pin_app = OathApp::boot(
-        &mut HostTrng::new(),
-        &mut pin_store,
-        emul_device_id(),
-        OathSeal::emul(),
-    )
-    .expect("boot with OTP PIN");
-    // The record must actually have decoded into a PIN, or the case is void.
-    let (_, sw) = drive(&mut pin_app, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(
-        sw, 0x6982,
-        "the PIN record decoded (a PIN locks the session) — otherwise this \
-         sub-case proves nothing"
+    // for a password that was never set.
+    //
+    // `OathApp::new` is the one constructor that does **not** provision the
+    // default access code, and SET_PIN needs only a validated session — which
+    // a code-less applet has. So this is the reachable way to reach the state
+    // the claim is about: a PIN with nothing else on file. (Booting a PIN
+    // record instead no longer reaches it at all, because `boot` provisions
+    // a code — see the converse case below.)
+    let mut pin_app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    let mut pin_data = vec![0x80, 3];
+    pin_data.extend_from_slice(b"123");
+    let (_, sw) = drive(&mut pin_app, &apdu(0xB4, 0, 0, &pin_data));
+    assert_eq!(sw, 0x9000, "SET_PIN on the code-less applet");
+    // The PIN must actually be on file, or the case is void.
+    assert!(
+        pin_app.otp_pin_record().is_some(),
+        "the PIN record decoded — otherwise this sub-case proves nothing"
     );
     let pin_tags: Vec<u8> = tlvs(&select(&mut pin_app))
         .into_iter()
@@ -984,6 +1014,38 @@ fn select_returns_version_deviceid_and_challenge() {
         pin_tags,
         vec![0x79, 0x71],
         "an OTP PIN is not an OATH access code: still no challenge"
+    );
+
+    // The converse, which is what the default code changed: a device that
+    // *boots* with a PIN record now **does** advertise a challenge — because
+    // `boot` provisioned an access code, not because of the PIN. The
+    // attribution is what is worth asserting, so answer the challenge with
+    // the access code and show the PIN neither grants nor is needed for.
+    let mut pin_store = HostSecureStore::new();
+    write_migration_stream(&mut pin_store, &record(0xBA44, &[0x09u8; 49]));
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut pin_store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot with OTP PIN");
+    assert!(
+        booted.otp_pin_record().is_some(),
+        "the PIN record decoded from the stream"
+    );
+    let sel = select(&mut booted);
+    assert_eq!(
+        tlvs(&sel).iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![0x79, 0x71, 0x74],
+        "a booted device carries the default access code, so SELECT advertises a \
+         challenge — this is the password a host must answer, not the OTP PIN"
+    );
+    authenticate_with_default(&mut booted);
+    let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(
+        sw, 0x9000,
+        "the challenge answers to the access code: VALIDATE with it unlocks the session"
     );
 }
 
@@ -1397,7 +1459,9 @@ fn hex_bytes(s: &str) -> Vec<u8> {
 /// `Apdu::write(CLA_ISO, INS_RESET, 0xDE, 0xAD, &[])` and **no** VALIDATE.
 /// Since US-132 dropped the session gate, that call reaches the applet: with
 /// the `0xDE`/`0xAD` magic and a user-presence grant — the two gates that
-/// remain — the bare RESET wipes the table (0x9000) and leaves a virgin applet.
+/// remain — the bare RESET wipes the table (0x9000) and leaves the applet in
+/// the state a factory-fresh device is in: no credentials, and the
+/// **documented default** access code rather than no code at all.
 ///
 /// The APDU here is the 5-byte form `00 04 DE AD 00` (the harness's
 /// case-1 + Le=0 encoding, which is what the C reference's own suite sends).
@@ -1424,7 +1488,7 @@ fn picoforge_bare_reset_wipes_without_validate() {
         let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
         assert_eq!(sw, 0x9000, "PUT before commissioning");
     }
-    let _key = picoforge_commission(&mut app);
+    let owner_key = picoforge_commission(&mut app);
     let _ = select(&mut app);
     // Unvalidated: LIST refuses. This is the gate US-132 removed for RESET.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
@@ -1437,15 +1501,34 @@ fn picoforge_bare_reset_wipes_without_validate() {
         "US-132: a bare 00 04 DE AD with a touch must succeed"
     );
 
-    // Wiped: virgin again, so LIST is granted and empty, and SELECT no longer
-    // advertises a challenge (the access code is gone too).
+    // The owner's access code is gone: VALIDATE with the key the applet was
+    // commissioned under must now fail.
+    let chal = select_challenge(&select(&mut app));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(&owner_key, &chal, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the owner's access code did not survive the reset"
+    );
+
+    // What a reset leaves is the **documented default** access code, not an
+    // open applet — so the device is locked again and must authenticate
+    // before it will list anything.
+    assert!(
+        tlv_find(&select(&mut app), 0x74).is_some(),
+        "the reset left the default access code in place, so SELECT advertises a challenge"
+    );
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(
-        !select(&mut app).contains(&0x74),
-        "the access code was wiped"
-    );
 }
 
 /// US-132: the same bare RESET with the touch withheld is refused (0x6985)
@@ -1497,7 +1580,7 @@ fn picoforge_bare_reset_without_presence_is_refused() {
 
 /// US-132, the test that makes the story real: picoforge's **exact wire
 /// bytes**, no padding added, with a presence grant and **no prior VALIDATE**
-/// → `0x9000`, credential table wiped, access code wiped.
+/// → `0x9000`, credential table wiped, the owner's access code wiped.
 #[test]
 fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
     let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
@@ -1510,7 +1593,7 @@ fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
         let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
         assert_eq!(sw, 0x9000, "PUT before commissioning");
     }
-    let _key = picoforge_commission(&mut app);
+    let owner_key = picoforge_commission(&mut app);
     let _ = select(&mut app);
     // Unvalidated: the session gate US-132 removed is the one in play here.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
@@ -1525,14 +1608,34 @@ fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
         "US-132: picoforge's 4-byte 00 04 DE AD must reach cmd_reset and wipe"
     );
 
-    // The wipe really ran: virgin applet, no credentials, no access code.
+    // The owner's access code is gone: VALIDATE with the key the applet was
+    // commissioned under must now fail.
+    let chal = select_challenge(&select(&mut app));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(&owner_key, &chal, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the owner's access code did not survive the reset"
+    );
+
+    // What a reset leaves is the **documented default** access code, not an
+    // open applet — so the device is locked again and must authenticate
+    // before it will list anything.
+    assert!(
+        tlv_find(&select(&mut app), 0x74).is_some(),
+        "the reset left the default access code in place, so SELECT advertises a challenge"
+    );
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(
-        !select(&mut app).contains(&0x74),
-        "the access code was wiped"
-    );
 }
 
 /// A frame too short to carry even a case-1 header is still garbage: 3 bytes
@@ -1574,6 +1677,9 @@ fn other_apdu_lengths_are_unaffected_by_the_case1_fix() {
     ] {
         let (_, sw) = drive(&mut app, &frame);
         assert_eq!(sw, 0x9000, "{name} RESET still reaches cmd_reset");
+        // The RESET left the documented default access code, so the session
+        // must authenticate before the table can be written back.
+        authenticate_with_default(&mut app);
         put_kaka(&mut app); // restore the wiped table for the next case
     }
 
@@ -2513,5 +2619,8 @@ fn reset_gates_are_the_magic_and_the_touch_and_nothing_else() {
     );
     let (_, sw) = drive(&mut app, &[0x00, 0x04, 0xDE, 0xAD, 0x00]);
     assert_eq!(sw, 0x9000, "magic + touch and nothing else is required");
+    // The wipe left the documented default access code, so the emptied table
+    // can only be read through an authenticated session.
+    authenticate_with_default(&mut app);
     assert!(table(&mut app).is_empty(), "the table really was wiped");
 }

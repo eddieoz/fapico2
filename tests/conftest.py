@@ -675,14 +675,92 @@ def pin_gate_lifted_once(card):
     restore_factory_card(card)
 
 
-@pytest.fixture(scope="class")
-def select_oath(ccid_card):
-    aid = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
+# --- OATH session authentication -------------------------------------------
+#
+# The applet provisions a documented default access code on every path that can
+# end up without one -- both boots (`OathApp::boot_in_place`) and the factory
+# reset (`reset_state`) -- so "no access code" is not a reachable state
+# (`apps/oath/src/oath_core.rs::provision_default_access_code`,
+# `DEFAULT_ACCESS_CODE = b"123456"`). Consequence for a host driver: a fresh
+# session is UNVALIDATED and every credential command answers 0x6982 until
+# VALIDATE runs.
+#
+# This is the handshake BOTH first-party clients already run, and it is why the
+# applet can afford to keep the lockout: `yubikit/oath.py` decides from the
+# SELECT response alone (`_has_key = self._challenge is not None`) and picoforge
+# from `info.password_set()`, then each answers the `74` challenge with
+# HMAC-SHA1 of the access code. The harness runs the same three steps rather
+# than assuming the applet grants itself.
+
+OATH_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
+OATH_DEFAULT_ACCESS_CODE = b"123456"
+OATH_TAG_CHALLENGE = 0x74
+OATH_TAG_RESPONSE = 0x75
+OATH_INS_VALIDATE = 0xA3
+
+import hmac as _hmac
+import hashlib as _hashlib
+
+
+def select_oath_aid(ccid_card):
+    """SELECT the OATH applet; returns the response body (TLVs, no SW)."""
     resp, sw1, sw2 = ccid_card.connection.transmit(
-        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, len(aid)] + aid + [0x00, 0x00]
+        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, len(OATH_AID)] + OATH_AID + [0x00, 0x00]
     )
     assert [sw1, sw2] == [0x90, 0x00], "OATH SELECT failed: %02X%02X" % (sw1, sw2)
+    return resp
+
+
+def oath_select_challenge(select_body):
+    """The `74` challenge value out of a SELECT response, or None.
+
+    The applet serves it only while an access code is on file -- which, since
+    the default-code provisioning, is always.
+    """
+    i = 0
+    while i + 1 < len(select_body):
+        tag, ln = select_body[i], select_body[i + 1]
+        if tag == OATH_TAG_CHALLENGE:
+            return bytes(select_body[i + 2:i + 2 + ln])
+        i += 2 + ln
+    return None
+
+
+def authenticate_oath(ccid_card, code=OATH_DEFAULT_ACCESS_CODE):
+    """SELECT + VALIDATE, i.e. the client flow both first-party clients use.
+
+    Mirrors ykman/yubikit and picoforge: read the challenge off the SELECT
+    response, answer it with HMAC-SHA1 of the access code (INS 0xA3, `74`
+    challenge + `75` proof), and every credential command is served until the
+    next host-issued SELECT drops the grant again.
+    """
+    # SELECT picks up the challenge; VALIDATE answers it. Same two steps the
+    # clients take, so a test that calls this is exercising a reachable path.
+    chal = oath_select_challenge(select_oath_aid(ccid_card))
+    assert chal is not None and len(chal) == 8, (
+        "OATH SELECT served no VALIDATE challenge: %s" % (chal,)
+    )
+    mac = _hmac.new(code, chal, _hashlib.sha1).digest()
+    data = [OATH_TAG_CHALLENGE, len(chal)] + list(chal) \
+        + [OATH_TAG_RESPONSE, len(mac)] + list(mac)
+    resp, sw1, sw2 = ccid_card.connection.transmit(
+        [0x00, OATH_INS_VALIDATE, 0x00, 0x00, len(data)] + data + [0x00, 0x00]
+    )
+    assert [sw1, sw2] == [0x90, 0x00], "OATH VALIDATE failed: %02X%02X" % (sw1, sw2)
+    return resp
+
+
+@pytest.fixture(scope="class")
+def select_oath(ccid_card):
+    select_oath_aid(ccid_card)
     return ccid_card
+
+
+@pytest.fixture(scope="class")
+def oath_session(reset_oath):
+    """A re-virginized OATH applet with an authenticated (validated) session."""
+    authenticate_oath(reset_oath)  # mirrors the client flow: SELECT + VALIDATE
+    return reset_oath
 
 
 @pytest.fixture(scope="class")
@@ -698,17 +776,25 @@ def reset_oath(select_oath):
     # session locked and every credential command is refused with 6982". That
     # was true, and it is why the whole suite was **blind** to the defect: every
     # OATH test began by re-virginizing, so none of them ever held a credential
-    # across a SELECT — which is the only state picoforge and ykman reach. The
-    # lockout is gone (a device with no access code is granted, because there is
-    # no secret to authenticate with), and `test_070_oath.py::
-    # a_credential_survives_a_new_session_without_an_access_code` now exercises
-    # the path these fixtures used to route around.
+    # across a SELECT -- which is the only state picoforge and ykman reach. A
+    # narrower version of the gap then reopened, in the other direction: with
+    # "no access code" no longer a reachable state (the applet provisions
+    # `DEFAULT_ACCESS_CODE` on boot and on reset), every session is locked and
+    # the fixture has to authenticate. What the fixture must NOT do is
+    # authenticate on the tests whose subject is the lockout --
+    # `test_070_oath.py::test_noauth` and the red-team refusals take
+    # `reset_oath` itself, deliberately.
     #
     # US-132 (PICOForge-COMPAT): OATH RESET (04/DE/AD) is NOT in that list any
     # more — its US-903 session gate was removed so the reference client's
     # bare, unlocked Reset reaches the applet. The 0xDE/0xAD magic and the
     # user-presence grant are the only two gates it still has.
     # (docs/tasks/us132-oath-reset-picocompat.md)
+    #
+    # This fixture deliberately leaves the session UNVALIDATED: the applet's
+    # RESET re-provisions the default access code, so a client that wants the
+    # table must run the SELECT + VALIDATE handshake — `oath_session`, or
+    # `authenticate_oath()` mid-test.
     mgmt_aid = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17]
     resp, sw1, sw2 = select_oath.connection.transmit(
         [0x00, 0xA4, 0x04, 0x00, len(mgmt_aid)] + mgmt_aid

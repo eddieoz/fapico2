@@ -357,6 +357,43 @@ const MAX_NAME: usize = 64;
 const MAX_KEY: usize = 66;
 /// C `OATH_ACCESS_CODE_MAX_LEN`.
 const MAX_ACCESS_CODE: usize = 65;
+
+/// The access code a device ships with, and the reason "no access code" can
+/// never mean "open".
+///
+/// # Why a device that trusts nobody has a code everyone knows
+///
+/// US-901 granted a session only to a **virgin** applet, so a device holding
+/// credentials and no access code was locked — and both first-party clients
+/// cannot recover from that, because `yubikit/oath.py`
+/// (`_has_key = self._challenge is not None`) and picoforge
+/// (`info.password_set()`) decide whether to authenticate from the SELECT
+/// response's `74` challenge TLV alone, which this applet emits only when an
+/// access code exists. Every credential command then answered `0x6982`, and
+/// `SET_CODE` — the only way out — sat behind the same gate.
+///
+/// Relaxing that to "granted whenever there is no code" fixed the clients and
+/// **reopened a closed red-team finding**: with no code configured, an
+/// unauthenticated session could `LIST` every credential name and `CALC_ALL`
+/// every live TOTP digest.
+///
+/// This is the third option, and it is the one that keeps both. The applet
+/// always has a secret to authenticate against — a **known** one — so an
+/// unauthenticated session is refused exactly as before, while a client that
+/// *can* authenticate is not locked out. The owner types `123456` once, the
+/// same default they already type for OpenPGP's user PIN, and changes it from
+/// either GUI afterwards.
+///
+/// # The residual, stated plainly
+///
+/// Until the owner changes it, anyone holding the token who tries `123456`
+/// gets in. That is **not** a mitigation — it is the OpenPGP default-PIN
+/// posture, chosen deliberately: the protection a user relies on is a
+/// credential they have changed, and a documented default is visible where a
+/// hidden lockout is not. It is recorded in `docs/secure-storage-story-matrix.md`
+/// and the OATH section of `AGENTS.md` so no future reader mistakes it for
+/// defence in depth.
+pub const DEFAULT_ACCESS_CODE: &[u8] = b"123456";
 const FID_CRED_BASE: u16 = 0xBA00;
 const FID_CRED_MAX: u16 = FID_CRED_BASE + MAX_CREDS as u16 - 1;
 const FID_ACCESS_CODE: u16 = 0xBAFF;
@@ -965,6 +1002,35 @@ impl OathApp {
     ///
     /// This is the single place the grant is derived; never store a self-grant
     /// blindly.
+    /// US-901 follow-on: make sure an access code exists, so that "no code"
+    /// is never a reachable state on a device.
+    ///
+    /// Idempotent — an existing code is left alone, so a device that has been
+    /// provisioned (or whose owner has chosen a code) is untouched. Called from
+    /// every path that can end up without one: the two boots, and
+    /// [`Self::reset_state`].
+    ///
+    /// **Deliberately does not mark `dirty`.** The default is a *constant*, so
+    /// persisting it would buy nothing: a boot that finds no access code
+    /// re-derives exactly this value, and a boot that finds one has a real
+    /// owner-chosen code. Writing it would add a store write to the boot path
+    /// and grow the secure partition on every device for no behavioural
+    /// difference — and that growth is visible, because `FlashInfo.used`
+    /// reports the partition length.
+    ///
+    /// What *is* persisted is a code the owner chooses: `cmd_set_code` sets
+    /// `dirty` itself, and that write is the one that matters.
+    fn provision_default_access_code(&mut self) {
+        if self.access_code.is_some() {
+            return;
+        }
+        let mut arr = [0u8; MAX_ACCESS_CODE];
+        arr[0] = ALG_SHA1;
+        let n = DEFAULT_ACCESS_CODE.len();
+        arr[1..=n].copy_from_slice(DEFAULT_ACCESS_CODE);
+        self.access_code = Some((arr, (n + 1) as u8));
+    }
+
     fn refresh_session_grant(&mut self) {
         self.validated = self.access_code.is_none() && self.pin.is_none();
     }
@@ -1219,13 +1285,24 @@ impl OathApp {
             Ok(n) => n,
             Err(SecureStoreError::NotFound) => match store.read(STATE_SLOT, &mut buf) {
                 Ok(n) => n,
-                Err(SecureStoreError::NotFound) => return Ok(app),
+                Err(SecureStoreError::NotFound) => {
+                    // Fresh device: provision the default rather than starting
+                    // with no secret at all.
+                    app.provision_default_access_code();
+                    app.refresh_session_grant();
+                    return Ok(app);
+                }
                 Err(e) => return Err(e),
             },
             Err(e) => return Err(e),
         };
         app.load_stream(&buf[..n])?;
-        // Boot restore must not leave a non-virgin app validated (US-901).
+        // A device must always have something to authenticate against — see
+        // [`DEFAULT_ACCESS_CODE`]. On a fresh device the early `return Ok(app)`
+        // above skips this, so it is done here for the loaded case and again
+        // on the not-found path below.
+        app.provision_default_access_code();
+        // Boot restore must not leave a session validated (US-901).
         app.refresh_session_grant();
         // US-1030: re-seal before the app is reachable by any APDU. A
         // failure here is a boot failure (see the note above) — the
@@ -1268,6 +1345,11 @@ impl OathApp {
         self.slots.fill(None);
         self.access_code = None;
         self.pin = None;
+        // A factory reset returns the applet to the state a fresh device is in,
+        // and that state carries the documented default access code — not an
+        // open one. Without this, a reset would leave the most-protected
+        // configuration in the product.
+        self.provision_default_access_code();
         self.refresh_session_grant();
     }
 
