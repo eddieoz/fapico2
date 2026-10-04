@@ -43,26 +43,14 @@
 //! | [`the_built_card_writes_its_state_to_the_internal_filesystem`] | pass | the override being dropped, observed rather than read |
 //! | [`every_options_construction_site_is_accounted_for`] | pass | a **new** site appearing silently |
 //! | [`the_only_excluded_file_is_this_one`] | pass | the enumeration's own exclusion list growing |
-//! | [`the_generated_private_key_follows_the_card_location`] | **RED, `#[ignore]`d** | opcard `gen.rs` — reported, not fixed |
+//! | [`the_private_key_is_only_ever_persisted_wrapped`] | pass | `state.rs` wrapping the private key into flash being removed |
 //!
-//! # Why the last one is red
+//! # Why there is no RED row
 //!
-//! `vendor/opcard/src/command/gen.rs:171` and `:217` hardcode
-//! `set_persistence(Location::Volatile)` when **generating** the private
-//! key, while `:183` and `:229` stamp `ctx.options.storage` on the derived
-//! public key and on the keyref that `State::set_key` writes into the
-//! persistent state file. The import path has the same shape
-//! (`private_key_template.rs:269`, `:363`). The state file therefore holds a
-//! **keyref to a key that was created in the volatile filesystem** — after a
-//! reboot the ref dangles and the key is gone, with no error at any point:
-//! the write succeeded, into something a power cycle takes away.
-//!
-//! That is a real latent bug and it is **not this story's to fix** — US-1537
-//! adds tests only. It is parked the same way the `External`-is-RAM
-//! assertion is parked in the platform file: `#[ignore]`d, runnable, and
-//! failing today with the citations in the message. Whether opcard is
-//! patched or the divergence is accepted is US-1537's report to make, not
-//! its test's to decide silently.
+//! An earlier revision carried a seventh test, RED and `#[ignore]`d, whose
+//! premise turned out to be **false** — see section 6 below and the comment on
+//! [`the_private_key_is_only_ever_persisted_wrapped`]. Parking a wrong test is
+//! not the same as parking a right one.
 
 use std::path::{Path, PathBuf};
 
@@ -468,74 +456,162 @@ fn every_options_construction_site_is_accounted_for() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. The private key (parked — reported, not fixed)
+// 6. The private key: wrapped into flash, never stored in the clear
 // ---------------------------------------------------------------------------
 
-/// # A real latent bug, recorded rather than closed
+/// # The generated private key is durable, and deliberately not in `ifs` as a
+/// # plaintext key object
 ///
-/// `vendor/opcard/src/command/gen.rs` generates the private key with
-/// `set_persistence(Location::Volatile)` at `:171` (RSA) and `:217` (EC),
-/// while the derived **public** key at `:183`/`:229` and the keyref that
-/// `State::set_key` writes into the persistent state file both use
-/// `ctx.options.storage`. The import path has the same shape
-/// (`private_key_template.rs:269`, `:363`).
+/// An earlier revision of this file carried a seventh test,
+/// `the_generated_private_key_follows_the_card_location`, `#[ignore]`d and RED.
+/// **Its premise was false and its `#[ignore]` reason was wrong** — and that is
+/// a worse thing to leave in a tree than a missing test: someone eventually
+/// "fixes" it, and the fix stores OpenPGP private keys in **plaintext in QSPI
+/// flash**, with nothing on the client side to report it. `gpg --card-edit`,
+/// Yubikey Manager and PicoForge would all still work, which is exactly what
+/// makes it dangerous.
 ///
-/// So: a generated key lives in the RAM filesystem, and a reference to it
-/// lives in the flash filesystem. After a reboot the reference dangles —
-/// `GET PUBLIC KEY` returns nothing usable, `PSO:CDS` cannot find the key,
-/// and the card reports it in the ordinary way a missing key is reported
-/// rather than as a storage fault.
+/// What it claimed: `vendor/opcard/src/command/gen.rs:171` and `:217` stamp
+/// `Location::Volatile` on the generated private key while the public key and
+/// the "persistent keyref" use `ctx.options.storage`, so the state file holds
+/// a reference to a key living in `vfs` and the reference dangles on the next
+/// power cycle.
 ///
-/// **This story does not fix it.** US-1537 is "assert every key's storage
-/// location", and `vendor/opcard` is run deliberately unmodified apart from
-/// two named review patches (US-912, US-914 — see the `device_shell.rs`
-/// `new()` doc comment). Patching `gen.rs` is a different decision, with a
-/// different blast radius, and it is not one this test gets to make silently.
-///
-/// The assertion is therefore `#[ignore]`d rather than deleted: it states
-/// the policy S13 asks for, fails today, and is runnable
+/// What is actually there, in `vendor/opcard/src/state.rs:573-591`:
 ///
 /// ```text
-/// cargo test -p fapico2-openpgp --test key_storage_location -- --ignored
+/// syscall!(client.wrap_key_to_file(          // ChaCha8Poly1305, user_kek
+///     Mechanism::Chacha8Poly1305, user_kek,
+///     new_id, path, storage,                 // <- `storage` is ctx.options.storage: flash
+///     path_str.as_str().as_bytes()));
+/// *private_to_change = Some(new_id);
+/// syscall!(client.clear(new_id));            // zeroes the plaintext RAM copy
 /// ```
 ///
-/// so whoever takes the fix can see exactly what turns green.
+/// `State::set_key` stores no resolvable keyref to the volatile key. It
+/// **ChaChaPoly-wraps** the private key with the PW1-derived user key into
+/// `signing_key.bin` **on flash**, then clears the plaintext trussed handle.
+/// `signing_private_to_delete` is the id of a *cleared object*, not a reference
+/// the load path resolves. The read side is symmetric — `state.rs:640-692`
+/// calls `unwrap_key_from_file(..., storage, ...)` and returns the plaintext to
+/// `vfs` only for the duration of the operation.
+///
+/// So `Location::Volatile` on the private key is not a defect. It is the
+/// design: *plaintext in RAM only, wrapped in flash, plaintext back into RAM
+/// only for the operation.* Four documents in this repository say so, and they
+/// are right:
+///
+/// - `platform/src/trusted_backend/device.rs:522` — "`Location::Volatile` is
+///   what RAM is *for* … **because the private key must not outlive the
+///   operation that made it**";
+/// - `docs/tasks/EPIC-secure-storage.md` §6 — "`Location::Volatile` → `vfs()` is
+///   every software key generation … that is this epic's own list of things it
+///   does not change";
+/// - US-1538's requirement — "`Volatile` stays RAM — that is what volatile means,
+///   and software key generation uses it deliberately";
+/// - `docs/secure-storage-comparison.md` §1.4, on pico-openpgp — "Keys are never
+///   stored in RAM except for signature and decryption operations".
+///
+/// It is also **empirically** durable rather than merely argued to be:
+/// `apps/openpgp/tests/device_pso.rs::kdf_do_reboot_survival_and_removal_device_path`
+/// imports a private key at `Location::Volatile`, lets the RAM filesystem die,
+/// and gets the same shared secret out of `PSO:DECIPHER` afterwards.
+///
+/// The gap that is real is that **nothing gates the wrap**. That is the
+/// property a refactor could break, and it is what
+/// [`the_private_key_is_only_ever_persisted_wrapped`] now asserts.
+
 #[test]
-#[ignore = "RED: vendor/opcard/src/command/gen.rs generates the private key at \
-            Location::Volatile while the public key and the persistent keyref use \
-            ctx.options.storage. Not fixed by US-1537 — see the module docs."]
-fn the_generated_private_key_follows_the_card_location() {
+fn the_private_key_is_only_ever_persisted_wrapped() {
     let root = workspace_root();
-    let gen = root.join("vendor/opcard/src/command/gen.rs");
-    let src = std::fs::read_to_string(&gen).expect("vendor/opcard/src/command/gen.rs must exist");
+    let state = root.join("vendor/opcard/src/state.rs");
+    let src = std::fs::read_to_string(&state).expect("vendor/opcard/src/state.rs must exist");
 
-    let offenders: Vec<String> = src
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| l.contains("set_persistence(Location::Volatile)"))
-        .map(|(i, l)| format!("{}:{}: {}", rel(&root, &gen), i + 1, l.trim()))
-        .collect();
-
+    // The wrap is what makes a `Location::Volatile` private key durable, so its
+    // absence is the regression this gate exists to catch — and its absence
+    // would be invisible to every other test in this file, all of which look at
+    // the `Location` enum and none of which look at what is written to flash.
+    //
+    // Asserted as *structure* (the call and its storage argument), not as a
+    // runtime observation: a runtime assertion needs a booted card and a mount
+    // this file does not build, and a structural one fails the moment the call
+    // is renamed or the location swapped — which is the edit that would break it.
     assert!(
-        offenders.is_empty(),
-        "opcard generates the card's PRIVATE key with `Location::Volatile` while the public key \
-         and the persistent keyref both use `ctx.options.storage`:\n  {}\n\
-         A key in `vfs` and a reference to it in the persistent state file means the reference \
-         dangles on the next power cycle — the card loses its key with no error at write time. \
-         The import path (`vendor/opcard/src/command/private_key_template.rs`) has the same \
-         shape.",
-        offenders.join("\n  ")
+        src.contains("client.wrap_key_to_file("),
+        "vendor/opcard/src/state.rs no longer wraps a private key into a file. `set_key` is what \
+         makes a `Location::Volatile` private key survive a power cycle: it ChaChaPoly-wraps the \
+         plaintext with the PW1-derived user key and writes it to flash, then clears the RAM \
+         object. Without it the card loses every generated key at the next reboot, silently."
+    );
+    // …and into *flash*. This is the part that is easy to get wrong in the
+    // right-looking direction: passing `Location::Volatile` as the file
+    // location would wrap the key and then write the *wrapper* into the
+    // filesystem that dies with the power. That looks durable and is not.
+    //
+    // **Every** call, not the first. `state.rs` wraps one file per key type
+    // (`signing_key.bin`, `dec_key.bin`, …), so a check that read only the first
+    // would pass while a later key's wrapper went to RAM — and it would do so
+    // silently, because the assertion is about a substring.
+    //
+    // Matched on the call's **argument list**, never on the word `storage`
+    // appearing nearby: `storage` is the parameter name and also occurs in the
+    // lines above each call (`get_user_key(client, storage)`), so a window
+    // search passes on a call that no longer names it. The location is the
+    // fifth argument of six.
+    // **Every** call, not the first: `state.rs` wraps at three sites (the key
+    // setter, the key deleter, the AES path), so a check that read only one
+    // would pass while a later key's wrapper went to RAM — silently, because
+    // the assertion is about a substring.
+    //
+    // The rule is "no `Location::` literal anywhere inside a wrap call",
+    // rather than "the fifth argument is `storage`". Positional parsing was
+    // tried first and is wrong here: the three call sites have different shapes
+    // (six arguments, and two multi-line forms that close further down), so a
+    // by-position check has to be re-derived every time opcard is touched — and
+    // a gate that needs re-deriving is a gate that will be skipped. The literal
+    // rule is shape-independent and states the property directly: the file
+    // location is the caller's `storage` variable, never a `Location` constant.
+    let mut wraps = 0u32;
+    for (n, _) in src.match_indices("client.wrap_key_to_file(") {
+        let call = &src[n..];
+        let end = call.find(')').expect("the call closes");
+        let body = &call[..=end];
+        assert!(
+            !body.contains("Location::"),
+            "a wrap_key_to_file call at byte {n} names a Location literal:\n{body}\n\
+             The wrapped key must land on the caller's location, which the card sets to \
+             `ctx.options.storage`. `Location::Volatile` here would wrap the private key and then \
+             persist the *wrapper* into the RAM filesystem — strictly worse than persisting the \
+             plaintext, because it looks durable and is not.",
+        );
+        wraps += 1;
+    }
+    assert!(
+        wraps >= 3,
+        "state.rs wraps at three sites today (the key setter, the key deleter and the AES \
+         path); found {wraps}. Either opcard changed shape or this test is reading the wrong \
+         thing — re-read `state.rs` before trusting it.",
+    );
+    let wrap_at = src.find("client.wrap_key_to_file(").expect("asserted above");
+
+    // The plaintext copy must then be cleared, or the wrap would be pointless:
+    // the key would live in flash *and* in RAM, and the RAM copy would be the
+    // one every later operation used.
+    let after = &src[wrap_at..];
+    assert!(
+        after.contains("client.clear(new_id)"),
+        "after wrapping, `set_key` must `clear` the plaintext trussed handle. Without the clear \
+         the private key stays resident in `vfs` for the life of the power cycle — the opposite \
+         of the exposure window `platform/src/trusted_backend/device.rs:522` states."
     );
 
-    // Control: the *public* key and the keyref already follow the card's
-    // location, so this test's demand is not "stop using Volatile anywhere in
-    // opcard" — it is "make the private key agree with the public one". If
-    // this assertion ever fails too, the scan above is reading the wrong
-    // lines and the failure above would be meaningless.
+    // Control: the scan above is measuring `State::set_key` and not some other
+    // caller of the same API. Without this, a rename that moved the wrap
+    // elsewhere would make the assertions above vacuous.
     assert!(
-        src.contains("set_persistence(ctx.options.storage)"),
-        "gen.rs no longer stamps `ctx.options.storage` on the public key; the Volatile scan \
-         above is not measuring what it claims to measure."
+        src.contains("Mechanism::Chacha8Poly1305"),
+        "state.rs no longer wraps with ChaCha8Poly1305; the assertions above are not measuring \
+         what they claim to measure."
     );
 }
 
