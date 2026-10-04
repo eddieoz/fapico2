@@ -87,17 +87,22 @@ def main():
     card.connect()
 
     def select(aid):
+        # pysmartcard returns the response body ALREADY excluding the status
+        # word, so it must not be trimmed again. Doing so silently chopped two
+        # bytes off the `74` challenge TLV, which made every VALIDATE fail
+        # 0x6984 and sent this script looking for a firmware bug that was not
+        # there. The status word arrives separately, as sw1/sw2.
         resp, sw1, sw2 = card.transmit(
             [0x00, 0xA4, 0x04, 0x00, len(aid)] + list(aid) + [0x00, 0x00]
         )
-        sw = (sw1 << 8) | sw2
-        return bytes(resp[:-2]), sw
+        return bytes(resp), (sw1 << 8) | sw2
 
     def apdu(ins, p1, p2, data):
+        # Same rule as `select` above: the body comes without the status word.
         resp, sw1, sw2 = card.transmit(
             [0x00, ins, p1, p2, len(data)] + list(data) + [0x00]
         )
-        return bytes(resp[:-2]), (sw1 << 8) | sw2
+        return bytes(resp), (sw1 << 8) | sw2
 
     if args.wipe:
         _, sw = select(MGMT_AID)
@@ -118,8 +123,10 @@ def main():
 
     chal = tlv(body, TAG_CHALLENGE)
     device_id = tlv(body, TAG_DEVICE_ID)
-    print(f"  74 challenge : {chal.hex() if chal else 'ABSENT'}")
-    print(f"  71 device_id : {device_id.hex() if device_id else 'ABSENT'}")
+    print(f"  74 challenge : {chal.hex() if chal else 'ABSENT'} ({len(chal) if chal else 0} bytes)")
+    print(f"  71 device_id : {device_id.hex() if device_id else 'ABSENT'} ({len(device_id) if device_id else 0} bytes)")
+    if chal is not None and len(chal) != 8:
+        print("  WARNING: the challenge is not 8 bytes — the response was truncated.")
 
     if not chal or not device_id:
         print(
