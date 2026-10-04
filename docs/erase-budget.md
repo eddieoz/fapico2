@@ -599,6 +599,193 @@ all.
 
 ---
 
+## 4c. The per-record counter write (US-1561, US-1562)
+
+### 4c.1 What changed, and what did not
+
+**FIDO credentials moved out of the whole-snapshot store.** A signature-counter
+bump is no longer a rewrite of a 14 KB image through `FlashSlotSink`; it is one
+record commit plus one index rewrite in the per-record key region
+(`FidoRecordStore::update`,
+`platform/src/keyregion/fido_store.rs`). So §2.1's measurement still describes
+`FlashSlotSink` — which the migration, the PIN state, the vendor state and the
+OATH stream still persist through — but it **no longer prices a FIDO
+assertion**, and leaving it as though it did would be the more expensive kind
+of stale document: a correct number about the wrong code.
+
+| | whole-snapshot persist (§2.1) | per-record counter write (§4c.2) |
+|---|---:|---:|
+| sector erases per **durable write** | 8 | **6** |
+| distinct sectors touched | 8 | **3** |
+| erases on the busiest **single** sector | 1 | **4** |
+| slot programs per durable write | ~5 × 1 KiB pages | 16 × 1 KiB slots |
+| bytes erased per durable write | 32,768 | 12,288 |
+| bytes erased per **assertion** (× 32 batched) | 32,768 | 384 |
+| `assertion_ceiling` (per durable write) | 100,000 | **25,000** |
+| `batched_*_assertion_ceiling` | 3,200,000 | **800,000** |
+
+**Both of the last two lines went down, and the second one is the one that
+matters.** The per-record write erases 2.7× fewer bytes per assertion, which is
+the win the per-record store was built for — and the *lifetime in assertions
+fell by 4×*, because the divisor is the busiest single sector and that divisor
+went from 1 to 4.
+
+That is not a contradiction, and it is worth a paragraph, because "fewer bytes,
+shorter life" is the kind of sentence a reader refuses until the mechanism is
+named. Endurance is specified **per sector**, and the per-record write does not
+spread its erases: three of the six land one each on the record's sector and
+the index's, and **the remaining three land on one sector** — the commit
+scratchpad — because the record commit and the index rewrite are two
+three-phase writes that stage through the *same* scratchpad sector, each erasing
+it to prepare and again to retire.
+
+**The scratchpad is the wear bottleneck of the whole per-record path.** One
+4 KiB sector out of 960 absorbs two thirds of every durable counter write's
+erasures. That is not derivable from either half's arithmetic taken alone (a
+record commit costs 3 erases on 3 different sectors; an index write costs 3
+more on 3 different sectors; together they cost 6 on 2 they share), which is
+why §4c.2 publishes the whole profile and not just the maximum.
+
+### 4c.2 Measured — on the host, exactly
+
+`platform/tests/key_region_counter_budget.rs::erase_budget_record_figures`
+drives the **real** [`FidoRecordStore::update`] over the NOR-modelling
+`FileKeyRegion` — a `program` that ANDs into what is there and **refuses** a
+0 → 1 transition — against the shipping region geometry, and prints the figures
+below. `check_erase_budget.py` parses them, compares them with the **constants
+read out of `platform/src/keyregion/commit.rs`**, and refuses this document on
+any disagreement.
+
+The fixture enrols `SLOTS_PER_SECTOR` credentials first, so the target's sector
+is **full** and the commit really does reprogram it whole. A sector with one
+record in it programs one slot; the budget's divisor is a per-sector figure and
+measuring the sparse case would under-report the wear.
+
+```text
+ERASE_BUDGET_RECORD slots_per_sector=4
+ERASE_BUDGET_RECORD sector_erases_per_record_commit=3
+ERASE_BUDGET_RECORD scratchpad_erases_per_record_commit=2
+ERASE_BUDGET_RECORD live_erases_per_record_commit=1
+ERASE_BUDGET_RECORD sector_erases_per_index_entry_write=3
+ERASE_BUDGET_RECORD sector_erases_per_counter_write=6
+ERASE_BUDGET_RECORD measured_sector_erases_per_counter_write=6
+ERASE_BUDGET_RECORD live_sector_erases_per_counter_write=1
+ERASE_BUDGET_RECORD live_slot_programs_per_counter_write=4
+ERASE_BUDGET_RECORD distinct_sectors_erased_per_counter_write=3
+ERASE_BUDGET_RECORD max_erases_per_sector_per_counter_write=4
+ERASE_BUDGET_RECORD erase_profile_per_counter_write=17:4,18:1,232:1
+ERASE_BUDGET_RECORD unchanged_sector_erases=0
+ERASE_BUDGET_RECORD second_update_sector_erases=6
+ERASE_BUDGET_RECORD measured_slot_programs_per_counter_write=16
+```
+
+Two controls ride along, and they are what make the measurement able to *fail*:
+
+| Figure | Value | What it pins |
+|---|---|---|
+| `unchanged_sector_erases` | 0 | **reading** a record touches no medium — the per-record analogue of §2.1's `unchanged_erase_calls = 0`, and the property that makes "31 assertions erase nothing" a measurement rather than a hope |
+| `second_update_sector_erases` | 6 | a second durable write costs exactly what the first did — a protocol that grew a phase, or started skipping one, moves this |
+
+The distribution, from the instrument's own log rather than from the table
+above — one sector takes four, one takes one, one takes one:
+
+```text
+ERASE_BUDGET_RECORD erase_profile_per_counter_write=17:4,18:1,232:1
+```
+
+Read as `<sector index>:<erases>`, sorted by count:
+
+| sector | slot range | erases | who |
+|---:|---|---:|---|
+| 17 | `68..72` | **4** | the commit scratchpad — `SCRATCHPAD_FIRST_SLOT = 68`, and both the record commit and the index rewrite stage through it |
+| 18 | `72..76` | 1 | the live record sector — `FIDO_FIRST_SLOT = 72`, the first four enrolled credentials |
+| 232 | `928..932` | 1 | the live index sector — `INDEX_FIRST_SLOT = 928` |
+
+The indices are geometry and the gate does not parse them; the **counts** are
+the profile, and they are what `max_erases_per_sector_per_counter_write = 4` is
+the maximum of.
+
+`measured_slot_programs_per_counter_write = 16` is the other half of the write's
+cost and is a **program** count, not an erase count: four slots staged and four
+reprogrammed, twice over (record, then index). Programs do not consume erase
+cycles, which is why the lifetime above divides only the six.
+
+### 4c.3 "One erase and one program", read at sector granularity
+
+**There is no slot erase on this part.** `SLOTS_PER_SECTOR` slots share one
+4 KiB NOR sector and NOR cannot rewrite programmed bytes, which is the entire
+reason `platform/src/keyregion/commit.rs` exists. So the acceptance criterion
+is satisfied at sector granularity, and saying so is the honest form of it:
+
+* `live_sector_erases_per_counter_write = 1` — **one** erase of the sector
+  holding the record;
+* `live_slot_programs_per_counter_write = 4 = slots_per_sector` — **one**
+  *sector* program, which is four slot programs because the erase left nothing
+  to keep.
+
+The other five sector erases — three on the scratchpad, one on the index
+sector, one back on the scratchpad at retire — are `the_32nd_assertion_costs_the_whole_counter_write`
+in `apps/fido/tests/region_counter_batching.rs`, which exists so that a reader of
+the "one erase" test can see where they went.
+
+### 4c.4 The arithmetic
+
+The same derivation as §3.3, with a different divisor:
+
+```text
+erases on the busiest sector per durable counter write = 4
+per_record_counter_write_ceiling = cycles_per_sector / 4
+                                = 100,000 / 4
+                                = 25,000 durable writes
+batched_per_record_assertion_ceiling = 100,000 * 32 / 4
+                                     = 800,000 assertions
+```
+
+The machine-readable form, for the same reason §3.3 has one:
+
+```text
+cycles_per_sector = 100000
+per_record_counter_write_ceiling = 25000
+batched_per_record_assertion_ceiling = 800000
+```
+
+**`cycles_per_sector` is still the literature figure and still not measured on
+this part.** §4c changed the divisor, which this project measured; it changed
+nothing about the endurance half, which it never had. The 25,000 and the
+800,000 are `literature × measured`, in that order, exactly as §3.3's 100,000
+was.
+
+The gate re-derives both, from the measured divisor and from
+`COUNTER_PERSIST_INTERVAL` read out of `apps/fido/src/device_keystore.rs`, and
+refuses this document if either disagrees. It also refuses a per-record
+lifetime derived from the **per-write total** (6) rather than from the busiest
+sector (4) — which would give 16,666 and is §3.4's withdrawn double-count under
+a new key.
+
+### 4c.5 What the per-record budget does not fix, and what it does
+
+* **It is still a shared budget.** §3.1a applies unchanged and with more force:
+  the index, the OATH records, the PIN state and the vendor state all live in
+  the same region, and OATH records pay `commit::SECTOR_ERASES_PER_COMMIT` per
+  durable write of their own.
+* **Batching still buys the same order of magnitude.** 6/32 = 0.19 sector
+  erases per assertion against 8 before it, so the *wear per assertion* fell
+  43×; the *lifetime* fell 4×, and those two numbers disagree because the
+  erases stopped being spread. Both are published rather than reconciled,
+  because reconciling them means picking one and calling it the answer.
+* **The honest recommendation is about the scratchpad, not the interval.** One
+  sector taking 4 of every 6 erases is the defect. Halving it — a scratchpad
+  that is not erased to retire on the common path, or an index write that
+  does not stage through the same sector — would move the lifetime by 2× with
+  no change to `COUNTER_PERSIST_INTERVAL` at all, and with no change to the
+  forward-skip budget US-1012 protects. Raising the interval moves it too, but
+  it moves the skip budget with it and needs a wear measurement this branch
+  still does not have (US-1007). Neither change is made here: both are
+  protocol changes, and both are arguments rather than measurements at this
+  point in the tree.
+
+---
+
 ## 5. Provenance table
 
 | Figure | Value | Measured / reasoned | How |

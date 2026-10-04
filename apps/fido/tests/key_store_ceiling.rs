@@ -447,7 +447,10 @@ fn no_partial_credential_remains_after_a_refusal() {
             (0..4u8).any(|n| c.user_handle.as_slice() == user_handle(n).as_slice()),
             "a credential whose user.id is not one of the four enrolled ones survived"
         );
-        assert_ne!(c.private_key, [0u8; 32], "a credential frame was left unsealed");
+        assert!(
+            !c.private_key.is_zero(),
+            "a credential frame was left unsealed"
+        );
     }
     assert!(
         app.keystore().get_credential(&refused_id).is_none(),

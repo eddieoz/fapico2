@@ -448,6 +448,41 @@ impl<K: Keystore> FidoApp<K> {
         self
     }
 
+    /// Which store this app answers credential-capacity questions from
+    /// (US-1557) — [`CredentialBackend::Snapshot`](crate::device_keystore::CredentialBackend::Snapshot),
+    /// always.
+    ///
+    /// # Why this method exists, given it has one answer
+    ///
+    /// Because **the absence of it is the bug**. `AGENTS.md` §1: "`app.rs` is
+    /// the host twin, not the shipped one. Fixing only `app.rs` passes every
+    /// host test and changes nothing on hardware — that is not hypothetical."
+    /// For capacity that risk is concrete: this twin's `cm_get_metadata` puts
+    /// `(existing + remaining)` on the wire as key 3, and `remaining` comes from
+    /// [`Keystore::max_remaining_creds`] — which for a `MemoryKeystore` is **a
+    /// test fixture's bound**, chosen by whoever constructed it, with nothing to
+    /// do with the RP2350's key region.
+    ///
+    /// The shipped device answers key 3 with [`FIDO_CAPACITY`], derived from
+    /// the region's geometry. Both are correct answers to "how many credentials
+    /// can this hold?", they are answers about **different stores**, and nothing
+    /// on the wire says which is which. So the two twins each report which
+    /// store they are talking about, and
+    /// [`CredentialBackend::advertised_capacity`](crate::device_keystore::CredentialBackend::advertised_capacity)
+    /// returns `None` here — the host twin publishes **no** device capacity,
+    /// because it has none.
+    ///
+    /// A full region-backed host twin is the honest fix for the *storage*
+    /// divergence and is out of scope here: `keystore.rs`'s backend is a
+    /// separate host-file store with no `KeyRegion` at all, and standing one up
+    /// under this file would be a second storage stack rather than a parity
+    /// fix. What this method makes possible **now** is that the divergence is a
+    /// value both twins return and a test compares, rather than a number only
+    /// one of them knows the provenance of.
+    pub fn credential_backend(&self) -> crate::device_keystore::CredentialBackend {
+        crate::device_keystore::CredentialBackend::Snapshot
+    }
+
     /// The user-presence answer for a presence-gated command. `false` means
     /// "the touch has not landed", i.e. answer `UpRequired` and let the
     /// transport open a consent window.

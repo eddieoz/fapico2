@@ -19,6 +19,7 @@ use crate::{AAGUID, CTAP1_VERSION};
 use fapico2_platform::secure_store::SecureStore;
 use fapico2_platform::trng::Trng;
 use heapless::Vec as HeaplessVec;
+use zeroize::Zeroizing;
 
 /// pinUvAuthPermission bits (host `app.rs` parity).
 pub const PERM_MC: u8 = 0x01;
@@ -852,6 +853,33 @@ impl FidoApp {
         crate::device_app::region_keys(store, &self.keystore)
     }
 
+    /// Which store this app is answering credential-capacity questions from
+    /// (US-1557).
+    ///
+    /// **Derived from the same seam the command path uses**, never stored: the
+    /// region is reachable or it is not, and
+    /// [`Self::with_region`](Self::with_region) asks the identical question on
+    /// every command. A cached answer would be a claim about the backend, and
+    /// `AGENTS.md` §4's rule is that the advertisement and the command path come
+    /// from one accessor.
+    ///
+    /// It deliberately does **not** take a `&dyn SecureStore`. The keys are
+    /// part of "is this app region-backed", but a capacity *claim* is about the
+    /// region, and a caller asking "which store is this?" wants that answer
+    /// without also having to supply a store to get it. A board with no provider
+    /// installed answers [`CredentialBackend::Snapshot`](crate::device_keystore::CredentialBackend::Snapshot),
+    /// which is the truth: that board's credentials are in the snapshot.
+    pub fn credential_backend(&self) -> crate::device_keystore::CredentialBackend {
+        // SAFETY of the call: `key_region()` hands back a `&'static mut` and
+        // this binding is dropped at the end of the expression, so nothing
+        // region-shaped escapes. The alternative — threading a store in — would
+        // make the accessor unable to answer on a bridge that has none.
+        match crate::device_app::key_region() {
+            Some(_) => crate::device_keystore::CredentialBackend::KeyRegion,
+            None => crate::device_keystore::CredentialBackend::Snapshot,
+        }
+    }
+
     /// Load one credential, owned by the caller.
     ///
     /// `None` for "no such credential", "not region-backed", **and** "the region
@@ -1220,7 +1248,7 @@ impl FidoApp {
         // failure, so an exhausted pool spun forever and the request never
         // came back. `try_fill_valid` caps the rejection and returns, which
         // is what turns "the card stopped answering" into a status byte.
-        let mut scalar = [0u8; 32];
+        let mut scalar = Zeroizing::new([0u8; 32]);
         // `try_fill_valid_with`, not `try_fill_valid`: the pool draw is not
         // an `RngCore` and cannot report a refusal, so the attempt cap is
         // the only thing bounding this. An exhausted pool serves the same
@@ -1230,11 +1258,11 @@ impl FidoApp {
                 self.draw_random(out);
                 Ok(())
             },
-            &mut scalar,
+            &mut *scalar,
             |b| p256::SecretKey::from_slice(b).is_ok(),
         )
         .map_err(|_| err(Ctap2Response::Other))?;
-        let sk = p256::SecretKey::from_slice(&scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+        let sk = p256::SecretKey::from_slice(&*scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
         let pub_bytes = crypto::public_key_bytes(&sk.public_key());
         let mut x = [0u8; 32];
         let mut y = [0u8; 32];
@@ -1361,7 +1389,7 @@ impl FidoApp {
         let mut cred = DeviceCredential {
             credential_id: cred_id.clone(),
             public_key: cose_key,
-            private_key: scalar,
+            private_key: crate::device_keystore::PrivateScalar::from_bytes(*scalar),
             rp_id_hash,
             rp_id: req.rp_id.clone(),
             user_handle: req.user_handle.clone(),
@@ -1730,7 +1758,7 @@ impl FidoApp {
         let lbk = cred.large_blob_key;
         let user_handle = cred.user_handle.clone();
         let resident = cred.resident;
-        let private_key = cred.private_key;
+        let private_key = cred.private_key.copy_out();
 
         // SOAK-FINDING-1 review round 2: transactional counter bump — the
         // snapshot is made durable here or the bump reverts.
@@ -1796,7 +1824,7 @@ impl FidoApp {
         }
 
         // Sign authData || clientDataHash with the credential key (DER).
-        let sk = p256::SecretKey::from_slice(&private_key)
+        let sk = p256::SecretKey::from_slice(private_key.expose())
             .map_err(|_| err(Ctap2Response::InvalidCommand))?;
         let mut signed: HeaplessVec<u8, 832> = HeaplessVec::new();
         signed.extend_from_slice(auth_data.as_slice()).ok();
@@ -2412,18 +2440,23 @@ impl FidoApp {
         // the alternative, which is a request that never returns, and the
         // window is the same one D-9 describes (a generator that has
         // stopped producing).
-        let mut scalar = [0u8; 32];
+        // US-1550: the new persistent key-agreement key's raw scalar, on the
+        // stack, before it becomes `self.hkey`. `p256::SecretKey` clears itself;
+        // this array had no destructor, and the `hkey` it is turned into
+        // outlives the frame by design (it is the device's long-lived ECDH
+        // key), so the intermediate copy is the one that needed clearing.
+        let mut scalar = Zeroizing::new([0u8; 32]);
         if crypto::try_fill_valid_with(
             &mut |out: &mut [u8]| {
                 self.draw_random(out);
                 Ok(())
             },
-            &mut scalar,
+            &mut *scalar,
             |b| p256::SecretKey::from_slice(b).is_ok(),
         )
         .is_ok()
         {
-            if let Ok(sk) = p256::SecretKey::from_slice(&scalar) {
+            if let Ok(sk) = p256::SecretKey::from_slice(&*scalar) {
                 self.hkey = sk;
             }
         }
@@ -4662,7 +4695,12 @@ impl FidoApp {
             if cred.cred_protect == 3 {
                 return Err(U2fStatus::SecurityStatusNotSatisfied);
             }
-            cred.private_key
+            // US-1550: a named, self-clearing copy rather than a `Clone` of the
+            // field. The block's value outlives the `&DeviceCredential` borrow
+            // it is read through — the counter bump below takes `&mut self` —
+            // so it has to own its 32 bytes, and `PrivateScalar` is what owns
+            // them without leaking them into the frame that follows.
+            cred.private_key.copy_out()
         };
         // SOAK-FINDING-1 review round 2: transactional counter bump —
         // durable or reverted.
@@ -4690,7 +4728,8 @@ impl FidoApp {
         sign_base.push(0x01).ok();
         sign_base.extend_from_slice(&counter.to_be_bytes()).ok();
         sign_base.extend_from_slice(client_param).ok();
-        let sk = p256::SecretKey::from_slice(&private_key).map_err(|_| U2fStatus::WrongData)?;
+        let sk = p256::SecretKey::from_slice(private_key.expose())
+            .map_err(|_| U2fStatus::WrongData)?;
         let mut sig: HeaplessVec<u8, 72> = HeaplessVec::new();
         crypto::p256_sign_der_into(&sk, sign_base.as_slice(), &mut sig).ok_or(U2fStatus::WrongData)?;
         out.extend_from_slice(sig.as_slice()).ok();

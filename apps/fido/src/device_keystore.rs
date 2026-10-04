@@ -32,10 +32,24 @@
 //!   (`apps/fido/tests/key_store_ceiling.rs`).
 //!
 //! * **Resident set — [`SNAPSHOT_MAX_CREDS`].** How many credentials the
-//!   *snapshot codec* will encode or decode. It stays 12, because the snapshot's
-//!   CBOR is a whole-image format and `chunked::MAX_PARTS * PART_PAYLOAD_MAX`
-//!   is 5,952 bytes — a **format** bound, not a store bound, and it will not move
-//!   when the store does.
+//!   *snapshot codec* will encode or decode. It stays 12, and the reason it was
+//!   12 was never a capacity: the snapshot's CBOR is a whole-image format whose
+//!   length is bounded by `chunked::MAX_LOGICAL_LEN`, and **5,952 bytes is a
+//!   single-generation figure that is not reachable on the device** — see
+//!   [`SNAPSHOT_MAX_CREDS`]'s own comment and `chunked::MAX_LOGICAL_LEN`. It is
+//!   a **format** bound, not a store bound, and it will not move when the store
+//!   does.
+//!
+//! US-1564 corrected what used to sit here. The previous text read: *"It stays
+//! 12, because the snapshot's CBOR is a whole-image format and
+//! `chunked::MAX_PARTS * PART_PAYLOAD_MAX` is 5,952 bytes"* — phrased so that
+//! the 12 read as a consequence of fitting a 5,952-byte payload. It never was.
+//! The store's occupancy arithmetic was
+//! `other_slots + old_parts + new_parts <= 24`, and twelve credentials would
+//! have needed `12 + 8 + 8 = 28`; the real ceiling was **four**
+//! (`apps/fido/tests/key_store_ceiling.rs`). Stating the format bound is
+//! useful; implying it produced the 12 is how the wrong number survived two
+//! orders of magnitude.
 //!
 //! Putting them under one name is what made `DEVICE_MAX_CREDS` a fiction: it was
 //! read as a capacity in `DeviceKeystore::max_creds` and as an array size in
@@ -58,6 +72,7 @@ use fapico2_platform::keyregion::record;
 use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead, FIDO_CAPACITY, FIDO_RECORD_MAX};
 use fapico2_platform::secure_store::{chunked, SecureStore, SecureStoreError};
 use heapless::Vec as HeaplessVec;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Snapshot slot (chunked) — the same logical slot the host `FileKeystore`
 /// uses.
@@ -79,13 +94,98 @@ pub const KEYSTORE_SLOT: &[u8] = b"fido.keystore.v1";
 /// `KeyStoreFull` — `apps/fido/tests/key_store_ceiling.rs`.
 pub const DEVICE_MAX_CREDS: usize = FIDO_CAPACITY as usize;
 
+/// Which store answers a credential-capacity question (US-1557).
+///
+/// # Why this is an enum and not a number
+///
+/// `AGENTS.md` §1: "`app.rs` is the host twin, not the shipped one. Fixing only
+/// `app.rs` passes every host test and changes nothing on hardware." The
+/// concrete expression of that for capacity is this: the two twins both answer
+/// credMgmt `getMetadata` with `{1: existing, 2: remaining, 3: total}`, both
+/// answer it with a `u32`, and both are *right* — but they are right about
+/// different stores, and nothing in either response says which.
+///
+/// Left implicit, that is a divergence a reader cannot see and a test cannot
+/// state: the host twin's `MemoryKeystore::with_max_creds(4)` reports a total of
+/// 4, the device reports 856, and both numbers are correct answers to "how many
+/// credentials can this hold?". A parity assertion that just compared the two
+/// numbers would be asserting that they differ; one that skipped the number
+/// would be asserting nothing.
+///
+/// So each twin reports **which** store, and
+/// [`Self::advertised_capacity`] returns the number only where the number
+/// means something about a device:
+///
+/// | backend | `advertised_capacity()` | why |
+/// |---|---|---|
+/// | [`KeyRegion`](Self::KeyRegion) | `Some(FIDO_CAPACITY)` | the device's real ceiling, derived from the region's geometry |
+/// | [`Snapshot`](Self::Snapshot) | `None` | a **test fixture bound** — [`SNAPSHOT_MAX_CREDS`], or whatever a `MemoryKeystore` was configured with. Not a device claim, so it is not published as one. |
+///
+/// `None` is the honest answer for the host twin and it is enforced at the type
+/// level: the host's `getMetadata` still puts a number on the wire (it has to —
+/// it is the CTAP reply), but nothing in the API invites a caller to read it as
+/// the device's capacity, and
+/// `apps/fido/tests/twin_parity.rs` asserts both halves of the divergence rather
+/// than leaving it to be discovered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CredentialBackend {
+    /// The per-record key region: what the shipped device uses, with
+    /// [`FIDO_CAPACITY`] credentials.
+    KeyRegion,
+    /// The resident snapshot array: what the host twin, the dispatcher bridge
+    /// and a not-yet-migrated device use.
+    ///
+    /// Bounded by [`SNAPSHOT_MAX_CREDS`] as a *format* bound and by whatever a
+    /// host `Keystore` was configured with as a *fixture* bound; see the
+    /// variant's note above for why neither is published.
+    Snapshot,
+}
+
+impl CredentialBackend {
+    /// The capacity this backend will advertise, or `None` when it has no
+    /// device-meaningful one.
+    ///
+    /// `None` for [`Snapshot`](Self::Snapshot) is the whole point of the enum:
+    /// it makes "the host twin's number is not the device's number" a value a
+    /// test can compare rather than a sentence in a comment.
+    pub const fn advertised_capacity(self) -> Option<u32> {
+        match self {
+            CredentialBackend::KeyRegion => Some(FIDO_CAPACITY),
+            CredentialBackend::Snapshot => None,
+        }
+    }
+}
+
 /// Credentials the resident snapshot codec will hold — a **format** bound, not a
-/// capacity.
+/// capacity, and the 5,952 B it is derived from is **not a reachable length**.
+///
+/// US-1010 corrected the *number*: the snapshot's bound is
+/// `chunked::MAX_PARTS * chunked::PART_PAYLOAD_MAX` = 12 × 496 = 5,952 B, not
+/// the 17-part 8,432 B it used to carry. US-1564 corrects the *reading* of it,
+/// because this comment used to present the 12 as following from that figure
+/// and it never did.
+///
+/// **5,952 B is a single-generation figure, and no device reaches it.** The
+/// chunked slot is **double-buffered** — a write goes to the buffer *not*
+/// holding the current set (`secure_store.rs`, "A logical slot may span up to
+/// `chunked::MAX_PARTS` parts per buffer") — so a rewrite of a maximum-width
+/// value transiently needs `2 × MAX_PARTS` physical entries, and `MAX_PARTS`
+/// is 12 because `2 × 12 = 24` exactly exhausts `Rp2350SecureStore::DEV_MAX_ENTRIES`
+/// (`secure_store.rs`'s compile-time assertion). Any applet holding an entry
+/// of its own alongside the table — and every credential applet does — pushes
+/// `parts_live + parts_being_written + resident` past 24, and the first
+/// full-width rewrite returns `SecureStoreError::Full`. OATH is the worked
+/// example: its durable ceiling is **30** maximal credentials, measured, not the
+/// 68 its table is sized for.
+///
+/// So the honest chain is: the codec's bound is a *format* bound; the number 12
+/// is the resident array size and therefore a **RAM** figure; and neither is a
+/// statement about how many credentials the device can hold, which is
+/// [`DEVICE_MAX_CREDS`] and nothing else.
 ///
 /// Unchanged at 12, and it must stay separate from [`DEVICE_MAX_CREDS`]: the
-/// snapshot is one whole-image CBOR document, so its bound is the chunked
-/// slot's payload (`chunked::MAX_PARTS * chunked::PART_PAYLOAD_MAX` = 5,952 B,
-/// US-1010), and no store with more capacity makes a longer snapshot legal.
+/// snapshot is one whole-image CBOR document, so no store with more capacity
+/// makes a longer snapshot legal.
 ///
 /// It is also the array size of [`DeviceKeystore::credentials`], so it is a
 /// **RAM** figure as much as a format one: `DeviceCredential` measures 720
@@ -306,11 +406,221 @@ const HMAC_MAX: usize = 64;
 /// 4,608 bytes of stack in a function marked `#[inline(never)]`, in a call
 /// chain that already carries an 8,448-byte output buffer. It is not free, and
 /// the ceiling it pushes against is the real one: the snapshot *total* is
-/// bounded by the chunked slot's 5,952-byte payload (US-1010), so a device with a full
-/// credential list can now run out of room where it did not before. That is
-/// reported rather than hidden — see `vendor_state`'s module docs, and
-/// `grow_checked`, which turns the shortfall into a clean `0x28`.
+/// bounded by `chunked::MAX_LOGICAL_LEN` — 5,952 B at one generation (US-1010),
+/// which is **not** a length the device store can actually hold, because the
+/// chunked slot is double-buffered and any applet with an entry of its own
+/// pushes the rewrite peak past `DEV_MAX_ENTRIES` ([`SNAPSHOT_MAX_CREDS`]'s
+/// comment has the arithmetic). So a device with a full credential list can now
+/// run out of room where it did not before. That is reported rather than hidden
+/// — see `vendor_state`'s module docs, and `grow_checked`, which turns the
+/// shortfall into a clean `0x28`.
 pub const AUTH_SCRATCH: usize = 4_608;
+
+/// Width of a P-256 private scalar, in bytes.
+///
+/// Named once so [`PrivateScalar`] and every "32 bytes" claim about the field
+/// have one spelling. It is the P-256 group order's byte width, and it is not
+/// configurable: a wider field is a different curve's key and a narrower one
+/// cannot express a scalar.
+pub const PRIVATE_KEY_LEN: usize = 32;
+
+/// A credential's P-256 private scalar, cleared when it goes out of scope
+/// (US-1550, matching pico-hsm's `sc_hsm.c:869`).
+///
+/// # Why this is a type and not a `[u8; 32]`
+///
+/// The field it replaces was a bare `[u8; 32]`, which has no destructor, so
+/// every owned `DeviceCredential` that held one left 32 bytes of signing key in
+/// freed stack for the rest of the command. On the key-region path
+/// (`device_core.rs::region_credential`) that is **one 720-byte stack copy per
+/// lookup** — the exclude-list walk in makeCredential opens one per excluded
+/// ID, the allow-list walk in getAssertion one per entry, credMgmt one per
+/// enumerated slot, and every one of them is a distinct 32-byte key that
+/// nothing wipes. The same was true of `self.keystore.credentials`, where a
+/// deleted or overwritten credential dropped a struct whose private key
+/// survived in the vacated slot.
+///
+/// `record::Plaintext` (`keyregion/record.rs`, "Why this type exists") and
+/// `crypto::IndexKey`/`PayloadKey` (`keyregion/crypto.rs`, "Keys") already
+/// make this guarantee by type for the region half of the store. This is the
+/// applet-half counterpart, and it is deliberately the same shape: a
+/// [`Zeroizing`] buffer, an explicit [`Drop`], no `Copy`, no `Clone`, no
+/// `Debug` that prints the bytes.
+///
+/// # Why not `Clone`
+///
+/// `crypto.rs` states the rule for the region's keys and it is the same rule
+/// here: "a `Clone` on a key type is the first step of a key that ends up in a
+/// `static`", and a copy is "a second buffer to forget"
+/// (`crypto.rs:330-345`). The places that genuinely need a second copy — the
+/// one site in `device_core.rs::build_assertion` that ends a borrow before the
+/// counter bump — call [`Self::copy_out`], which returns another
+/// [`PrivateScalar`] and therefore another buffer that clears itself. The name
+/// is the point: a clone is invisible, `copy_out` reads as a copy at the call
+/// site and the reader can go and check it drops.
+///
+/// # Why `PartialEq` is constant-time
+///
+/// The only comparisons are tests and the "is this credential still usable"
+/// question, so the timing argument is weak — but it costs three lines to make
+/// the type's equality not depend on where the first differing byte is, and a
+/// key type whose `PartialEq` is a `memcmp` is the kind of thing that later
+/// gets called from a path where the argument *is* weak.
+pub struct PrivateScalar(Zeroizing<[u8; PRIVATE_KEY_LEN]>);
+
+impl PrivateScalar {
+    /// The all-zero scalar — "no key here", which is what
+    /// [`DeviceCredential::new_template`] and a revoked credential hold.
+    ///
+    /// A real value rather than an `Option`, because CTAP's credential record
+    /// has a fixed key-3 field and an absent one would be a wire change. The
+    /// security of this state is that it is **unusable**: P-256 rejects a zero
+    /// scalar (`device_core.rs`'s `p256::SecretKey::from_slice` leg), so a
+    /// credential whose scalar is zero cannot sign, whatever the rest of its
+    /// record says.
+    ///
+    /// Not `const`: `Zeroizing::new` is not a const fn, and a `const` here
+    /// would only be reachable from a `static`, which is the one place a key
+    /// must never live (`crypto.rs`, "not `Copy` — a copy is a second buffer
+    /// to forget").
+    pub fn zero() -> Self {
+        PrivateScalar(Zeroizing::new([0u8; PRIVATE_KEY_LEN]))
+    }
+
+    /// Take ownership of 32 bytes of key material.
+    pub fn from_bytes(bytes: [u8; PRIVATE_KEY_LEN]) -> Self {
+        PrivateScalar(Zeroizing::new(bytes))
+    }
+
+    /// Copy key material out of a slice, refusing anything that is not exactly
+    /// [`PRIVATE_KEY_LEN`] bytes.
+    ///
+    /// The width check is not pedantry: a truncated scalar is a *different*
+    /// (and usually invalid) key, and silently left-padding or right-truncating
+    /// one would mint a credential whose public key does not match its private
+    /// key — a signature no relying party can ever verify.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        let fixed: [u8; PRIVATE_KEY_LEN] = bytes.try_into().ok()?;
+        Some(PrivateScalar(Zeroizing::new(fixed)))
+    }
+
+    /// The scalar, **borrowed**.
+    ///
+    /// Borrowed and never returned by value on purpose: a method returning
+    /// `[u8; 32]` would be a method whose result outlives the zeroize, which is
+    /// the whole bug this type exists to remove (`fused_key::FusedRead::as_bytes`
+    /// is the precedent for the argument).
+    pub fn expose(&self) -> &[u8; PRIVATE_KEY_LEN] {
+        &self.0
+    }
+
+    /// An owned second copy, for the caller that must end a borrow before it
+    /// takes `&mut self`.
+    ///
+    /// The one sanctioned duplication, and it is a *type* rather than a
+    /// `Clone` impl so that a reader who sees the call can see the obligation:
+    /// the returned [`PrivateScalar`] clears itself at the end of the scope that
+    /// named it.
+    pub fn copy_out(&self) -> Self {
+        PrivateScalar(Zeroizing::new(*self.0))
+    }
+
+    /// Overwrite with 32 fresh bytes, clearing whatever was here.
+    ///
+    /// The mutation path [`DeviceCredential::decode`] uses when it opens a
+    /// sealed field, and — more importantly — the one it uses when it **revokes**
+    /// a credential whose sealed fields failed to open. Assigning
+    /// `Zeroizing::new([0; 32])` would have the same effect but reads like
+    /// "the key is now the zero key", which is true of the value and false of
+    /// the operation; `zero()` says the key was wiped.
+    pub fn set_from_slice(&mut self, bytes: &[u8]) -> Option<()> {
+        let fixed: [u8; PRIVATE_KEY_LEN] = bytes.try_into().ok()?;
+        self.0 = Zeroizing::new(fixed);
+        Some(())
+    }
+
+    /// Wipe the scalar in place, leaving an unusable credential behind.
+    ///
+    /// Named `wipe` rather than `zero` so it cannot collide with the
+    /// associated constructor [`Self::zero`], and so a call site reads as an
+    /// action on a key that exists rather than as a value being produced.
+    ///
+    /// **This records the host witness too**, and the reason is specific: the
+    /// one call site that matters is [`DeviceCredential::decode`]'s revocation
+    /// arm, and that is a `wipe` on a credential that is *still alive and still
+    /// owned by the keystore*. Nothing will drop it for hours of uptime, so if
+    /// only `Drop` recorded, the claim "a revoked credential's key was actually
+    /// cleared rather than merely marked unusable" would be untestable — and an
+    /// untestable security claim is an assertion in a comment.
+    pub fn wipe(&mut self) {
+        #[cfg(not(target_arch = "arm"))]
+        let was_nonzero = !self.is_zero();
+        let bytes: &mut [u8; PRIVATE_KEY_LEN] = &mut self.0;
+        bytes.zeroize();
+        #[cfg(not(target_arch = "arm"))]
+        testing::record_dropped_scalar(*self.0, was_nonzero);
+    }
+
+    /// Is this the unusable all-zero state?
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+}
+
+impl Drop for PrivateScalar {
+    /// Clear the bytes, then — on host only — record what was there *after* the
+    /// clear so a test can read it.
+    ///
+    /// The `was_nonzero` flag is the half that stops the test being vacuous.
+    /// "The witness saw zeroes" is satisfied just as well by a scalar that was
+    /// never written as by one that was, so the buffer's populated-ness is
+    /// sampled **before** the clear and carried in the record. This is
+    /// `fused_key::FusedRead::drop`'s shape (`fused_key.rs:223-237`), and
+    /// `crypto.rs`'s key drop is the one place in the tree that lacks it.
+    ///
+    /// The redundant clear is deliberate: `Zeroizing` would do it anyway, and
+    /// this body is also where the host witness reads the buffer — after the
+    /// clear, so that what it reports is evidence of the clear rather than of
+    /// the clear having been skipped.
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "arm"))]
+        let was_nonzero = !self.is_zero();
+        let bytes: &mut [u8; PRIVATE_KEY_LEN] = &mut self.0;
+        bytes.zeroize();
+        #[cfg(not(target_arch = "arm"))]
+        testing::record_dropped_scalar(*self.0, was_nonzero);
+    }
+}
+
+impl Default for PrivateScalar {
+    /// The all-zero scalar — see [`PrivateScalar::zero`].
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+/// Never prints the bytes — `Sealed`'s and `Plaintext`'s rule
+/// (`keyregion/mod.rs:349-355`, `keyregion/record.rs:679-686`): a `Debug`
+/// that dumps a private key puts it in a log buffer, and a log buffer outlives
+/// the stack frame the key was cleared in by a very long way.
+impl core::fmt::Debug for PrivateScalar {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PrivateScalar(<redacted>)")
+    }
+}
+
+/// Constant-time equality over the scalar's bytes.
+///
+/// See the type's docs for why a key type's equality is not a `memcmp`.
+impl PartialEq for PrivateScalar {
+    fn eq(&self, other: &Self) -> bool {
+        let mut diff = 0u8;
+        for i in 0..PRIVATE_KEY_LEN {
+            diff |= self.0[i] ^ other.0[i];
+        }
+        diff == 0
+    }
+}
 
 /// COSE public key (fixed-size; P-256 EC2 or OKP).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -332,12 +642,33 @@ impl DeviceCoseKey {
 }
 
 /// A stored credential (fixed-size mirror of the host `StoredCredential`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # Not `Clone`, and why
+///
+/// The derive was dropped with US-1550. A `DeviceCredential` is 720 bytes and
+/// 32 of those are a private key, so a `Clone` is a `Clone` of a key — the
+/// first step of a key that ends up somewhere nobody will drop it
+/// (`keyregion/crypto.rs:330-345`). No caller needed it: every site that wants
+/// to keep a credential past a borrow takes an explicit
+/// [`PrivateScalar::copy_out`] of the one field it is still holding, which is
+/// both narrower and self-clearing. The compiler is what makes this stick —
+/// there is no `clone()` to reach for.
+///
+/// # `Debug` is hand-written, not derived
+///
+/// A derived `Debug` on this struct would print `private_key` — and, because
+/// it is a struct of mostly arrays, in full. That is a credential key in a log
+/// buffer, which is exactly the outcome
+/// [`keyregion::record::Plaintext`](fapico2_platform::keyregion::record::Plaintext)
+/// and [`CredentialWindow`] refuse to allow. `large_blob_key` is redacted for
+/// the same reason: it is derived from the private key and a `Debug` that
+/// printed it would still be printing key-equivalent material.
+#[derive(PartialEq)]
 pub struct DeviceCredential {
     pub credential_id: HeaplessVec<u8, ID_MAX>,
     pub public_key: DeviceCoseKey,
-    /// P-256 private scalar (32 bytes).
-    pub private_key: [u8; 32],
+    /// P-256 private scalar (32 bytes), zeroized when it goes out of scope.
+    pub private_key: PrivateScalar,
     pub rp_id_hash: [u8; 32],
     pub rp_id: HeaplessVec<u8, NAME_MAX>,
     pub user_handle: HeaplessVec<u8, ID_MAX>,
@@ -354,6 +685,47 @@ pub struct DeviceCredential {
     pub counter: u32,
     pub revoked: bool,
     pub expires_at: Option<u32>,
+}
+
+/// A `Debug` for [`DeviceCredential`] that prints its **identity and policy**,
+/// never its secrets.
+///
+/// Three of its fields are key material or key-equivalent: `private_key` (the
+/// scalar itself), `large_blob_key` (derived from it, and returned to clients
+/// in cleartext by design — so it must not also be in a log) and `hmac_secret`
+/// (a credential-key-encrypted salt, useless to an attacker but a second copy
+/// of something that only had one). All three are summarised here. Everything
+/// else this prints is what a log is for: which credential, for which relying
+/// party, with which policy.
+///
+/// The lengths rather than the bytes are the point for `credential_id`,
+/// `rp_id`, `user_handle`, `user_name`, `user_display_name` and `cred_blob`:
+/// they are not secrets, they are personal data, and a credential ID in a log
+/// is a credential ID a site can still be correlated against.
+impl core::fmt::Debug for DeviceCredential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceCredential")
+            .field("credential_id", &format_args!("<{} B>", self.credential_id.len()))
+            .field("public_key", &self.public_key)
+            .field("private_key", &self.private_key)
+            .field("rp_id", &format_args!("<{} B>", self.rp_id.len()))
+            .field("user_handle", &format_args!("<{} B>", self.user_handle.len()))
+            .field("cred_protect", &self.cred_protect)
+            .field(
+                "large_blob_key",
+                &self.large_blob_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("hmac_secret", &format_args!("<{} B>", self.hmac_secret.len()))
+            .field("cred_blob", &format_args!("<{} B>", self.cred_blob.len()))
+            .field("third_party_payment", &self.third_party_payment)
+            .field("pin_complexity_policy", &self.pin_complexity_policy)
+            .field("resident", &self.resident)
+            .field("algorithm", &self.algorithm)
+            .field("counter", &self.counter)
+            .field("revoked", &self.revoked)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// US-911: seal one sensitive snapshot field and push it as a bstr into
@@ -411,7 +783,7 @@ impl DeviceCredential {
         Self {
             credential_id: HeaplessVec::new(),
             public_key: DeviceCoseKey { kty: 2, alg: -7, crv: Some(1), x: None, y: None },
-            private_key: [0; 32],
+            private_key: PrivateScalar::zero(),
             rp_id_hash: [0; 32],
             rp_id: HeaplessVec::new(),
             user_handle: HeaplessVec::new(),
@@ -460,7 +832,13 @@ impl DeviceCredential {
         no_heap::push_uint(&mut body, 2)?;
         self.public_key.encode(&mut body)?;
         no_heap::push_uint(&mut body, 3)?;
-        seal_push(key, FieldScope::CredentialPrivateKey, &self.credential_id, &self.private_key, &mut body)?;
+        seal_push(
+            key,
+            FieldScope::CredentialPrivateKey,
+            &self.credential_id,
+            self.private_key.expose(),
+            &mut body,
+        )?;
         no_heap::push_uint(&mut body, 4)?;
         no_heap::push_bstr(&mut body, &self.rp_id_hash)?;
         // Host parity: StoredCredential::to_cbor stores the algorithm as
@@ -632,7 +1010,9 @@ impl DeviceCredential {
                 blob,
                 &mut scratch,
             ) {
-                Some(32) => c.private_key.copy_from_slice(&scratch[..32]),
+                Some(32) => {
+                    c.private_key.set_from_slice(&scratch[..32])?;
+                }
                 _ => killed = true,
             }
             if let Some(blob) = raw_cred_blob {
@@ -683,7 +1063,10 @@ impl DeviceCredential {
                 // The entry is refused, not zeroed: metadata survives, the
                 // secrets do not, the credential is dead.
                 c.revoked = true;
-                c.private_key = [0u8; 32];
+                // Wipe rather than assign: a revoked credential must leave no
+                // recoverable scalar behind, and `zero()` says the intent where
+                // a fresh all-zero `PrivateScalar` reads like a value.
+                c.private_key.wipe();
                 c.hmac_secret.clear();
                 c.large_blob_key = None;
                 c.cred_blob.clear();
@@ -691,7 +1074,9 @@ impl DeviceCredential {
         } else {
             // Legacy plaintext fields (the pre-US-911 shape).
             match raw_private {
-                Some(b) if b.len() == 32 => c.private_key.copy_from_slice(b),
+                Some(b) if b.len() == PRIVATE_KEY_LEN => {
+                    c.private_key.set_from_slice(b)?;
+                }
                 _ => return None,
             }
             if let Some(b) = raw_cred_blob {
@@ -1032,7 +1417,12 @@ impl DevicePinState {
 }
 
 /// No-heap device keystore.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// **`Clone` was dropped with US-1550**, with [`DeviceCredential`]'s: a clone
+/// of this type is a clone of every credential private key it holds, and
+/// nothing in the tree called it. Keeping the derive would have required a
+/// `Clone` on [`PrivateScalar`] for its sake.
+#[derive(Debug, PartialEq)]
 pub struct DeviceKeystore {
     pub pin_state: DevicePinState,
     pub credentials: HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS>,
@@ -2286,6 +2676,278 @@ pub enum RegionCredentialError {
 pub const E_NO_REGION: &str =
     "fido: the key region is not reachable (not installed, or not yet released)";
 
+// ---------------------------------------------------------------------------
+// US-1561 — the batched signature counter over the per-record region
+// ---------------------------------------------------------------------------
+
+/// US-1561: the batched signature-counter window over the per-record region.
+///
+/// **No new constant, deliberately.** The window flushes on
+/// [`COUNTER_PERSIST_INTERVAL`] — the same constant the snapshot path uses —
+/// and introducing a second literal here would be two numbers a reviewer has to
+/// diff by eye, which is the exact defect the `check_erase_budget.py` coupling
+/// exists to remove.
+///
+/// **The interval is re-*derived* here, not inherited by habit.** 32 was chosen
+/// for a persist that cost **8 sector erases on 8 distinct sectors, one per
+/// sector**. A per-record counter write costs **6 sector erases on 3 distinct
+/// sectors**, and the distribution is nothing like uniform — both the record
+/// commit and the index rewrite stage through the **same** commit scratchpad,
+/// so **one 4 KiB sector collects four of the six**. Both halves matter and they
+/// point opposite ways, so the arithmetic has to be made again.
+/// `docs/erase-budget.md` §4c has it; the short form is
+///
+/// | | whole-snapshot persist | per-record counter write |
+/// |---|---:|---:|
+/// | sector erases per **durable write** | 8 | 6 |
+/// | distinct sectors touched | 8 | 3 |
+/// | erases on the busiest **single** sector | 1 | **4** |
+/// | sector erases per **assertion** | 8 | 6 / 32 = 0.1875 |
+///
+/// Two consequences, and the first is not the one a reader expects:
+///
+/// * the **per-assertion byte** cost falls from 32 KiB to 12 KiB (2.7×), which
+///   is the win the per-record store was built for;
+/// * the **lifetime in assertions falls**, because the divisor is the busiest
+///   single sector and it went from 1 to 4: per-**persist** 100,000 → 25,000, and
+///   per-**assertion** 3,200,000 → **800,000**. Fewer bytes per assertion does
+///   not mean more assertions per sector when the bytes land on the *same*
+///   sector four times over.
+///
+/// 32 is still the value the applet flushes on, and changing it is not a
+/// documentation decision: it moves the CTAP1 forward-skip budget as well as the
+/// wear, and the factor that would justify a different one needs a measurement
+/// of the fitted flash part (US-1007) that this branch does not have. The
+/// honest statement of where this leaves the design is that **the scratchpad,
+/// not the record, is the wear bottleneck** — one sector out of 960 absorbing
+/// two thirds of every durable counter write's erases — and shrinking that is
+/// the change that would move the number, not the interval.
+///
+/// # Why it is not the snapshot's `dirty` flag, and not a credential array
+///
+/// The window holds **no credentials** — a `(slot, counter)` list, at most
+/// [`CounterWindow::PENDING_MAX`] entries — so it is bounded by the *batch*,
+/// never by the store. That is what keeps it compatible with the derived
+/// capacity: `DeviceCredential` is 720 bytes and a resident array of them is
+/// the thing [`DEVICE_MAX_CREDS`] = 856 can never have
+/// (`fido_store.rs`'s module docs).
+///
+/// # The invariant, and the weakening
+///
+/// **At most [`COUNTER_PERSIST_INTERVAL`] bumps are un-persisted, and the reply
+/// may sign a counter that is not yet the durable one.** The second half is the
+/// deliberate weakening US-1011 made; [`CounterWindow::restored`] and
+/// [`CounterWindow::resume_from`] are US-1012's two halves making it safe, on
+/// the same terms as [`DeviceKeystore::load`] — a restore grants one window of
+/// slack **and spends it**, so a cut inside a window can only skip forward.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CounterWindow {
+    /// Slots holding a counter that is not durable yet, and the value each now
+    /// carries.
+    pending: HeaplessVec<(Slot, u32), { CounterWindow::PENDING_MAX }>,
+    /// Bumps since the last successful durable write, over the whole store.
+    ///
+    /// **Store-wide, not per credential, for the reason the snapshot window is**
+    /// (`DeviceKeystore::counter_unpersisted`): one flush writes every pending
+    /// record at once, so a shared budget bounds the total number of durable
+    /// writes without bounding how many credentials may be in flight — which is
+    /// what makes a mixed workload cost one flush per
+    /// [`COUNTER_PERSIST_INTERVAL`] bumps in total rather than one per counter.
+    unpersisted: u16,
+    /// Whether this session began as a **restore** from the durable image.
+    ///
+    /// The flag, not the slack arithmetic: [`Self::resume_base`] is what applies
+    /// US-1012's grant, and the flag is only what turns it on. It never clears —
+    /// "this session started from a restore image" is a fact about the session,
+    /// not about the current window.
+    restore: bool,
+    /// Slots whose restore slack has already been granted this session.
+    ///
+    /// **Bounded, and the bound costs counter space rather than correctness.**
+    /// Once it is full, [`Self::resume_base`] keeps granting the slack to slots
+    /// it has never seen: a slack applied twice is a *larger forward skip*, and
+    /// FIDO's requirement is that a `signCount` never repeats — never that it
+    /// advances by one. So the overflow direction is the safe one, and the bound
+    /// exists only because this is a fixed-size array on a part with no spare
+    /// RAM. 32 slots is 64 bytes and covers every device whose power-on sees
+    /// fewer than 32 distinct credentials.
+    resumed: HeaplessVec<Slot, { CounterWindow::RESUME_TRACK_MAX }>,
+}
+
+impl CounterWindow {
+    /// Slots a window can hold before a flush is forced.
+    ///
+    /// **Equal to the batch interval on purpose.** It is the smallest bound that
+    /// makes [`Self::record`] unable to refuse: the window closes after
+    /// [`COUNTER_PERSIST_INTERVAL`] bumps and each bump touches one slot, so
+    /// "the list is full" and "the window is full" are the same event, and
+    /// [`RegionCredentials::bump_counter`] flushes between them.
+    pub const PENDING_MAX: usize = COUNTER_PERSIST_INTERVAL as usize;
+
+    /// US-1012: the counter slack a restored session is granted, in counter
+    /// values — one whole batch window.
+    ///
+    /// The arithmetic is US-1012's, made exact: before the cut a credential's
+    /// in-RAM counter was at most `durable + COUNTER_PERSIST_INTERVAL - 1`, so a
+    /// restored device must not sign anything below that, and `durable + W` is
+    /// the first value it may sign.
+    pub const RESTORE_SLACK: u32 = COUNTER_PERSIST_INTERVAL as u32;
+
+    /// A window for a session that has issued no counter value yet: nothing
+    /// granted, nothing spent, nothing pending.
+    pub const RESUME_TRACK_MAX: usize = 32;
+
+    /// A window for a session that has issued no counter value yet: nothing
+    /// granted, nothing spent, nothing pending.
+    pub const fn fresh() -> Self {
+        CounterWindow {
+            pending: HeaplessVec::new(),
+            unpersisted: 0,
+            restore: false,
+            resumed: HeaplessVec::new(),
+        }
+    }
+
+    /// A window for a session that began as a **restore**: the whole budget
+    /// spent, so the first bump writes down.
+    ///
+    /// This is the "spend" half of US-1012 and [`Self::resume_from`] is the
+    /// "grant" half; the applet applies the grant to each credential it reads.
+    /// Granting without spending would let a restored device run a whole extra
+    /// window past the skip; spending without granting would resume at the
+    /// durable value and **repeat** it, which is the clone-detection failure
+    /// both halves exist to prevent. See [`DeviceKeystore::load`], which states
+    /// the same mechanism for the snapshot path.
+    pub const fn restored() -> Self {
+        CounterWindow {
+            pending: HeaplessVec::new(),
+            unpersisted: COUNTER_PERSIST_INTERVAL,
+            restore: true,
+            resumed: HeaplessVec::new(),
+        }
+    }
+
+    /// US-1012: the counter value a record read from the durable image resumes
+    /// from on a session that began as a restore.
+    ///
+    /// `saturating_add`, like [`DeviceKeystore::decode`]'s slack: a wrapped
+    /// counter repeats values whatever this code does, and 2³² assertions from
+    /// saturation is not a deployment.
+    pub const fn resume_from(durable: u32) -> u32 {
+        durable.saturating_add(Self::RESTORE_SLACK)
+    }
+
+    /// Did this session begin as a restore from the durable image?
+    pub const fn is_restore(&self) -> bool {
+        self.restore
+    }
+
+    /// US-1012's "grant" half, applied **here** rather than left to the caller.
+    ///
+    /// # Why it cannot be the caller's job
+    ///
+    /// The snapshot path grants the slack at *decode*, and its decoder reads the
+    /// whole snapshot — so every credential is reached exactly once per session
+    /// and there is nothing to forget. **The region store has no such sweep.**
+    /// S9 forbids the boot path from touching the key region, so a restored
+    /// device meets its records one at a time, on first use, and a caller that
+    /// has to remember "and add the slack the first time" will eventually not.
+    ///
+    /// That failure is invisible until it is a clone-detection failure: the
+    /// counter resumes at the durable value, the device signs a `signCount` the
+    /// client has already seen, and every other assertion in the story still
+    /// passes. So the grant is part of the window, keyed on the slot, and
+    /// [`Self::resumed`] remembers which records have had it.
+    ///
+    /// Returns the value `slot`'s counter may be raised from: `durable` on a
+    /// session that did not begin as a restore, [`Self::resume_from`] of it on
+    /// the first use of a record in one that did, and the durable value itself
+    /// for a record already resumed.
+    pub fn resume_base(&mut self, slot: Slot, durable: u32) -> u32 {
+        if !self.restore || self.resumed.contains(&slot) {
+            return durable;
+        }
+        // `push` failing is the overflow case named in `resumed`'s docs: the
+        // slack is granted anyway, which skips further forward and never
+        // repeats. Deliberately not handled by refusing — a refusal would be a
+        // credential that cannot sign after a power cut.
+        let _ = self.resumed.push(slot);
+        Self::resume_from(durable)
+    }
+
+    /// Bumps that have happened since the last durable write.
+    pub const fn unpersisted(&self) -> u16 {
+        self.unpersisted
+    }
+
+    /// How many slots hold a counter that is not durable yet.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The pending `(slot, counter)` pairs, oldest first.
+    pub fn pending(&self) -> &[(Slot, u32)] {
+        self.pending.as_slice()
+    }
+
+    /// Must the applet write now?
+    ///
+    /// Two reasons, and both are load-bearing: the batch budget is spent
+    /// (US-1011's window) or the pending list is full ([`Self::PENDING_MAX`]).
+    pub fn should_flush(&self) -> bool {
+        self.unpersisted >= COUNTER_PERSIST_INTERVAL || self.pending_full()
+    }
+
+    /// Whether [`Self::record`] could refuse.
+    pub fn pending_full(&self) -> bool {
+        self.pending.len() >= Self::PENDING_MAX
+    }
+
+    /// The counter `slot` currently carries, durable or pending.
+    ///
+    /// A pending entry wins, and it is strictly newer than what is in the
+    /// region because [`Self::record`] only ever raises it.
+    pub fn pending_value(&self, slot: Slot) -> Option<u32> {
+        self.pending.iter().find(|(s, _)| *s == slot).map(|(_, c)| *c)
+    }
+
+    /// Record that `slot`'s counter now reads `counter`.
+    ///
+    /// A slot already in the list is **updated, not appended** — the window
+    /// tracks a value per slot, not a bump log — while `unpersisted` still
+    /// rises, because the budget is in **bumps**.
+    ///
+    /// Returns `false` only when the pending list is full. That is the one
+    /// failure [`RegionCredentials::bump_counter`] handles by flushing first,
+    /// and it is a `bool` rather than a panic because a silently dropped bump
+    /// would let the next one sign a *lower* value — a clone-detection failure,
+    /// which is the one outcome worse than a reported error.
+    pub fn record(&mut self, slot: Slot, counter: u32) -> bool {
+        if let Some(entry) = self.pending.iter_mut().find(|(s, _)| *s == slot) {
+            entry.1 = counter;
+        } else if self.pending.push((slot, counter)).is_err() {
+            return false;
+        }
+        self.unpersisted = self.unpersisted.saturating_add(1);
+        true
+    }
+
+    /// One pending entry has become durable; drop it from the window.
+    pub(crate) fn commit_pending(&mut self, index: usize) {
+        self.pending.remove(index);
+        self.unpersisted = self.unpersisted.saturating_sub(1);
+    }
+
+    /// Every pending entry is durable: close the window.
+    ///
+    /// Never called for an empty flush — see [`RegionCredentials::flush_counters`],
+    /// where an empty list means "nothing happened", not "the budget reset".
+    pub(crate) fn note_durable_write(&mut self) {
+        self.pending.clear();
+        self.unpersisted = 0;
+    }
+}
+
 /// The record body one FIDO credential occupies, as a CBOR map.
 ///
 /// **The same map the snapshot codec writes**, not a second format. That is the
@@ -2688,6 +3350,182 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
     /// here and why no cut point can lose a credential.
     pub fn compact(&mut self, sector: Slot) -> Result<fido_store::CompactionReport, RegionCredentialError> {
         self.store.compact(&self.keys.payload, sector).map_err(map_store_error)
+    }
+
+    /// US-1561: the counter the record in `slot` carries right now — durable or
+    /// batched.
+    ///
+    /// The pending value is consulted first because it is the one the region does
+    /// **not** have yet, and a caller that read the durable value after a bump
+    /// would hand back a number the device has already signed past — which is
+    /// the shape of a clone-detection failure even though no signature repeats.
+    pub fn counter_value(
+        &mut self,
+        window: &CounterWindow,
+        slot: Slot,
+    ) -> Result<u32, RegionCredentialError> {
+        if let Some(pending) = window.pending_value(slot) {
+            return Ok(pending);
+        }
+        self.read_counter(slot)
+    }
+
+    /// The counter the **durable** record in `slot` carries, with no pending
+    /// window consulted.
+    ///
+    /// Split out from [`Self::counter_value`] because a caller that has just
+    /// written a counter — or that is deliberately about to be handed the
+    /// pre-bump value on a failed write — must be able to say "what is actually
+    /// in the region" without the window answering for it.
+    pub fn durable_counter(&mut self, slot: Slot) -> Result<u32, RegionCredentialError> {
+        self.read_counter(slot)
+    }
+
+    /// US-1561: make one record's counter durable.
+    ///
+    /// The only place a counter write touches the medium. It is
+    /// [`fido_store::FidoRecordStore::update`] run against a slot the caller
+    /// already names — a record commit plus the index rewrite that follows it —
+    /// and that function's docs give the order, the generation rule and the
+    /// fault window. What is added here is the **read-modify-write**: the record
+    /// is opened, its counter replaced, and the applet's own codec
+    /// ([`credential_record_body`]) re-encodes it.
+    ///
+    /// Re-encoding rather than patching in place, because the record body is a
+    /// CBOR map and a counter is not at a fixed offset in it — `push_uint`
+    /// re-chooses the encoding width when the value grows past a byte. The bytes
+    /// that come back out are the bytes that go in, because both ends are the
+    /// applet's codec and not a second layout to keep in step
+    /// (`AGENTS.md` §5).
+    ///
+    /// A tombstone reaches here as [`RegionCredentialError::Malformed`]: the
+    /// tombstone body is one byte and does not decode as a credential, so a
+    /// counter write cannot resurrect a deleted one.
+    pub fn write_counter(
+        &mut self,
+        nonce: &[u8; record::NONCE_LEN],
+        slot: Slot,
+        counter: u32,
+    ) -> Result<fido_store::PutReport, RegionCredentialError> {
+        let mut buf = CredentialWindow::new();
+        match self.load_slot(slot, &mut buf) {
+            SlotRead::Present(()) => {}
+            SlotRead::Absent => return Err(RegionCredentialError::NoSuchCredential),
+            SlotRead::Fault(why) => return Err(RegionCredentialError::Unreachable(why)),
+        }
+        let mut cred =
+            credential_from_record_body(buf.as_slice()).ok_or(RegionCredentialError::Malformed)?;
+        cred.counter = counter;
+        let body = credential_record_body(&cred).ok_or(RegionCredentialError::Malformed)?;
+        let rp_hash = RpIdHash::from_bytes(cred.rp_id_hash);
+        self.store
+            .update(&self.keys.payload, &self.keys.index, slot, nonce, &rp_hash, body.as_slice())
+            .map_err(map_store_error)
+    }
+
+    /// US-1561: bump `slot`'s signature counter, batching the durable write.
+    ///
+    /// `current` is the counter the applet holds — what
+    /// [`Self::counter_value`] returned, which is the **pending** value when
+    /// the window has one and the durable value otherwise.
+    ///
+    /// **The restore slack is applied inside this function, not by the caller.**
+    /// A caller passing `durable + W` by hand would be one forgotten line away
+    /// from signing a `signCount` the client has already seen, and every other
+    /// assertion in the story would still pass; see
+    /// [`CounterWindow::resume_base`] for the whole argument. The applet's job
+    /// is to read the record and pass it here.
+    ///
+    /// Returns the counter the reply must sign. **It is not the durable counter
+    /// until the window closes** — the weakening US-1011 made, in a store whose
+    /// write pattern has since changed shape and whose divisor has been
+    /// re-derived (`docs/erase-budget.md` §4c).
+    ///
+    /// `next_nonce` supplies a fresh GCM nonce per durable write. The store does
+    /// not derive one (`record::seal`'s docs: a module holding no key has no
+    /// business choosing a nonce), and a repeated nonce under one key is
+    /// catastrophic for GCM; on the device this is one draw from the applet's
+    /// TRNG pool.
+    pub fn bump_counter(
+        &mut self,
+        window: &mut CounterWindow,
+        slot: Slot,
+        current: u32,
+        next_nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
+    ) -> Result<u32, RegionCredentialError> {
+        // A full pending list is the only way `record` refuses, and a flush
+        // empties it — so flushing *before* the record is what makes the refusal
+        // unreachable rather than merely unlikely.
+        if window.pending_full() {
+            self.flush_counters(window, next_nonce)?;
+        }
+        let base = match window.pending_value(slot) {
+            // Already in flight: this session's own raise is the newest value,
+            // and it has already had whatever slack it was owed.
+            Some(p) => p.saturating_add(1),
+            None => window.resume_base(slot, current).saturating_add(1),
+        };
+        if !window.record(slot, base) {
+            // Unreachable — the list was just emptied or had room. Reported
+            // rather than swallowed, because the alternative is signing `base`
+            // without recording it, and the next bump would then read a *lower*
+            // durable value and sign a repeat.
+            return Err(RegionCredentialError::Unreachable(
+                "fido: the counter window could not hold the pending write",
+            ));
+        }
+        if window.should_flush() {
+            self.flush_counters(window, next_nonce)?;
+        }
+        Ok(base)
+    }
+
+    /// US-1561: make every batched counter durable, and report how many records
+    /// were written.
+    ///
+    /// **Entries are dropped one at a time, on success**, so a write that fails
+    /// part-way leaves the rest pending and the next flush retries them. A flush
+    /// that cleared the window up front and then failed would drop counters the
+    /// device had already signed — the same lost-update shape SOAK-FINDING-1 is
+    /// about, in a store that keeps none of the state in RAM to be lost.
+    ///
+    /// An **empty** flush writes nothing and does not close the window. A
+    /// restore arrives with an already-spent window and no pending entries, and
+    /// zeroing the budget there would spend the restore's whole guarantee on
+    /// nothing: the first assertion after the power-on would then ride in RAM
+    /// exactly like the thirty-first, which is the repeat US-1012 rules out.
+    pub fn flush_counters(
+        &mut self,
+        window: &mut CounterWindow,
+        next_nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
+    ) -> Result<u32, RegionCredentialError> {
+        let mut written = 0u32;
+        // No `at += 1`: `commit_pending(at)` removes the entry, so the next
+        // pending record shifts down into the slot just vacated.
+        let at = 0usize;
+        while at < window.pending_len() {
+            let (slot, counter) = window.pending()[at];
+            self.write_counter(&next_nonce(), slot, counter)?;
+            window.commit_pending(at);
+            written += 1;
+        }
+        if written > 0 {
+            window.note_durable_write();
+        }
+        Ok(written)
+    }
+
+    /// Open `slot` and answer with its durable counter.
+    fn read_counter(&mut self, slot: Slot) -> Result<u32, RegionCredentialError> {
+        let mut buf = CredentialWindow::new();
+        match self.load_slot(slot, &mut buf) {
+            SlotRead::Present(()) => {}
+            SlotRead::Absent => return Err(RegionCredentialError::NoSuchCredential),
+            SlotRead::Fault(why) => return Err(RegionCredentialError::Unreachable(why)),
+        }
+        credential_from_record_body(buf.as_slice())
+            .map(|c| c.counter)
+            .ok_or(RegionCredentialError::Malformed)
     }
 
     /// How many FIDO index entries the region holds.
@@ -3180,6 +4018,76 @@ pub fn migrate_snapshot_to_region(
 }
 
 // ---------------------------------------------------------------------------
+// Host-only observation point for the US-1550 zeroization assertion
+// ---------------------------------------------------------------------------
+
+/// Host-only hooks the device build does not have, for asserting that a
+/// credential's private scalar really is cleared when the credential goes out
+/// of scope.
+///
+/// **Why this exists, and why it is host-only.** "The private key is zeroized
+/// when the credential drops" is a claim about bytes that are, by then, in
+/// freed stack — there is no sound way for a test to read them back. So the
+/// scalar's own [`Drop`] records what it holds, *after* clearing it, into a
+/// thread-local, and the test asserts against that record. The claim under test
+/// is exactly the production claim: the same `Drop` body runs on arm, where the
+/// only difference is that nobody is left to read the result. This is
+/// `keyregion::crypto::testing` and `fused_key::testing` restated for the
+/// applet half of the store, and it exists for the same class of problem.
+///
+/// **Why `was_nonzero` is here and `crypto::testing` does not have it.** Without
+/// it, "every recorded buffer was all zeroes" is satisfied exactly as well by a
+/// [`PrivateScalar::zero`] — a template credential, a revoked one, a
+/// `default()` — as by a key that was really loaded and really wiped. The applet
+/// half has far more zero scalars in normal traffic than the region half has
+/// zero keys, so a witness without the flag would be vacuous here more often
+/// than anywhere else in the tree. `fused_key::DropWitness` is the shape to
+/// copy, and `apps/fido/tests/credential_zeroize.rs` copies it.
+#[cfg(not(target_arch = "arm"))]
+pub mod testing {
+    use core::cell::RefCell;
+
+    /// What one dropped [`PrivateScalar`](super::PrivateScalar) held, recorded by
+    /// its own `Drop` after its explicit zeroize ran.
+    #[cfg(not(target_arch = "arm"))]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct DroppedScalar {
+        /// Whether the buffer held anything before its zeroize ran.
+        ///
+        /// The half that makes "it was cleared" mean anything: a scalar that
+        /// was never populated would otherwise satisfy the assertion for free.
+        pub was_nonzero: bool,
+        /// The bytes the buffer held **after** the zeroize — expected all
+        /// zeroes.
+        pub bytes: [u8; super::PRIVATE_KEY_LEN],
+    }
+
+    std::thread_local! {
+        /// Post-zeroize contents of every credential scalar dropped on this
+        /// thread, oldest first. Thread-local so the parallel test harness
+        /// gives each `#[test]` its own record.
+        static DROPPED: RefCell<std::vec::Vec<DroppedScalar>> =
+            const { RefCell::new(std::vec::Vec::new()) };
+    }
+
+    /// Called from [`PrivateScalar`](super::PrivateScalar)'s `Drop`, after the
+    /// buffer is cleared.
+    pub(super) fn record_dropped_scalar(bytes: [u8; super::PRIVATE_KEY_LEN], was_nonzero: bool) {
+        DROPPED.with(|d| d.borrow_mut().push(DroppedScalar { was_nonzero, bytes }));
+    }
+
+    /// Every credential scalar dropped on this thread since the last [`clear`].
+    pub fn dropped_scalars() -> std::vec::Vec<DroppedScalar> {
+        DROPPED.with(|d| d.borrow().clone())
+    }
+
+    /// Forget the record, so one test cannot make the next one pass.
+    pub fn clear() {
+        DROPPED.with(|d| d.borrow_mut().clear());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time assertions
 // ---------------------------------------------------------------------------
 
@@ -3329,7 +4237,7 @@ mod us1011_batched_path_tests {
         let cred = DeviceCredential {
             credential_id: id,
             public_key: DeviceCoseKey::es256([1; 32], [2; 32]),
-            private_key: [0x0B; 32],
+            private_key: PrivateScalar::from_bytes([0x0B; 32]),
             rp_id_hash: [0xA0; 32],
             rp_id: heapless::Vec::new(),
             user_handle: heapless::Vec::new(),

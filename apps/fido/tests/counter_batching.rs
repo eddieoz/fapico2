@@ -19,7 +19,7 @@
 
 use fapico2_fido::FidoApp;
 use fapico2_platform::dispatch::App as _;
-use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential, KEYSTORE_SLOT};
+use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential, PrivateScalar, KEYSTORE_SLOT};
 use fapico2_platform::secure_store::rp2350::Rp2350SecureStore;
 use fapico2_platform::secure_store::{SecureStore, SecureStoreError};
 use fapico2_platform::trng::HostTrng;
@@ -221,7 +221,7 @@ fn booted_with_legacy_credential(
     let cred = DeviceCredential {
         credential_id: id,
         public_key: DeviceCoseKey::es256([1; 32], [2; 32]),
-        private_key: [0x0B; 32], // valid non-zero P-256 scalar
+        private_key: PrivateScalar::from_bytes([0x0B; 32]), // valid non-zero P-256 scalar
         rp_id_hash: APP_PARAM,
         rp_id: heapless::Vec::new(),
         user_handle: heapless::Vec::new(),
@@ -455,7 +455,7 @@ fn credential_deleted_inside_a_batch_window_is_durable() {
     let cred = DeviceCredential {
         credential_id: id,
         public_key: DeviceCoseKey::es256([3; 32], [4; 32]),
-        private_key: [0x0C; 32],
+        private_key: PrivateScalar::from_bytes([0x0C; 32]),
         rp_id_hash: APP_PARAM,
         rp_id: heapless::Vec::new(),
         user_handle: heapless::Vec::new(),

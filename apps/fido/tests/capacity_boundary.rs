@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use fapico2_fido::device_keystore::{
     credential_from_record_body, credential_record_body, region_pin_secret, DeviceCredential,
-    DevicePinState, RegionCredentialError, RegionCredentials, RegionKeys,
+    DevicePinState, PrivateScalar, RegionCredentialError, RegionCredentials, RegionKeys,
 };
 use fapico2_platform::keyregion::crypto;
 use fapico2_platform::keyregion::fido_store::FidoStoreError;
@@ -205,7 +205,7 @@ fn maximal_credential(n: u32) -> DeviceCredential {
     let mut cred = DeviceCredential {
         credential_id: HeaplessVec::new(),
         public_key: fapico2_fido::device_keystore::DeviceCoseKey::es256([n as u8; 32], [0x77; 32]),
-        private_key: [0x33; 32],
+        private_key: PrivateScalar::from_bytes([0x33; 32]),
         rp_id_hash: rp_hash(n),
         rp_id: HeaplessVec::new(),
         user_handle: HeaplessVec::new(),

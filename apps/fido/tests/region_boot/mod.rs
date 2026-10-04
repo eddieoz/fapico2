@@ -48,7 +48,8 @@ use fapico2_platform::trng::HostTrng;
 use heapless::Vec as HV;
 
 pub use fapico2_fido::device_keystore::{
-    DeviceCoseKey, DeviceCredential, DeviceKeystore, RegionKeys,
+    DeviceCoseKey, DeviceCredential, DeviceKeystore, PrivateScalar, RegionCredentialError,
+    RegionCredentials, RegionKeys,
 };
 
 pub const MAX_MSG: usize = fapico2_fido::CTAP2_MAX_MSG;
@@ -271,7 +272,7 @@ pub fn credential(n: u32, resident: bool) -> DeviceCredential {
     let mut cred = DeviceCredential {
         credential_id: HV::new(),
         public_key: DeviceCoseKey::es256([n as u8; 32], [0x22; 32]),
-        private_key: [0x66; 32],
+        private_key: PrivateScalar::from_bytes([0x66; 32]),
         rp_id_hash: rp_hash(n),
         rp_id: HV::new(),
         user_handle: HV::new(),
@@ -420,6 +421,87 @@ impl Device {
     /// store the applet wrote to.
     pub fn with_store<R>(&mut self, f: impl FnOnce(&mut Rp2350SecureStore) -> R) -> R {
         f(&mut self.store)
+    }
+
+    /// Grant user presence unconditionally.
+    ///
+    /// The board polls a button (`device_app.rs`'s `presence_grant`), and every
+    /// makeCredential/getAssertion/U2F-enforce needs one, so a test that wants
+    /// to reach those paths has to answer it. A `fn` pointer cannot capture,
+    /// hence the inner `fn` — the same constraint `install`'s `provider` states.
+    pub fn grant_presence_always(&mut self) {
+        fn grant(_tag: u32) -> bool {
+            true
+        }
+        self.app.set_presence_grant(grant);
+    }
+
+    /// The live `pinUvAuthToken`, once [`Self::set_pin`] has minted one.
+    pub fn pin_token(&self) -> Option<[u8; 32]> {
+        self.pin_token
+    }
+
+    /// Which store this device's credentials are in (US-1557).
+    ///
+    /// Delegates to the applet's own accessor rather than re-deriving the
+    /// answer from `key_region().is_some()` here: the test's subject is what
+    /// the applet *says*, and a second copy of the predicate in a test file is
+    /// free to drift from the one the command path uses.
+    pub fn backend(&self) -> fapico2_fido::device_keystore::CredentialBackend {
+        self.app.credential_backend()
+    }
+
+    /// Fill the key region to [`FIDO_CAPACITY`] credentials, through the
+    /// applet's own codec and its own key derivation.
+    ///
+    /// **The cost is `tests/capacity_boundary.rs`'s, not this file's to pay
+    /// inside a parity script**: the allocator is a linear scan by design
+    /// (`slotmap.rs`, "Lowest free slot is a linear scan"), so enrolling *n*
+    /// credentials costs ~n²/2 header reads and 856 is ~366,000 1 KiB reads.
+    /// What a caller wants from this is a region that is *full*, so that the
+    /// next command-path enrolment is refused — and that single call is the part
+    /// worth driving through `process_ctap2_with_store`.
+    ///
+    /// Panics rather than returning a result: a fill that did not reach
+    /// capacity would make the caller's boundary assertion vacuous, and a
+    /// `Result` here would only invite it to be ignored.
+    pub fn fill_region_to_capacity(&mut self, region_file: &InstalledRegion) {
+        for n in 0..fapico2_platform::keyregion::FIDO_CAPACITY {
+            if let Err(e) = self.enroll_directly(region_file, n) {
+                panic!("credential {n} of FIDO_CAPACITY must enrol, got {e:?}");
+            }
+        }
+    }
+
+    /// Register one resident credential directly into the region: no clientPIN
+    /// leg, no presence window, no makeCredential handshake.
+    ///
+    /// `make_cred` is the real path and is what most tests want. This exists for
+    /// the tests whose subject is what happens *after* an enrolment — US-1550's
+    /// zeroization and US-1557's capacity boundary — where paying the
+    /// makeCredential handshake on every fixture would make the test about the
+    /// handshake instead of about the region.
+    ///
+    /// It writes through the applet's own codec
+    /// ([`credential_record_body`](fapico2_fido::device_keystore::credential_record_body)),
+    /// so the record is byte-for-byte one the device would write, and it derives
+    /// its keys through [`region_keys`] — the applet's own accessor — so a test
+    /// cannot accidentally seal under a different key hierarchy than the one
+    /// shipped.
+    pub fn enroll_directly(
+        &mut self,
+        region_file: &InstalledRegion,
+        n: u32,
+    ) -> Result<(), RegionCredentialError> {
+        let keys = self.with_store(|store| {
+            let ks = DeviceKeystore::load(store).expect("readable").expect("snapshot present");
+            region_keys(store, &ks)
+        });
+        let cred = credential(n, true);
+        region_file.with(|region| {
+            let mut creds = RegionCredentials::new(region, &keys);
+            creds.put(&nonce(n), &cred).map(|_| ())
+        })
     }
 
     /// One U2F (CTAP1) APDU, through the **store-bearing** entry point, and the
@@ -718,6 +800,42 @@ impl Device {
     pub fn cm_enumerate_rps(&mut self) -> (u8, Vec<u8>) {
         self.cred_mgmt(0x02)
     }
+
+    /// credMgmt `enumerateCredsBegin` (PicoForge sub-command `0x04`) for one
+    /// RP, in the request layout PicoForge sends.
+    ///
+    /// Not `cred_mgmt(0x04)`, because that helper signs the **bare** sub-command
+    /// byte — which is right for `getCredsMetadata` and `enumerateRpsBegin`
+    /// (PicoForge omits their empty parameters from the signed message) and
+    /// wrong for this one.
+    pub fn cm_enumerate_creds(&mut self, rp_id: &str) -> (u8, Vec<u8>) {
+        let hash = crypto::sha256(rp_id.as_bytes());
+        // PicoForge's `subCommandParams` is a **bare map** under the request's
+        // key `0x02`, not a byte string wrapping one — `device_core.rs`'s
+        // `cm_dialect` decides "PicoForge" precisely because key 2 decodes as
+        // `Item::Map`, and a bstr there reads as neither dialect and is answered
+        // `0x12`. Inside it, `rpIdHash` is key **1**, not the CTAP2 key 4.
+        let mut r: HV<u8, 256> = HV::new();
+        nh::push_map_header(&mut r, 4).unwrap();
+        nh::push_uint(&mut r, 1).unwrap();
+        nh::push_uint(&mut r, 4).unwrap();
+        nh::push_uint(&mut r, 2).unwrap();
+        let params_at = r.len();
+        nh::push_map_header(&mut r, 1).unwrap();
+        nh::push_uint(&mut r, 1).unwrap();
+        nh::push_bstr(&mut r, &hash).unwrap();
+        let params_end = r.len();
+        // And the signed message is `subCommand ‖ CBOR(subCommandParams)` — the
+        // params map byte-exact, as it appears on the wire, key order included
+        // (`device_core.rs` captures the raw bytes for exactly this reason).
+        let mut auth_msg: Vec<u8> = vec![0x04];
+        auth_msg.extend_from_slice(&r[params_at..params_end]);
+        nh::push_uint(&mut r, 3).unwrap();
+        nh::push_uint(&mut r, 1).unwrap();
+        nh::push_uint(&mut r, 4).unwrap();
+        nh::push_bstr(&mut r, &self.pin_auth(&auth_msg)).unwrap();
+        self.call(0x0A, r.as_slice())
+    }
 }
 
 /// Read an unsigned integer at `key` out of a CTAP2 response map.
@@ -756,6 +874,45 @@ pub fn uint_at(cbor: &[u8], key: u64) -> Option<u64> {
         };
     }
     None
+}
+
+/// The integer keys of a CBOR map, in wire order, with their values skipped.
+///
+/// **The key *set*, not the decoded map.** US-1557's claim is that the two
+/// twins answer the same command with the same CBOR shape — the same key
+/// numbering, which is the thing `AGENTS.md` §2 calls binding — and a decoded
+/// `BTreeMap`/`Vec` would have thrown that order away, and would have made an
+/// assertion built on the *implementation's* parser able to mistake an
+/// implementation bug for its own. Reading the head of each item and skipping
+/// its value keeps the assertion on the bytes.
+///
+/// Values are skipped through [`cbor_skip`], so a nested map (`{"id": …}`,
+/// which every credMgmt reply carries) does not confuse the walk.
+pub fn top_level_keys(cbor: &[u8]) -> Vec<u64> {
+    let mut i = 0;
+    let mut keys = Vec::new();
+    let (major, pairs) = match cbor_head(cbor, &mut i) {
+        Some(head) => head,
+        None => return keys,
+    };
+    if major != 5 {
+        return keys;
+    }
+    for _ in 0..pairs {
+        let key_at = i;
+        if cbor_skip(cbor, &mut i).is_none() {
+            break;
+        }
+        if cbor_skip(cbor, &mut i).is_none() {
+            break;
+        }
+        let mut j = key_at;
+        match cbor_head(cbor, &mut j) {
+            Some((0, k)) => keys.push(k),
+            _ => break,
+        }
+    }
+    keys
 }
 
 /// The CBOR major type and argument of the item starting at `i`.

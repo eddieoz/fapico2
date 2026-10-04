@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 
 use fapico2_fido::device_keystore::{
     credential_from_record_body, credential_record_body, is_deleted_body, region_pin_secret,
-    DeviceCredential, DeviceCoseKey, DevicePinState, RegionCredentialError, RegionCredentials,
-    RegionKeys,
+    DeviceCredential, DeviceCoseKey, DevicePinState, PrivateScalar, RegionCredentialError,
+    RegionCredentials, RegionKeys,
 };
 use fapico2_platform::keyregion::crypto;
 use fapico2_platform::keyregion::fido_store::{self, FidoRecordStore, FidoStoreError};
@@ -132,7 +132,7 @@ fn credential(n: u32, resident: bool) -> DeviceCredential {
     let mut cred = DeviceCredential {
         credential_id: HeaplessVec::new(),
         public_key: DeviceCoseKey::es256([n as u8; 32], [0x22; 32]),
-        private_key: [0x66; 32],
+        private_key: PrivateScalar::from_bytes([0x66; 32]),
         rp_id_hash: rp_hash(n),
         rp_id: HeaplessVec::new(),
         user_handle: HeaplessVec::new(),

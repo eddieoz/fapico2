@@ -307,7 +307,7 @@ fn stateless_auth_survives_reboot() {
 /// store lookup runs first for handles without the stateless shape.
 #[test]
 fn legacy_store_backed_handle_still_auths() {
-    use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential};
+    use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential, PrivateScalar};
     let mut trng = HostTrng::new();
     let mut store = Rp2350SecureStore::new();
     let mut app = FidoApp::boot(&mut trng, &mut store).unwrap();
@@ -318,7 +318,7 @@ fn legacy_store_backed_handle_still_auths() {
     let cred = DeviceCredential {
         credential_id: id,
         public_key: DeviceCoseKey::es256([1; 32], [2; 32]),
-        private_key: [0x0B; 32], // valid non-zero P-256 scalar
+        private_key: PrivateScalar::from_bytes([0x0B; 32]), // valid non-zero P-256 scalar
         rp_id_hash: [0xA0; 32],
         rp_id: heapless::Vec::new(),
         user_handle: heapless::Vec::new(),

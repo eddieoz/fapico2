@@ -121,6 +121,110 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
+// The wear an index-entry write costs (US-1561, US-1562)
+// ---------------------------------------------------------------------------
+//
+// The index writer runs the **same three-phase shape** a record commit does —
+// stage a whole sector through the scratchpad, erase the live one, copy back,
+// retire — so the two are expressed in terms of [`commit`]'s own published
+// counts rather than in a second set of literals. Sharing them is deliberate:
+// a second set would be a second protocol, and the gap between them is exactly
+// what `docs/erase-budget.md` would then be publishing a lifetime from.
+
+/// Sector erases one index-entry write issues against the **scratchpad**: the
+/// prepare erase and the retire erase, the same two [`commit`] performs.
+///
+/// Stated by reference so a change to the staging shape in [`commit`] moves this
+/// figure with it instead of leaving it stale here.
+pub const INDEX_SCRATCHPAD_ERASES_PER_ENTRY_WRITE: u32 = commit::SCRATCHPAD_ERASES_PER_COMMIT;
+
+/// Sector erases one index-entry write issues against the **live** index
+/// sector: exactly one.
+pub const INDEX_LIVE_ERASES_PER_ENTRY_WRITE: u32 = commit::LIVE_ERASES_PER_COMMIT;
+
+/// Total sector erases one index-entry write issues: **three**.
+///
+/// This is the half of a durable counter write that is *not* the record. See
+/// [`SECTOR_ERASES_PER_COUNTER_WRITE`] for why a counter write pays it.
+pub const INDEX_SECTOR_ERASES_PER_ENTRY_WRITE: u32 =
+    INDEX_SCRATCHPAD_ERASES_PER_ENTRY_WRITE + INDEX_LIVE_ERASES_PER_ENTRY_WRITE;
+
+/// Sector erases one **durable** signature-counter write performs: the record
+/// commit plus the index-entry rewrite that follows it.
+///
+/// **Six**, over three distinct sectors. And the distribution is **not** the
+/// snapshot path's uniform one-per-sector: it is
+///
+/// | sector | erases | why |
+/// |---|---:|---|
+/// | the commit scratchpad | **4** | both writes stage through the **same** sector, and each erases it to prepare and again to retire |
+/// | the live record sector | 1 | the record commit's step 5 |
+/// | the live index sector | 1 | the index rewrite's live erase |
+///
+/// **The scratchpad is the wear bottleneck, and it is not visible from either
+/// half's arithmetic taken alone.** A record commit costs three erases on three
+/// different sectors; an index write costs three more on three different
+/// sectors; together they cost six on **two** sectors they share and one they
+/// do not. This is the number `docs/erase-budget.md` §4c divides by, and it is
+/// four times the divisor the whole-snapshot path used — which is why the
+/// per-record budget with the same interval comes out *smaller* in assertions,
+/// not larger, despite erasing 2.7× fewer bytes per assertion.
+///
+/// Measured, not asserted: `platform/tests/key_region_counter_budget.rs`
+/// publishes the full profile (`erase_profile_per_counter_write`) so the shape
+/// is checkable and not just the maximum.
+///
+/// # Why the index half is paid at all (US-1561, and its cost stated)
+///
+/// A counter write has to advance the record's **generation** — `commit::commit`
+/// refuses a commit that does not, and rightly so: a write at the generation
+/// already in the slot is a replay by another name. The index entry's `generation`
+/// field is bound into its MAC over `(domain, slot, generation, rp_id_hash)`
+/// ([`index.rs`](super::index), "What the MAC covers"), and
+/// [`IndexEntry::generation`] is documented as *the generation of the record this
+/// entry names* — so a record that advances leaves an index asserting something
+/// false about the region, and every later reader of that field would be reading
+/// a lie.
+///
+/// **Named honestly: nothing currently compares the two.** `index::lookup_all`
+/// verifies an entry's tag against the entry's *own* `(domain, slot,
+/// generation)` and answers a slot; no call path today reads
+/// [`IndexEntry::generation`] to decide anything. So this half buys an invariant
+/// the index maintains rather than an attack it stops, and `AGENTS.md` §5 asks
+/// for the attack to be named before a mechanism is added.
+///
+/// The name is: **the index must not be able to disagree with the region about
+/// which generation is current.** The alternative is to leave the field stale and
+/// document it as stale, which turns a field every future reader will consult
+/// into one whose value is a lie by a factor that grows with the batch window.
+/// That is not cheaper in any sense a later change can rely on. The cost is
+/// published here, measured by `platform/tests/key_region_counter_budget.rs`,
+/// and divided out of the lifetime in `docs/erase-budget.md` §4c — so a reader
+/// who disagrees with the trade can see exactly what it costs, and can divide
+/// three erases back out of six and recompute.
+///
+/// The other thing batching buys is that all of it is paid **once per
+/// `COUNTER_PERSIST_INTERVAL` assertions** and not once per assertion: the
+/// honest per-assertion figure is `6 / 32` sector erases, not 6.
+pub const SECTOR_ERASES_PER_COUNTER_WRITE: u32 =
+    commit::SECTOR_ERASES_PER_COMMIT + INDEX_SECTOR_ERASES_PER_ENTRY_WRITE;
+
+/// Sector erases one durable counter write lands on its **busiest single**
+/// sector: **four**, all of them on the commit scratchpad.
+///
+/// **This is the divisor the per-record lifetime is computed from.** NOR
+/// endurance is specified per sector, so the lifetime is
+/// `cycles_per_sector / this` — the same reasoning as §3.3 of
+/// `docs/erase-budget.md`, and the same refusal to divide a per-sector budget
+/// by a per-write operation count that produced the withdrawn 12,500 there.
+///
+/// Derived, not literal: the record commit and the index rewrite are two
+/// three-phase writes that share one scratchpad, so each contributes
+/// [`SCRATCHPAD_ERASES_PER_COMMIT`] to it.
+pub const MAX_ERASES_PER_SECTOR_PER_COUNTER_WRITE: u32 =
+    commit::SCRATCHPAD_ERASES_PER_COMMIT + INDEX_SCRATCHPAD_ERASES_PER_ENTRY_WRITE;
+
+// ---------------------------------------------------------------------------
 // Layout: which slots this applet may touch
 // ---------------------------------------------------------------------------
 
@@ -934,6 +1038,96 @@ impl FidoRecordStore<'_> {
         })
     }
 
+    /// Rewrite the record already in `slot`, and the index entry that names it.
+    ///
+    /// # What this is for
+    ///
+    /// **A signature-counter bump**, which changes one field of a record that is
+    /// already stored — [`Self::put`]'s job is the opposite, and its allocator
+    /// would hand a counter bump a *new* slot and strand the old one.
+    ///
+    /// # The generation, and why it advances
+    ///
+    /// The commit is offered `current + 1`, because [`commit::commit`] refuses a
+    /// commit that does not advance the generation and the refusal is right: a
+    /// write at the generation already in the slot is a replay by another name.
+    /// That in turn is why this function rewrites the **index entry** rather than
+    /// leaving it alone — see [`SECTOR_ERASES_PER_COUNTER_WRITE`] for the whole
+    /// argument, including what the extra half of the wear buys and what it does
+    /// not.
+    ///
+    /// # Order, and it is [`Self::put`]'s order with one difference
+    ///
+    /// Record first, index second, for the reason `put` gives: a record with no
+    /// entry is *unfindable*, while an entry naming a slot whose record is stale
+    /// reads as a credential at a generation the region does not hold. The
+    /// difference is that the index write is a **rewrite of an existing cell**
+    /// ([`rewrite_index_entry`]) rather than an append — appending here would
+    /// leave two entries naming one slot, and every enumeration would return the
+    /// credential twice.
+    ///
+    /// # The fault window
+    ///
+    /// Inherits both halves of the fault tables above it, and they are the same
+    /// ones: a cut inside the record commit leaves generation *N* readable
+    /// (`commit.rs`'s phase table); a cut inside the index rewrite leaves up to
+    /// [`SLOTS_PER_SECTOR`] × [`index::ENTRIES_PER_SLOT`] entries unfindable,
+    /// which makes credentials unfindable and destroys none. In the middle —
+    /// after the record commit and before the index rewrite — the index names a
+    /// generation the record has left behind, and a tag check against the
+    /// *record's* generation would fail. That is the safe direction: the entry
+    /// is not deleted, only described as an older generation of a slot that
+    /// still holds the credential, and re-running the rewrite repairs it.
+    ///
+    /// `slot` must already hold a FIDO record. Over an erased slot this is
+    /// [`Self::put`]'s job, and refusing is what keeps "a counter write" from
+    /// quietly becoming "an enrolment".
+    pub fn update(
+        &mut self,
+        payload_key: &PayloadKey,
+        index_key: &IndexKey,
+        slot: Slot,
+        nonce: &[u8; record::NONCE_LEN],
+        rp_id_hash: &RpIdHash,
+        plaintext: &[u8],
+    ) -> Result<PutReport, FidoStoreError> {
+        let max = super::FIDO_RECORD_MAX as usize;
+        if plaintext.len() > max {
+            return Err(FidoStoreError::CredentialTooLarge { len: plaintext.len(), max });
+        }
+        if !is_fido_slot(slot) {
+            return Err(FidoStoreError::RegionUnreadable(
+                "an update named a slot outside the FIDO range",
+            ));
+        }
+        // 1.
+        self.recover()?;
+        // 2. `0` means "empty, or a record this build cannot read", and an
+        //    enrolment is the operation for that: allocating here would pick a
+        //    different slot and leave `slot`'s index entry naming whatever is
+        //    already there, which is a second definition of "where this
+        //    credential lives".
+        let current = self.record_generation(slot)?;
+        if current == 0 {
+            return Err(FidoStoreError::RegionUnreadable(
+                "an update named a slot that holds no FIDO record",
+            ));
+        }
+        let generation = current.checked_add(1).ok_or(FidoStoreError::Full)?;
+        // 3.
+        let header = RecordHeader::new(Domain::Fido, slot, generation);
+        let sealed = record::seal(&header, payload_key.as_bytes(), nonce, plaintext)
+            .map_err(FidoStoreError::Record)?;
+        // 4.
+        let plan =
+            CommitPlan::new(scratchpad_slot(), slot, Domain::Fido, generation);
+        let commit = commit::commit(self.region, plan, &sealed).map_err(FidoStoreError::Commit)?;
+        // 5.
+        let entry = IndexEntry::build(index_key, KeyDomain::Fido, slot, generation, rp_id_hash);
+        let index_slot = rewrite_index_entry(self.region, slot, entry)?;
+        Ok(PutReport { slot, generation, commit, index_slot })
+    }
+
     /// Load one credential of one RP into `out`, opening nothing else.
     ///
     /// The single-decryption path, and the one [`on_demand::load`] exists to
@@ -1503,71 +1697,135 @@ fn clear_index_entries(
     let mut pass = 0u32;
     while pass < INDEX_SLOT_COUNT {
         pass += 1;
-        let Some(touched) = find_entry_sector(region, want)? else {
+        let Some((touched, _)) = find_entry_cell(region, want)? else {
             break;
         };
         if first.is_none() {
             first = Some(touched);
         }
-        rewrite_index_sector(region, touched, want)?;
+        rewrite_index_sector(region, touched, |bytes| {
+            let mut n = 0u32;
+            while n < index::ENTRIES_PER_SLOT {
+                let at = index::entry_offset(n) as usize;
+                let cell = &bytes[at..at + index::INDEX_ENTRY_BYTES];
+                if !IndexEntry::is_erased(cell) {
+                    if let SlotRead::Present(e) = IndexEntry::decode(cell) {
+                        if e.slot().index() == want {
+                            bytes[at..at + index::INDEX_ENTRY_BYTES].fill(ERASED_CELL_BYTE);
+                        }
+                    }
+                }
+                n += 1;
+            }
+        })?;
     }
     Ok(first)
 }
 
-/// The index slot holding an entry that names `want`, if any.
+/// The index slot and byte offset of the first cell naming `want`, if any.
 ///
-/// Matches on **slot only**, deliberately: a delete is about the slot, and an
-/// entry left behind for an earlier generation of it would keep the deleted
-/// credential findable. The entry's own tag is not checked — a cell this build
-/// cannot parse is not this store's to interpret, and clearing it would destroy
-/// a record this build does not own.
-fn find_entry_sector(
+/// **Cell, not just slot**, because [`rewrite_index_entry`] has to overwrite the
+/// entry that is already there: a rewrite that appended would leave two cells
+/// naming one slot and every enumeration would return the credential twice.
+/// `find_entry_sector`'s slot-only answer was enough for a delete — which clears
+/// every cell naming the slot and so does not care where they are — and is not
+/// enough for a rewrite, which does.
+///
+/// Matches on **slot only**, and the entry's tag is deliberately not checked: a
+/// cell this build cannot parse is not this store's to rewrite, and overwriting
+/// one would destroy a record this build does not own.
+fn find_entry_cell(
     region: &mut dyn KeyRegion,
     want: u16,
-) -> Result<Option<Slot>, FidoStoreError> {
+) -> Result<Option<(Slot, u32)>, FidoStoreError> {
     let mut s = 0u32;
     while s < INDEX_SLOT_COUNT {
         let slot = index::entry_slot(s * index::ENTRIES_PER_SLOT)
             .ok_or(FidoStoreError::IndexUnreadable(index::E_INDEX_SLOT_UNREADABLE))?;
         let raw = region.read_slot(slot).map_err(FidoStoreError::IndexUnreadable)?;
-        if index_slot_holds(&raw, want) {
-            return Ok(Some(slot));
+        if let Some(at) = cell_naming(&raw, want) {
+            return Ok(Some((slot, at)));
         }
         s += 1;
     }
     Ok(None)
 }
 
-/// Does any cell of this index slot name `want`?
-fn index_slot_holds(raw: &SlotImage, want: u16) -> bool {
+/// The byte offset inside one index slot of a cell naming `want`.
+fn cell_naming(raw: &SlotImage, want: u16) -> Option<u32> {
     let mut n = 0u32;
     while n < index::ENTRIES_PER_SLOT {
-        let at = index::entry_offset(n) as usize;
-        let cell = &raw[at..at + index::INDEX_ENTRY_BYTES];
+        let at = index::entry_offset(n);
+        let cell = &raw[at as usize..at as usize + index::INDEX_ENTRY_BYTES];
         if !IndexEntry::is_erased(cell) {
             if let SlotRead::Present(e) = IndexEntry::decode(cell) {
                 if e.slot().index() == want {
-                    return true;
+                    return Some(at);
                 }
             }
         }
         n += 1;
     }
-    false
+    None
 }
 
-/// Erase `live`'s sector and reprogram it without any cell naming `want`.
+/// Overwrite the one index cell naming `slot` with `entry`, at sector
+/// granularity.
 ///
-/// Stage → erase → copy back, one slot image at a time — the same three phases
-/// and the same fault window as `write_index_entry`, for the reason this
-/// function's own docs give. The staged set is a complete replacement for the
-/// live sector at every cut point after the erase (the affected cells are erased
-/// on both sides), so `commit::recover` scores the staged sector as a legitimate
-/// replay rather than abandoning it.
+/// The in-place counterpart of [`write_index_entry`], and it shares that
+/// function's fault table exactly: stage → erase the live index sector → copy
+/// back → retire. A cut before the erase leaves the index as it was; a cut
+/// between the erase and the copy-back leaves that sector **empty**, which makes
+/// up to [`index::ENTRIES_PER_SLOT`] × [`SLOTS_PER_SECTOR`] credentials
+/// *unfindable* and destroys none — their records are still sealed in their
+/// slots, the allocator will not hand those slots out, and the user re-enrols.
+///
+/// **Why the cell is spliced rather than the whole slot rebuilt.** Splicing is
+/// what keeps the entry's *position* stable, and a stable position is what lets
+/// this find the same cell again after a failed write — a whole-slot rebuild
+/// that re-derived the layout would be a second placement rule, which is the
+/// defect [`write_index_entry`]'s own docs refuse to introduce.
+pub fn rewrite_index_entry(
+    region: &mut dyn KeyRegion,
+    slot: Slot,
+    entry: IndexEntry,
+) -> Result<Slot, FidoStoreError> {
+    let want = slot.index();
+    let Some((live, at)) = find_entry_cell(region, want)? else {
+        // The record exists but nothing names it: an orphan, which
+        // `FidoRecordStore::put`'s fault table calls *unfindable* rather than
+        // corrupt. Reported rather than repaired — inventing an entry here would
+        // be the operation whose failure mode `index.rs` calls out: "an entry
+        // naming a slot with no record reads as a credential that is not one",
+        // and the converse of that rule is the one this call is on.
+        return Err(FidoStoreError::IndexUnreadable(
+            "no index entry names the slot being updated — the record is an orphan",
+        ));
+    };
+    let bytes = entry.encode();
+    rewrite_index_sector(region, live, |image| {
+        image[at as usize..at as usize + index::INDEX_ENTRY_BYTES].copy_from_slice(&bytes);
+    })?;
+    Ok(live)
+}
+
+/// Erase `live`'s sector and reprogram it with `edit` applied to each slot image.
+///
+/// Stage → erase → copy back, one slot image at a time — the three phases and
+/// the fault window `write_index_entry` documents, and the reason this function
+/// exists as a closure-taking shape rather than two near-identical copies: the
+/// delete and the counter-update paths differ by **one splice** and must not
+/// differ by a staging protocol.
+///
+/// The staged set is a complete replacement for the live sector at every cut
+/// point after the erase — the edited cells read the same on both sides, since
+/// the staged image is a copy of the live one with the splice applied — so
+/// `commit::recover` scores the staged sector as a legitimate replay rather than
+/// abandoning it.
 fn rewrite_index_sector(
     region: &mut dyn KeyRegion,
     live: Slot,
-    want: u16,
+    mut edit: impl FnMut(&mut SlotImage),
 ) -> Result<(), FidoStoreError> {
     let live_base = commit::sector_base(live);
     let scratch_base = commit::sector_base(scratchpad_slot());
@@ -1578,19 +1836,7 @@ fn rewrite_index_sector(
     while offset < SLOTS_PER_SECTOR {
         let from = slot_in_sector(live_base, offset)?;
         let mut bytes: SlotImage = region.read_slot(from).map_err(FidoStoreError::IndexUnreadable)?;
-        let mut n = 0u32;
-        while n < index::ENTRIES_PER_SLOT {
-            let at = index::entry_offset(n) as usize;
-            let cell = &bytes[at..at + index::INDEX_ENTRY_BYTES];
-            if !IndexEntry::is_erased(cell) {
-                if let SlotRead::Present(e) = IndexEntry::decode(cell) {
-                    if e.slot().index() == want {
-                        bytes[at..at + index::INDEX_ENTRY_BYTES].fill(ERASED_CELL_BYTE);
-                    }
-                }
-            }
-            n += 1;
-        }
+        edit(&mut bytes);
         if !is_erased(&bytes) {
             region
                 .program(slot_in_sector(scratch_base, offset)?, 0, &bytes)

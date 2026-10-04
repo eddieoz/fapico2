@@ -218,6 +218,85 @@ use super::FIDO_SLOT_BYTES;
 /// visible at the call site rather than implied.
 pub const SCRATCHPAD_SLOTS: u32 = SLOTS_PER_SECTOR;
 
+// ---------------------------------------------------------------------------
+// The wear a commit costs (US-1561, US-1562)
+//
+// These are **published counts, not assertions about an optimum**: they say how
+// many sector erases and slot programs this protocol issues, so that
+// `docs/erase-budget.md` derives a lifetime from a number the protocol owns
+// rather than from prose. `platform/tests/key_region_counter_budget.rs` drives
+// the real code over the NOR-modelling host region and fails if a measurement
+// stops agreeing, and `tests/scripts/check_erase_budget.py` reads **these
+// constants out of the source** and refuses a document whose arithmetic used
+// different ones. Three parties hold one number, which is the only arrangement
+// in which a drift is a red build rather than a stale paragraph.
+//
+// **Why a sector and not a slot.** The counts are in sector erases because that
+// is the unit NOR endurance is specified in, and there is no slot erase on this
+// part to count instead: `SLOTS_PER_SECTOR` slots share one erase
+// (`mod.rs`, "Slots per NOR sector"), which is the entire reason this module
+// exists. "One erase and one program" in the acceptance criterion means *one
+// live-sector erase and one live-sector reprogram* — see
+// [`LIVE_ERASES_PER_COMMIT`] and [`LIVE_PROGRAMS_PER_COMMIT`].
+//
+// **Where each call site is.** [`SCRATCHPAD_ERASES_PER_COMMIT`] is `stage`'s
+// prepare erase plus `commit`'s step 7 retire erase; [`LIVE_ERASES_PER_COMMIT`]
+// is step 5. Both are named here rather than counted at the call sites because a
+// count a caller has to add up is a count two people add up differently.
+// ---------------------------------------------------------------------------
+
+/// Sector erases [`commit`] issues against the **scratchpad**: one to prepare
+/// (`stage`) and one to retire (step 7).
+///
+/// The retire erase is best effort and its failure is not reported
+/// ([`commit`]'s step 7), but it is still *issued*, and a wear figure that
+/// counted only the erases that can fail would under-report half of them. The
+/// honest statement is about attempts.
+///
+/// The scratchpad therefore collects **two** erases per commit against **one**
+/// sector, and that is the busiest sector a single commit has.
+///
+/// **It is also the busiest sector of a larger operation, and that is the
+/// divisor the lifetime is computed from.** A durable per-record counter write
+/// is *two* three-phase writes — a record commit and an index rewrite — that
+/// stage through the **same** scratchpad sector, so it collects **four** erases
+/// there out of the six the whole write issues. See
+/// [`MAX_ERASES_PER_SECTOR_PER_COUNTER_WRITE`](super::fido_store::MAX_ERASES_PER_SECTOR_PER_COUNTER_WRITE)
+/// and `docs/erase-budget.md` §4c; neither figure is derivable from this one
+/// alone, which is the reason it is stated as a sum of two three-phase shapes
+/// rather than as a property of `commit`.
+pub const SCRATCHPAD_ERASES_PER_COMMIT: u32 = 2;
+
+/// Sector erases [`commit`] issues against the **live** sector holding the
+/// records: step 5, and always exactly one.
+///
+/// `report.live_erases = 1` is set unconditionally after this erase succeeds,
+/// which is the same statement made by the type rather than by this constant —
+/// see [`CommitReport::live_erases`].
+pub const LIVE_ERASES_PER_COMMIT: u32 = 1;
+
+/// Total sector erases [`commit`] issues: scratchpad prepare, live, scratchpad
+/// retire.
+///
+/// **Three, for one record.** The live erase alone would be one, and it is the
+/// one the acceptance criterion counts; the two scratchpad erases are the price
+/// of the atomicity the module docs argue for, paid on a sector that holds
+/// nothing the owner can lose.
+pub const SECTOR_ERASES_PER_COMMIT: u32 = SCRATCHPAD_ERASES_PER_COMMIT + LIVE_ERASES_PER_COMMIT;
+
+/// Slot programs [`commit`] issues into the **live** sector: one per
+/// non-erased staged slot, target last.
+///
+/// One per sector slot, so a full sector reprograms completely and an empty one
+/// programs only the target. `SLOTS_PER_SECTOR` rather than `4` because the
+/// stride is derived ([`mod.rs`], "Slots per NOR sector") and a literal here
+/// would be a second geometry.
+pub const LIVE_PROGRAMS_PER_COMMIT: u32 = SLOTS_PER_SECTOR;
+
+/// Slot programs [`commit`] issues into the **scratchpad**, the staging pass:
+/// one per non-erased mate plus the witness.
+pub const STAGED_PROGRAMS_PER_COMMIT: u32 = SLOTS_PER_SECTOR;
+
 /// Why a commit did not happen — or did not finish.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitError {
@@ -1065,5 +1144,33 @@ const _: () = {
     assert!(
         FIDO_SLOT_BYTES != 0 && FIDO_SLOT_BYTES & (FIDO_SLOT_BYTES - 1) == 0,
         "the commit path programs whole slot images"
+    );
+    // --- the published wear figures (US-1562) -------------------------------
+    // These constants are what `docs/erase-budget.md` derives the per-record
+    // lifetime from, so they are held here against the two structural facts
+    // they rest on rather than left as free-floating numbers a protocol change
+    // would silently falsify.
+    //
+    // The scratchpad erases twice per commit because it is erased once to
+    // prepare and once to retire, and it is the *same sector* both times — which
+    // is what makes it the busiest sector in the protocol and the divisor the
+    // per-record lifetime is computed from. If a future protocol reuses the
+    // scratchpad without retiring it, this assertion is where the wear figure
+    // stops being true.
+    assert!(
+        SCRATCHPAD_ERASES_PER_COMMIT == 2 && LIVE_ERASES_PER_COMMIT == 1,
+        "a commit erases the scratchpad to prepare and to retire, and the live sector exactly \
+         once — if the protocol changes, SECTOR_ERASES_PER_COMMIT and every figure derived from \
+         it in docs/erase-budget.md have to be re-measured"
+    );
+    // A live-sector program is a whole sector's worth of slots, because
+    // `copy_into_live` rewrites every slot it staged and the erase left nothing
+    // to keep. A "one program" reading of the acceptance criterion is one
+    // *sector* program, which is this many slot programs.
+    assert!(
+        LIVE_PROGRAMS_PER_COMMIT == SLOTS_PER_SECTOR
+            && STAGED_PROGRAMS_PER_COMMIT == SLOTS_PER_SECTOR,
+        "a commit programs the same slots twice — once staged, once copied back — and both \
+         passes cover a whole sector"
     );
 };

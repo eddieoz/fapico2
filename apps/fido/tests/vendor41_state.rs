@@ -877,7 +877,12 @@ fn the_ring_evicts_into_the_epoch_and_the_head_covers_everything() {
 /// No MSE session is a refusal, never a zero key.
 #[test]
 fn no_mse_session_is_a_refusal_not_a_zero_key() {
-    let ks = fresh_keystore();
+    // US-1550: borrowed directly rather than through `ks.clone()`. A clone of
+    // `DeviceKeystore` is a clone of every credential private key it holds, and
+    // `DeviceKeystore` therefore no longer derives `Clone` — this test is the
+    // only caller that needed one, and it did not: the keystore is not read
+    // after `with_keystore_ops` returns.
+    let mut ks = fresh_keystore();
     let session = VendorSession::default();
     let mut counter = 0u8;
     let mut random = move |b: &mut [u8]| {
@@ -889,7 +894,7 @@ fn no_mse_session_is_a_refusal_not_a_zero_key() {
     let mut store: Option<&mut dyn SecureStore> = None;
     let mut out = MseChannel { key: [0; 32], aad: [0; P256_POINT_LEN] };
     vendor_state::with_keystore_ops(
-        &mut ks.clone(),
+        &mut ks,
         &mut { session },
         &mut store,
         &mut random,

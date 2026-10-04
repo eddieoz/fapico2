@@ -1705,10 +1705,21 @@ pub use rp2350::Rp2350SecureStore;
 // * part 0 of a set is the *commit marker* and is written last.
 //
 // A logical slot may span up to [`chunked::MAX_PARTS`] parts per buffer
-// (payload capacity [`chunked::MAX_LOGICAL_LEN`] = 12 × 496 = 5,952 B) at up
-// to `2 × MAX_PARTS` physical entries per logical slot — and the second
+// ([`chunked::MAX_LOGICAL_LEN`] = 12 × 496 = 5,952 B **at one generation**) at
+// up to `2 × MAX_PARTS` physical entries per logical slot — and the second
 // number is the one that binds, because the two generations are live
 // simultaneously. See the assertion below.
+//
+// **5,952 B is a single-generation figure, not a capacity the device serves.**
+// Stated here because the sentence above used to read it as one, and that
+// reading is what US-1010's `MAX_PARTS` correction and US-1564's capacity
+// correction are between them about: the byte figure counts one generation's
+// parts, the store has to hold two at once, and an applet with an entry of its
+// own needs a third. `MAX_PARTS` is 12 precisely because `2 × 12 = 24` exactly
+// fills `DEV_MAX_ENTRIES` and leaves nothing for that third consumer — so a
+// full-width rewrite by any credential applet returns `SecureStoreError::Full`
+// and the documented length is unreachable on hardware. `MAX_PARTS`'s own
+// comment says this in the place a reader of *this* module will be sent to.
 pub mod chunked {
     use super::{crc32, SecureStore, SecureStoreError, MAX_KEY_LEN};
 
@@ -1718,7 +1729,21 @@ pub mod chunked {
     /// Maximum payload bytes per part (keeps the physical record ≤ 512 B —
     /// the device store's `DEV_MAX_VALUE_LEN`).
     pub const PART_PAYLOAD_MAX: usize = 512 - PART_HEADER_LEN;
-    /// Maximum number of parts per buffer (payload capacity 12 × 496 = 5,952 B).
+    /// Maximum number of parts per buffer.
+    ///
+    /// 12 × 496 = 5,952 B of payload **for one generation**. That is a format
+    /// bound, not a capacity: the store holds both generations of a logical slot
+    /// at once, `2 × MAX_PARTS` physical entries at the rewrite peak, and any
+    /// applet holding an entry of its own needs a `+1` beyond that. With
+    /// `DEV_MAX_ENTRIES = 24` and `MAX_PARTS = 12` there is no room for the
+    /// third, so 5,952 B is **unreachable on the device** and the first
+    /// full-width rewrite by an applet with resident state returns
+    /// `SecureStoreError::Full`. US-1564: this number was quoted as a capacity
+    /// in three places — here, the module comment above, and
+    /// `device_keystore.rs`'s [`SNAPSHOT_MAX_CREDS`] — which is how
+    /// `DEVICE_MAX_CREDS = 12` came to be read as "twelve credentials fit the
+    /// payload". They did not fit the store, and twelve would have needed
+    /// `12 + 8 + 8 = 28` entries of its 24.
     ///
     /// US-1010: this was 17 (8,432 B) while the device store held 24 entries,
     /// and those two numbers contradicted each other for as long as both
@@ -1739,14 +1764,24 @@ pub mod chunked {
     /// build with 0 B of unallocated RAM (see `docs/size-report.md`), so it is
     /// not the cheap direction.
     ///
-    /// The 5,952 B figure is a *true* ceiling now, not a ceiling the store
-    /// would refuse to meet — with the caveat the invariant below spells out:
-    /// it is the ceiling for a store whose **only** resident entries are the
-    /// chunked table's. Consumers: the FIDO keystore snapshot
-    /// (`DEVICE_MAX_CREDS = 12` credentials + a 1,024-B large-blob array,
-    /// ~4.1 KB worst case → 9 parts) fits; the OATH table
-    /// (`MAX_CREDS = 68` × ~195 B ≈ 13.3 KB) never did and is documented as
-    /// such.
+    /// The 5,952 B figure is **not** a ceiling the device store meets — the
+    /// caveat the invariant below spells out is the whole of it: it is the
+    /// ceiling for a store whose **only** resident entries are the chunked
+    /// table's, and every credential applet has others. Read it as *the width
+    /// of one generation of one logical slot*, which is what it measures.
+    ///
+    /// Consumers, with the honest arithmetic for each:
+    ///
+    /// * the FIDO keystore snapshot — `SNAPSHOT_MAX_CREDS = 12` credentials plus
+    ///   a 1,024-B large-blob array is ~4.1 KB worst case → 9 parts. **It is a
+    ///   RAM/format bound, not a capacity**: 12 was never derived from this
+    ///   figure, and on the pre-key-region store the fourth registration's
+    ///   rewrite (`12 + 8 + 8 > 24`) is what refused the fifth. The device's
+    ///   real credential capacity is `keyregion::FIDO_CAPACITY`.
+    /// * the OATH table — `MAX_CREDS = 68` × ~195 B ≈ 13.3 KB never fit and is
+    ///   documented as such; its durable ceiling is **30** maximal credentials,
+    ///   measured (`apps/oath/tests/oath_capacity.rs`), set by the rewrite peak
+    ///   `parts_live + parts_being_written + 1`.
     ///
     /// The OATH app's real durable ceiling is **30** maximal credentials
     /// (`apps/oath/tests/oath_capacity.rs`, measured), not the `~29` this
@@ -1758,7 +1793,17 @@ pub mod chunked {
     /// rewrites from 11 (`11 + 12 + 1 = 24`), while a 12-part value that is
     /// rewritten at the same width peaks at `12 + 12 + 1 = 25` and is refused.
     pub const MAX_PARTS: usize = 12;
-    /// Maximum logical value length.
+    /// Maximum logical value length: `MAX_PARTS × PART_PAYLOAD_MAX` = 5,952 B.
+    ///
+    /// **A single-generation figure.** A logical slot is double-buffered, so the
+    /// store has to hold `2 × MAX_PARTS` physical entries at the rewrite peak and
+    /// an applet with resident state needs `+1` beyond that; at `MAX_PARTS = 12`
+    /// and `DEV_MAX_ENTRIES = 24` there is no room for the third, and a
+    /// full-width rewrite by such an applet returns `SecureStoreError::Full`.
+    /// The type does not say so — it is an arithmetic identity, which is the
+    /// point: the number is exact about what it measures and silent about
+    /// whether the store can serve it, so nothing reading the length learns a
+    /// capacity claim from it. See [`MAX_PARTS`] and `docs/capacity.md`.
     pub const MAX_LOGICAL_LEN: usize = MAX_PARTS * PART_PAYLOAD_MAX;
 
     /// US-1010: the capacity invariant, as a compile error rather than a

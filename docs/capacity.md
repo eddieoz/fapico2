@@ -2,7 +2,13 @@
 
 Where a number here is **derived**, it says so and names the derivation. Where
 a compile-time constant *looks* like a capacity claim and is not, it is called
-out; that gap is how the `MAX_CREDS = 68` misreading survived.
+out; that gap is how both the `MAX_CREDS = 68` and the `MAX_LOGICAL_LEN = 5,952 B`
+misreadings survived — and, before US-1564, how the `DEVICE_MAX_CREDS = 12`
+reading survived two orders of magnitude.
+
+**US-1564 added no numbers and removed none.** It corrected which of the figures
+here may be called a capacity, which is the only thing that was ever wrong with
+them.
 
 ## The 24-entry store: four credentials, and the constant that was not a ceiling
 
@@ -28,6 +34,43 @@ The binding constraint was `other_slots + old_parts + new_parts ≤ 24`, with
 the attestation scalar and certificate). Twelve credentials would have needed
 `12 + 8 + 8 = 28`.
 
+## `MAX_LOGICAL_LEN` is a length, not a capacity either (US-1564)
+
+The other number in that paragraph deserves its own heading, because it was
+quoted as a capacity in three places and is not one.
+
+**`chunked::MAX_LOGICAL_LEN` = 5,952 B is a *single-generation* figure.** A
+chunked logical slot is double-buffered — a write goes to the buffer not holding
+the current set — so a rewrite transiently holds `2 × MAX_PARTS` physical
+entries, and an applet with an entry of its own needs `+1` beyond that.
+`MAX_PARTS` is **12** precisely because `2 × 12 = 24` exactly exhausts
+`DEV_MAX_ENTRIES` and leaves nothing for that third consumer, which is why
+`secure_store.rs` keeps it at 12 with a compile-time assertion.
+
+| reading | status |
+|---|---|
+| "a logical slot may be 5,952 bytes wide" | **true** — the only true thing here |
+| "a device can store a 5,952-byte value" | **false** — the first full-width rewrite by an applet holding resident state returns `SecureStoreError::Full` |
+| "twelve credentials fit it" | **false twice over** — the count was never derived from it, and `12 + 8 + 8 = 28 > 24` |
+
+OATH is the worked example, and it is why this is worth a section rather than a
+footnote: its table is sized for 68 and its **durable** ceiling is **30**
+maximal credentials, measured (`apps/oath/tests/oath_capacity.rs`), because its
+rewrite peak is `parts_live + parts_being_written + 1`. So 5,952 B has a real
+consumer that provably cannot reach it, which is the sharpest available
+statement of the difference.
+
+**What was corrected, and where.** `platform/src/secure_store.rs` at the
+`chunked` module header and on `MAX_PARTS` / `MAX_LOGICAL_LEN`; and
+`apps/fido/src/device_keystore.rs` on `SNAPSHOT_MAX_CREDS`, where the surviving
+sentence — *"it stays 12, because … `chunked::MAX_PARTS * PART_PAYLOAD_MAX` is
+5,952 bytes"* — read as though the payload figure produced the 12. It never
+did, and it says so now.
+
+**No constant was changed.** Every number in this document is unchanged by
+US-1564; what changed is which of them may be called a capacity. That is the
+whole of the story: the defect was never an arithmetic error, it was a label.
+
 ## The per-record key store: derived, not asserted
 
 The region is `0x300_000 .. 0x3F0_000` — 960 KiB on the shipping 4 MiB `pico2`
@@ -43,15 +86,29 @@ The layout and every assertion about it are in
 | record slot | 1 KiB | largest sealed record (836 B) + 16 B header + 128 B margin, rounded up |
 | slots per NOR sector | 4 | 4 KiB erase granularity ÷ 1 KiB slot |
 | total slots | 960 | region ÷ slot |
-| OATH reservation | 68 | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the RAM array and nothing else |
+| OATH **reservation** | 68 slots | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the applet's RAM array, and `keyregion::OATH_CAPACITY` charges the same 68 slots to the region because a store that accepted more would refuse on a RAM bound it never mentions |
 | commit scratchpad | 4 | one whole NOR sector, staged through (US-1544) |
 | index reservation | 32 | `index::INDEX_SLOT_COUNT` — one entry per slot in the region, rounded up to whole sectors |
-| **FIDO resident credentials** | **856** | 960 − 68 − 4 − 32 |
-| **OATH credentials** | **68** | as above |
+| **FIDO resident credentials** | **856** | 960 − 68 − 4 − 32, and **measured** below |
 
-Raising either capacity requires a region that fits it; the compile-time
+Raising either reservation requires a region that fits it; the compile-time
 assertions in `keyregion/mod.rs` stop the build otherwise. That is the whole
 point — the old failure was a constant no region could contradict.
+
+**The two rows are deliberately not parallel, and US-1564 is why.** The FIDO row
+is a **capacity claim** and this document measures it to the refusal (§ below).
+The OATH row is a **reservation**: the region holds 68 OATH slots, and whether
+any given build enrols 68 OATH credentials is a question about
+`apps/oath`'s in-RAM table and its tombstone compaction, not about this region.
+**No OATH enrolment count has been run to its boundary the way FIDO's has** —
+`platform/tests/key_region_capacity.rs` proves the region *reserves* 68 slots
+and that they tile the partition, which is a different statement from "the
+device holds 68 OATH credentials".
+
+The earlier version of this table had a row reading **"OATH credentials | 68 |
+as above"**, which quietly converted the reservation into a capacity claim. That
+is the same defect the previous section is about, one row further down: a number
+that looks like a measurement because it is in a table titled "derived from".
 
 **No slot is reserved.** The epic proposed leaving ~500 KB spare; with
 per-record commits there is nothing to spend it on, because the spare existed
@@ -106,6 +163,16 @@ It has no gate — with one exception, added above: the US-1563 test reads this
 file and fails if the measured figure is absent. Everything else here is the
 prose view of numbers that can drift. `check_flash_budget.py` (US-1534) gates
 the flash map; this file has no equivalent for the other rows.
+
+**And it is not a claim that any number in it is reachable.** Two specific
+caveats are load-bearing and both are now stated above rather than implied:
+
+* `MAX_LOGICAL_LEN`'s 5,952 B is a single-generation width, not a storeable
+  size;
+* `OATH_CAPACITY`'s 68 is a reservation, not a measured enrolment count.
+
+The FIDO row is the only row in this document that has been **run to its
+refusal**, and it says so.
 
 Related: the keystore capacity layers and the durable-ack latch are recorded in
 [`docs/known-gate-divergences.md`](known-gate-divergences.md) under SF-1

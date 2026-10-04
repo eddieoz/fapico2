@@ -1,7 +1,7 @@
 //! S-701-3 TDD: the no-heap device credential keystore.
 
 use fapico2_fido::device_keystore::{
-    DeviceCoseKey, DeviceCredential, DeviceKeystore, COUNTER_PERSIST_INTERVAL,
+    DeviceCoseKey, DeviceCredential, DeviceKeystore, PrivateScalar, COUNTER_PERSIST_INTERVAL,
 };
 use fapico2_fido::keystore;
 use fapico2_platform::secure_store::{chunked, HostSecureStore, SecureStore};
@@ -18,7 +18,7 @@ fn sample_cred(id: &[u8]) -> DeviceCredential {
     let mut c = DeviceCredential {
         credential_id: heapless::Vec::new(),
         public_key: DeviceCoseKey::es256([7u8; 32], [9u8; 32]),
-        private_key: [0x42u8; 32],
+        private_key: PrivateScalar::from_bytes([0x42u8; 32]),
         rp_id_hash: [0x33u8; 32],
         rp_id: heapless::Vec::new(),
         user_handle: heapless::Vec::new(),
@@ -138,7 +138,7 @@ fn snapshot_written_on_host_loads_on_device() {
     let c = ks.get_credential(b"host-cred").unwrap();
     assert_eq!(c.counter, 9);
     assert_eq!(c.rp_id.as_slice(), b"host.example");
-    assert_eq!(c.private_key, [0x24u8; 32]);
+    assert_eq!(c.private_key, PrivateScalar::from_bytes([0x24u8; 32]));
     assert_eq!(ks.pin_state.retries, 3);
     assert_eq!(ks.pin_state.pin_hash, Some([0x0Fu8; 16]));
 }
@@ -359,7 +359,7 @@ fn us911_sealed_snapshot_round_trip_preserves_signing() {
     x.copy_from_slice(&pk_bytes[1..33]);
     y.copy_from_slice(&pk_bytes[33..65]);
     let mut cred = sample_cred(b"sign-cred");
-    cred.private_key = sk.to_bytes().into();
+    cred.private_key = PrivateScalar::from_bytes(sk.to_bytes().into());
     cred.public_key = DeviceCoseKey::es256(x, y);
     ks.store_credential(cred).unwrap();
     ks.persist(&mut store).unwrap();
@@ -377,7 +377,7 @@ fn us911_sealed_snapshot_round_trip_preserves_signing() {
     restored.from_partition_image(&image);
     let ks2 = DeviceKeystore::load(&mut restored).unwrap().expect("snapshot present");
     let cred2 = ks2.get_credential(b"sign-cred").expect("credential survives");
-    let sk2 = crypto::secret_key_from_bytes(&cred2.private_key).expect("key reloads");
+    let sk2 = crypto::secret_key_from_bytes(cred2.private_key.expose()).expect("key reloads");
     let sig_after = crypto::p256_sign_bytes(&sk2, &challenge);
     assert_eq!(sig_before, sig_after, "assertion signature must survive the sealed round trip");
     // Metadata intact for enumeration.
@@ -400,9 +400,9 @@ fn us911_corrupt_ciphertext_field_revokes_entry_keeps_metadata() {
     let mut store = HostSecureStore::new();
     let mut ks = DeviceKeystore::fresh(&mut trng).expect("host TRNG");
     let mut c1 = sample_cred(b"cred-1");
-    c1.private_key = [0x42u8; 32];
+    c1.private_key = PrivateScalar::from_bytes([0x42u8; 32]);
     let mut c2 = sample_cred(b"cred-2");
-    c2.private_key = [0x43u8; 32];
+    c2.private_key = PrivateScalar::from_bytes([0x43u8; 32]);
     ks.store_credential(c1).unwrap();
     ks.store_credential(c2).unwrap();
     ks.persist(&mut store).unwrap();
@@ -429,13 +429,17 @@ fn us911_corrupt_ciphertext_field_revokes_entry_keeps_metadata() {
     assert_eq!(dead.rp_id.as_slice(), b"example.com", "metadata kept");
     assert_eq!(dead.cred_protect, 2, "metadata kept");
     assert_eq!(dead.user_name.as_slice(), b"ada", "metadata kept");
-    assert_eq!(dead.private_key, [0u8; 32], "the secret is unusable");
+    assert!(
+        dead.private_key.is_zero(),
+        "the secret is unusable — US-1550: a revoked credential's scalar must be wiped, not just \
+         left unused"
+    );
     assert!(dead.hmac_secret.is_empty());
     assert!(dead.large_blob_key.is_none());
     // The untouched credential is fully alive.
     let alive = ks2.get_credential(b"cred-2").unwrap();
     assert!(!alive.revoked);
-    assert_eq!(alive.private_key, [0x43u8; 32]);
+    assert_eq!(alive.private_key, PrivateScalar::from_bytes([0x43u8; 32]));
     // Enumeration (host codec) still lists both metadata records.
     let (_auth, creds, _max) =
         keystore::snapshot::parse(&bytes[..n], Some(&store_key())).expect("host parse");
