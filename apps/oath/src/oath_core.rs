@@ -70,8 +70,7 @@
 //!   bound, never a capacity claim.
 //!
 //!   **All of that paragraph describes the legacy path, and US-1553 replaces
-//!   it — on the region path, which today exists only where a caller attaches
-//!   a region.** With a key region attached ([`OathApp::attach_region`]) the table is
+//!   it.** With a key region attached ([`OathApp::attach_region`]) the table is
 //!   no longer a chunked whole snapshot in the 24-entry image shared with
 //!   FIDO: each credential is one record in one slot of the key region
 //!   (`fapico2_platform::keyregion::oath_store`), committed one at a time, so
@@ -83,16 +82,17 @@
 //!   — the access code and the US-904 OTP-PIN verifier — so `encode_state` is
 //!   not dead code.
 //!
-//!   **Wiring status: the region path is implemented and host-tested
-//!   (`apps/oath/tests/oath_keyregion.rs`), but no firmware call site attaches
-//!   a region yet** — `attach_region`'s only caller is that test. A device
-//!   build therefore serves OATH from the legacy chunked store, and the
-//!   ceiling on hardware is the legacy one, not [`MAX_CREDS`]. Installing the
-//!   provider in `firmware/src/main.rs` after `boot::release_key_region()`
-//!   (mirroring `fapico2_fido::device_app::install_region_provider` and its
-//!   `main.rs` call site) is the step that makes this paragraph's
-//!   substitution true on hardware; until then, `docs/capacity.md`'s OATH row
-//!   is a reservation for that wiring, not a served capacity.
+//!   **Wiring: the region path is live on a device build.** `main.rs` installs
+//!   [`install_region_provider`] immediately after `boot::release_key_region()`
+//!   — mirroring `fapico2_fido::device_app::install_region_provider` and its
+//!   call site — and [`OathApp::attach_region_if_available`] mounts on the
+//!   first command. The legacy path remains the fallback whenever the provider
+//!   yields nothing, which is what a device with an unavailable OTP row gets:
+//!   `boot::derive_oath_payload_key` is an `Option` and answers `None` rather
+//!   than halting (S10), and that applet serves the chunked store at the
+//!   legacy ceiling. So [`MAX_CREDS`] is the ceiling **when the region mounts**,
+//!   and the legacy one otherwise — which is the honest form of the claim, and
+//!   why `docs/capacity.md`'s OATH row is still labelled a reservation.
 //!
 //! - US-1553 (secure storage): **credentials are per-record in the key region,
 //!   and the secure store holds no credential table.** The properties are
@@ -115,8 +115,10 @@
 //!     to be called at first applet use, after `RUNG_USB`, never from
 //!     `OathApp::boot` or `boot_in_place`, and
 //!     `apps/oath/tests/oath_keyregion.rs` asserts that a booted app whose
-//!     region is mounted never touches the medium. **No firmware call site
-//!     does this yet** — see the wiring-status paragraph above.
+//!     region is mounted never touches the medium. `main.rs` installs the
+//!     provider **after** `mark!(RUNG_USB)` for exactly that reason, and
+//!     `platform/tests/key_region_boot_gate.rs` fails if either the ordering or
+//!     the mount sites move.
 //!   * *an unreadable region degrades* — [`OathApp::attach_region`] returns
 //!     [`RegionStatus::Degraded`] and the applet serves an **empty** credential
 //!     set with a clean status word. Never `fatal_boot`, never a panic: a
@@ -136,8 +138,12 @@ use alloc::boxed::Box;
 use fapico2_platform::ckey::{OathSeal, OATH_SEAL_OVERHEAD};
 use fapico2_platform::dispatch::{App, Sw, MAX_RESPONSE};
 use fapico2_platform::keyregion::oath_store::{
-    self, Entry, OathCredential, OathRegion, OathStoreError,
+    self, Entry, OathCredential, OathStoreError,
 };
+// US-1553: re-exported because the firmware has to name it to build one. A
+// `use` is private to this module, so without this the type is unreachable from
+// `main.rs` even though the applet is public.
+pub use fapico2_platform::keyregion::oath_store::OathRegion;
 use fapico2_platform::presence::PresenceService;
 use fapico2_platform::secure_store::chunked;
 use fapico2_platform::secure_store::chunked::MAX_LOGICAL_LEN;
@@ -775,6 +781,73 @@ pub enum RegionStatus {
 /// change that can drop it is reported rather than panicked.
 const E_NO_REGION: &str = "oath: the key-region handle disappeared between statements";
 
+/// US-1553: how the firmware hands this applet a key region.
+///
+/// A `fn` pointer, and a `fn` pointer **rather than a closure**, because
+/// [`REGION_PROVIDER`] stores the provider's code address. A capturing closure
+/// would be a data pointer into a stack frame that is gone by the time the
+/// applet calls it.
+pub type RegionProvider = fn() -> Option<OathRegion>;
+
+/// The installed provider, or a null pointer when none is.
+///
+/// **A code address in an `AtomicPtr`, transmuted back at the call site** —
+/// which is why [`install_region_provider`] insists on a `fn`. There is no
+/// `static mut` alternative here that is *also* safe: the applet is reached
+/// from the CCID task, and a `static mut` read from task context is exactly the
+/// shape `boot.rs`'s `KEY_REGION` discipline spends paragraphs ruling out.
+static REGION_PROVIDER: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// US-1553: install the firmware's region provider.
+///
+/// Called by `firmware/src/main.rs` immediately after `boot::release_key_region`,
+/// which is itself immediately after `mark!(RUNG_USB)`. **That ordering is the
+/// point, not an accident of where the line landed.** A mount reads up to 68 KiB
+/// and opens up to 68 AEAD records; doing that during boot would make boot's
+/// latency proportional to how many credentials the owner has, which is what S8
+/// and S9 forbid.
+///
+/// Without this call the whole region path is linked out of the image by LTO —
+/// the same thing `main.rs`'s FIDO line documents for its side, and the reason
+/// that comment exists.
+///
+/// **Idempotent**, for the reason `OathApp::reset`'s management hook is: a boot
+/// path that reached `RUNG_USB` and found one already installed has been
+/// re-entered by a caller meaning the same thing, and failing there would be a
+/// halt over nothing (S10).
+pub fn install_region_provider(provider: RegionProvider) {
+    REGION_PROVIDER.store(provider as *mut (), core::sync::atomic::Ordering::Release);
+}
+
+/// The installed provider, or `None`.
+///
+/// # Safety
+///
+/// The stored value is a `fn`'s code address, published by
+/// [`install_region_provider`] and only ever written with a `RegionProvider`.
+/// Calling a code address cannot be a use-after-free the way calling a stale
+/// *data* pointer could, which is the property FIDO's equivalent doc leans on.
+///
+/// # What it does NOT do
+///
+/// No handle is cached in [`OathApp`], no `once` wrapper, no "have I looked
+/// yet" flag. A cached `Option<&'static mut …>` would have to be refreshed when
+/// the provider starts answering `Some`, which is the boot-order problem the
+/// function pointer exists to avoid. The cost is one indirect call per applet
+/// command that reaches an entry point, against a mount that reads the whole
+/// table on the first one.
+fn region_provider() -> Option<RegionProvider> {
+    let raw = REGION_PROVIDER.load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: see the note above — only [`install_region_provider`] writes
+        // this, and only with a `RegionProvider`.
+        Some(unsafe { core::mem::transmute::<*mut (), RegionProvider>(raw) })
+    }
+}
+
 pub struct OathApp {
     /// Storage slots in creation order; deleted slots are None and are
     /// reused by the next PUT (C free-slot bitmap parity). Slot index i
@@ -1217,8 +1290,50 @@ impl OathApp {
 
     /// US-1553: is a key region attached? `false` means the legacy chunked
     /// stream path, which is the default for every existing caller.
+    ///
+    /// Also the **"attach was attempted"** flag, which is why
+    /// [`Self::attach_region_if_available`] gates on it rather than on
+    /// [`Self::is_region_degraded`]: [`Self::attach_region`] writes
+    /// `self.region` before any of its failure paths, so `is_some()` means
+    /// *tried*, not *succeeded*. A degraded mount must not be retried per APDU
+    /// — that would re-read 68 KiB on every command, forever. Degrade and
+    /// stick, which `oath_keyregion.rs`'s
+    /// `an_unreadable_region_degrades_to_an_empty_set_and_a_clean_status_word`
+    /// pins.
     pub fn has_region(&self) -> bool {
         self.region.is_some()
+    }
+
+    /// US-1553: mount the key region **once**, on first applet use.
+    ///
+    /// The applet-side half of the wiring `firmware/src/main.rs` completes by
+    /// calling [`install_region_provider`] after `mark!(RUNG_USB)`. The
+    /// indirection exists for the same reason it does on the FIDO side
+    /// (`apps/fido/src/device_app.rs`): the dispatcher owns `&mut OathApp` for
+    /// the process lifetime, so the firmware cannot reach into the applet to
+    /// hand it a region — the dependency runs the other way and has to be
+    /// inverted.
+    ///
+    /// # Where it is called, and why all three
+    ///
+    /// [`App::select_apdu`], [`App::process`] and [`App::factory_wipe`].
+    /// `factory_wipe` is the one that is easy to miss and the one that matters:
+    /// `firmware/src/tasks.rs` runs `dispatcher.factory_wipe_apps()` on a
+    /// management-RESET generation bump **with no prior OATH SELECT**, and
+    /// [`Self::reset`] only wipes the region `if self.region.is_some()`.
+    /// Unmounted, it would empty the legacy stream and leave the 68 flash records
+    /// standing — and `attach_region` would faithfully serve them again on the
+    /// next command. A factory reset that resurrects every credential is worse
+    /// than one that fails.
+    ///
+    /// Returns `None` when there is nothing to do: no provider installed (a host
+    /// or emulator caller), no region available, or a mount already attempted.
+    pub fn attach_region_if_available(&mut self) -> Option<RegionStatus> {
+        if self.has_region() {
+            return None;
+        }
+        let provider = region_provider()?;
+        Some(self.attach_region(provider()?))
     }
 
     /// US-1553: attach the key region and mount it into the credential table.
@@ -2086,6 +2201,9 @@ impl App for OathApp {
         _apdu: &[u8],
         resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
     ) -> Sw {
+        // US-1553: first applet use in the ordinary case is this SELECT, so
+        // this is where the region mounts on a device build.
+        self.attach_region_if_available();
         let sw = self.select(internal);
         if sw == SW_OK {
             // US-130 defence in depth. The constructor now *requires* the
@@ -2128,6 +2246,10 @@ impl App for OathApp {
     }
 
     fn process(&mut self, apdu: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+        // US-1553: belt and braces. `select_apdu` covers the ordinary path, but
+        // a caller that reaches `process` without a SELECT must not be served a
+        // legacy-stream table when a region is available. One call, once.
+        self.attach_region_if_available();
         let (ins, p1, p2, data) = Self::parse_apdu(apdu);
         let sw = self.handle(ins, p1, p2, data, resp);
         let _ = resp.extend_from_slice(&sw.to_be_bytes());
@@ -2136,6 +2258,15 @@ impl App for OathApp {
     /// US-711: the management RESET hook — clear the table, let the persist
     /// gate write the emptied stream (see [`OathApp::reset`]).
     fn factory_wipe(&mut self) {
+        // US-1553: **mount before wiping, not after.** `firmware/src/tasks.rs`
+        // calls this on a management-RESET generation bump with no prior OATH
+        // SELECT, and [`OathApp::reset`] only wipes the region
+        // `if self.region.is_some()`. Unmounted, a factory reset would empty the
+        // legacy stream and leave all 68 flash records standing — and the next
+        // command's mount would serve them again. A reset that resurrects every
+        // credential is a worse outcome than a reset that reports it could not
+        // run.
+        self.attach_region_if_available();
         self.reset();
     }
 

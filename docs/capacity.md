@@ -105,14 +105,28 @@ any given build enrols 68 OATH credentials is a question about
 and that they tile the partition, which is a different statement from "the
 device holds 68 OATH credentials".
 
-**The reservation is not served on a device build yet.** `OathApp::attach_region`
-has no firmware call site — the region path is implemented and host-tested
-(`apps/oath/tests/oath_keyregion.rs`), but the firmware never attaches a region
-to the OATH applet, so on hardware OATH still runs on the legacy chunked store
-with its measured ceiling of **30**. The 68 slots are flash reserved against
-that wiring, and only geometry keeps FIDO's allocator out of them. Wiring the
-provider (mirroring FIDO's `install_region_provider` call in `main.rs`) is the
-step that turns this row from a reservation into a served capacity.
+**Served on a device build, and still a reservation rather than a measured
+count.** `main.rs` now installs `oath_core::install_region_provider` after
+`boot::release_key_region()`, and `attach_region_if_available` mounts on the
+first command — so on hardware OATH uses the region and its ceiling is
+[`MAX_CREDS`] = 68 rather than the legacy store's 30.
+
+What that does **not** make is this a *measurement*. Two things stand between
+the reservation and one, and neither is closed by the wiring:
+
+* **The legacy path is still reachable.** `boot::derive_oath_payload_key`
+  returns an `Option` and answers `None` for an unavailable OTP row rather than
+  halting (S10), and a provider that yields nothing leaves the applet on the
+  chunked store at its legacy ceiling. That is the right failure direction — a
+  degraded applet that answers beats a board that parks — but it means the
+  number an OATH build serves depends on whether the key derived.
+* **No OATH enrolment count has been run to its boundary**, the same gap
+  `capacity_boundary.rs` closes for FIDO. `key_region_capacity.rs` proves the
+  region reserves 68 slots and that they tile the partition; that is geometry,
+  not a device holding 68 credentials.
+
+So the row keeps the word *reservation*, and the honest sentence is "the region
+is mounted and its ceiling is 68 when it is", not "the device holds 68".
 
 The earlier version of this table had a row reading **"OATH credentials | 68 |
 as above"**, which quietly converted the reservation into a capacity claim. That

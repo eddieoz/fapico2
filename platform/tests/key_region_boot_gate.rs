@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 const MAIN_RS: &str = "firmware/src/main.rs";
 const BOOT_RS: &str = "firmware/src/boot.rs";
 const REGION_RS: &str = "platform/src/keyregion/device_region.rs";
+const OATH_CORE_RS: &str = "apps/oath/src/oath_core.rs";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -173,37 +174,73 @@ fn no_boot_path_call_site_reaches_the_accessor_before_rung_usb() {
     }
 }
 
-/// The one pre-`RUNG_USB` thing that *is* allowed: constructing the handle.
+/// The one pre-`RUNG_USB` thing that *is* allowed: constructing the handles.
 ///
-/// A `Flash` cannot be built without a `Peri`, and `p.FLASH` is consumed two
-/// lines below the other two `Flash::new_blocking` calls, so the handle has to be
+/// A `Flash` cannot be built without a `Peri`, and `p.FLASH` is consumed a few
+/// lines below the other `Flash::new_blocking` calls, so the handles have to be
 /// made there. What matters is that this is the **whole** of what happens: one
-/// construction call, and no other region symbol in that neighbourhood.
+/// construction call per owner, and no other region symbol in that
+/// neighbourhood.
+///
+/// **Two owners, two handles (US-1553).** FIDO re-borrows one handle per command;
+/// OATH has to own its own, because `OathApp::attach_region` holds the handle
+/// for the life of the process and a permanent `&mut` beside a stream of
+/// transient ones is UB (the `DRBG_SEED_PROBE` rule). So the count here is two
+/// and the assertion names which is which — what it still forbids is a *third*
+/// construction, or any of these handles being read before the release.
 #[test]
 fn the_only_pre_usb_region_mention_is_the_handle_construction() {
     let main = src(MAIN_RS);
     let usb = at(&main, "mark!(fapico2_firmware::bootphase::RUNG_USB");
     let before = &main[..usb];
-    let inits = all_lines(before, "boot::init_key_region(");
-    assert_eq!(
-        inits.len(),
-        1,
-        "expected exactly one `boot::init_key_region(` before `RUNG_USB` ({}), found {}",
-        cite(MAIN_RS, before, "boot::init_key_region("),
-        inits.len()
-    );
+
+    // One per owner, and each named exactly once.
+    for (init, why) in [
+        ("boot::init_key_region(", "FIDO's handle"),
+        ("boot::init_oath_key_region(", "OATH's handle"),
+    ] {
+        let inits = all_lines(before, init);
+        assert_eq!(
+            inits.len(),
+            1,
+            "expected exactly one `{init}` before `RUNG_USB` ({why}), found {}: {}",
+            inits.len(),
+            cite(MAIN_RS, before, init)
+        );
+    }
+
+    // Two `KeyRegionHandle::new` expressions, and nothing else naming the type.
+    // The count is the point: a third handle would mean another owner nobody
+    // accounted for, and a handle used rather than parked would mean a boot-path
+    // read.
     let names = all_lines(before, "KeyRegionHandle");
     assert_eq!(
         names.len(),
-        1,
-        "the pre-USB block must name `KeyRegionHandle` exactly once — the construction \
-         expression itself. More mentions would mean the boot path is doing something with the \
-         region beyond parking a handle: {}",
+        2,
+        "the pre-USB block must name `KeyRegionHandle` exactly twice — one construction \
+         expression per owner (FIDO and OATH). More would mean a third owner or the boot path \
+         doing something with a region beyond parking a handle: {}",
         names
             .iter()
             .map(|(n, _)| format!("{MAIN_RS}:{n}"))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+
+    // OATH's handle may be *taken* only from inside the provider `fn`, whose
+    // definition sits above `RUNG_USB` but which is not reachable until
+    // `install_region_provider` runs below it — so the text position proves
+    // nothing on its own and the invariant is the runtime one: `boot::
+    // take_oath_key_region` answers `None` until `KEY_REGION_READY`, which
+    // `the_accessor_refuses_before_the_release` pins. What *is* checkable here
+    // is that the take exists in exactly one place: a second caller would be a
+    // second owner racing for the same handle.
+    assert_eq!(
+        all_lines(&main, "take_oath_key_region(").len(),
+        1,
+        "exactly one call site for `take_oath_key_region` in `main.rs`, and it must be the \
+         provider `fn`. A second caller would be a second owner racing for one handle: {}",
+        cite(MAIN_RS, &main, "take_oath_key_region(")
     );
 }
 
@@ -263,6 +300,136 @@ fn the_release_cannot_fail() {
             cite(BOOT_RS, &boot, "pub fn release_key_region()")
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// OATH's half of the same gate (US-1553)
+// ---------------------------------------------------------------------------
+
+/// **OATH's provider is installed, after `RUNG_USB`, and it is the line that
+/// makes the region path exist at all.**
+///
+/// This is the FIDO line's twin, and it is load-bearing for the same stated
+/// reason (`main.rs`'s comment names it): without it nothing calls
+/// `attach_region`, LTO proves `REGION_PROVIDER` is never written, and OATH's
+/// 68 reserved slots stay flash that nothing reads. A test that only checked
+/// the applet side would pass with the firmware call deleted.
+#[test]
+fn the_oath_provider_is_installed_after_rung_usb() {
+    let main = src(MAIN_RS);
+    let usb = at(&main, "mark!(fapico2_firmware::bootphase::RUNG_USB");
+    let after = &main[usb..];
+
+    assert!(
+        after.contains("fapico2_oath::oath_core::install_region_provider("),
+        "firmware/src/main.rs must install OATH's region provider after `RUNG_USB`. Without this \
+         line the whole US-1553 path is linked out: nothing calls `attach_region`, LTO drops the \
+         region code, and a device build keeps serving OATH from the legacy chunked store while \
+         the region holds 68 slots nothing reads."
+    );
+}
+
+/// **The payload-key derivation degrades; it never halts.**
+///
+/// The sharpest contrast in the whole wiring, and the one worth a gate.
+/// `derive_oath_seal` three functions away in the same file uses `fatal_boot`,
+/// and it is right to: an OATH app without its seal can load a migrated
+/// credential it can never re-seal, so there is no fallback to take.
+///
+/// This one has a fallback — the legacy chunked store, which is exactly what
+/// the firmware ran before — so a cold OTP row must leave OATH serving from
+/// there rather than parking the board at a halt four rungs before `RUNG_USB`.
+#[test]
+fn the_oath_payload_key_derivation_never_halts() {
+    let boot = src(BOOT_RS);
+    let start = at(&boot, "pub fn derive_oath_payload_key()");
+    let body_start = at(&boot[start..], "{") + start;
+    let end = at(&boot[body_start..], "\n}") + body_start;
+    let body = &boot[body_start..end];
+
+    assert!(
+        boot[..start].contains("-> Option<"),
+        "`derive_oath_payload_key` must return an `Option`. An infallible signature means the \
+         caller has to decide what to do about failure, and the only two answers are a halt or a \
+         lie."
+    );
+    for forbidden in ["unwrap(", "expect(", "assert", "panic!", "fatal_boot"] {
+        assert!(
+            !body.contains(forbidden),
+            "`derive_oath_payload_key` contains `{forbidden}` ({}). It runs on the applet path \
+             after `RUNG_USB`, and S10 is explicit: an unavailable OTP row degrades to the legacy \
+             store, never to a halt.\n\n{body}",
+            cite(BOOT_RS, &boot, "pub fn derive_oath_payload_key()")
+        );
+    }
+}
+
+/// **The applet mounts at every entry point that can reach the table.**
+///
+/// `select_apdu` and `process` are the ordinary doors. `factory_wipe` is the one
+/// that is easy to omit and the one that matters: `firmware/src/tasks.rs` runs
+/// `dispatcher.factory_wipe_apps()` on a management-RESET generation bump with
+/// no prior OATH SELECT, and `OathApp::reset` only wipes the region
+/// `if self.region.is_some()`. Unmounted, a factory reset empties the legacy
+/// stream, leaves all 68 flash records standing, and the next command's mount
+/// serves them again — a reset that resurrects every credential.
+#[test]
+fn the_applet_mounts_at_every_entry_point_that_can_touch_the_table() {
+    let oath = src(OATH_CORE_RS);
+    for (what, anchor) in [
+        ("select_apdu", "fn select_apdu("),
+        ("process", "fn process(&mut self, apdu:"),
+        ("factory_wipe", "fn factory_wipe(&mut self)"),
+    ] {
+        let start = at(&oath, anchor);
+        let body_start = at(&oath[start..], "{") + start;
+        let end = at(&oath[body_start..], "\n    }") + body_start;
+        let body = &oath[body_start..end];
+        assert!(
+            body.contains("attach_region_if_available"),
+            "`{what}` must call `attach_region_if_available` before touching the credential table \
+             ({}). Omitting it on `factory_wipe` in particular lets a management factory reset \
+             leave the region's records standing, and the next mount serves them again.",
+            cite(OATH_CORE_RS, &oath, anchor)
+        );
+    }
+}
+
+/// **The mount happens once, and never per APDU.**
+///
+/// `attach_region` reads the whole table and opens up to 68 AEAD records. If
+/// [`OathApp::attach_region_if_available`] consulted the provider on every
+/// command, every APDU would cost a full mount — a latency bug that no test
+/// running the applet would catch, because the existing region suite mounts
+/// explicitly through `Probe::mount` and never goes near this path.
+///
+/// The gate is `has_region()`, which reads `self.region.is_some()`. That is the
+/// right predicate and not `is_region_degraded()`: `attach_region` writes
+/// `self.region` *before* any of its failure paths, so `is_some()` means
+/// *attempted*, and a degraded mount retried per command would re-read 68 KiB
+/// forever. Degrade-and-stick is what
+/// `oath_keyregion.rs::an_unreadable_region_degrades_to_an_empty_set_and_a_clean_status_word`
+/// pins from the other side.
+#[test]
+fn the_mount_is_gated_on_attempted_not_on_success() {
+    let oath = src(OATH_CORE_RS);
+    let start = at(&oath, "pub fn attach_region_if_available(");
+    let body_start = at(&oath[start..], "{") + start;
+    let end = at(&oath[body_start..], "\n    }") + body_start;
+    let body = &oath[body_start..end];
+
+    assert!(
+        body.contains("if self.has_region()"),
+        "`attach_region_if_available` must return early when `has_region()`. Without that gate \
+         every APDU costs a full mount — up to 68 AEAD opens per command on a populated region."
+    );
+    assert!(
+        !body.contains("is_region_degraded"),
+        "`attach_region_if_available` must not gate on `is_region_degraded()`. `attach_region` \
+         sets `self.region` before its failure paths, so a degraded mount has already been \
+         *attempted*; gating on degradation would retry the mount on every subsequent APDU, \
+         re-reading the whole table each time."
+    );
 }
 
 // ---------------------------------------------------------------------------

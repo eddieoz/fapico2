@@ -24,6 +24,9 @@
 #![no_std]
 #![no_main]
 
+// US-1553: `Box::new` for `OathRegion::new`, which owns its `KeyRegion`.
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use defmt_rtt as _;
@@ -218,6 +221,32 @@ fn boot_fido<T: Trng>(
 /// outside the declared construction sites, so the next app's boot helper has
 /// to declare itself instead of compiling.
 #[inline(never)]
+/// US-1553: hand the OATH applet its key region.
+///
+/// A `fn` item, not a closure, because `oath_core::install_region_provider`
+/// stores a **code address** in its `AtomicPtr` — the same constraint the FIDO
+/// provider's comment above states.
+///
+/// Two orders inside, and the sequence is not incidental:
+///
+/// 1. **Derive the key first.** A derivation that fails (cold OTP row, or an
+///    all-zero root) must leave the handle in place, so a later call can still
+///    succeed. Taking the handle first and then failing would consume the only
+///    one that exists and permanently pin OATH to the legacy path.
+/// 2. **Then take the handle**, which is `Option` precisely so that only this
+///    first successful call moves it (see `boot::take_oath_key_region`).
+///
+/// `None` in any case means "no region", and the applet answers APDUs from the
+/// legacy chunked store — never `fatal_boot`. S10: degrade, never halt.
+fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
+    let key = boot::derive_oath_payload_key()?;
+    let region = boot::take_oath_key_region()?;
+    Some(fapico2_oath::oath_core::OathRegion::new(
+        ::alloc::boxed::Box::new(region),
+        key,
+    ))
+}
+
 fn boot_oath<T: Trng>(
     trng: &mut T,
     store: &mut boot::DeviceStore,
@@ -832,6 +861,33 @@ async fn main(spawner: Spawner) -> ! {
         )))
     };
 
+    // US-1553: OATH needs a **FOURTH** handle, not a second `&mut` to the one
+    // above. `OathApp::attach_region` takes ownership and holds the handle for
+    // the life of the process, while the FIDO accessor mints a fresh
+    // `&'static mut` for every CTAP2 command — a permanent `&mut` beside a
+    // stream of transient ones over one object is UB whether or not the
+    // non-overlap argument holds, which is the `DRBG_SEED_PROBE` rule stated
+    // twice in `boot.rs`.
+    //
+    // (`key_region_boot_gate.rs` scans this file for the FIDO accessor's
+    // spelling and fails on any occurrence before `RUNG_USB` — *including
+    // inside a comment*, which is how this sentence had to be written twice.)
+    //
+    // A second handle over the same physical window, with disjoint slot ranges:
+    // OATH owns `[0, OATH_CAPACITY)` at the head and FIDO starts after the
+    // scratchpad, asserted exact by `keyregion/mod.rs`'s compile-time tiling
+    // check. Same serialization as every other handle here — single core, no
+    // region method ever yields.
+    //
+    // SAFETY: as for the third handle above. `boot::init_oath_key_region` —
+    // single-core boot path, before any task exists; the slot is written once
+    // here and not read until `release_key_region`.
+    unsafe {
+        boot::init_oath_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
     let flash: boot::DevFlash = Flash::new_blocking(p.FLASH);
     // S-701-3: hand the flash handle to the write-once static (single init,
     // boot path) so the HID task can persist FIDO keystore changes too.
@@ -1149,6 +1205,10 @@ async fn main(spawner: Spawner) -> ! {
     fapico2_fido::device_app::install_region_provider(|| {
         boot::key_region().map(|r| r as &'static mut dyn fapico2_platform::keyregion::KeyRegion)
     });
+    // US-1553: the same line for OATH, and it is just as load-bearing — without
+    // it nothing calls `attach_region`, LTO proves `REGION_PROVIDER` is never
+    // written, and OATH's 68 reserved slots stay flash nothing reads.
+    fapico2_oath::oath_core::install_region_provider(oath_region);
     // US-929 boot ladder, stage 3 (dbg-log builds only): the USB device is
     // constructed and `usb_task` spawned — configuration completes when the
     // executor first polls `usb_task` (stage 4's record proves that poll
