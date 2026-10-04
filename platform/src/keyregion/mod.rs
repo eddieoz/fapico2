@@ -426,10 +426,12 @@ impl<T> SlotRead<T> {
 /// Implementations: the QSPI-backed device region, and the host file region
 /// US-1541 adds. Every method is sector-granular where the hardware is, because
 /// [`SLOTS_PER_SECTOR`] slots share one erase.
-pub mod slotmap;
+pub mod commit;
 pub mod crypto;
 pub mod host;
+pub mod index;
 pub mod record;
+pub mod slotmap;
 
 pub trait KeyRegion {
     /// Read one slot's raw bytes into `buf`, or report why it could not.
