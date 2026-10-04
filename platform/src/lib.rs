@@ -150,6 +150,14 @@ pub mod sha512;
 /// Secure-partition image format v3 — encrypt-then-MAC (US-915): the AEAD
 /// sealing layer over [`secure_store`]'s logical serialization.
 pub mod store_v3;
+
+/// US-1572: **fused** root keys — a [`fused_key::FusedKey`] holds *where a key
+/// comes from*, never the key, so each use re-reads and re-derives into a
+/// [`fused_key::FusedRead`] whose lifetime **is** the exposure window. The
+/// discipline `drbg_seed` already follows for the DRBG seed, extended to the
+/// store key; see the module docs for the pico-hsm failure it is aimed at.
+pub mod fused_key;
+
 pub mod cflash;
 pub mod cfs;
 

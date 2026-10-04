@@ -1876,12 +1876,30 @@ fn calc_all_cannot_bypass_require_touch() {
 /// by a byte fails here rather than in a stack measurement three stories
 /// later. The app lives in a `static mut` (US-939/US-956), not on a task
 /// frame, so +96 B is RAM, not stack.
+///
+/// **US-1553 moves it by 16 B on this target, and 16 is not the number that
+/// matters.** The key-region handle is `Option<Box<OathRegion>>` — a pointer,
+/// 8 B here and **4 B on `thumbv8m`** — plus the one-byte `region_degraded`
+/// flag and the tail padding the pointer's alignment forces. Everything the
+/// handle *points at* (the region box and the 32-byte `PayloadKey`) is heap,
+/// allocated after `platform::rsa_heap::init()`, so it is not in `bss` and not
+/// in this figure.
+///
+/// The number was chosen to be the smallest one that keeps the accounting
+/// honest: the alternative was carrying the handle's contents inline, which
+/// would put a 33-byte key in a `static` for the whole life of the process
+/// (`ckey.rs` says keys are "per-operation: derive, use, drop"), or reaching a
+/// global, which is a worse design than 16 bytes. 16 B of an 11.3 KiB static
+/// is 0.14 %; the record it buys — credentials that are per-record, per-sector
+/// and per-slot instead of one 12-part snapshot — is the whole of US-1553.
 #[test]
 fn adding_the_property_bit_cost_no_ram() {
     assert_eq!(
         core::mem::size_of::<OathApp>(),
-        11400,
-        "US-1030: the only permitted growth is the 96 B seal context"
+        11416,
+        "US-1030 added the 96 B seal context; US-1553 adds 16 B on this target (4 B pointer + \
+         1 B flag + tail padding; 8 B of it is 64-bit pointer width, and on thumbv8m the whole \
+         delta is 8 B). Nothing else may grow the applet."
     );
 }
 

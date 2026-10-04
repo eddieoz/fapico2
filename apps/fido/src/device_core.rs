@@ -10,7 +10,9 @@
 use crate::cbor::no_heap::{self, Item, Parser};
 use crate::crypto;
 use crate::device_app::FidoApp;
-use crate::device_keystore::{DeviceCoseKey, DeviceCredential, DEVICE_MAX_CREDS};
+use crate::device_keystore::{
+    DeviceCoseKey, DeviceCredential, MAX_PENDING_CREDENTIAL_IDS,
+};
 use crate::ctap2::Ctap2Response;
 use crate::stateless;
 use crate::{AAGUID, CTAP1_VERSION};
@@ -1292,7 +1294,8 @@ impl FidoApp {
             }
 
             let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
-            let mut matched: HeaplessVec<HeaplessVec<u8, 64>, DEVICE_MAX_CREDS> = HeaplessVec::new();
+            let mut matched: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
+                HeaplessVec::new();
             if !req.allow.is_empty() {
                 for id in &req.allow {
                     if let Some(cred) = self.keystore.get_credential(id) {
@@ -1310,7 +1313,8 @@ impl FidoApp {
             } else {
                 // Resident credentials for the RP, newest first; credProtect
                 // >= 2 withheld without UV.
-                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, DEVICE_MAX_CREDS> = HeaplessVec::new();
+                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
+                    HeaplessVec::new();
                 for cred in &self.keystore.credentials {
                     if cred.resident
                         && !cred.revoked
@@ -2870,7 +2874,7 @@ impl FidoApp {
             }
             CM_ENUMERATE_RPS_BEGIN => {
                 // enumerateRpsBegin
-                let mut rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
                 for cred in &self.keystore.credentials {
                     if !cred.resident || cred.revoked {
@@ -2976,7 +2980,7 @@ impl FidoApp {
             CM_ENUMERATE_CREDS_BEGIN => {
                 // enumerateCredsBegin
                 let hash = rp_id_hash.ok_or(err(Ctap2Response::MissingParameter))?;
-                let mut ids: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut ids: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
                 for cred in &self.keystore.credentials {
                     if cred.resident
@@ -2988,7 +2992,7 @@ impl FidoApp {
                     }
                 }
                 // newest first
-                let mut ordered: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut ordered: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
                 while let Some(id) = ids.pop() {
                     let _ = ordered.push(id);

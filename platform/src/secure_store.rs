@@ -812,6 +812,8 @@ pub mod rp2350 {
         SecureStore, SecureStoreError, SliceReader, ZeroWindow, MAX_KEY_LEN,
         PARTITION_IMAGE_MAGIC,
     };
+    // US-1572: the store holds a *source* for its key, not the key.
+    use crate::fused_key::{FusedKey, KeySource};
     #[cfg(test)]
     use super::partition_image_is_valid;
 
@@ -884,11 +886,18 @@ pub mod rp2350 {
     pub struct Rp2350SecureStore {
         slots: [Slot; DEV_MAX_ENTRIES],
         n: usize,
-        /// US-915: the store-key AEAD key, set once at boot (OTP row +
-        /// chipid via [`crate::store_v3::derive_store_key`]). `None` keeps
-        /// the legacy logical format-v2 serialization — the boot path
-        /// always sets the key before any persist or restore.
-        key: Option<[u8; 32]>,
+        /// US-1572: **where the store key comes from**, not the key. This
+        /// used to be `Option<[u8; 32]>` — a root key set once at boot
+        /// (OTP row + chipid via [`crate::store_v3::derive_store_key`]) and
+        /// never cleared for the whole power cycle, which is the exposure
+        /// window RS-Key calls out in `rsk-crypto/src/kdf.rs:41-53`.
+        ///
+        /// It is now a [`KeySource`]: a fused descriptor that re-reads the
+        /// OTP row and re-derives per operation, so what lives here for the
+        /// life of the store is a label and a code address. `None` keeps the
+        /// legacy logical format-v2 serialization — the boot path always sets
+        /// a key before any persist or restore.
+        key: Option<KeySource>,
     }
 
     impl Rp2350SecureStore {
@@ -912,8 +921,36 @@ pub mod rp2350 {
         /// US-915: configure the store-key AEAD key (boot derives it from
         /// the OTP row + chipid). Must be called before any restore or
         /// snapshot; the boot path sets it once, before the slots are read.
+        ///
+        /// **Deprecated (US-1572), and the reason is call-site ownership, not
+        /// preference.** This hands the store a key that has already been
+        /// derived, which is precisely the shape US-1572 removes: the value
+        /// then stays live in this store until the store is dropped. It is
+        /// kept because the two device call sites (`firmware/src/main.rs:595`,
+        /// `firmware/src/bin/bridge.rs:132`) and four test files pin this
+        /// signature, and they are outside this story's ownership.
+        ///
+        /// What it does buy even on this path: the key is now held in a
+        /// `Zeroizing` with a real `Drop`, so replacing or dropping the store
+        /// clears it — where the old plain `[u8; 32]` field had no `Drop` at
+        /// all and the key was never cleared.
+        ///
+        /// Device call sites should use [`Self::set_fused_store_key`] with
+        /// [`crate::fused_key::rp2350_store_key`].
         pub fn set_store_key(&mut self, key: [u8; 32]) {
-            self.key = Some(key);
+            self.key = Some(KeySource::resident(key));
+        }
+
+        /// US-1572: configure a **fused** store key — the source re-reads and
+        /// re-derives per operation, so no root key is resident between them.
+        ///
+        /// On the device this is [`crate::fused_key::rp2350_store_key`]; the
+        /// host and bridge builds use [`crate::fused_key::emulation_store_key`]
+        /// or their own reader over their own root
+        /// ([`crate::fused_key::FusedKey::new`]). Same contract as
+        /// [`Self::set_store_key`]: call it before any restore or snapshot.
+        pub fn set_fused_store_key(&mut self, key: FusedKey) {
+            self.key = Some(KeySource::fused(key));
         }
     }
 
@@ -977,12 +1014,17 @@ pub mod rp2350 {
                 size += 4 + s.key_len as usize + 4 + s.val_len as usize;
             }
             let logical = size + 4; // trailing CRC-32
-            match self.key {
-                Some(_) => {
-                    logical + crate::store_v3::V3_NONCE_LEN
-                        + n * crate::store_v3::V3_TAG_LEN
-                }
-                None => logical,
+            // US-1572: the length is a function of the *entries* and of
+            // whether the store is keyed — never of the key's value (GCM
+            // ciphertext is plaintext-length and the image nonce is a fixed
+            // 12 bytes), so this asks only whether a key is configured and
+            // materialises nothing. A fused source that cannot be read right
+            // now does not change this answer, which is what keeps the bound
+            // stable across a transient refusal.
+            if self.key.is_some() {
+                logical + crate::store_v3::V3_NONCE_LEN + n * crate::store_v3::V3_TAG_LEN
+            } else {
+                logical
             }
         }
 
@@ -1006,8 +1048,25 @@ pub mod rp2350 {
                     emit_window_seg(buf, off, end, &mut pos, &mut filled, &$bytes);
                 }};
             }
-            match self.key {
-                Some(key) => {
+            match self.key.as_ref() {
+                Some(src) => {
+                    // US-1572: one read for this one operation. The `FusedRead`
+                    // is this function's local, so the key is cleared before
+                    // it returns on every branch.
+                    //
+                    // A read that fails is a REFUSAL, not a reason to fall
+                    // through to the legacy plaintext emission below: emitting
+                    // a v2 image because the OTP row was momentarily unreadable
+                    // would write credentials to flash in the clear. Zero
+                    // filled bytes is the fail-closed shape here — the persist
+                    // sink treats a short window as a program failure
+                    // (`persist_sink.rs:112-130`) and the boot compare treats it
+                    // as "not matching" (`persist_sink.rs:145-150`), so a
+                    // refusal never programs and never loses the previous good
+                    // image.
+                    let Some(key) = src.read() else {
+                        return 0;
+                    };
                     // Sealed emission (format v3). Deterministic nonce: the
                     // same store content re-seals byte-identically, so the
                     // persist gate's compare-then-write stays quiet.
@@ -1030,7 +1089,7 @@ pub mod rp2350 {
                                 )
                             }),
                     );
-                    let image_nonce = crate::store_v3::nonce_for(&key, &digest);
+                    let image_nonce = crate::store_v3::nonce_for(key.as_bytes(), &digest);
                     seg!(crate::store_v3::PARTITION_IMAGE_MAGIC_V3.to_le_bytes());
                     seg!((n as u32).to_le_bytes());
                     seg!(image_nonce);
@@ -1047,7 +1106,7 @@ pub mod rp2350 {
                         // declared entry bounds and the key is always 32
                         // bytes — the only `seal_entry` failure modes.
                         let tag = crate::store_v3::seal_entry(
-                            &key,
+                            key.as_bytes(),
                             &image_nonce,
                             n,
                             i,
@@ -1210,13 +1269,18 @@ pub mod rp2350 {
         /// A forged or torn v3 image (bad tag, bad CRC, bad structure)
         /// never yields a partial secret — the store stays empty.
         fn restore_v3(&mut self, reader: &mut dyn ImageReader) {
-            let Some(key) = self.key else {
+            // US-1572: one fused read for this one restore, dropped when this
+            // function returns. A store with no key configured *and* one whose
+            // key cannot be read right now both land here, and both take the
+            // same all-or-nothing branch — the store stays empty rather than
+            // guessing at a key.
+            let Some(key) = self.key.as_ref().and_then(KeySource::read) else {
                 // A sealed image with no key configured cannot validate —
                 // all-or-nothing: the store stays empty.
                 self.reset();
                 return;
             };
-            if crate::store_v3::sealed_image_len_reader(reader, &key).is_none() {
+            if crate::store_v3::sealed_image_len_reader(reader, key.as_bytes()).is_none() {
                 self.reset();
                 return;
             }
@@ -1235,7 +1299,7 @@ pub mod rp2350 {
             for idx in 0..count {
                 let Some((kl, vl, next)) = crate::store_v3::sealed_next_entry(
                     reader,
-                    &key,
+                    key.as_bytes(),
                     &image_nonce,
                     count,
                     idx,
@@ -1395,7 +1459,14 @@ pub mod rp2350 {
         Ok(())
     }
     fn store_key(&self) -> Option<[u8; 32]> {
-        self.key
+        // US-1572: re-read per call rather than copying a resident field. The
+        // trait method still *returns a copy* — that is a by-copy seam this
+        // story cannot close, because its callers
+        // (`platform/src/persist.rs:505`, `apps/fido/src/device_keystore.rs`)
+        // are outside this story's ownership. What this change removes is the
+        // second, long-lived copy: the value handed out here is derived at the
+        // call and the holder's `FusedRead` is dropped with this expression.
+        self.key.as_ref().and_then(KeySource::read).map(|k| *k.as_bytes())
     }
 }
 

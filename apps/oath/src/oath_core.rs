@@ -68,6 +68,45 @@
 //!   is exactly on the limit, which is why the real app does not get it.
 //!   `MAX_CREDS` below is a different kind of bound — a `heapless` table
 //!   bound, never a capacity claim.
+//!
+//!   **All of that paragraph describes the legacy path, and US-1553 replaces
+//!   it.** With a key region attached ([`OathApp::attach_region`]) the table is
+//!   no longer a chunked whole snapshot in the 24-entry image shared with
+//!   FIDO: each credential is one record in one slot of the key region
+//!   (`fapico2_platform::keyregion::oath_store`), committed one at a time, so
+//!   the double-buffered rewrite peak — the only thing that made the ceiling a
+//!   *peak* — does not exist. The ceiling becomes [`MAX_CREDS`], the same
+//!   number the table was always sized for, and OATH and FIDO stop competing
+//!   for the same entries. The legacy stream is still **read** (the US-413
+//!   migration) and still **written** for the records that are not credentials
+//!   — the access code and the US-904 OTP-PIN verifier — so `encode_state` is
+//!   not dead code.
+//!
+//! - US-1553 (secure storage): **credentials are per-record in the key region,
+//!   and the secure store holds no credential table.** The properties are
+//!   argued where they are implemented, not here:
+//!   * *a mutation is one record, not one table* — [`OathApp::region_sync`], so
+//!     a PUT costs one sector erase instead of a 12-part double-buffered
+//!     rewrite, and a failure costs one credential rather than the set;
+//!   * *durable-before-ack is not weakened* — the record is written **before**
+//!     the command returns, and a refused commit rolls the in-RAM table back
+//!     and then re-reads the medium, which is authoritative
+//!     ([`OathApp::region_reconcile`]);
+//!   * *the US-1030 seal-generation ordering is subsumed, not dropped* — the
+//!     nonce generation is now the record's own generation, so the counter and
+//!     the sealed bytes are programmed by one sector-atomic commit and no
+//!     window exists in which one is ahead of the other. The argument is in
+//!     `keyregion/oath_store.rs`, "Why the seal generation is the record
+//!     generation"; `oath.seal.gen.v1` is still reserved and written on the
+//!     legacy path only;
+//!   * *the boot path does not touch the region* (S8/S9) — `attach_region` is
+//!     called at first applet use, after `RUNG_USB`, never from `OathApp::boot`
+//!     or `boot_in_place`, and `apps/oath/tests/oath_keyregion.rs` asserts that
+//!     a booted app whose region is mounted never touches the medium;
+//!   * *an unreadable region degrades* — [`OathApp::attach_region`] returns
+//!     [`RegionStatus::Degraded`] and the applet serves an **empty** credential
+//!     set with a clean status word. Never `fatal_boot`, never a panic: a
+//!     failing flash must not become a board that will not enumerate over USB.
 //! - US-133 (PICOForge-COMPAT): a credential's Yubiko property bits are
 //!   stored with it (`Cred::props`, persisted as a trailing **bare**
 //!   `78 <props>` object — the same two-byte dialect the PUT request parser
@@ -79,8 +118,12 @@
 //!   unchanged, so the US-413 stream format does not move.
 
 use crate::ct::ct_eq;
+use alloc::boxed::Box;
 use fapico2_platform::ckey::{OathSeal, OATH_SEAL_OVERHEAD};
 use fapico2_platform::dispatch::{App, Sw, MAX_RESPONSE};
+use fapico2_platform::keyregion::oath_store::{
+    self, Entry, OathCredential, OathRegion, OathStoreError,
+};
 use fapico2_platform::presence::PresenceService;
 use fapico2_platform::secure_store::chunked;
 use fapico2_platform::secure_store::chunked::MAX_LOGICAL_LEN;
@@ -270,6 +313,24 @@ const MAX_OTP_COUNTER: u8 = 3;
 //
 // NOT C parity — C allows 255 slots.
 const MAX_CREDS: usize = 68;
+
+// US-1553: the RAM table bound and the region's OATH reservation must be the
+// same number, and this is the line that keeps them so.
+//
+// It is the one cross-crate claim in this file that cannot be a `pub use`
+// (`platform` does not depend on `apps/oath`, and the dependency runs the other
+// way), so it is a `const` assertion over two literals rather than a link. A
+// region that could hold fewer credentials than the table has slots would make
+// the *extra* table entries unwritable; one that could hold more would refuse
+// on a bound this applet never mentions. Both are capacity claims, and
+// `mod.rs` refuses to let either be asserted instead of derived — so the
+// agreement is asserted here, in the one place both numbers are in scope.
+const _: () = assert!(
+    oath_store::OATH_SLOTS as usize == MAX_CREDS,
+    "the key region's OATH reservation and this applet's table must be the same bound — one \
+     bigger makes table entries unwritable, one smaller makes the store refuse on a RAM bound \
+     it never mentions"
+);
 
 const MAX_NAME: usize = 64;
 /// Stored key TLV value: [alg|type, digits, secret ≤ 64].
@@ -671,6 +732,35 @@ fn default_user_present() -> bool {
     }
 }
 
+/// US-1553: the outcome of [`OathApp::attach_region`].
+///
+/// Two states, and the split is the requirement (S10, "degrade, never halt"):
+/// the caller has to be able to tell "the region mounted and here is what was
+/// in it" from "the region could not be read and the applet is serving an empty
+/// table". Collapsing them would make a failing flash look like a factory-fresh
+/// token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionStatus {
+    /// The region was recovered and read.
+    Mounted {
+        /// Credentials in the table afterwards, imported ones included.
+        live: u16,
+        /// Credentials moved in from the legacy `oath.keystore.v1` stream.
+        ///
+        /// Non-zero exactly once in a device's life — on the mount that found
+        /// the region virgin.
+        imported: u16,
+    },
+    /// The region could not be read. The credential table is **empty** and the
+    /// applet still answers APDUs.
+    Degraded,
+}
+
+/// US-1553: the region handle was not where [`OathApp::attach_region`] had just
+/// installed it. Unreachable, and named rather than `unwrap`ed so a future
+/// change that can drop it is reported rather than panicked.
+const E_NO_REGION: &str = "oath: the key-region handle disappeared between statements";
+
 pub struct OathApp {
     /// Storage slots in creation order; deleted slots are None and are
     /// reused by the next PUT (C free-slot bitmap parity). Slot index i
@@ -731,6 +821,31 @@ pub struct OathApp {
     /// reached the medium, so a fault leaves the app refusing rather than
     /// serving the plaintext it just read.
     reseal_pending: bool,
+    /// US-1553: the key region this applet stores its credentials in, once one
+    /// has been attached at first applet use. `None` is the legacy path — the
+    /// chunked `oath.keystore.v1` snapshot in the shared secure store — and it
+    /// is the default rather than an error so that every existing caller and
+    /// test keeps working unchanged.
+    ///
+    /// **Boxed, so the cost in `bss` is one pointer.** The handle carries a
+    /// `PayloadKey`, and 33 bytes of static on a build that tracks its `bss`
+    /// delta would be paid for every session including the ones that never
+    /// mount a region. `Option<Box<_>>` is 4 bytes on the device target (the
+    /// null-pointer niche) and nothing is allocated until a region is attached
+    /// — which is after `platform::rsa_heap::init()`, so the US-961 heap gate
+    /// is unaffected.
+    region: Option<Box<OathRegion>>,
+    /// US-1553: set when the region could not be read, so the credential table
+    /// is **empty because nothing could be learned**, not because the owner has
+    /// none. It is a distinct state from `region == None` on purpose: the
+    /// former is a device with a failing flash, the latter is a device on the
+    /// legacy path, and only one of them should answer a PUT with a refusal.
+    ///
+    /// A single byte rather than an `Option<&'static str>` for the same reason
+    /// the rest of this file does not carry reasons in statics: the applet has
+    /// no log to write them to, and the difference that matters to a caller is
+    /// "degraded or not".
+    region_degraded: bool,
 }
 
 impl OathApp {
@@ -900,6 +1015,8 @@ impl OathApp {
         core::ptr::addr_of_mut!((*app).device_id).write(device_id);
         core::ptr::addr_of_mut!((*app).seal).write(seal);
         core::ptr::addr_of_mut!((*app).reseal_pending).write(false);
+        core::ptr::addr_of_mut!((*app).region).write(None);
+        core::ptr::addr_of_mut!((*app).region_degraded).write(false);
         let app = &mut *app;
         app.fill_rng_pool(trng);
         let mut challenge = [0u8; 8];
@@ -1050,9 +1167,402 @@ impl OathApp {
     /// US-711: factory-reset the app (the management RESET hook): clear the
     /// credential table and mark the emptied state dirty for the persist
     /// gate — the same durable wipe path a PUT uses.
+    ///
+    /// US-1553: on the key-region path the clear is **68 sector-atomic
+    /// tombstone commits**, one per occupied slot, and not a store write — the
+    /// store never held the table in the first place. A tombstone rather than
+    /// an erase because [`fapico2_platform::keyregion::commit`] has no
+    /// single-slot delete: a target programmed `0xFF` is indistinguishable from
+    /// a commit that never reached its witness, so `recover` could resurrect a
+    /// delete as a replay (`commit.rs`, "Why there is no single-slot delete
+    /// here").
+    ///
+    /// The management hook cannot report a status word, so a failed wipe marks
+    /// the applet **degraded** instead of returning an error — a factory reset
+    /// that reports success having erased nothing is worse than one that
+    /// reports failure, and here the only report available is the flag. The
+    /// APDU path ([`Self::cmd_reset`]) does return a status word.
     pub fn reset(&mut self) {
+        if self.region.is_some() && self.wipe_region().is_err() {
+            self.region_degraded = true;
+        }
         self.reset_state();
-        self.dirty = true;
+        if self.region.is_none() {
+            self.dirty = true;
+        }
+    }
+
+    /// US-1553: the region could not be read, so the credential table is
+    /// **empty because nothing could be learned**, not because the owner has
+    /// none. The caller learns which it is and can say so; the applet cannot
+    /// serve a partial table, because a table that silently lost an entry is
+    /// indistinguishable from one that never had it.
+    pub fn is_region_degraded(&self) -> bool {
+        self.region_degraded
+    }
+
+    /// US-1553: is a key region attached? `false` means the legacy chunked
+    /// stream path, which is the default for every existing caller.
+    pub fn has_region(&self) -> bool {
+        self.region.is_some()
+    }
+
+    /// US-1553: attach the key region and mount it into the credential table.
+    ///
+    /// # When this is called — S8/S9
+    ///
+    /// **Never from [`Self::boot`] or [`Self::boot_in_place`].** Boot runs
+    /// before USB is constructed and inside a time budget, and a mount reads up
+    /// to 68 KiB and opens 68 AEAD records; making boot's latency proportional
+    /// to how many credentials the owner has is the failure this rule names.
+    /// The caller attaches at **first applet use, after `RUNG_USB`**.
+    /// `apps/oath/tests/oath_keyregion.rs` asserts the negative half directly:
+    /// a booted app whose region is mounted never reads or writes the medium.
+    ///
+    /// # What it does, in order
+    ///
+    /// 1. [`fapico2_platform::keyregion::oath_store::OathStore::recover`] —
+    ///    finish or abandon a commit a power cut interrupted. A live sector
+    ///    caught between its erase and its copy-back reads as **empty**, and
+    ///    "this credential is gone" is exactly what a mount that skipped this
+    ///    would conclude and report to the owner.
+    /// 2. Read and open all [`MAX_CREDS`] slots into the table.
+    /// 3. **Import** — see [`Self::import_legacy`].
+    /// 4. Recompute the session grant (US-901): a mounted non-empty table is a
+    ///    non-virgin applet, so the virgin auto-validate rule must not fire.
+    ///
+    /// # Degrade, never halt
+    ///
+    /// Any [`OathStoreError`] leaves the table **empty** and the applet usable,
+    /// and is reported as [`RegionStatus::Degraded`]. A `fatal_boot` here turns
+    /// a failing flash into a board that will not enumerate over USB at all —
+    /// `ykman` cannot reach it, the rescue applet cannot be selected, and the
+    /// user is told nothing. An empty credential set with a clean status word is
+    /// a token that still works and a fault the caller can log.
+    ///
+    /// The failure is **all-or-nothing on purpose**: if slot 40 faults and the
+    /// other 67 mount, the owner sees a credential list that quietly lost an
+    /// entry, and the next PUT will reuse that slot — writing a second identity
+    /// on top of one they still believe is there.
+    pub fn attach_region(&mut self, region: OathRegion) -> RegionStatus {
+        self.region = Some(Box::new(region));
+        self.region_degraded = false;
+        // Whatever the region says is what the table becomes. The order below is
+        // the whole migration argument, so it is worth stating: the legacy
+        // table is **only** cleared once the region has been shown to be
+        // non-empty, and the legacy credentials are **only** cleared by writing
+        // them into a region shown to be empty. Neither side loses anything to
+        // the other.
+        let had_legacy = self.slots.iter().any(|s| s.is_some());
+
+        // The borrow of the handle is taken inside the expression and ends
+        // with it, so the `degrade` calls below can take `&mut self` whole.
+        let recovered = self.region.as_mut().map(|handle| handle.store().recover());
+        match recovered {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return self.degrade(e),
+            // Unreachable: the handle was set two lines above and nothing takes
+            // it. `degrade` rather than `panic` because the property this
+            // function exists for — degrade, never halt — must hold even for a
+            // bug, and a panic in `no_std` is a reset vector.
+            None => return self.degrade(OathStoreError::Fault(E_NO_REGION)),
+        }
+
+        // One counting pass to decide which of the two paths this is. It costs
+        // the same 68 slot reads the read pass below would have cost; doing it
+        // first is what lets the legacy table stay intact until the region has
+        // been shown to be empty.
+        let report = match self.region.as_mut() {
+            Some(handle) => handle.store().mount(),
+            None => return self.degrade(OathStoreError::Fault(E_NO_REGION)),
+        };
+        let report = match report {
+            Ok(r) => r,
+            Err(e) => return self.degrade(e),
+        };
+
+        // "Virgin" means **no OATH content at all**, not merely nothing
+        // readable: a slot holding a record this build cannot open is a
+        // credential somebody provisioned, and importing over it would
+        // destroy it. Tombstones are not content — a slot holding one is free
+        // for an import, which writes at a strictly higher generation.
+        let virgin = report.live == 0 && report.undecodable == 0;
+        let imported = if virgin {
+            self.import_legacy()
+        } else {
+            self.slots.fill(None);
+            for i in 0..MAX_CREDS {
+                let entry = match self.region.as_mut() {
+                    Some(handle) => handle.store().read(i as u16),
+                    None => return self.degrade(OathStoreError::Fault(E_NO_REGION)),
+                };
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => return self.degrade(e),
+                };
+                if let Entry::Live(record) = entry {
+                    // A record whose `OathSeal` blob will not open is treated
+                    // as an empty table slot, **not** as a fatal error: the
+                    // medium read cleanly, so this is a fact about the data,
+                    // and the record is one this firmware cannot serve under any
+                    // retry. The alternative — reserving the slot — leaks it
+                    // forever against a credential nobody can use. The next
+                    // PUT overwrites it at a strictly higher generation, which
+                    // is an erase-then-program rather than a rewrite.
+                    self.slots[i] = self.cred_from_record(&record);
+                }
+            }
+            0
+        };
+
+        if imported > 0 {
+            // US-1030: everything now in the region carries a sealed key, so
+            // the "re-seal before serving" obligation is discharged.
+            self.reseal_pending = false;
+        }
+        if had_legacy {
+            // Retire the legacy stream at the next persist: `encode_state` no
+            // longer emits credential records once a region is attached, so
+            // this write is what makes "the secure store holds no OATH
+            // credential table" true of the *medium* and not only of the live
+            // record. `tests/oath_keyregion.rs` asserts it on the store's bytes.
+            self.dirty = true;
+        }
+        self.refresh_session_grant();
+        let live = self.slots.iter().filter(|s| s.is_some()).count() as u16;
+        RegionStatus::Mounted { live, imported }
+    }
+
+    /// US-1553: the empty-table degradation path.
+    fn degrade(&mut self, reason: OathStoreError) -> RegionStatus {
+        self.slots.fill(None);
+        self.region_degraded = true;
+        self.refresh_session_grant();
+        // The reason is kept out of the applet's state on purpose: `no_std`
+        // has no log to write it to, and the only difference a caller can act
+        // on is degraded-or-not. The error string is still reachable from
+        // `OathStore::mount`/`recover` for a caller that wants it.
+        let _ = reason;
+        RegionStatus::Degraded
+    }
+
+    /// US-1553: move a legacy stream credential into the region, once.
+    ///
+    /// Only when the region came up **empty**. That condition is the
+    /// whole safety argument: a region with records in it has already been
+    /// migrated, and merging a stream table into it would have to decide what
+    /// to do about a name that exists on both sides — and the two sides have no
+    /// shared identity, because a stream record carries a table *index* and a
+    /// region record carries a *slot*, and nothing ties index 7 to slot 7
+    /// across the two schemes except that they are both called 7.
+    ///
+    /// So the migration is one-way and single-shot, and a device that somehow
+    /// has both keeps the region's view: the region's records are the ones the
+    /// owner has used since, and the stream's are a snapshot of a state that
+    /// has demonstrably already moved on.
+    ///
+    /// Imports run **highest table index first**, so a failure part-way leaves
+    /// the *tail* of the table migrated and the head still in the stream, where
+    /// the next boot's legacy read finds it — never a hole in the middle that
+    /// both sides believe the other owns.
+    fn import_legacy(&mut self) -> u16 {
+        let mut imported = 0u16;
+        for i in (0..MAX_CREDS).rev() {
+            // `Cred` is `Copy`, so the entry survives the borrow `region_sync`
+            // takes — which matters, because on a refusal `region_sync`
+            // reconciles the table against the medium and the medium says
+            // "empty", and this credential must not vanish from RAM because it
+            // could not be written. It is still the owner's credential; it is
+            // simply not durable yet.
+            let Some(cred) = self.slots[i] else { continue };
+            if self.region_sync(i).is_err() {
+                self.slots[i] = Some(cred);
+                self.region_degraded = true;
+                break;
+            }
+            imported += 1;
+        }
+        imported
+    }
+
+    /// US-1553: push table slot `index` to the region and report whether it
+    /// reached the medium.
+    ///
+    /// `Err` means the table now agrees with the medium, not with the caller:
+    /// on any failure the slot is re-read ([`Self::region_reconcile`]) and the
+    /// **medium wins**. That is the only correct resolution for the one failure
+    /// mode that is not a clean refusal — a commit interrupted after the sector
+    /// erase, where `commit::recover` will replay the staged record on the next
+    /// attempt and the new credential is already the durable one. Rolling the
+    /// RAM table back to the *old* credential in that state would leave a token
+    /// computing codes from a secret the owner has already replaced.
+    fn region_sync(&mut self, index: usize) -> Result<(), ()> {
+        if self.region.is_none() {
+            return Ok(());
+        }
+        let result = match self.slots[index] {
+            Some(cred) => {
+                // Seal first, so the plaintext key never crosses into the
+                // region handle's borrow and the nonce generation is the one
+                // the commit is about to use.
+                //
+                // **Every** failure path falls through to `region_reconcile`
+                // below, including the ones that never reach the commit — a
+                // failure to read the slot's current generation is just as much
+                // "the table may now disagree with the medium" as a refused
+                // commit is, and leaving the in-RAM credential in place is how
+                // a token ends up serving a secret it never stored.
+                let record = match self.region_record(index, &cred) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        self.region_reconcile(index);
+                        return Err(e);
+                    }
+                };
+                match self.region.as_mut() {
+                    Some(handle) => handle.store().write(index as u16, &record).map(|_| ()),
+                    None => Ok(()),
+                }
+            }
+            None => match self.region.as_mut() {
+                Some(handle) => handle.store().delete(index as u16).map(|_| ()),
+                None => Ok(()),
+            },
+        };
+        if result.is_ok() {
+            return Ok(());
+        }
+        self.region_reconcile(index);
+        Err(())
+    }
+
+    /// US-1553: build the region record for table slot `index`.
+    ///
+    /// The `OathSeal` nonce generation **is** the region record's generation,
+    /// read from the medium a moment earlier. That is the substitution US-1553
+    /// makes and `keyregion/oath_store.rs` argues in full: the counter and the
+    /// sealed bytes are programmed by one sector-atomic commit, so the US-1030
+    /// "reserve before you seal" ordering is not weakened — there is no longer
+    /// a second write that could be cut between them, and the slot's generation
+    /// is durably monotonic without a resident counter to lose across a reset.
+    fn region_record(&mut self, index: usize, cred: &Cred) -> Result<OathCredential, ()> {
+        let index_u16 = index as u16;
+        let generation = match self.region.as_mut() {
+            Some(handle) => handle.store().next_generation(index_u16).map_err(|_| ())?,
+            None => return Err(()),
+        };
+        let mut sealed = [0u8; MAX_KEY + OATH_SEAL_OVERHEAD];
+        let n = self
+            .seal
+            .seal(
+                FID_CRED_BASE + index_u16,
+                u64::from(generation),
+                &cred.key[..cred.key_len as usize],
+                &mut sealed,
+            )
+            .map_err(|_| ())?;
+        OathCredential::new(
+            &cred.name[..cred.name_len as usize],
+            &sealed[..n],
+            u64::from(generation),
+            cred.imf.unwrap_or(0),
+            cred.props,
+        )
+        .ok_or(())
+    }
+
+    /// US-1553: adopt whatever the medium holds at table slot `index`.
+    ///
+    /// Called after a refused commit, and after any other moment where RAM and
+    /// the region could disagree. A read that itself faults sets the degraded
+    /// flag: at that point the applet knows it has changed something it cannot
+    /// prove was stored, and a token that does not know what it holds should
+    /// not serve the table it thinks it has.
+    fn region_reconcile(&mut self, index: usize) {
+        let entry = match self.region.as_mut() {
+            Some(handle) => handle.store().read(index as u16),
+            None => return,
+        };
+        self.slots[index] = match entry {
+            Ok(Entry::Live(record)) => self.cred_from_record(&record),
+            Ok(_) => None,
+            Err(_) => {
+                self.region_degraded = true;
+                None
+            }
+        };
+        self.refresh_session_grant();
+    }
+
+    /// US-1553: rebuild a `Cred` from a region record by opening its
+    /// `OathSeal` blob.
+    ///
+    /// `None` for a blob this firmware did not write (an unsealed one) or one
+    /// that will not open. The record's `imf` is only honoured for an HOTP
+    /// secret — the algorithm/type byte inside the sealed blob is the
+    /// authority, exactly as it was when the record was a TLV in a stream, and
+    /// a TOTP credential carrying a stale counter must not grow one.
+    fn cred_from_record(&mut self, record: &OathCredential) -> Option<Cred> {
+        let blob = record.sealed_key();
+        if !OathSeal::is_sealed(blob) {
+            return None;
+        }
+        let mut plain = [0u8; MAX_KEY];
+        let n = self.seal.open(blob, &mut plain).ok()?;
+        if !(2..=MAX_KEY).contains(&n) {
+            plain.zeroize();
+            return None;
+        }
+        let mut cred = Cred::default();
+        cred.key[..n].copy_from_slice(&plain[..n]);
+        cred.key_len = n as u8;
+        plain.zeroize();
+        let name = record.name();
+        cred.name[..name.len()].copy_from_slice(name);
+        cred.name_len = name.len() as u8;
+        cred.imf = if cred.key[0] & TYPE_MASK == TYPE_HOTP {
+            Some(record.imf())
+        } else {
+            None
+        };
+        cred.props = record.props() & PROP_ENFORCED;
+        Some(cred)
+    }
+
+    /// US-1553: tombstone every occupied slot, so a factory reset is durable in
+    /// the region rather than only in RAM.
+    ///
+    /// Not atomic across slots, and cannot be: 68 sector-atomic commits are 68
+    /// erases with no way to make the last conditional on the first, which is
+    /// the same statement [`fapico2_platform::keyregion::commit::wipe`] makes
+    /// about the whole region. The failure direction is chosen — a reset that
+    /// stops early leaves *fewer* credentials, not more, and every tombstone
+    /// that did land is durable.
+    fn wipe_region(&mut self) -> Result<(), Sw> {
+        for i in 0..MAX_CREDS {
+            if self.slots[i].is_none() {
+                continue;
+            }
+            self.slots[i] = None;
+            if self.region_sync(i).is_err() {
+                return Err(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        }
+        Ok(())
+    }
+
+    /// US-1553: note a credential mutation.
+    ///
+    /// The `dirty` flag means "the **secure store** is out of date", which is
+    /// what [`App::persist_state`] and the gate's partition-image program both
+    /// act on. A credential mutation that went to the region has nothing
+    /// pending in the store, so marking it dirty would make every credential
+    /// write re-serialize the stream and reprogram the partition image — a real
+    /// cost, and a lie about where the bytes went.
+    fn note_change(&mut self) {
+        if self.region.is_none() {
+            self.dirty = true;
+        }
     }
 
     /// Decode the `oath.keystore.v1` record stream into the slot table.
@@ -1229,9 +1739,24 @@ impl OathApp {
         Ok(())
     }
 
+    /// US-1553: **the credentials the stream has to carry.**
+    ///
+    /// Empty once a key region is attached. The region is where a credential
+    /// lives; the stream keeps only the two records that were never applet
+    /// credentials to begin with — the access code and the US-904 OTP-PIN
+    /// verifier — and that is what makes "the secure store holds no applet
+    /// credential table" a fact about the *medium* rather than a fact about
+    /// the code path that happens to be taken today.
+    fn credentials_in_stream(&self) -> impl Iterator<Item = &Cred> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(move |_| self.region.is_none())
+    }
+
     fn encode_len(&self) -> usize {
         let mut total = 0usize;
-        for slot in self.slots.iter().flatten() {
+        for slot in self.credentials_in_stream() {
             total += 6 // [fid][len]
                 + 2 + slot.name_len as usize // TAG_NAME
                 + 2 + slot.key_len as usize + OATH_SEAL_OVERHEAD // TAG_KEY (US-1030: sealed)
@@ -1284,12 +1809,15 @@ impl OathApp {
         // US-1030: one reservation for the whole table; credential `i` is
         // sealed at `base + 1 + i`, so two credentials never share a
         // generation even though one counter pass covers them.
-        let count = self.slots.iter().flatten().count();
+        let count = self.credentials_in_stream().count();
         let base = reserve_seal_generations(store, count)?;
         let mut next = base;
         let mut out = HeaplessVec::<u8, MAX_LOGICAL_LEN>::new();
         let mut sealed = [0u8; MAX_KEY + OATH_SEAL_OVERHEAD];
         for (idx, slot) in self.slots.iter().enumerate() {
+            if self.region.is_some() {
+                break; // US-1553: credentials live in the region, not the stream
+            }
             let Some(cred) = slot else { continue };
             next += 1;
             let fid = FID_CRED_BASE + idx as u16;
@@ -1718,14 +2246,23 @@ impl OathApp {
         cred.key_len = key.len() as u8;
         cred.imf = imf;
         cred.props = props;
-        match self.find_cred(name) {
-            Some(idx) => self.slots[idx] = Some(cred),
+        let idx = match self.find_cred(name) {
+            Some(idx) => idx,
             None => match self.slots.iter().position(|c| c.is_none()) {
-                Some(free) => self.slots[free] = Some(cred),
+                Some(free) => free,
                 None => return SW_FILE_FULL,
             },
+        };
+        self.slots[idx] = Some(cred);
+        // US-1553: the record is durable before the command answers, so a
+        // `0x9000` here means the credential is on the medium. A refusal rolls
+        // the table back to whatever the medium says (`region_sync`), which is
+        // the only correct resolution: a commit interrupted after its sector
+        // erase leaves the *new* credential as the one `recover` will replay.
+        if self.region_sync(idx).is_err() {
+            return SW_CONDITIONS_NOT_SATISFIED;
         }
-        self.dirty = true;
+        self.note_change();
         SW_OK
     }
 
@@ -1739,7 +2276,13 @@ impl OathApp {
         match self.find_cred(name) {
             Some(idx) => {
                 self.slots[idx] = None;
-                self.dirty = true;
+                // US-1553: a delete is a tombstone commit, not an erase — see
+                // `keyregion/oath_store::TOMBSTONE_NAME_LEN`. The slot is
+                // reused by the next PUT, at a strictly higher generation.
+                if self.region_sync(idx).is_err() {
+                    return SW_CONDITIONS_NOT_SATISFIED;
+                }
+                self.note_change();
                 SW_OK
             }
             None => SW_DATA_INVALID,
@@ -1768,7 +2311,10 @@ impl OathApp {
                 let cred = self.slots[idx].as_mut().expect("slot present");
                 cred.name[..new.len()].copy_from_slice(new);
                 cred.name_len = new.len() as u8;
-                self.dirty = true;
+                if self.region_sync(idx).is_err() {
+                    return SW_CONDITIONS_NOT_SATISFIED;
+                }
+                self.note_change();
                 SW_OK
             }
             None => SW_DATA_INVALID,
@@ -1917,13 +2463,22 @@ impl OathApp {
         let Some(n) = n else {
             return SW_INCORRECT_PARAMS;
         };
-        let _ = resp.push(TAG_RESPONSE + p2);
-        let _ = resp.extend_from_slice(&body[..n]);
+        // US-1553: the HOTP counter is made durable **before** the code is
+        // handed out. A CALCULATE that answers `0x9000` with a code but does
+        // not advance the counter is a one-shot credential, and a caller that
+        // retries would get the same code twice — so the ordering here is the
+        // protocol, not a preference. It also means a failed commit cannot
+        // leave a response body already written next to an error status word.
         if is_hotp {
             self.slots[idx].as_mut().expect("slot present").imf =
                 Some(counter.expect("HOTP counter").wrapping_add(1));
-            self.dirty = true;
+            if self.region_sync(idx).is_err() {
+                return SW_CONDITIONS_NOT_SATISFIED;
+            }
+            self.note_change();
         }
+        let _ = resp.push(TAG_RESPONSE + p2);
+        let _ = resp.extend_from_slice(&body[..n]);
         SW_OK
     }
 
@@ -2179,8 +2734,16 @@ impl OathApp {
         if !self.user_present(PRESENCE_TAG_RESET) {
             return SW_CONDITIONS_NOT_SATISFIED;
         }
+        // US-1553: on the key-region path the wipe is one tombstone commit per
+        // occupied slot, made durable before the command answers. On the legacy
+        // path it is the emptied stream below, marked dirty for the gate.
+        if self.wipe_region().is_err() {
+            return SW_CONDITIONS_NOT_SATISFIED;
+        }
         self.reset_state();
-        self.dirty = true;
+        if self.region.is_none() {
+            self.dirty = true;
+        }
         SW_OK
     }
 
@@ -2313,3 +2876,6 @@ impl OathApp {
         SW_OK
     }
 }
+
+// TEMPORARY MEASUREMENT — removed immediately after the numbers are taken.
+

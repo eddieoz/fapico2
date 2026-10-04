@@ -37,7 +37,7 @@ const CTAP2_ERR_INVALID_COMMAND: u8 = 0x01;
 /// Pending getAssertion enumeration state (S-701-4): remaining credential
 /// IDs served one-per-getNextAssertion on the same channel.
 pub struct DeviceGaState {
-    pub(crate) remaining: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) remaining: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) client_data_hash: [u8; 32],
     pub(crate) uv: bool,
     pub(crate) do_up: bool,
@@ -202,7 +202,7 @@ impl fapico2_platform::dispatch::App for FidoApp {
 
 /// credMgmt RP enumeration state.
 pub struct CmRpState {
-    pub(crate) rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) cursor: usize,
     pub(crate) channel: [u8; 4],
     /// The dialect of the `enumerateRpsBegin` that armed this enumeration.
@@ -217,7 +217,7 @@ pub struct CmRpState {
 
 /// credMgmt credential enumeration state.
 pub struct CmCredState {
-    pub(crate) creds: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) creds: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) total: usize,
     pub(crate) channel: [u8; 4],
     /// See [`CmRpState::dialect`] — `enumerateCredentialsGetNextCredential`

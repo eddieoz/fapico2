@@ -9,10 +9,38 @@
 //! interchangeable, and the snapshot survives the device's 512-B physical
 //! value cap.
 //!
-//! Bounded by design: [`DEVICE_MAX_CREDS`] credentials with fixed-size
-//! COSE key / name fields. A snapshot that does not fit these bounds is a
-//! parse error — corrupt input is refused, never truncated (FX-440 parity
-//! with FX-409).
+//! Bounded by design: the resident credential set is
+//! [`SNAPSHOT_MAX_CREDS`], and the store's **capacity** — how many credentials
+//! the device can hold at all — is [`DEVICE_MAX_CREDS`], which is derived from
+//! the per-record key region rather than asserted here. A snapshot that does not
+//! fit the resident bound is a parse error — corrupt input is refused, never
+//! truncated (FX-440 parity with FX-409).
+//!
+//! # Two bounds, because they are two different questions (US-1552)
+//!
+//! The number this file used to carry for both was `12`, and it answered
+//! neither:
+//!
+//! * **Capacity — [`DEVICE_MAX_CREDS`].** How many passkeys the device can
+//!   hold. This is [`fapico2_platform::keyregion::FIDO_CAPACITY`] (856 at the
+//!   shipping geometry), which is a function of the region's size, the measured
+//!   record size, the commit protocol and the index reservation
+//!   (`keyregion/mod.rs`, "Capacities — derived, never asserted"). The old `12`
+//!   was a literal in a file no region could contradict, and it was unreachable
+//!   anyway: the real ceiling was `other_slots + old_parts + new_parts <= 24`
+//!   in the shared `Rp2350SecureStore`, which is four credentials
+//!   (`apps/fido/tests/key_store_ceiling.rs`).
+//!
+//! * **Resident set — [`SNAPSHOT_MAX_CREDS`].** How many credentials the
+//!   *snapshot codec* will encode or decode. It stays 12, because the snapshot's
+//!   CBOR is a whole-image format and `chunked::MAX_PARTS * PART_PAYLOAD_MAX`
+//!   is 5,952 bytes — a **format** bound, not a store bound, and it will not move
+//!   when the store does.
+//!
+//! Putting them under one name is what made `DEVICE_MAX_CREDS` a fiction: it was
+//! read as a capacity in `DeviceKeystore::max_creds` and as an array size in
+//! six `heapless::Vec`s in `device_core.rs`/`device_app.rs`, and no change to
+//! the region could move the first without detonating the second.
 
 use crate::cbor::no_heap::{self, CborError, Item, Parser};
 use crate::crypto;
@@ -21,6 +49,7 @@ use crate::vendorff::{
     IdentityName, LedConf, PHY_FIELD_ENABLED_USB_ITF, PHY_FIELD_LED_CONF, PHY_FIELD_MANUFACTURER,
     PHY_FIELD_PRODUCT,
 };
+use fapico2_platform::keyregion::FIDO_CAPACITY;
 use fapico2_platform::secure_store::{chunked, SecureStore, SecureStoreError};
 use heapless::Vec as HeaplessVec;
 
@@ -28,10 +57,71 @@ use heapless::Vec as HeaplessVec;
 /// uses.
 pub const KEYSTORE_SLOT: &[u8] = b"fido.keystore.v1";
 
-/// Maximum credentials held on device (bounded so the snapshot with a
-/// populated large-blob array still fits the chunked slot's 5,952-B payload
-/// capacity — US-1010, 12 parts x 496 B).
-pub const DEVICE_MAX_CREDS: usize = 12;
+/// **The capacity: how many FIDO credentials this device can hold.**
+///
+/// [`fapico2_platform::keyregion::FIDO_CAPACITY`] — **856** at the shipping
+/// geometry, and derived rather than asserted: `keyregion/mod.rs` computes it
+/// as `TOTAL_SLOTS − OATH_CAPACITY − SCRATCHPAD_SLOTS − INDEX_SLOT_COUNT` and
+/// has a compile-time assertion that the four terms claim every slot exactly
+/// once. Change the region's size, the measured record size, the commit
+/// protocol or the index reservation and this number moves with them.
+///
+/// The `12` this replaced was the *resident* bound ([`SNAPSHOT_MAX_CREDS`])
+/// being read as a capacity. On the board it was not even reachable: a soak
+/// partition holds 24 secure-store entries shared with every other applet, so
+/// the fourth registration's rewrite (`12 + 6 + 7 > 24`) refused the fifth with
+/// `KeyStoreFull` — `apps/fido/tests/key_store_ceiling.rs`.
+pub const DEVICE_MAX_CREDS: usize = FIDO_CAPACITY as usize;
+
+/// Credentials the resident snapshot codec will hold — a **format** bound, not a
+/// capacity.
+///
+/// Unchanged at 12, and it must stay separate from [`DEVICE_MAX_CREDS`]: the
+/// snapshot is one whole-image CBOR document, so its bound is the chunked
+/// slot's payload (`chunked::MAX_PARTS * chunked::PART_PAYLOAD_MAX` = 5,952 B,
+/// US-1010), and no store with more capacity makes a longer snapshot legal.
+///
+/// It is also the array size of [`DeviceKeystore::credentials`], so it is a
+/// **RAM** figure as much as a format one: `DeviceCredential` measures 720
+/// bytes, so 12 of them is 8,640 bytes of `.bss`. A resident array sized to
+/// [`DEVICE_MAX_CREDS`] would be 856 × 720 = **616,320 bytes** against 532,480
+/// bytes of RAM on an RP2350 — which is why the per-record store
+/// (`keyregion::fido_store::FidoRecordStore`) is stateless and loads one
+/// credential at a time into a bounded `CredentialWindow`, and why the array is
+/// a transitional shape on the not-yet-migrated snapshot path rather than the
+/// destination.
+pub const SNAPSHOT_MAX_CREDS: usize = 12;
+
+/// How many credential IDs one CTAP operation may hold in RAM at once.
+///
+/// The bound on the *pending* lists `getAssertion` and credential management
+/// build — the assertion remainder after the first one is returned, the RPs of
+/// an `enumerateRPsBegin`, the IDs of an `enumerateCredsBegin`.
+///
+/// It is emphatically **not** a capacity and must not be one: each element is
+/// 64 bytes of credential ID (72 with the `heapless` length), so sizing these
+/// vectors at [`DEVICE_MAX_CREDS`] would be 856 × 72 = **61,632 bytes of stack**
+/// in `get_assertion`, on a task whose whole frame is already the boot path's
+/// 5,056-byte budget in miniature. The number lives here so the two are never
+/// confused again.
+///
+/// **Why 12, and why that is a deliberate choice rather than a leftover.** CTAP
+/// 2.1 does not bound how many passkeys one relying party may register, so this
+/// is a genuine limit and not a claim about the spec. It is 12 because it is the
+/// value these vectors already had — they were sized by [`DEVICE_MAX_CREDS`] when
+/// that was 12 — and **keeping it is what makes the decoupling free**: `.bss`
+/// does not move by a byte, and no wire behaviour changes, so the only thing
+/// this constant buys is the separation of the two questions. Beyond it the
+/// device answers `CTAP2_ERR_LIMIT_EXCEEDED` (0x27) rather than truncating,
+/// which is the refusal `device_core.rs` already returns on overflow.
+///
+/// Raising it is a `.bss` decision, not a correctness one: 16 entries of
+/// 64-byte credential IDs is +288 bytes per list across four statics plus two
+/// stack frames, against a part whose statics are already 439 KiB of 520 KiB
+/// (`secure_store.rs`'s DARK-BOOT-1 note). When the on-demand read path lands
+/// (US-1554's follow-through) these lists become a cursor into the key region's
+/// index and this constant goes away with them.
+pub const MAX_PENDING_CREDENTIAL_IDS: usize = 12;
 /// US-1011: how many signature-counter bumps may accumulate in RAM before the
 /// whole keystore image is rewritten to the store.
 ///
@@ -916,7 +1006,7 @@ impl DevicePinState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceKeystore {
     pub pin_state: DevicePinState,
-    pub credentials: HeaplessVec<DeviceCredential, DEVICE_MAX_CREDS>,
+    pub credentials: HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS>,
     pub cred_counter: u32,
     /// Per-device random (32 bytes) seeding the encIdentifier /
     /// encCredStoreState getInfo fields.
@@ -1039,7 +1129,22 @@ impl DeviceKeystore {
             vault_state: None,
             phy: crate::vendorff::PhyConfig::default(),
             vendor: crate::vendor_state::VendorState::default(),
-            max_creds: DEVICE_MAX_CREDS,
+            // **The smaller of the two bounds, and that is the point.**
+            //
+            // `max_creds` is wire-visible: credMgmt `getMetadata` answers
+            // `maxPossibleRemainingResidentCredentialsCount` from
+            // `max_remaining_creds`, and a number the device cannot honour is
+            // exactly the defect AGENTS.md §4 is about ("a wire claim the device
+            // does not honour"). The store's capacity is [`DEVICE_MAX_CREDS`];
+            // the binding constraint today is the resident snapshot array at
+            // [`SNAPSHOT_MAX_CREDS`], and the honest answer is the smaller of
+            // them.
+            //
+            // When the per-record backend lands and the array goes away, this
+            // expression collapses to `DEVICE_MAX_CREDS` with no other edit —
+            // which is the reason it is written as a `min` of two named bounds
+            // rather than as a literal that has to be remembered.
+            max_creds: DEVICE_MAX_CREDS.min(SNAPSHOT_MAX_CREDS),
             dirty: true,
             stored: false,
             // A fresh keystore has issued no counter value at all, so the
@@ -1200,13 +1305,24 @@ impl DeviceKeystore {
         let max_creds = {
             let mut q = Parser::new(max_b?);
             match q.next().ok()? {
-                Item::U(u) => (u as usize).min(DEVICE_MAX_CREDS),
+                // The snapshot's own bound, not the store's capacity: this is
+                // a whole-image CBOR document, so the array it decodes into is
+                // sized by the chunked slot's payload. Reading `maxCreds` from
+                // an image and letting it exceed what the array can hold is how
+                // a corrupt header becomes a heapless `push` failure; the
+                // `min` is the same refusal as before.
+                //
+                // It is then raised to the binding bound, so a snapshot written
+                // by a build with a different `maxCreds` cannot leave this one
+                // advertising a capacity it will not honour on the wire
+                // (`DeviceKeystore::fresh`, and AGENTS.md §4).
+                Item::U(u) => (u as usize).min(SNAPSHOT_MAX_CREDS),
                 _ => return None,
             }
         };
         let (pin_state, cred_counter, device_random, large_blob_array, vault_state, phy, vendor) =
             Self::decode_auth(auth_b?, key, sealed)?;
-        let mut creds: HeaplessVec<DeviceCredential, DEVICE_MAX_CREDS> = HeaplessVec::new();
+        let mut creds: HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS> = HeaplessVec::new();
         let mut q = Parser::new(creds_b?);
         let n = match q.next().ok()? {
             Item::Array(n) => n,
@@ -1232,7 +1348,7 @@ impl DeviceKeystore {
             vault_state,
             phy,
             vendor,
-            max_creds,
+            max_creds: max_creds.max(DEVICE_MAX_CREDS.min(SNAPSHOT_MAX_CREDS)),
             dirty: false,
             stored: false,
             // A restore is handed its slack already spent: the first assertion

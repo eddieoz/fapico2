@@ -890,8 +890,19 @@ pub fn lookup(
         }
         true
     });
+    // **The `outcome` arm is the fix, and it was missing.** This used to be
+    // `(_, None) => Absent`, which discarded the walk's outcome entirely — so
+    // an index that could not be read returned "no such credential". That is
+    // the US-1573 mistake in its purest form: a transient fault memoized as a
+    // decided fact, and the caller that acts on the answer writes.
+    //
+    // Here that is concrete. A faulted read reads as an empty credential set,
+    // the applet reports zero resident credentials, and the next enrollment
+    // builds a second identity for a relying party whose first one is still on
+    // the part.
     match (outcome, found) {
         (_, Some(slot)) => SlotRead::Present(slot),
+        (SlotRead::Fault(reason), None) => SlotRead::Fault(reason),
         (_, None) => SlotRead::Absent,
     }
 }

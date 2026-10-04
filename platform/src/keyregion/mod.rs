@@ -187,6 +187,69 @@ pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS
 pub const OATH_CAPACITY: u32 = 68;
 
 // ---------------------------------------------------------------------------
+// The partition — one owner, because two applets share one region
+// ---------------------------------------------------------------------------
+
+/// First slot of OATH's range: the head of the region.
+///
+/// Head, and not a choice: `SlotAllocator`'s rule is *lowest free slot*
+/// (`slotmap.rs`), so a reservation anywhere but the tail would be handed out
+/// by the first applet to allocate. OATH is small and fixed-size; FIDO is the
+/// one that grows. Pinning the small fixed domain to the head and the growing
+/// one after it is the arrangement where an allocator bug costs the fewest
+/// records.
+pub const OATH_FIRST_SLOT: u32 = 0;
+
+/// First slot of the commit scratchpad.
+pub const SCRATCHPAD_FIRST_SLOT: u32 = OATH_FIRST_SLOT + OATH_CAPACITY;
+
+/// First slot of FIDO's range.
+///
+/// **This constant is why the partition lives here and not in either adapter.**
+/// `fido_store.rs` and `oath_store.rs` each defined their own `FIDO_FIRST_SLOT`
+/// while being written in parallel, and they disagreed: OATH's put itself at
+/// `[0, 68)` with FIDO starting at 72, while FIDO's took `[0, 856)` — so FIDO's
+/// lowest-free-slot rule would have handed out OATH's credentials' slots and
+/// destroyed them. Two files describing one layout is the same defect as two
+/// AAD builders, and the fix is the same: one owner, referenced by both.
+pub const FIDO_FIRST_SLOT: u32 = SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS;
+
+/// The exclusive end of FIDO's range.
+pub const FIDO_SLOT_LIMIT: u32 = FIDO_FIRST_SLOT + FIDO_CAPACITY;
+
+/// Is this slot inside OATH's range?
+///
+/// `saturating_sub(..) < CAPACITY` rather than the two-sided comparison: OATH's
+/// range starts at slot 0, so `i >= OATH_FIRST_SLOT` is vacuously true and
+/// clippy is right to say so. The saturating form says the same thing the range
+/// does — "within OATH_CAPACITY of OATH's first slot" — and keeps working if
+/// the range ever moves off the head.
+pub const fn is_oath_slot(slot: Slot) -> bool {
+    let i = slot.index() as u32;
+    i.saturating_sub(OATH_FIRST_SLOT) < OATH_CAPACITY
+}
+
+/// Is this slot inside FIDO's range?
+pub const fn is_fido_slot(slot: Slot) -> bool {
+    let i = slot.index() as u32;
+    i >= FIDO_FIRST_SLOT && i < FIDO_SLOT_LIMIT
+}
+
+/// Is this slot reserved — the scratchpad or the index?
+///
+/// **Published but not yet enforced.** `commit.rs` takes the scratchpad as a
+/// caller's argument and cannot refuse a slot from where it sits, and
+/// `fido_store.rs`/`oath_store.rs` both scan their own ranges. A caller that
+/// passes an index slot as the scratchpad erases the index on every commit.
+/// This is the predicate that closes it, and making the allocator and the
+/// commit plan consult it is the follow-through.
+pub const fn is_reserved_slot(slot: Slot) -> bool {
+    let i = slot.index() as u32;
+    (i >= SCRATCHPAD_FIRST_SLOT && i < FIDO_FIRST_SLOT)
+        || (i >= crate::keyregion::index::INDEX_FIRST_SLOT)
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time assertions — the discipline US-1540 exists to install
 // ---------------------------------------------------------------------------
 
@@ -260,6 +323,20 @@ const _: () = {
                 + SCRATCHPAD_SLOTS
                 + crate::keyregion::index::INDEX_SLOT_COUNT,
         "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index"
+    );
+    // …and the ranges must be *contiguous*, in the order the constants above
+    // build them. Two applet adapters each described this layout independently
+    // while being written in parallel and they disagreed, so the shape is
+    // asserted here where the owners are declared rather than in either
+    // consumer.
+    assert!(
+        OATH_FIRST_SLOT == 0
+            && SCRATCHPAD_FIRST_SLOT == OATH_FIRST_SLOT + OATH_CAPACITY
+            && FIDO_FIRST_SLOT == SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS
+            && FIDO_SLOT_LIMIT == FIDO_FIRST_SLOT + FIDO_CAPACITY
+            && crate::keyregion::index::INDEX_FIRST_SLOT == FIDO_SLOT_LIMIT
+            && FIDO_SLOT_LIMIT + crate::keyregion::index::INDEX_SLOT_COUNT == TOTAL_SLOTS,
+        "the four reservations must tile the region contiguously: OATH, scratchpad, FIDO, index"
     );
     // The scratchpad is a whole sector, and a commit stages into it — a
     // scratchpad that is not sector-aligned is a staging area with no
@@ -465,9 +542,11 @@ impl<T> SlotRead<T> {
 /// [`SLOTS_PER_SECTOR`] slots share one erase.
 pub mod commit;
 pub mod crypto;
+pub mod fido_store;
 pub mod host;
 pub mod index;
 pub mod on_demand;
+pub mod oath_store;
 pub mod record;
 pub mod slotmap;
 
