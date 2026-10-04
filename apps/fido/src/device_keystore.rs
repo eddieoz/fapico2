@@ -1755,6 +1755,71 @@ impl DeviceKeystore {
         Ok(())
     }
 
+    /// Remove this snapshot's credential array, and make that removal durable.
+    ///
+    /// The last step of [`migrate_snapshot_to_region`], and the only one that
+    /// writes. Returns the number retired, or the store's error with **this
+    /// keystore restored to exactly what it was** — see the rollback note
+    /// below.
+    ///
+    /// # Rollback, and SOAK-FINDING-1
+    ///
+    /// The array is *taken* before the write and put back on failure, and
+    /// `dirty` is restored to whatever it was. That is the whole of the
+    /// rollback, and it is the shape SOAK-FINDING-1 asks for: a mutation that
+    /// could not be persisted is never left latched. A retirement that failed
+    /// with `dirty = true` and an empty array would be the worst of both — the
+    /// device would report an empty credential set, refuse an enrolment with
+    /// `KeyStoreFull`, and persist that answer on the next flush.
+    ///
+    /// # `stored`, not `dirty`
+    ///
+    /// A successful retirement **is** a transactional mutation, so it sets
+    /// `stored = true` on the same terms [`Self::store_credential_checked`] does
+    /// and for the same reason: the store now holds exactly this snapshot, so
+    /// the persist gate must program the partition image *without* rewriting
+    /// the snapshot — which on a store at its slot bound would transiently hold
+    /// both chunked generations and fail, re-latching the very gate this
+    /// honours.
+    ///
+    /// # What this does not retire
+    ///
+    /// Only `credentials`. The PIN state, the counters, `device_random`, the
+    /// large-blob array, the vault state, `phy` and the `0x41` vendor state are
+    /// all still written — the snapshot remains the keystore, and only its
+    /// credential set has moved.
+    pub fn retire_credentials(&mut self, store: &mut dyn SecureStore) -> Result<u32, SecureStoreError> {
+        let count = self.credentials.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        // Taken, not cleared: `HeaplessVec` has no cheap "restore what was
+        // there", and the alternative — encoding the array back into it — is
+        // the one operation whose cost is proportional to the thing being
+        // rescued. `core::mem::take` on a `Vec`-shaped field is a four-word
+        // move, and it leaves a valid empty vector in its place so nothing
+        // observes a half-cleared keystore if the write below panics.
+        let taken = core::mem::take(&mut self.credentials);
+        let was_dirty = self.dirty;
+        self.dirty = true;
+        match self.persist(store) {
+            Ok(()) => {
+                // Every record derived from these credentials was durable before
+                // this call — the caller establishes that — so the write above
+                // is what makes "migrated" true rather than merely believed.
+                self.dirty = false;
+                self.stored = true;
+                self.counter_unpersisted = 0;
+                Ok(count as u32)
+            }
+            Err(e) => {
+                self.credentials = taken;
+                self.dirty = was_dirty;
+                Err(e)
+            }
+        }
+    }
+
     /// Persist the snapshot into the chunked `fido.keystore.v1` slot.
     /// US-911: the sensitive fields are sealed under the store's AEAD key
     /// ([`SecureStore::store_key`]); an unkeyed store (pre-US-915 shape)
@@ -2724,6 +2789,73 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
         ))
     }
 
+    /// Is a credential with ID `credential_id` already in the region?
+    ///
+    /// **The idempotence check the migration needs, and nothing else.**
+    /// [`migrate_snapshot_to_region`] asks this before every write so a re-run
+    /// after an interrupted migration does not put a second record and a second
+    /// index entry for a credential that is already durable — which is what
+    /// would make a passkey enumerate twice and assert against either copy.
+    ///
+    /// It delegates to the store's own [`CredentialIdLocator`] through
+    /// [`on_demand::load`], deliberately rather than walking the index here: a
+    /// second walk would be a second definition of "which slots hold this
+    /// credential", and the two could disagree about a tombstone or a corrupt
+    /// record (`AGENTS.md` §5).
+    ///
+    /// Cost is `candidates + 1` AEAD operations — the same price
+    /// [`Self::load_by_id`] pays, and the index cannot answer a by-ID query
+    /// alone because it stores no credential ID (`fido_store.rs`,
+    /// `CredentialIdLocator`'s docs). Bounded in practice by the migration
+    /// having at most [`SNAPSHOT_MAX_CREDS`] credentials to ask about.
+    ///
+    /// Three states, and the caller must keep them apart: `Present(false)` means
+    /// "looked, and it is not there" — safe to write; `Fault` means the region
+    /// could not be read, and writing over it could destroy a credential that
+    /// is really there, so it must **not** be read as `false`
+    /// (`mod.rs`'s [`SlotRead`]).
+    pub fn contains_credential(&mut self, credential_id: &[u8]) -> SlotRead<bool> {
+        let probe = CredentialIdProbe { credential_id };
+        let mut locator =
+            fido_store::CredentialIdLocator::new(
+                &self.keys.index,
+                &self.keys.payload,
+                None,
+                credential_id,
+                &probe,
+            );
+        // `on_demand::load` insists on a query even though this locator narrows
+        // only by the credential ID it already holds. The same argument as
+        // `load_by_id`'s: a tag-only query is the honest choice — it is the one
+        // the locator will not use, and claiming otherwise would be a lie a
+        // future caller could act on.
+        let tag: &[u8; on_demand::RP_ID_TAG_LEN] = &[0u8; on_demand::RP_ID_TAG_LEN];
+        let mut window = CredentialWindow::new();
+        match on_demand::load(
+            self.store.region(),
+            &mut locator,
+            &self.keys.payload,
+            &SlotQuery::RpIdTag { tag },
+            &mut window,
+        ) {
+            // A tombstone opens cleanly and `load` reports it as a hit, so a
+            // deleted credential would read as present and never be migrated.
+            // `is_deleted_body` is the same predicate
+            // `credential_from_record_body` uses, for the same reason: the
+            // answer "not present" sends the allocator somewhere new, and the
+            // answer "present" would strand the snapshot's copy of this
+            // credential forever. Re-enrolment, not migration, is what reclaims
+            // a tombstoned slot.
+            //
+            // The slot itself is discarded: the answer is a yes/no, and the
+            // migration never overwrites an existing slot — it lets the
+            // allocator choose, so a first run and a re-run take one path.
+            SlotRead::Present(_) => SlotRead::Present(!is_deleted_body(window.as_slice())),
+            SlotRead::Absent => SlotRead::Present(false),
+            SlotRead::Fault(why) => SlotRead::Fault(why),
+        }
+    }
+
     /// The slot holding the credential with ID `credential_id`.
     ///
     /// # Why a locator and not a scan of this module's own
@@ -2821,6 +2953,229 @@ fn map_store_error(e: fido_store::FidoStoreError) -> RegionCredentialError {
             RegionCredentialError::Unreachable(why)
         }
         other => RegionCredentialError::Store(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// US-1558 — migrating a snapshot into records
+// ---------------------------------------------------------------------------
+
+/// What one [`migrate_snapshot_to_region`] did.
+///
+/// # Why this is a report and not a `Result`
+///
+/// The gherkin's obligations are *"every credential is written"* and *"each
+/// snapshot slot is retired only after every record is durable"*. A failure to
+/// write one record is not an error the caller should surface to a user as a
+/// fault: the device still answers every command, from the snapshot, exactly as
+/// it did before the migration ran. So the failure is a **state the migration
+/// rests in** ([`Self::Deferred`]) rather than a `Result` an applet might treat
+/// as fatal — which is S10's "degrade, never halt" in the shape this story
+/// actually needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MigrationOutcome {
+    /// The snapshot holds no credentials. This is the **steady state**, and it
+    /// is what makes the snapshot itself the migration marker: an empty
+    /// credential array is a statement that has been made durable by
+    /// [`DeviceKeystore::retire_credentials`]'s `persist`, not a value in RAM
+    /// that a power cut can undo.
+    ///
+    /// Cost on the steady-state path: one `len()` on a resident vector, before
+    /// any region borrow is taken. Every command pays it.
+    AlreadyMigrated,
+    /// Every credential in the snapshot is a durable record, **and** the
+    /// snapshot's credential array has been retired.
+    Retired {
+        /// Records written by *this* run.
+        migrated: u32,
+        /// Credentials that were already durable — the re-run case, below.
+        already_present: u32,
+        /// Credentials removed from the snapshot. Equal to
+        /// `migrated + already_present` when the retirement landed.
+        retired: u32,
+    },
+    /// The migration did not finish, and **the snapshot is intact** — so it is
+    /// still the store, and the next applet use tries again.
+    ///
+    /// `reason` is the transport's own `&'static str`, or
+    /// [`E_NO_REGION`](crate::device_keystore::E_NO_REGION) when the region was
+    /// never reachable. Neither is a panic and neither is a `fatal_boot`
+    /// (S10/S11), and neither is reported to the user: the device enumerates
+    /// from the snapshot and every command keeps working.
+    Deferred(&'static str),
+}
+
+/// The reason string for "there is no region to migrate into".
+///
+/// A named constant so a log line and a test can match it, and so the
+/// unreachable-region case is distinguishable from a flash that is failing.
+pub const E_MIGRATION_NO_REGION: &str =
+    "fido: no key region to migrate the snapshot into (not installed, or not yet released)";
+
+/// The reason string for "there is no store to migrate out of".
+///
+/// The bridge dispatch path hands `process_ctap2` no `SecureStore` at all
+/// (`device_app.rs`, `process_ctap2`), so there is nowhere the retirement could
+/// be made durable. Migrating anyway would leave records in the region and the
+/// credentials **also** in the snapshot, which is the half-applied state the
+/// gherkin forbids.
+pub const E_MIGRATION_NO_STORE: &str =
+    "fido: no secure store to retire the snapshot from (the persist gate runs after the command)";
+
+/// The reason string for "a record or the retirement write did not land".
+///
+/// Distinct from the two above because they have different fixes: this one
+/// means the medium refused, and the next applet use retries the whole run.
+/// Reported, never surfaced to the user — see [`MigrationOutcome`].
+pub const E_MIGRATION_STORE_FAILED: &str =
+    "fido: the key region refused a record write; the snapshot is intact and still the store";
+
+/// Write every snapshot credential into the key region as its own record, then
+/// retire the snapshot's credential array — in that order.
+///
+/// ```gherkin
+/// Scenario: a provisioned device upgrades without losing keys
+///   Given a store holding a populated fido.keystore.v1 snapshot
+///   When the new firmware first touches the applet after RUNG_USB
+///   Then every credential is written as an individual record
+///   And the snapshot slot is retired only after every record is durable
+///   And an interrupted migration leaves the snapshot intact and re-runs next time
+///   And a device whose OTP row is unavailable still enumerates
+/// ```
+///
+/// # The marker is the snapshot itself
+///
+/// There is no separate "migrated" flag, and that is the whole design. The
+/// question a restart has to answer is "were these credentials made durable as
+/// records?" and the snapshot's own credential array answers it:
+///
+/// * **array non-empty** ⇒ not every credential is a durable record. Re-run.
+/// * **array empty** ⇒ [`DeviceKeystore::retire_credentials`] wrote it that way,
+///   so every record was durable *before* the write that emptied it.
+///
+/// A flag would need its own atomicity argument, and the argument would be the
+/// same one: written *after* the last record and *before* the array is cleared,
+/// it is a third thing that can be lost in a window where the array is not.
+/// `AGENTS.md` §5: take the simpler one.
+///
+/// # "Retire only after every record is durable"
+///
+/// Enforced by ordering and pinned by
+/// `tests/snapshot_migration.rs::the_snapshot_is_retired_only_after_the_last_record`:
+/// [`RegionCredentials::put`] returns only after `commit::commit` has made the
+/// record atomic and `write_index_entry` has put the entry in the index. The
+/// loop below returns the moment any credential fails, so the retirement call
+/// is unreachable while any credential is not durable. There is no window to
+/// reason about because there is no early return and no `continue`.
+///
+/// # "An interrupted migration re-runs, and does not duplicate"
+///
+/// Re-running is not enough on its own: a migration interrupted after three of
+/// twelve credentials would, naively, write all twelve again and leave two
+/// records — and two index entries — naming the same credential. A device that
+/// does that enumerates a passkey twice and can assert against either copy.
+///
+/// So each credential is **looked for before it is written**
+/// ([`RegionCredentials::contains_credential`], the store's own
+/// `CredentialIdLocator` — not a second walk written here). A credential
+/// already in the region is counted, not re-written. That makes the whole
+/// migration idempotent in the one sense that matters, and it needs no
+/// per-credential progress marker: the region is the progress marker.
+///
+/// The cost is `SNAPSHOT_MAX_CREDS × entries` AEAD operations on a device that
+/// is mid-migration, and **nothing at all** afterwards, because the steady
+/// state is [`MigrationOutcome::AlreadyMigrated`] and returns before a region
+/// borrow is taken. A device in the deferred state re-runs on each applet use,
+/// which is bounded by the same product — and a device that cannot write a
+/// record cannot write it more cheaply by waiting.
+///
+/// # Why this needs no PIN
+///
+/// `region_pin_secret`'s own docs: the payload key is **device-rooted**, mixed
+/// from the `device_random` the snapshot already persists, and *not* from
+/// `pin_hash`. So a credential enrolled before the user set a PIN opens under
+/// the same key after, and the migration runs identically on a PIN-set and a
+/// PIN-less board. Had the derivation been PIN-gated, "migrate at first applet
+/// use" would have had to wait for a PIN entry that may never come.
+///
+/// # What it does not migrate
+///
+/// Only credentials. `pin_state`, `cred_counter`, `device_random`,
+/// `large_blob_array`, `vault_state`, `phy` and the `0x41` vendor state stay in
+/// the snapshot — they are the keystore, not the credential set, and the
+/// credential array is the only thing this design moves. OATH's
+/// `oath.keystore.v1` is the same story in `apps/oath`, which is not this
+/// file's.
+///
+/// # What a caller must not do
+///
+/// Call this on the boot path. S8/S9 forbid the boot path from reading the
+/// region at all, and `FidoApp::boot` restores the snapshot long before
+/// `boot::release_key_region()` runs — the region is not even reachable there.
+/// The device calls it from `process_ctap2_with_store`, which is by
+/// construction after `RUNG_USB`.
+pub fn migrate_snapshot_to_region(
+    region: &mut dyn KeyRegion,
+    keys: &RegionKeys,
+    nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
+    ks: &mut DeviceKeystore,
+    store: Option<&mut dyn SecureStore>,
+) -> MigrationOutcome {
+    // The steady state, before anything is borrowed or read. A device past this
+    // story pays one `len()` per command.
+    if ks.credentials.is_empty() {
+        return MigrationOutcome::AlreadyMigrated;
+    }
+    let Some(store) = store else {
+        return MigrationOutcome::Deferred(E_MIGRATION_NO_STORE);
+    };
+
+    let mut migrated: u32 = 0;
+    let mut already_present: u32 = 0;
+    {
+        let mut creds = RegionCredentials::new(region, keys);
+        for i in 0..ks.credentials.len() {
+            // Borrowed, never cloned: `DeviceCredential` is 720 B and the
+            // resident array is the 8,640 B this epic exists to delete, so the
+            // loop must not add a second copy of one. `credential_id` is cloned
+            // only because `contains_credential` borrows it while `ks` is
+            // borrowed again by `put` — 32 B, not 720.
+            let credential_id = ks.credentials[i].credential_id.clone();
+            match creds.contains_credential(&credential_id) {
+                // Found: a previous, interrupted run already made this one
+                // durable. Counting it is what makes a re-run idempotent.
+                SlotRead::Present(true) => already_present += 1,
+                SlotRead::Present(false) => {
+                    if creds.put(&nonce(), &ks.credentials[i]).is_err() {
+                        // **No retirement, and no partial application.** The
+                        // snapshot is untouched — nothing above writes to it —
+                        // so every credential on it is still readable through
+                        // the path this device used before the migration ran.
+                        return MigrationOutcome::Deferred(E_MIGRATION_STORE_FAILED);
+                    }
+                    migrated += 1;
+                }
+                // A transport failure, or a record that is there but does not
+                // open. Both stop the run: the first because we do not know what
+                // is durable, the second because writing a second copy of a
+                // credential we cannot read is how a passkey gets enumerated
+                // twice.
+                SlotRead::Absent | SlotRead::Fault(_) => {
+                    return MigrationOutcome::Deferred(E_MIGRATION_STORE_FAILED);
+                }
+            }
+        }
+    }
+
+    // Every credential above returned `Ok` from `put`, which returns only after
+    // the sector commit is atomic and the index entry is written. Only now is
+    // the snapshot's array cleared.
+    match ks.retire_credentials(store) {
+        Ok(retired) => MigrationOutcome::Retired { migrated, already_present, retired },
+        // The records are durable and the snapshot still holds them. That is a
+        // duplicate, not a data loss, and it is resolved by the next run, which
+        // finds all twelve already present and tries the retirement again.
+        Err(_) => MigrationOutcome::Deferred(E_MIGRATION_STORE_FAILED),
     }
 }
 

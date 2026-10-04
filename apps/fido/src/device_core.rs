@@ -884,6 +884,100 @@ impl FidoApp {
         .flatten()
     }
 
+    /// Migrate the snapshot's credentials into the key region, once, if needed.
+    ///
+    /// # Why it is a method here and not a free function at the call site
+    ///
+    /// Three things have to be asked in this order and each can answer `no`:
+    /// is there anything to migrate, is there a region, are there keys. The
+    /// first is `self.keystore`; the second is
+    /// [`crate::device_app::key_region`]; the third is
+    /// [`crate::device_app::region_keys`], which needs the `SecureStore` *and*
+    /// the keystore's `device_random`. Gathering them in one place is what keeps
+    /// the three `None`s from becoming three slightly different answers at
+    /// three call sites — the `AGENTS.md` §4 rule about a wire claim and the
+    /// command path agreeing, applied to "did we migrate".
+    ///
+    /// # The nonce
+    ///
+    /// A **fresh TRNG draw per write**, from the same pool
+    /// [`Self::draw_random`] feeds makeCredential from. The store will not
+    /// choose one (`record::seal`'s docs) and neither will this; a closure
+    /// rather than a `&mut Trng` because the applet has no TRNG handle at
+    /// serve time, only a pool.
+    ///
+    /// # Never fatal (S10/S11)
+    ///
+    /// Every failure below is a `MigrationOutcome::Deferred` this method
+    /// discards. There is no `?`, no `unwrap`, no `panic!` and no halt on any
+    /// path: a device that cannot migrate keeps serving from the snapshot,
+    /// which is exactly what it did before this firmware was flashed.
+    /// The `+ '_` on the trait object is load-bearing, not decoration: a bare
+    /// `dyn SecureStore` in an elided position defaults to
+    /// `dyn SecureStore + 'a` with `'a` the *reference's* lifetime, which makes
+    /// the caller reborrow its own `store` binding for that whole lifetime and
+    /// then be unable to move it into a dispatch arm. Decoupling the two is what
+    /// lets `process_ctap2_with_store` pass `store.as_deref_mut()` and still
+    /// hand `store` to `handle_make_credential` on the next line.
+    pub(crate) fn migrate_snapshot_to_region(
+        &mut self,
+        store: Option<&mut (dyn SecureStore + '_)>,
+    ) {
+        // The steady state, and the cheapest possible test of it: an empty
+        // resident array. Checked before the region is even asked for, so a
+        // device that has migrated pays one `len()` per CTAP2 command and
+        // nothing else — and, on the host, never calls the provider at all.
+        if self.keystore.credentials.is_empty() {
+            return;
+        }
+        let Some(store) = store else {
+            // No store, so nowhere to make a retirement durable. Migrating the
+            // records anyway would leave the credentials in *both* places,
+            // which is the half-applied state the gherkin forbids. The bridge
+            // dispatch path is the caller that reaches here; it persists after
+            // the command, so the next command retries.
+            return;
+        };
+        // `region_keys` borrows the keystore immutably and returns an owned
+        // `RegionKeys`, so the borrow ends here and the mutable one below does
+        // not conflict.
+        let Some(keys) = crate::device_app::region_keys(store, &self.keystore) else {
+            // No root — an unkeyed store, which is the host emulation and the
+            // pre-US-915 device shape. This is the gherkin's last clause: a
+            // device that cannot derive its keys **still enumerates**, because
+            // `region_keys_for` answers `None` too and the snapshot — untouched
+            // — stays the store.
+            return;
+        };
+        let Some(region) = crate::device_app::key_region() else {
+            return;
+        };
+        // Disjoint field borrows, so the nonce closure can hold the pool while
+        // the migration holds the keystore. `take_random` is the same primitive
+        // `draw_random` is one line of — destructuring rather than calling it is
+        // what lets the two borrows coexist, and it is why this does not go
+        // through a `&mut self` closure (which would claim the whole app).
+        let Self { keystore, rng_pool, rng_cursor, .. } = self;
+        let mut nonce = || {
+            let mut n = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+            take_random(rng_pool, rng_cursor, &mut n);
+            n
+        };
+        // The outcome is deliberately discarded. Every variant is a state the
+        // device serves correctly from: `AlreadyMigrated` and `Retired` need
+        // no further work, and `Deferred` means the snapshot is intact and is
+        // still the store. Surfacing it as a command error would tell a user
+        // their authenticator is broken over an upgrade detail that costs them
+        // nothing.
+        let _ = crate::device_keystore::migrate_snapshot_to_region(
+            region,
+            &keys,
+            &mut nonce,
+            keystore,
+            Some(store),
+        );
+    }
+
     fn token_allows(&self, perm: u8) -> bool {
         match self.token_permissions {
             0 => perm == PERM_MC || perm == PERM_GA,

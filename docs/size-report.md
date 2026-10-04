@@ -1,5 +1,5 @@
 **Date:** 2026-10-04 (**US-1555 / US-1556 / US-1563 — the FIDO applet wired to
-the key region.** `text` 850,796 → **838,948 B**; `.bss` **407,168 → 407,168 B**;
+the key region.** `text` 855,884 → **838,948 B**; `.bss` **407,168 → 407,168 B**;
 `.data` 13,780 → **13,780 B**; `.uninit` 1,024 → **1,024 B**. **RAM statics: +0
 bytes.** The measured capacity boundary is **856**, and `docs/capacity.md` now
 carries it as a measurement rather than as a derivation.
@@ -48,38 +48,42 @@ both twins and answers `InvalidSubcommand` (0x3E) immediately — no presence
 window — matching the C reference's fall-through at
 `pico-fido2/src/fido/cbor_client_pin.c:909`. GetInfo is unchanged. See
 `.superpowers/sdd/report-0x06-refusal.md`.)
-**US-1544/1545/1546, US-1547-1554, US-1552/1553, US-1559, US-1569 — the key
-region.** `text` 817,960 → **850,796 B**. UF2 **3073 → 3199 blocks**.
-Shipping sha256 → **`966688255af5…`**.
+**US-1538, US-1544/1545/1546, US-1547-1554, US-1552/1553/1555/1556/1558/1563,
+US-1559, US-1569, US-1570, US-1571 — the key region.** `text` 817,960 →
+**855,884 B**. UF2 **3199 → 3219 blocks**; shipping sha256 →
+**`7aa5e0070b03787abdb568f528c85b861b3629968dc5acf39354594d862e368b`**.
 
-**RAM is the number that matters, and it went down.**
+**RAM went down by 32 KB, and that is the headline.**
 
 | | pre-epic (`4132c5f`) | now | delta |
 |---|---:|---:|---:|
-| `.bss` | 420,744 | **407,176** | **−13,568** |
+| `.bss` | 420,744 | **374,448** | **−46,296** |
 | `.data` | 196 | **13,780** | +13,584 |
 | `.uninit` | 1,024 | 1,024 | 0 |
-| **RAM statics** | **421,964** | **421,980** | **+16** |
+| **RAM statics** | **421,964** | **389,252** | **−32,712** |
 
-**Read the `.bss`/`.data` movement before the total.** Roughly 13.5 KB of what
-the linker used to place in `.bss` now lands in `.data`, which holds
-RAM-resident code (`firmware/src/button.rs:62` puts a function in
-`.data.ram_func`, and `.data` absorbs it). The total is what is physically
-allocated, and it moved by 16 bytes: 8 for `Option<Box<OathRegion>>` and 8 for
-the FIDO region provider slot. Both are pinned by tests rather than reclaimed
-with a static.
+Two movements, and they pull in opposite directions, so the total is the only
+number worth reading:
 
-`.bss` itself fell by 13,568 bytes because the 12-entry resident credential array
-is no longer the only way a credential is held — that is the point of US-1554,
-since a resident array of the derived 856 credentials would be ~616 KB on a part
-with 532,480 B of RAM.
+* **`.bss` down 46,296.** US-1538 took the 32 KiB RAM `efs` buffer out of
+  `.bss` by backing `Location::External` with flash — the first half of the
+  window now littlefs2 rather than RAM. The rest is the 12-entry resident
+  credential array giving way to on-demand reads. Acceptance criterion 9 says
+  `bss` must not increase; it has fallen by 46 KB.
+* **`.data` up 13,584.** Roughly 13.5 KB of what the linker used to place in
+  `.bss` now lands there, because `.data` absorbs `.data.ram_func` — RAM-resident
+  code (`firmware/src/button.rs:62`). That is RAM either way, which is why the
+  table shows both rows rather than only the flattering one.
 
-**The 11.6 KB of `.text` growth is the real cost of this epic.** Until
-`main.rs` called `install_region_provider`, LTO proved the region path was never
-reached and linked it out entirely, so an earlier measurement of "0 bytes"
-measured nothing. That is worth recording: *a gate that measures a path the
-linker has deleted is not a gate*. `arm-none-eabi-nm` now finds 39 symbols on the
-region path.
+`.text` grew ~34 KB. That is the honest cost of the region: the commit protocol,
+the index, the codec, the two applet adapters, and the SHA-256 driver — none of
+which existed when the linker was dropping the region path as unreachable.
+
+**The stack zone moved and is worth watching.** `check_boot_chain.py` measures
+110,496 → 143,224 B when `efs` left `.bss`; the migration's boot path adds
++576 B to the boot root. Main stack zone is the largest single RAM consumer now
+that `.bss` has fallen.
+
 Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
 `measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
 
@@ -1441,13 +1445,13 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 783,916 | `0x10000200` | no (flash) |
-| `.rodata` | 20,036 | `0x100bf830` | no (flash) |
+| `.text` | 788,464 | `0x10000200` | no (flash) |
+| `.rodata` | 20,576 | `0x100c09f0` | no (flash) |
 | `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100c7c60` | non-alloc, not in Berkeley `text` |
-| `.bss` | 407,176 | `0x200035d8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20066c60` | yes |
-| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100c9040` | non-alloc, not in Berkeley `text` |
+| `.bss` | 374,448 | `0x200035d8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x2005ec88` | yes |
+| `.defmt` | 41 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
@@ -1455,13 +1459,13 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 Berkeley `text` = 765,984 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **850,796**. That identity is stated so a reader can check
+the `X` flag) = **855,884**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 850,796 B** · **`.data` = 13,780 B** · **`.bss` = 408,200 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 855,884 B** · **`.data` = 13,780 B** · **`.bss` = 375,472 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 421,980 B** (421,984 B address-to-address: `__sheap` `0x20067060` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067060` → **main stack zone = 110,496 B** of 532,480 B of SRAM.
+**RAM statics = 389,252 B** (389,256 B address-to-address: `__sheap` `0x2005f088` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2005f088` → **main stack zone = 143,224 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->

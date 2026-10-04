@@ -742,6 +742,17 @@ impl FidoApp {
         mut store: Option<&mut dyn SecureStore>,
     ) -> usize {
         self.current_channel = channel;
+        // US-1558: migrate the snapshot into records **before** the dispatch
+        // below decides which backend to answer from.
+        //
+        // This is the *first applet use after `RUNG_USB`*: `process_ctap2` is
+        // reached only from the HID and CCID tasks, and `FidoApp::boot` — which
+        // restored the snapshot — ran long before `boot::release_key_region()`.
+        // Putting the call inside a dispatch arm would be a bug: the arm has
+        // already computed `region_keys_for` by then, so the first command
+        // after an upgrade would read an empty region and report zero
+        // credentials — exactly the loss this story exists to prevent.
+        self.migrate_snapshot_to_region(store.as_deref_mut());
         match command {
             0x04 => self.handle_get_info(out),
             0x01 => self.handle_make_credential(data, out, store),
@@ -966,8 +977,19 @@ impl FidoApp {
         &mut self,
         apdu: &[u8],
         out: &mut heapless::Vec<u8, { crate::CTAP2_MAX_MSG }>,
-        store: Option<&mut dyn SecureStore>,
+        mut store: Option<&mut dyn SecureStore>,
     ) -> usize {
+        // US-1558, the same call CTAP2 gets, and for the same reason: `U2F
+        // AUTHENTICATE` takes the region path whenever a region is reachable
+        // (`device_core.rs::u2f_authenticate` calls `region_keys_for`), so a
+        // device whose only traffic is CTAP1 would read an empty region and
+        // report every legacy key as unknown. The migration has to happen on
+        // whichever applet surface is used first, not on the one that happens
+        // to be more common.
+        //
+        // Idempotent, so the second of the two surfaces to be used pays one
+        // `len()` and nothing else.
+        self.migrate_snapshot_to_region(store.as_deref_mut());
         self.handle_u2f(apdu, out, store)
     }
 

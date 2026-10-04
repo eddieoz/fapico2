@@ -163,3 +163,17 @@ required-features = ["host"]
 [[test]]
 name = "region_delete_compaction"
 required-features = ["host"]
+
+# US-1558: the snapshot -> records migration, and the "the boot path does not
+# touch the region" / "a cold OTP row still enumerates" clauses S8/S9/S12 ask
+# for. Shares its fixtures with `region_degradation` through
+# `tests/region_boot/mod.rs`.
+[[test]]
+name = "snapshot_migration"
+required-features = ["host"]
+
+# US-1560: a key-region failure degrades to an empty key set rather than
+# halting, and the `fatal_boot` call-site count is unchanged.
+[[test]]
+name = "region_degradation"
+required-features = ["host"]
