@@ -315,6 +315,18 @@ impl Slot {
 pub struct Sealed(alloc::vec::Vec<u8>);
 
 impl Sealed {
+    /// The only way a `Sealed` comes into existence outside this module's own
+    /// sealing path — and it is reachable only from inside this crate.
+    ///
+    /// It is not `pub` for the same reason `Sealed`'s field is not: an applet
+    /// in `apps/` cannot call it, so on the device there is exactly one code
+    /// path that can produce a sealed record, and it is the one that encrypts
+    /// and authenticates. Tests inside `platform` can call it, which is how a
+    /// round-trip test builds a record without a real key.
+    pub(crate) fn from_sealed_bytes(bytes: alloc::vec::Vec<u8>) -> Self {
+        Sealed(bytes)
+    }
+
     /// The sealed bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
@@ -400,6 +412,11 @@ impl<T> SlotRead<T> {
 /// Implementations: the QSPI-backed device region, and the host file region
 /// US-1541 adds. Every method is sector-granular where the hardware is, because
 /// [`SLOTS_PER_SECTOR`] slots share one erase.
+pub mod slotmap;
+pub mod crypto;
+pub mod host;
+pub mod record;
+
 pub trait KeyRegion {
     /// Read one slot's raw bytes into `buf`, or report why it could not.
     ///
