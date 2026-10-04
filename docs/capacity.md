@@ -186,3 +186,28 @@ refusal**, and it says so.
 Related: the keystore capacity layers and the durable-ack latch are recorded in
 [`docs/known-gate-divergences.md`](known-gate-divergences.md) under SF-1
 (including the US-1010 amendment that supersedes the earlier `≤ 16` figure).
+## Four acceptance criteria that had to be restated (US-1566 amendment)
+
+`docs/tasks/EPIC-secure-storage.md` is the story document for the work that
+produced this file, but it is **untracked** (`.gitignore`: `docs/tasks/`), so
+the divergences between its acceptance criteria and what actually shipped are
+recorded here, in a file the US-1563 gate already reads. Each was a wording in
+the criterion that the hardware or the design could not satisfy as written.
+
+| Criterion as written | What shipped, and why |
+|---|---|
+| US-1544: "exactly one erase and one program" | **One sector**, not one slot. `SLOTS_PER_SECTOR` slots share one 4 KiB NOR sector and NOR cannot rewrite programmed bytes — the reason `commit.rs` exists at all. The consequence, that a sector's three *other* credentials survive a neighbour's update, is what is actually pinned. |
+| US-1557: both twins "report the same capacity" | They cannot, and the divergence is the point. The host twin's capacity is a property of a RAM array and its store cannot reach the region. `twin_parity.rs` asserts `assert_ne!` and pins `Snapshot::advertised_capacity() == None`, so a fixture bound can never be published as a device capacity. |
+| US-1546: "a region holding FIDO, OATH **and OpenPGP** records", "every slot is erased" | OpenPGP's keys are not in the key region (they are in the trussed `ifs` window), and a **FIDO** reset that erased every slot would destroy OATH's credentials — the opposite of what a scoped reset owes. `FidoRecordStore::wipe_fido_range` erases FIDO's sectors and the index tail; `reset_wipes_region.rs` pins both halves, including the refusal arm. |
+| US-1573: "every absent-arm that writes state first takes a `try_` probe" | The **property** is met structurally instead. RS-Key's own docs reject that derivation method (`fs.rs:352-364`: "Do not derive the sites by asking 'does the absent arm write?' … missed six live regressions"). The store is stateless, so there is nothing to memoize a fault into, and every write already re-reads the same medium fallibly first. The one residual — a faulted `excludeList` probe reading as "not excluded", costing a duplicate credential in a free slot rather than credential loss — is recorded in §6 of the epic and is not fixed here. |
+
+The audit that produced this table also found that **criterion 3's cited
+evidence does not support it**. `apps/openpgp/tests/device_boot_order.rs`
+replays a captured C-flash image across a simulated reboot; it does not
+generate a key. The test that *would* show a generated key surviving a power
+cycle is `key_storage_location.rs::the_generated_private_key_follows_the_card_location`,
+and it is `#[ignore]`d RED against `vendor/opcard/src/command/gen.rs`, which
+stamps `Location::Volatile` on a generated private key while the keyref goes to
+flash — a real latent bug, reported with citations and parked as US-1537's
+call rather than fixed inside a tests-only story. What US-1537 *does* deliver
+is the gate: six passing tests that fail if the storage location moves.
