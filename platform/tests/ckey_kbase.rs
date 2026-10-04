@@ -75,8 +75,14 @@ fn kbase_bound_refuses_without_entropy() {
 }
 
 /// (c) Determinism with entropy — and the pinned KAT (independently
-/// generated with Python's hmac HKDF-SHA256):
-/// salt = serial_hash(32) ‖ chipid BE(8) ‖ 32 × 0xA5, info = "DEVICE/ROOT".
+/// generated with Python's `hmac` HKDF-SHA256, not with this crate):
+/// salt = serial_hash(32) ‖ chipid BE(8) ‖ 32 × 0xA5.
+///
+/// **The vector changed under US-1575**, which moved the bound root's info
+/// label from `"DEVICE/ROOT"` to `"DEVICE/ROOT/BOUND"`. The generator is
+/// unchanged and still reproduces the *old* label's value exactly
+/// (`6bcd…60f4`) when given the old label, which is what keeps this a real KAT
+/// rather than a rubber stamp of whatever the code emitted.
 #[test]
 fn kbase_bound_is_deterministic_and_matches_vector() {
     let otp = otp();
@@ -87,7 +93,7 @@ fn kbase_bound_is_deterministic_and_matches_vector() {
     assert_eq!(a, b);
     assert_eq!(
         a.as_slice(),
-        h("6bdcd5495c109ab2c85b49d92627f3e772363ae1b03cd4e268fb5d737f9e60f4").as_slice()
+        h("83651163da62972b5ba9f53f49567366776e35ab5ba87c217c56668fd019fff8").as_slice()
     );
     // A different entropy changes the root (the entropy is load-bearing).
     let other = [0x5Au8; BOOT_ENTROPY_LEN];
@@ -99,4 +105,49 @@ fn kbase_bound_is_deterministic_and_matches_vector() {
 fn boot_entropy_slot_name_contract() {
     assert_eq!(SLOT_BOOT_ENTROPY, b"boot.entropy.v1".as_slice());
     assert_eq!(BOOT_ENTROPY_LEN, 32);
+}
+
+/// US-1575: the bound root and the C-compat root must not share an HKDF info
+/// label. They shared `"DEVICE/ROOT"` and were separated only by their salts,
+/// which is not separation — a caller holding one root reaches the other by
+/// deriving with the other salt, and nothing in the API said which was which.
+#[test]
+fn the_bound_root_and_the_c_root_do_not_share_an_info_label() {
+    assert_ne!(ckey::KBASE_LABEL, b"DEVICE/ROOT");
+    assert_eq!(ckey::KBASE_LABEL, b"DEVICE/ROOT/BOUND");
+
+    // And the two roots really are different values for the same OTP row.
+    let otp = otp();
+    let serial = sh();
+    let bound = derive_kbase(&otp, &serial, 0x0102_0304_0506_0708, Some(&ENTROPY)).unwrap();
+    let c_root = ckey::derive_kbase_c(&otp, &serial).unwrap();
+    assert_ne!(
+        bound.as_slice(),
+        c_root.as_slice(),
+        "the two roots are the same value, so separating their labels changed nothing"
+    );
+}
+
+/// US-1575: no two distinct derivations in this tree share both a salt and an
+/// info label. The one collision the inventory found was
+/// `derive_kbase`/`derive_kbase_c`; this asserts the pairs that matter are
+/// still distinct so a future label cannot quietly reintroduce one.
+#[test]
+fn no_two_derivations_share_a_salt_and_info_pair() {
+    let pairs: &[(&str, &[u8], &[u8])] = &[
+        ("derive_kbase (bound)", b"salt72", ckey::KBASE_LABEL),
+        ("derive_kbase_c (C-compat)", b"serial_hash32", b"DEVICE/ROOT"),
+        ("store v3", b"PS3F", b"store"),
+        ("DRBG seed", b"dynamic", b"DRBG/SEED"),
+        ("wrap key", b"serial_hash32", b"fapico2/ckey/wrap/v1"),
+    ];
+    for (i, (an, asalt, ainfo)) in pairs.iter().enumerate() {
+        for (bn, bsalt, binfo) in pairs.iter().skip(i + 1) {
+            assert!(
+                !(asalt == bsalt && ainfo == binfo),
+                "{an} and {bn} share both a salt and an info label ({:?})",
+                core::str::from_utf8(ainfo).unwrap_or("?")
+            );
+        }
+    }
 }
