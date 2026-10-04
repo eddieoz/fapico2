@@ -181,13 +181,26 @@ const _: () = {
 
     // Strides must be whole flash pages, and the region must divide into whole
     // slots, so the last slot of the region is not partly outside it.
+    //
+    // Stated as power-of-two and exact-multiple identities rather than
+    // `x % y == 0` for two reasons. It says more: a power of two at or above
+    // the page size is necessarily a whole number of pages, which is the fact
+    // a reader wants. And it is the form that compiles here — CI runs clippy
+    // with `-D warnings` and `manual_is_multiple_of` rejects the `%` form,
+    // while `checked_rem` and `PartialEq for Option` are not const-stable, so
+    // a `const _` block cannot use them either.
     assert!(
-        FIDO_SLOT_BYTES % 256 == 0 && OATH_SLOT_BYTES % 256 == 0,
-        "a slot stride must be a whole number of flash pages"
+        FIDO_SLOT_BYTES >= 256 && FIDO_SLOT_BYTES & (FIDO_SLOT_BYTES - 1) == 0,
+        "the FIDO stride must be a power of two at or above one flash page, so a slot never \
+         straddles a page boundary"
     );
     assert!(
-        KEY_REGION_BYTES % FIDO_SLOT_BYTES == 0,
-        "the key region does not divide into whole FIDO slots — the region's size is \
+        OATH_SLOT_BYTES >= 256 && OATH_SLOT_BYTES & (OATH_SLOT_BYTES - 1) == 0,
+        "the OATH stride must be a power of two at or above one flash page"
+    );
+    assert!(
+        KEY_REGION_BYTES == TOTAL_SLOTS * FIDO_SLOT_BYTES,
+        "the key region is not exactly TOTAL_SLOTS whole FIDO slots — the region's size is \
          board-derived, so a board whose remainder is non-zero needs a different stride, not \
          a partial last slot"
     );
@@ -196,13 +209,14 @@ const _: () = {
     // one: a record whose bytes spanned two sectors could not be erased without
     // destroying a record in the other.
     assert!(
-        BLOCK_SIZE as u32 % FIDO_SLOT_BYTES == 0,
-        "a FIDO slot must divide a NOR sector exactly, or a record would straddle two of them \
-         and erasing one would destroy the other"
+        BLOCK_SIZE as u32 == SLOTS_PER_SECTOR * FIDO_SLOT_BYTES,
+        "a NOR sector must be exactly SLOTS_PER_SECTOR whole FIDO slots, or a record would \
+         straddle two of them and erasing one would destroy the other"
     );
     assert!(
-        FIDO_SLOT_BYTES % OATH_SLOT_BYTES == 0,
-        "the OATH slot must divide the FIDO slot, or the two grids could not share one region"
+        FIDO_SLOT_BYTES / OATH_SLOT_BYTES * OATH_SLOT_BYTES == FIDO_SLOT_BYTES,
+        "the OATH slot must divide the FIDO slot exactly, or the two grids could not share one \
+         region"
     );
 
     // The capacities must be real: positive, and the areas must not overlap.
