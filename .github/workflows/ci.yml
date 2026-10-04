@@ -12,18 +12,19 @@
 #                  is #![no_std] + nothing allocates before rsa_heap::init()
 #                  (US-383; rewritten US-961 when the token grep went red on
 #                  the sanctioned allocator)
-#   5. pytest-gate  full Phase 3 exit gate      (fido blocking; openpgp + merged
-#                                                tracked-but-non-blocking — see below)
+#   5. pytest-gate  full Phase 3 exit gate      (fapico2's own emulator suites:
+#                                                tests/pico-fido, tests/piv,
+#                                                tests/openpgp, tests/harness —
+#                                                see the job for what blocks)
 #
 # Plus the standalone structural gates: persist-gate, attestation-gate, and
 # advertise-serve-gate (US-962/US-964 — the default *and* the reduced build of
 # the advertise/serve coupling check; it existed as a script nothing ran, which
 # is why a one-line manifest mutation kept every signal green).
 #
-# Layout: fapico2 is checked out under $GITHUB_WORKSPACE/fapico2. The pytest
-# gate also checks out the sibling test-harness repo `pico-fido2` from the same
-# GitHub owner (actions/checkout cannot express two repos otherwise) and derives
-# FAPICO2/TESTS from PICO_ROOT, exactly like the local run_all_tests.sh.
+# Layout: fapico2 is checked out under $GITHUB_WORKSPACE/fapico2 and every gate
+# runs against THAT tree. There is no second checkout: the pytest suites and
+# their requirements are in this repository (tests/, tests/requirements.txt).
 name: CI
 
 on:
@@ -35,9 +36,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Both repos live as siblings under the workspace; run_all_tests.sh (and the
-  # pytest harness) resolve FAPICO2 + TESTS from PICO_ROOT.
-  PICO_ROOT: ${{ github.workspace }}
   CARGO_TERM_COLOR: always
   # US-1043 (RS-KEY-ADOPT Phase 5): the flash-budget RATCHET, RS-Key's
   # FIRMWARE_FLASH_BUDGET_KIB pattern. It is a CEILING on the shipping image
@@ -161,8 +159,8 @@ jobs:
       #
       # This is the only evidence for the epic's DoD item 6 (emulator and
       # board answer identically), the entire anti-regression value of
-      # US-1524, and the suite every pytest acceptance run and the sibling
-      # `pico-fido2` suites execute against. A gate that nothing runs is
+      # US-1524, and the suite every pytest acceptance run and every emulator
+      # suite in tests/ executes against. A gate that nothing runs is
       # not a gate — the same sentence this file already uses at the
       # `advertise-serve-gate` job, reproduced one level up.
       #
@@ -642,8 +640,12 @@ jobs:
         with:
           persist-credentials: false
           path: fapico2
-      - name: Set up Rust (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      # No Rust toolchain here, and that is deliberate: every script in the loop
+      # below is plain python3 over files in the checkout. This step used to
+      # install stable, which cost ~30s of toolchain download per push for a
+      # job that never invoked cargo. (advertise-serve-gate DOES need Rust —
+      # its script shells out to cargo to measure the reduced build — so the
+      # toolchain stays there.)
       - name: "Gates: the remaining gate scripts, unconditionally"
         working-directory: fapico2
         run: |
@@ -654,12 +656,13 @@ jobs:
           # so it can run here and fail a pull request in seconds; inside the
           # device-build job it would run only after a full release build of
           # the ELF, which is minutes per raise of the budget.
+          for g in \
+            tests/scripts/check_flash_budget.py \
           rc=0
           for g in \
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \
-            tests/scripts/check_flash_budget.py \
             tests/scripts/check_otp_provisioning_precondition.py \
             tests/scripts/check_picoforge_compat_docs.py \
             tests/scripts/check_readme.py \
@@ -808,81 +811,72 @@ jobs:
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
-  # 4/4 — full pytest gate (Phase 3 exit config). Builds the single Rust
-  #      emulation binary once, then runs the pytest suites against it.
+  # 4/4 — the pytest gate (Phase 3 exit config).
   #
-  #      BLOCKING (regressions fail the pipeline):
-  #        fido   — pico-fido2/tests/pico-fido (pytest, HID transport).
-  #      The cargo oath/otp/platform unit tests from run_all_tests.sh are
-  #      covered by the host-tests job above (superset: `--workspace`).
+  #      fapico2's OWN suites, in this repository: tests/pico-fido (HID/CTAP2),
+  #      tests/piv (CCID), tests/openpgp (CCID), tests/harness (relay, restart,
+  #      red-team). They run against the one Rust emulation binary, built once.
   #
-  #      TRACKED / NON-BLOCKING (continue-on-error) — known-red, documented so
-  #      the gate stays meaningful (red only on a real regression in a
-  #      blocking suite) until the deferrals are resolved:
-  #        openpgp — US-340 deferred KDF-adminless-PIN cluster + the
-  #                  emulation skip posture (see docs/tasks/openpgp-suite-report.md).
-  #        merged  — the PIV-init test (PIV is not implemented and is excluded
-  #                  per the EPIC) plus one pre-existing SDK CCID app-re-binding
-  #                  failure (fails identically at the pre-US-380 baseline).
+  #      This job used to check out a sibling repository, `pico-fido2`, for its
+  #      suites, and guard every step on `hashFiles('pico-fido2/…')`. That
+  #      repository was never published, so the checkout failed behind
+  #      `continue-on-error`, `hashFiles` returned '', every step was skipped, and
+  #      the job reported success having executed nothing — for every push since
+  #      the initial release. A separate `phase3-gate.yml` duplicated the same
+  #      arrangement with the `repository:` key missing from its checkout
+  #      entirely, so it re-checked fapico2 into the `pico-fido2/` path and
+  #      skipped for the same reason. Both are gone.
+  #
+  #      There is now no second checkout and no conditional step in this job: the
+  #      suites and tests/requirements.txt are in the tree that is checked out,
+  #      so a step here cannot vanish. The `if:` guards were not a safety
+  #      measure; they were the failure mode.
+  #
+  #      BLOCKING. Every suite in tests/ is green as of this commit, and the
+  #      known-red PIV stories (US-374/375) are `xfail(strict=False)` inside
+  #      tests/piv — they run and report, and they do not make the job red.
+  #
+  #      `--suites-only` because clippy, `cargo test` and the gate scripts each
+  #      already have their own job in this workflow; see run_tests.sh.
   # ---------------------------------------------------------------------------
   pytest-gate:
-    name: pytest gate (Phase 3 exit config)
+    name: pytest gate (fapico2 emulator suites)
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout fapico2 (Rust firmware)
+      - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: fapico2
-      # Sibling harness repo (published first, per US-725): when it is absent
-      # (owner hasn't pushed pico-fido2 yet), the checkout and every step that
-      # depends on it are skipped instead of turning this job red.
-      - name: Checkout pico-fido2 (Python test suites)
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          repository: ${{ github.repository_owner }}/pico-fido2
-          path: pico-fido2
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+      # pyscard builds its C extension against the PC/SC headers, and
+      # tests/pico-fido/utils.py imports the smartcard package unconditionally.
+      - name: Install PC/SC headers (pyscard build dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcsclite-dev
       - name: Set up Rust (stable; host target for the emulator)
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Install Python test dependencies
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
         run: |
           python -m venv .test-venv
           ./.test-venv/bin/pip install --upgrade pip
-          ./.test-venv/bin/pip install -r pico-fido2/tests/requirements.txt
-      - name: Build the emulation binary (once)
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
+          ./.test-venv/bin/pip install -r fapico2/tests/requirements.txt
+      - name: "GATE: the emulator suites (pico-fido, piv, openpgp, harness)"
         working-directory: fapico2
-        run: cargo build --bin fapico2-emulation --no-default-features --features emulation --target x86_64-unknown-linux-gnu
-      - name: Install emulator where the merged harness expects it
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        run: |
-          mkdir -p pico-fido2/tests/build
-          cp fapico2/target/x86_64-unknown-linux-gnu/debug/fapico2-emulation pico-fido2/tests/build/pico_fido2
-          chmod +x pico-fido2/tests/build/pico_fido2
-      - name: "GATE: fido (pytest, HID)"
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        working-directory: pico-fido2/tests
-        run: ${{ github.workspace }}/.test-venv/bin/python -m pytest pico-fido/ -q
-      - name: "TRACK: openpgp (pytest, CCID) — US-340 deferred, non-blocking"
-        continue-on-error: true
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        working-directory: pico-fido2/tests
-        run: ${{ github.workspace }}/.test-venv/bin/python -m pytest openpgp/ -q
-      - name: "TRACK: merged (pytest, cross-app) — PIV-excluded + known app-switching, non-blocking"
-        continue-on-error: true
-        if: ${{ hashFiles('pico-fido2/tests/requirements.txt') != '' }}
-        working-directory: pico-fido2/tests
-        run: ${{ github.workspace }}/.test-venv/bin/python -m pytest merged/ -q
+        env:
+          # run_tests.sh takes the pytest interpreter from this variable, so CI's
+          # own venv is used rather than any path that happens to exist locally.
+          PICO_FIDO2_VENV: ${{ github.workspace }}/.test-venv/bin/python
+        run: ./run_tests.sh --suites-only
       - name: Archive emulator logs
-        if: ${{ always() && hashFiles('pico-fido2/tests/requirements.txt') != '' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pytest-gate-emulator-logs
-          path: pico-fido2/tests/build/
+          path: |
+            /tmp/fapico2_relay.log
+            fapico2/tests/harness/
