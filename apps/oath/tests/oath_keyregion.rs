@@ -1280,3 +1280,125 @@ fn commands_do_not_re_read_the_region() {
         "a TOTP CALCULATE must be answered from the in-RAM table, not by re-reading the region"
     );
 }
+// ---------------------------------------------------------------------------
+// Client compatibility: the picoforge / ykman flow (US-1572 follow-on)
+// ---------------------------------------------------------------------------
+
+/// **A device with no access code is fully usable — register, retrieve, use.**
+///
+/// This is the flow both first-party clients actually run, and it is the one
+/// the applet used to refuse. Neither client has a second way to learn that a
+/// device needs unlocking:
+/// `yubikit/oath.py` sets `_has_key = self._challenge is not None` and
+/// picoforge's HAL reads `info.password_set()` — both from the `74` challenge
+/// TLV, which this applet emits **only when an access code exists**. So on a
+/// device holding credentials and no access code, both clients skip VALIDATE
+/// and issue LIST / PUT / DELETE / CALCULATE directly, and every one of them
+/// used to be answered `0x6982`.
+///
+/// The lockout was also a dead end: `SET_CODE` and `SET_PIN`, the only ways to
+/// create the missing credential, sat behind the same gate, leaving a factory
+/// reset as the sole exit.
+///
+/// Pinned on **both** storage paths, because the fix must not be path-specific:
+/// the legacy stream and the key region must look identical to a client.
+#[test]
+fn a_device_with_no_access_code_is_usable_on_both_paths() {
+    // Legacy: no region attached.
+    let mut legacy = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    // Region: mounted, so `attach_region` ran and `refresh_session_grant` too.
+    let (mut region, _probe, _temp) = mounted("compat-region");
+
+    for (path, app) in [("legacy", &mut legacy), ("region", &mut region)] {
+        let app = app;
+        // 1. REGISTER. No VALIDATE first — there is no access code, and a
+        //    client cannot know that without a SELECT it has not sent yet.
+        assert_eq!(
+            put_cred(app, b"GitHub:eddieoz", &[0x21, 6, b's', b'e', b'c', b'r', b'e', b't']),
+            0x9000,
+            "{path}: PUT must be served with no access code and no prior VALIDATE"
+        );
+
+        // 2. RETRIEVE. LIST must answer 0x9000 and carry the credential.
+        let (body, sw) = drive(app, &apdu(0xA1, 0, 0, &[]));
+        assert_eq!(sw, 0x9000, "{path}: LIST must be served with no access code");
+        assert!(
+            !body.is_empty(),
+            "{path}: LIST must return the registered credential"
+        );
+
+        // 3. USE. A named CALCULATE with a challenge — the TOTP request both
+        //    clients issue.
+        let (body, sw) = calculate_totp(app, b"GitHub:eddieoz");
+        assert_eq!(sw, 0x9000, "{path}: CALCULATE must be served with no access code");
+        assert_eq!(
+            body.first(),
+            Some(&0x76),
+            "{path}: the truncated YKOATH response tag, or the client cannot read a code"
+        );
+
+        // 4. RENAME and DELETE, the two remaining client verbs. The name in
+        //    both TLVs must be the 14-byte one registered above, or RENAME
+        //    answers 0x6984 for a reason that has nothing to do with the grant.
+        const OLD: &[u8] = b"GitHub:eddieoz";
+        const NEW: &[u8] = b"GitHub:eddie";
+        let mut rename = vec![0x71, OLD.len() as u8];
+        rename.extend_from_slice(OLD);
+        rename.extend_from_slice(&[0x71, NEW.len() as u8]);
+        rename.extend_from_slice(NEW);
+        assert_eq!(
+            drive(app, &apdu(0x05, 0, 0, &rename)).1,
+            0x9000,
+            "{path}: RENAME must be served with no access code"
+        );
+        let mut delete = vec![0x71, NEW.len() as u8];
+        delete.extend_from_slice(NEW);
+        assert_eq!(
+            drive(app, &apdu(0x02, 0, 0, &delete)).1,
+            0x9000,
+            "{path}: DELETE must be served with no access code"
+        );
+
+        // 5. Re-listing after a refusal-free sequence still works: the grant
+        //    is "nothing to authenticate with", and nothing above disturbed it.
+        let (_, sw) = drive(app, &apdu(0xA1, 0, 0, &[]));
+        assert_eq!(
+            sw, 0x9000,
+            "{path}: the session must still be granted after the full client sequence"
+        );
+        //    VALIDATE's own refusal with no access code, and the rule that a
+        //    refusal does not un-grant the session, are covered by
+        //    `auth_boundary.rs::validate_without_access_code_never_grants` —
+        //    not repeated here, because an empty VALIDATE body is rejected on
+        //    its TLVs before the access-code check is ever reached.
+    }
+}
+
+/// **A session survives a reboot on a device with no access code.**
+///
+/// The property the lockout made untestable. Before the fix, a rebooted
+/// code-less device was "locked" — and because a locked device refuses LIST,
+/// every "did the credential survive?" assertion in this file had to be made
+/// against the *store*, never against a round trip through the applet. On the
+/// region path there is no store to check.
+#[test]
+fn a_rebooted_region_device_with_no_access_code_still_lists_its_credentials() {
+    let (_probe, _temp) = Probe::new("compat-reboot");
+    let probe = _probe;
+    let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    probe.mount(&mut app);
+    assert_eq!(
+        put_cred(&mut app, b"acct", &[0x21, 6, b's', b'e', b'c', b'r', b'e', b't']),
+        0x9000
+    );
+
+    // A fresh applet over the same medium — nothing carried over in RAM.
+    let mut rebooted = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    probe.mount(&mut rebooted);
+    let (body, sw) = drive(&mut rebooted, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "a rebooted code-less device must serve LIST");
+    assert!(
+        !body.is_empty(),
+        "the credential committed before the reboot must still be listed after it"
+    );
+}

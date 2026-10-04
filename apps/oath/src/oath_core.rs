@@ -936,17 +936,37 @@ pub struct OathApp {
 }
 
 impl OathApp {
-    /// US-901 (SEC-HARDEN): recompute the session grant — the virgin
-    /// auto-validate rule. A session is granted (`validated == true`) only
-    /// while the app is completely virgin: no access code, no OTP PIN, no
-    /// credentials. As soon as any of those exist, construction, boot
-    /// restore and host-issued SELECT start the session unvalidated and only
-    /// VALIDATE (access code) or VERIFY_PIN (OTP PIN) grant it. This is the
-    /// single place the grant is derived; never store a self-grant blindly.
+    /// US-901 (SEC-HARDEN): recompute the session grant.
+    ///
+    /// A session is granted (`validated == true`) exactly while there is **no
+    /// secret to authenticate with** — no access code and no OTP PIN. That is
+    /// what "no access code set" means on a YubiKey, and it is the only
+    /// definition both first-party clients can act on.
+    ///
+    /// **This used to require virginity as well — no credentials either — and
+    /// that was a compatibility lockout, not a hardening.** Both clients decide
+    /// whether to authenticate from the SELECT response alone:
+    /// `yubikit/oath.py` (`_has_key = self._challenge is not None`) and
+    /// picoforge's HAL (`info.password_set()`) both read the `74` challenge
+    /// TLV, which this applet emits **only when an access code exists**
+    /// ([`Self::select_apdu`]). So on a device holding credentials and no
+    /// access code, both GUIs skip VALIDATE and issue LIST / PUT / DELETE /
+    /// CALCULATE directly — and every one of them was answered `0x6982`. The
+    /// state was also **unrecoverable**: `SET_CODE` and `SET_PIN`, the only ways
+    /// to create the missing credential, sit behind the same gate, leaving a
+    /// factory reset (magic + touch) as the sole exit.
+    ///
+    /// Credentials are not a secret that needs authenticating — they are the
+    /// thing being managed — and every command that touches one already
+    /// requires user presence (`cmd_put`, `cmd_delete`, `cmd_rename`,
+    /// `cmd_calculate` and `cmd_calculate_all` each gate on `user_present`), so
+    /// dropping the virginity conjunct trades nothing away. It restores what the
+    /// owner's configuration already implies.
+    ///
+    /// This is the single place the grant is derived; never store a self-grant
+    /// blindly.
     fn refresh_session_grant(&mut self) {
-        self.validated = self.access_code.is_none()
-            && self.pin.is_none()
-            && self.slots.iter().all(|s| s.is_none());
+        self.validated = self.access_code.is_none() && self.pin.is_none();
     }
 
     /// US-903 (SEC-HARDEN): attach the user-presence source (mirrors
