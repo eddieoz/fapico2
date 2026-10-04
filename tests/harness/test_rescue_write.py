@@ -219,13 +219,18 @@ def test_every_mask_retaining_ccid_is_accepted(tmp_path):
             assert parse_phy(blob)[TAG_ENABLED_USB_ITF][0] == mask
 
 
-def test_the_five_undestined_tags_are_refused_whole(tmp_path):
-    """A tag with no field in the record is refused, and nothing beside it lands.
+def test_the_five_unsupported_tags_are_skipped_and_the_rest_applied(tmp_path):
+    """A tag this build does not model is skipped; the records beside it apply.
 
-    The client skips a tag it does not recognise
-    (``picoforge/src/hal/fido/mod.rs:1001-1003``), so accepting one of these and
-    dropping it would report a configuration change that never happened
-    (threat model §10.3). Refusing is the only answer that does not lie.
+    This applet used to refuse the **whole blob** with ``6A86`` on the first
+    tag it had no field for. Both references skip instead: RS-Key's ``overlay``
+    ends in a terminal ``_ => {}`` and returns ``PhyData``, not ``Result``, so
+    no tag can fail a write (``rsk-phy/src/lib.rs:270``); pico-keys-sdk's
+    ``phy_unserialize_data`` has ``default: break;`` (``fs/phy.c:170-182``).
+
+    Refusing cost a real user every configuration change, because picoforge
+    synthesises a ``Curves`` record whenever the device reports none — see
+    :func:`test_the_picoforge_vendor_preset_saves`.
     """
     values = {
         0x08: b"\x0a",              # PresenceTimeout, 1 byte
@@ -250,9 +255,9 @@ def test_the_five_undestined_tags_are_refused_whole(tmp_path):
                     )
                 )
             )
-            assert sw == 0x6A86, (
-                f"tag {tag:#04x} has no field in the persisted record; it must "
-                f"be refused with 6A86. Got {sw:04X}"
+            assert sw == 0x9000, (
+                f"tag {tag:#04x} has no field here, but that must not cost the "
+                f"operator the record beside it. Got {sw:04X}"
             )
             assert data == b""
 
@@ -260,11 +265,60 @@ def test_the_five_undestined_tags_are_refused_whole(tmp_path):
         assert sw == 0x9000
         records = parse_phy(blob)
         assert records[TAG_LED_BRIGHTNESS] == bytes([11]), (
-            "the seed must be untouched by the refused writes"
+            "the seed must survive the writes that skipped a tag"
         )
-        assert records.get(TAG_LED_GPIO) != bytes([0x22]), (
-            "the 0x04 record beside a refused tag must not be applied"
+        assert records.get(TAG_LED_GPIO) == bytes([0x22]), (
+            f"the 0x04 record beside a skipped tag {tag:#04x} must be applied"
         )
+
+
+def test_the_picoforge_vendor_preset_saves(tmp_path):
+    """The reported scenario, end to end over CCID: YubiKey 5, 1050:0407.
+
+    picoforge — which we neither control nor fork — synthesises a ``Curves``
+    (``0x0A``) record whenever the device reports none, so **every**
+    configuration save it makes carries one. Before this applet learned to skip
+    an unsupported tag, that single record discarded the whole blob and the
+    operator saw ``Write failed: [6A, 86]`` with the status word reading like a
+    P1/P2 complaint.
+
+    The APDU below is built the way picoforge builds it (``ops.rs``: tag/len
+    TLVs, ``1050`` and ``0407`` parsed from the preset's hex and written
+    big-endian as ``vid:u16 BE, pid:u16 BE``), plus the ``0x0A`` it always
+    emits. The assertion is the one the user cares about: afterwards, a
+    ``PhyConfig`` READ reports the new identity.
+    """
+    vid, pid = 0x1050, 0x0407  # "YubiKey 5 (1050:0407)"
+    vid_pid = bytes([TAG_VIDPID, 0x04,
+                     (vid >> 8) & 0xFF, vid & 0xFF,
+                     (pid >> 8) & 0xFF, pid & 0xFF])
+    curves = bytes([0x0A, 0x04, 0x00, 0x00, 0x00, 0x00])  # mask 0, no toggles
+
+    # The same tmp_path across two emulator lifetimes is what makes the second
+    # a restart rather than a fresh boot — the discipline
+    # `test_a_write_is_durable_across_an_emulator_restart` uses.
+    for attempt in (1, 2):
+        with RescueEmu("write", tmp_path) as emu:
+            _, sw = emu.select()
+            assert sw == 0x9000
+            if attempt == 1:
+                # The blob exactly as picoforge builds it for this save.
+                data, sw = emu.send(write_phy(vid_pid + curves))
+                assert sw == 0x9000, (
+                    "the vendor preset save must succeed. The Curves record is "
+                    "one this build does not model and must be skipped, not "
+                    f"refused. Got {sw:04X} ({data.hex()})"
+                )
+                continue
+            # The point of the operation: the device reports the new identity,
+            # and it still does after a restart.
+            read, sw = emu.send(bytes([0x80, 0x1E, 0x01, 0x01, 0x00]))
+            assert sw == 0x9000
+            records = parse_phy(read)
+            assert records.get(TAG_VIDPID) == bytes([0x10, 0x50, 0x04, 0x07]), (
+                "the PhyConfig READ must report 1050:0407 after the write, and "
+                f"after a restart. Got {records.get(TAG_VIDPID)!r}"
+            )
 
 
 def test_a_write_round_trips_every_supported_record(tmp_path):
@@ -319,8 +373,6 @@ def test_malformed_writes_are_refused_on_their_own_terms(tmp_path):
              0x6700, "a 3-byte 0x0B record: a width problem, NOT a mask problem"),
             (bytes([0x80, 0x1C, 0x01, 0x00, 0x03, 0x0B, 0x01, 0x00]),
              0x6A80, "a 1-byte 0x0B record with a zero mask: a value problem"),
-            (bytes([0x80, 0x1C, 0x01, 0x00, 0x03, 0x7A, 0x01, 0xAB]),
-             0x6A86, "a tag byte the protocol does not define"),
             (bytes([0x80, 0x1C, 0x02, 0x00, 0x03, 0x05, 0x01, 0x32]),
              0x6A86, "a WRITE P1 that names nothing"),
             (bytes([0x80, 0x1C, 0x01, 0x01, 0x03, 0x05, 0x01, 0x32]),

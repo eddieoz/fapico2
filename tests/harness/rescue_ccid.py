@@ -69,8 +69,10 @@ READ_PHY_P2_ZERO = bytes([CLA, 0x1E, 0x01, 0x00, 0x00])
 #: A P2 the protocol does not define for this read. Must be refused.
 READ_PHY_P2_BOGUS = bytes([CLA, 0x1E, 0x01, 0x02, 0x00])
 
-#: The PHY TLV tags this firmware has a field for, in ascending order. The
-#: other seven of the protocol's twelve are refused whole.
+#: The PHY TLV tags this firmware has a field for, in ascending order. A tag
+#: outside this list — one of the protocol's other five — is **skipped**, not
+#: refused: both references do that, and refusing the whole blob broke every
+#: configuration save from picoforge.
 TAG_VIDPID = 0x00
 TAG_LED_GPIO = 0x04
 TAG_LED_BRIGHTNESS = 0x05
