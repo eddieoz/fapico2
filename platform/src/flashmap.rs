@@ -8,10 +8,29 @@
 //! ```text
 //! 0x000_000 .. 0x180_000   firmware image                  1,536 KiB — the CI ratchet
 //! 0x180_000 .. 0x200_000   firmware growth headroom          512 KiB — unreferenced, on purpose
-//! 0x200_000 .. 0x300_000   trussed internal FS (OpenPGP/PIV) 1,024 KiB
+//! 0x200_000 .. 0x300_000   trussed window                   1,024 KiB
+//!                         ├ 0x200_000 .. 0x2C0_000   ifs     768 KiB — OpenPGP + PIV
+//!                         └ 0x2C0_000 .. 0x300_000   efs     256 KiB — Location::External
 //! 0x300_000 .. 0x3F0_000   per-record key store               960 KiB
 //! 0x3F0_000 .. 0x400_000   secure partition (small secrets)     64 KiB — board::SECURE_PARTITION_OFFSET
 //! ```
+//!
+//! # The trussed window is split, and `ifs` keeps the front (US-1538)
+//!
+//! [`TRUSSED_FS_OFFSET`]/[`TRUSSED_FS_BLOCKS`] describe the whole 1 MiB window,
+//! which is what the linker reserves and what `board::KEY_REGION_BYTES` is
+//! derived from — neither of them moved. The **window** is now two littlefs2
+//! filesystems: [`TRUSSED_IFS_BLOCKS`] at the front for `ifs`, and
+//! [`TRUSSED_EFS_BLOCKS`] at the tail for `efs`.
+//!
+//! The order is not cosmetic. littlefs2 stores `block_count` in the volume
+//! superblock and refuses to mount a volume whose geometry does not match the
+//! driver's (`lfs.c:4523-4531`: `Invalid block count`, `LFS_ERR_INVAL`). A
+//! legacy volume copied byte-for-byte into the *tail* window would therefore
+//! refuse to mount, and the boot path's `is_mountable` → `format` fall-through
+//! would erase every OpenPGP key on the unit. Keeping `ifs` at the front means
+//! the relocated bytes land at the same block indices they were written at, and
+//! [`crate::trusted_backend::device`]'s migration reads them there.
 //!
 //! # Why this module exists (US-1536)
 //!
@@ -81,13 +100,67 @@ pub const TRUSSED_FS_BLOCKS: usize = 256;
 /// The trussed window's first byte past its end.
 pub const TRUSSED_FS_END: u32 = TRUSSED_FS_OFFSET + (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32;
 
+/// Blocks of the trussed window given to the **internal** FS (`ifs`): 192 ×
+/// 4 KiB = 768 KiB.
+///
+/// `ifs` sits at [`TRUSSED_FS_OFFSET`] — the front of the window, which is
+/// where the relocated legacy volume's blocks land. See the module docs for why
+/// the order matters.
+///
+/// # Why 768 KiB and not the whole window
+///
+/// The window is shared now because there is no free flash left to give
+/// `efs` its own: the data partition is tiled to the top of the part
+/// (`KEY_REGION_BYTES` is board-derived from the window's size, so shrinking
+/// the window would silently shrink the key store, and enlarging it would
+/// move `board::SECURE_PARTITION_OFFSET`).
+///
+/// 768 KiB is **27× the measured cost of what `ifs` carries**.
+///
+/// That measurement is
+/// `platform/tests/fs_store_backing.rs::the_split_leaves_ifs_room_for_what_it_carries`,
+/// which writes a whole OpenPGP card's worth of payload — three RSA-4096
+/// private keys at the 7–10 KB of DER the epic cites
+/// (`docs/tasks/EPIC-secure-storage.md` §2), plus the state files beside them —
+/// into a real littlefs2 volume and reads back what the volume *cost*, CTZ
+/// skip-lists and metadata included: **28,672 B**. (The epic's own "roughly
+/// 254 KB used, ~770 KB spare" for the same window is a transcription nobody
+/// measured; this is the number with littlefs2's overhead in it.)
+pub const TRUSSED_IFS_BLOCKS: usize = 192;
+
+/// Blocks of the trussed window given to the **external** FS (`efs`): 64 ×
+/// 4 KiB = 256 KiB, at [`TRUSSED_EFS_OFFSET`].
+///
+/// This is what makes `Location::External` flash-backed (US-1538). It used to
+/// be an 8-block RAM buffer that `mount_ram_fs` reformatted on every boot,
+/// while `vendor/opcard/src/card.rs:569` makes `External` the opcard default —
+/// so a key written at the default location survived exactly until the next
+/// power cycle, with no error at any point.
+///
+/// 256 KiB is sized against the payload `efs` exists to hold: one OpenPGP key
+/// set is three RSA-4096 private keys at 7–10 KB of DER each, so this holds
+/// on the order of ten key sets with littlefs2's metadata overhead, against
+/// the one the tree has ever needed. Anything larger would be taken from an
+/// `ifs` that has to hold both OpenPGP and PIV, for no applet that exists.
+pub const TRUSSED_EFS_BLOCKS: usize = TRUSSED_FS_BLOCKS - TRUSSED_IFS_BLOCKS;
+
+/// Start of the `efs` window — the **tail** of the trussed window, immediately
+/// after `ifs`.
+///
+/// Tail, not front, for the reason in the module docs: `ifs` must keep the
+/// window's low block indices so the relocated legacy volume's superblock pair
+/// (blocks 0 and 1) stays inside `ifs` and every CTZ pointer stays valid.
+pub const TRUSSED_EFS_OFFSET: u32 =
+    TRUSSED_FS_OFFSET + (TRUSSED_IFS_BLOCKS * BLOCK_SIZE) as u32;
+
 /// Where the trussed window lived before US-1536, retained only as the source
 /// of a one-shot relocation.
 ///
 /// `0x102_000 .. 0x202_000` — the front of the C data partition. It is
-/// **read** by [`crate::trusted_backend::device`]'s relocation and never
-/// written, which is what makes the relocation idempotent and retryable: an
-/// interrupted copy leaves the source intact and the next boot tries again.
+/// **read** by [`crate::trusted_backend::device`]'s migration and never
+/// written, which is what makes the migration idempotent and retryable: an
+/// interrupted copy leaves the source intact, the partial destination is erased,
+/// and the next boot tries again.
 pub const LEGACY_TRUSSED_FS_OFFSET: u32 = 0x102_000;
 
 /// Start of the per-record key store, flash-relative (US-1539).
@@ -164,5 +237,29 @@ const _: () = {
         KEY_REGION_BYTES == (KEY_REGION_BYTES / BLOCK_SIZE as u32) * BLOCK_SIZE as u32,
         "the key region must be a whole number of NOR sectors; the record stride US-1540 \
          derives divides it, and a remainder would leave a partial sector nobody can erase"
+    );
+    // US-1538: the two halves of the trussed window. These are the assertions
+    // that make "the window is split" a geometric fact rather than two
+    // constants that happen to sum today: `ifs` and `efs` must tile the window
+    // exactly, with no gap (flash nothing can use) and no overlap (two
+    // littlefs2 filesystems claiming the same 4 KiB sector — which does not
+    // fail at link time, it destroys one of them at run time).
+    assert!(
+        TRUSSED_IFS_BLOCKS > 0 && TRUSSED_EFS_BLOCKS > 0,
+        "the trussed window must hold both a non-empty ifs and a non-empty efs"
+    );
+    assert!(
+        TRUSSED_IFS_BLOCKS + TRUSSED_EFS_BLOCKS == TRUSSED_FS_BLOCKS,
+        "ifs and efs must tile the trussed window exactly: a gap is flash no filesystem \
+         can reach, an overlap is two filesystems erasing each other's blocks"
+    );
+    assert!(
+        TRUSSED_EFS_OFFSET == TRUSSED_FS_OFFSET + (TRUSSED_IFS_BLOCKS * BLOCK_SIZE) as u32,
+        "the external filesystem must begin exactly where the internal one ends"
+    );
+    assert!(
+        TRUSSED_EFS_OFFSET + (TRUSSED_EFS_BLOCKS * BLOCK_SIZE) as u32 == TRUSSED_FS_END,
+        "the external filesystem must end where the trussed window ends — and therefore \
+         before the key region, which is not this module's flash to hand out"
     );
 };

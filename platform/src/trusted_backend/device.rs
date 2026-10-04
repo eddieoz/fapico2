@@ -28,8 +28,8 @@ use embassy_rp::peripherals::FLASH;
 use embassy_time::Instant;
 use littlefs2::consts::{U256, U8};
 use littlefs2::driver::Storage;
-use littlefs2::fs::{Allocation, Filesystem};
-use littlefs2_core::{DynFilesystem, PathBuf};
+use littlefs2::fs::{Allocation, FileType, Filesystem};
+use littlefs2_core::{DynFilesystem, OpenSeekFrom, Path, PathBuf};
 use rand_core::{CryptoRng, RngCore};
 use trussed::platform::{Platform, UserInterface};
 use trussed::pipe::{ServiceEndpoint, TrussedChannel};
@@ -54,7 +54,16 @@ use super::runner::{Backends, Client, SyscallRunner};
 // over the front of this filesystem. Re-exported here because `device` is where
 // the window is actually used and `platform/src/trusted_backend/host.rs`
 // documents itself against `device::TRUSSED_FS_BLOCKS`.
-pub use crate::flashmap::{BLOCK_SIZE, TRUSSED_FS_BLOCKS, TRUSSED_FS_END, TRUSSED_FS_OFFSET};
+//
+// US-1538 adds the split of that window into the two filesystems this module
+// mounts: `ifs` at the front ([`TRUSSED_IFS_BLOCKS`]) and `efs` at the tail
+// ([`TRUSSED_EFS_BLOCKS`] at [`TRUSSED_EFS_OFFSET`]). `TRUSSED_FS_OFFSET` /
+// `TRUSSED_FS_BLOCKS` still name the *window*, because that is what the linker
+// reserves and what `board::KEY_REGION_BYTES` is derived from.
+pub use crate::flashmap::{
+    BLOCK_SIZE, TRUSSED_EFS_BLOCKS, TRUSSED_EFS_OFFSET, TRUSSED_FS_BLOCKS, TRUSSED_FS_END,
+    TRUSSED_FS_OFFSET, TRUSSED_IFS_BLOCKS,
+};
 
 /// littlefs2 read quantum.
 pub const READ_SIZE: usize = 256;
@@ -270,16 +279,55 @@ impl CryptoRng for Rp2350Rng {}
 // ---------------------------------------------------------------------------
 
 /// [`littlefs2::driver::Storage`] over the embassy-rp blocking QSPI `Flash`
-/// driver, confined to the [`TRUSSED_FS_OFFSET`] window. The driver is held
-/// by value (constructed at boot from `p.FLASH`; S-721-2 passes it in).
+/// driver, confined to the **front** of the trussed window — the `ifs`
+/// filesystem, at [`TRUSSED_FS_OFFSET`] for [`TRUSSED_IFS_BLOCKS`] blocks.
+///
+/// The driver is held by value (constructed at boot from `p.FLASH`; S-721-2
+/// passes it in) and is **the one owner of the QSPI handle**: every other
+/// filesystem in this module reaches the flash through
+/// [`DevFlashStorage::alias`], never by owning a second handle.
 pub struct DevFlashStorage {
     flash: DevFlash,
 }
 
 impl DevFlashStorage {
-    /// The live trussed window, at [`TRUSSED_FS_OFFSET`].
+    /// The live `ifs` window, at [`TRUSSED_FS_OFFSET`].
     pub fn new(flash: DevFlash) -> Self {
         Self { flash }
+    }
+
+    /// A second view of the **same** QSPI handle, for a filesystem that must
+    /// address a different part of flash.
+    ///
+    /// # Why a raw pointer, and why it is sound here
+    ///
+    /// A QSPI flash part has one controller. Two `DevFlash` values would be two
+    /// drivers for one peripheral, which is the thing this module has always
+    /// refused to do; a raw pointer to the one owner says the same thing more
+    /// honestly, and lets the safety argument be stated once, here.
+    ///
+    /// It is sound because every alias this returns is used **strictly
+    /// sequentially and never re-entrantly**:
+    ///
+    /// * `ifs` and `efs` are separate flash windows. A trussed syscall resolves
+    ///   exactly one `Location` (`trussed-0.2.0/src/store.rs:136-141`), so a
+    ///   request touches one of them and not the other, and each
+    ///   `blocking_read`/`blocking_write`/`blocking_erase` is a complete
+    ///   transaction that returns before the next one begins. The same argument
+    ///   as [`LedUi`]'s shared board LED: the device is single-core and the
+    ///   executor is cooperative, so there is no point at which two handles are
+    ///   inside a flash transaction at once.
+    /// * The migration ([`migrate_legacy_window`]) does hold two mounted
+    ///   filesystems at once, but it too alternates — read a chunk from the
+    ///   legacy volume, write it to the new one — and runs on the boot path
+    ///   before any task, client or service exists.
+    ///
+    /// What this buys back: `ifs` and `efs` both being flash-backed costs zero
+    /// permanent `.bss` and zero extra `.bss` growth over the single-owner
+    /// design, on a board where `.bss` growth moves `MSPLIM` and shrinks the
+    /// main stack (DARK-BOOT-1, documented on the statics below).
+    fn alias(&mut self) -> *mut DevFlash {
+        core::ptr::addr_of_mut!(self.flash)
     }
 }
 
@@ -287,28 +335,32 @@ impl Storage for DevFlashStorage {
     const READ_SIZE: usize = READ_SIZE;
     const WRITE_SIZE: usize = WRITE_SIZE;
     const BLOCK_SIZE: usize = BLOCK_SIZE;
-    const BLOCK_COUNT: usize = TRUSSED_FS_BLOCKS;
+    const BLOCK_COUNT: usize = TRUSSED_IFS_BLOCKS;
     const BLOCK_CYCLES: isize = -1;
 
     type CACHE_SIZE = U256;
     type LOOKAHEAD_SIZE = U8;
 
     fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
-        self.flash
+        // SAFETY: `&mut self` is an exclusive borrow of the owner, so no other
+        // handle is in a flash transaction (see `Self::alias`).
+        unsafe { &mut *self.alias() }
             .blocking_read(TRUSSED_FS_OFFSET + off as u32, buf)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(buf.len())
     }
 
     fn write(&mut self, off: usize, data: &[u8]) -> littlefs2::io::Result<usize> {
-        self.flash
+        // SAFETY: as `read`.
+        unsafe { &mut *self.alias() }
             .blocking_write(TRUSSED_FS_OFFSET + off as u32, data)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(data.len())
     }
 
     fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
-        self.flash
+        // SAFETY: as `read`.
+        unsafe { &mut *self.alias() }
             .blocking_erase(
                 TRUSSED_FS_OFFSET + off as u32,
                 TRUSSED_FS_OFFSET + (off + len) as u32,
@@ -318,18 +370,116 @@ impl Storage for DevFlashStorage {
     }
 }
 
-/// littlefs2 `Storage` over the **legacy** trussed window, for the
-/// mountability probe only.
+/// [`littlefs2::driver::Storage`] over the **tail** of the trussed window — the
+/// `efs` filesystem, at [`TRUSSED_EFS_OFFSET`] for [`TRUSSED_EFS_BLOCKS`]
+/// blocks (US-1538).
 ///
-/// Stack-only and never installed in a static: it exists so the relocation can
-/// ask "is there a filesystem at the old offset?" without a second live `Flash`
-/// handle and without growing [`DevFlashStorage`] by an `offset` field. See
-/// [`DeviceFsStore::boot`] for where it is used and why the cost matters.
-struct LegacyWindow<'a> {
-    flash: &'a mut DevFlash,
+/// # What this type is for
+///
+/// `Location::External` is opcard's default storage
+/// (`vendor/opcard/src/card.rs:569`), and until US-1538 `efs` was a 32 KiB RAM
+/// buffer that `mount_ram_fs` **formatted on every boot**. A key written at the
+/// default location therefore survived exactly until the next power cycle, and
+/// nothing reported an error at any point in between: the write succeeded, into
+/// something that was about to be erased. That is the defect. This type is the
+/// fix — a second littlefs2 filesystem in flash, mounted like `ifs` and
+/// formatted only when it does not already carry a volume.
+///
+/// `efs` is a tail window because `ifs` must stay at the front: littlefs2 pins
+/// `block_count` in the volume superblock and refuses a geometry mismatch
+/// (`lfs.c:4523-4531`), so the relocated legacy volume's blocks 0 and 1 — its
+/// superblock pair — must stay inside `ifs`.
+///
+/// # Safety of the aliased handle
+///
+/// The pointer comes from [`DevFlashStorage::alias`], whose serialization
+/// argument is the contract this type depends on. `efs` and `ifs` are distinct
+/// flash windows and a trussed request resolves exactly one `Location`, so the
+/// two are never inside a flash transaction together.
+pub struct DevEfsStorage {
+    flash: *mut DevFlash,
 }
 
-impl Storage for LegacyWindow<'_> {
+impl DevEfsStorage {
+    /// The `efs` tail window, borrowing the one QSPI handle.
+    ///
+    /// # Safety
+    ///
+    /// `flash` must point at the live `DevFlash` owned by the boot-path
+    /// `IFS_STORAGE` static, and every access through it must be serialized
+    /// against every access through that owner — see [`DevFlashStorage::alias`].
+    unsafe fn new(flash: *mut DevFlash) -> Self {
+        Self { flash }
+    }
+}
+
+impl Storage for DevEfsStorage {
+    const READ_SIZE: usize = READ_SIZE;
+    const WRITE_SIZE: usize = WRITE_SIZE;
+    const BLOCK_SIZE: usize = BLOCK_SIZE;
+    const BLOCK_COUNT: usize = TRUSSED_EFS_BLOCKS;
+    const BLOCK_CYCLES: isize = -1;
+
+    type CACHE_SIZE = U256;
+    type LOOKAHEAD_SIZE = U8;
+
+    fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
+        // SAFETY: `Self::new`'s contract — the pointer is the live boot-path
+        // handle and accesses are serialized against the `ifs` owner.
+        unsafe { &mut *self.flash }
+            .blocking_read(TRUSSED_EFS_OFFSET + off as u32, buf)
+            .map_err(|_| littlefs2::io::Error::IO)?;
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, off: usize, data: &[u8]) -> littlefs2::io::Result<usize> {
+        // SAFETY: as `read`.
+        unsafe { &mut *self.flash }
+            .blocking_write(TRUSSED_EFS_OFFSET + off as u32, data)
+            .map_err(|_| littlefs2::io::Error::IO)?;
+        Ok(data.len())
+    }
+
+    fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
+        // SAFETY: as `read`.
+        unsafe { &mut *self.flash }
+            .blocking_erase(
+                TRUSSED_EFS_OFFSET + off as u32,
+                TRUSSED_EFS_OFFSET + (off + len) as u32,
+            )
+            .map_err(|_| littlefs2::io::Error::IO)?;
+        Ok(len)
+    }
+}
+
+/// littlefs2 `Storage` over the **legacy** trussed window, at
+/// [`crate::flashmap::LEGACY_TRUSSED_FS_OFFSET`], read-only.
+///
+/// Stack-only and never installed in a static: the migration asks "is there a
+/// filesystem at the old offset, and if so what is in it?" without giving the
+/// module a second owner of the QSPI handle.
+///
+/// `BLOCK_COUNT` is the **legacy** [`TRUSSED_FS_BLOCKS`] — the whole 1 MiB — and
+/// has to be. littlefs2 compares the driver's block count against the volume's
+/// superblock and fails the mount on a mismatch (`lfs.c:4523-4531`), so this is
+/// the only geometry at which a pre-US-1536 volume can be read at all.
+struct LegacyWindow {
+    flash: *mut DevFlash,
+}
+
+impl LegacyWindow {
+    /// A read-only view of the legacy window over the one QSPI handle.
+    ///
+    /// # Safety
+    ///
+    /// As [`DevFlashStorage::alias`]: the pointer must be the live boot-path
+    /// handle, and accesses serialized against every other use of it.
+    unsafe fn new(flash: *mut DevFlash) -> Self {
+        Self { flash }
+    }
+}
+
+impl Storage for LegacyWindow {
     const READ_SIZE: usize = READ_SIZE;
     const WRITE_SIZE: usize = WRITE_SIZE;
     const BLOCK_SIZE: usize = BLOCK_SIZE;
@@ -340,15 +490,19 @@ impl Storage for LegacyWindow<'_> {
     type LOOKAHEAD_SIZE = U8;
 
     fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
-        self.flash
+        // SAFETY: `Self::new`'s contract. `write` and `erase` below refuse, so
+        // nothing this handle does can move a byte in the source window.
+        unsafe { &mut *self.flash }
             .blocking_read(crate::flashmap::LEGACY_TRUSSED_FS_OFFSET + off as u32, buf)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(buf.len())
     }
 
     fn write(&mut self, _off: usize, _data: &[u8]) -> littlefs2::io::Result<usize> {
-        // The legacy window is never written: that is what makes the relocation
-        // idempotent and retryable.
+        // The legacy window is never written: that is what makes the migration
+        // idempotent and retryable — a power cut leaves the source intact and
+        // the next boot tries again from the source, not from a half-written
+        // destination.
         Err(littlefs2::io::Error::IO)
     }
 
@@ -357,12 +511,19 @@ impl Storage for LegacyWindow<'_> {
     }
 }
 
-// RAM littlefs2 storage (32 KiB = 8 × 4 KiB blocks) for the external and
-// volatile stores. `const_ram_storage!` from littlefs2; the buffer is a
+// RAM littlefs2 storage (32 KiB = 8 × 4 KiB blocks) for the **volatile** store
+// only (US-1538). `const_ram_storage!` from littlefs2; the buffer is a
 // const-initialized static (the erase value 0xFF), so the "storage" is a
 // zero-copy slice of a fixed RAM region. The macro emits a `pub struct`,
 // so the invocation is confined to a private submodule — `RamFsStorage`
 // is nameable inside this module only, never from the crate root.
+//
+// It used to back the external store too, which is the defect US-1538 fixes:
+// `Location::External` resolved to RAM and `mount_ram_fs` reformatted it on
+// every boot. `Location::Volatile` is what RAM is *for* — software key
+// generation asks for it deliberately (`vendor/opcard/src/command/gen.rs:171`,
+// `:217`), because the private key must not outlive the operation that made
+// it.
 mod ram_fs {
     use littlefs2::const_ram_storage;
     use littlefs2::consts::{U256, U4};
@@ -384,10 +545,10 @@ mod ram_fs {
 // escape `device`).
 use self::ram_fs::RamFsStorage;
 
-/// The trussed [`Store`]: three mounted littlefs2 filesystems (internal on
-/// flash, external + volatile on RAM). `Copy` of `'static` references — the
-/// mounted filesystems and their storage/allocation state live in the statics
-/// below (init-once at boot).
+/// The trussed [`Store`]: three mounted littlefs2 filesystems — `ifs` and
+/// `efs` on the QSPI window, `vfs` on RAM (US-1538). `Copy` of `'static`
+/// references — the mounted filesystems and their storage/allocation state live
+/// in the statics below (init-once at boot).
 #[derive(Clone, Copy)]
 pub struct DeviceFsStore {
     ifs: &'static dyn DynFilesystem,
@@ -440,10 +601,10 @@ static mut IFS_ALLOC: core::mem::MaybeUninit<Allocation<DevFlashStorage>> =
 static mut IFS: core::mem::MaybeUninit<Filesystem<'static, DevFlashStorage>> =
     core::mem::MaybeUninit::uninit();
 
-static mut EFS_STORAGE: core::mem::MaybeUninit<RamFsStorage> = core::mem::MaybeUninit::uninit();
-static mut EFS_ALLOC: core::mem::MaybeUninit<Allocation<RamFsStorage>> =
+static mut EFS_STORAGE: core::mem::MaybeUninit<DevEfsStorage> = core::mem::MaybeUninit::uninit();
+static mut EFS_ALLOC: core::mem::MaybeUninit<Allocation<DevEfsStorage>> =
     core::mem::MaybeUninit::uninit();
-static mut EFS: core::mem::MaybeUninit<Filesystem<'static, RamFsStorage>> =
+static mut EFS: core::mem::MaybeUninit<Filesystem<'static, DevEfsStorage>> =
     core::mem::MaybeUninit::uninit();
 
 static mut VFS_STORAGE: core::mem::MaybeUninit<RamFsStorage> = core::mem::MaybeUninit::uninit();
@@ -455,6 +616,11 @@ static mut VFS: core::mem::MaybeUninit<Filesystem<'static, RamFsStorage>> =
 impl DeviceFsStore {
     /// Mount (or format, on first boot) the three filesystems. Boot-path
     /// only, before any task exists (single-core; see the static docs).
+    ///
+    /// The order is load-bearing: `IFS_STORAGE` is written first because it
+    /// **owns the QSPI handle**, and both the external storage and the
+    /// migration's legacy window are aliases of it
+    /// ([`DevFlashStorage::alias`]). Nothing may reach flash before that write.
     fn boot(flash: DevFlash) -> Self {
         // SAFETY: single-core pre-task boot path — each static is written
         // exactly once here, before any executor task exists, and the only
@@ -466,7 +632,7 @@ impl DeviceFsStore {
             (*core::ptr::addr_of_mut!(IFS_ALLOC)).write(Allocation::new());
             let storage = (*core::ptr::addr_of_mut!(IFS_STORAGE)).as_mut_ptr();
             let alloc = (*core::ptr::addr_of_mut!(IFS_ALLOC)).as_mut_ptr();
-            relocate_legacy_window(&mut *storage);
+            migrate_legacy_window(&mut *storage, &mut *alloc);
             if !Filesystem::is_mountable(&mut *storage) {
                 defmt::info!("trussed: formatting internal FS (first boot)");
                 Filesystem::format(&mut *storage).expect("trussed: format internal FS");
@@ -475,10 +641,16 @@ impl DeviceFsStore {
                 .expect("trussed: mount internal FS");
             (*core::ptr::addr_of_mut!(IFS)).write(ifs);
 
-            let efs = mount_ram_fs(
+            // The external store is a second window of the same flash part,
+            // addressed through an alias of the handle `IFS_STORAGE` owns.
+            // SAFETY: `storage` is the live boot-path owner written above; the
+            // alias's serialization contract is `DevFlashStorage::alias`.
+            (*core::ptr::addr_of_mut!(EFS_STORAGE)).write(DevEfsStorage::new((*storage).alias()));
+            let efs = mount_flash_fs(
                 &mut *core::ptr::addr_of_mut!(EFS_STORAGE),
                 &mut *core::ptr::addr_of_mut!(EFS_ALLOC),
                 &mut *core::ptr::addr_of_mut!(EFS),
+                "external",
             );
             let vfs = mount_ram_fs(
                 &mut *core::ptr::addr_of_mut!(VFS_STORAGE),
@@ -495,51 +667,156 @@ impl DeviceFsStore {
     }
 }
 
-/// One-shot relocation of the trussed window from its pre-US-1536 offset.
+/// Format-on-first-boot + mount for a **flash-backed** store.
 ///
-/// The window moved from `0x102_000` to `0x200_000` so the CI flash-budget
-/// ratchet can no longer reach it. A unit provisioned before that move has a
-/// populated littlefs2 volume at the old offset, and this is what carries it
-/// across — otherwise the move is a silent wipe of every OpenPGP and PIV key.
+/// # Why this is not `mount_ram_fs`
+///
+/// `mount_ram_fs` formats unconditionally, because a RAM volume has nothing
+/// worth preserving. A flash volume has something worth preserving, and
+/// formatting one on every boot is the exact defect US-1538 exists to remove —
+/// so the format here is guarded by `is_mountable`, and a store that already
+/// carries a volume comes up with its contents intact.
+///
+/// # Safety
+///
+/// The caller passes the dedicated single-core boot-path statics (see the
+/// statics docs) — each is written exactly once here, before any executor task
+/// exists. `label` is a `&'static str` used only in log messages.
+unsafe fn mount_flash_fs<S: Storage>(
+    storage: &'static mut core::mem::MaybeUninit<S>,
+    alloc: &'static mut core::mem::MaybeUninit<Allocation<S>>,
+    fs_slot: &'static mut core::mem::MaybeUninit<Filesystem<'static, S>>,
+    label: &'static str,
+) -> &'static dyn DynFilesystem {
+    unsafe {
+        let storage = storage.as_mut_ptr();
+        if !Filesystem::is_mountable(&mut *storage) {
+            defmt::info!("trussed: formatting the {} FS (first boot)", label);
+            // `.expect()`, not the fail-closed `return false` that
+            // `wipe_internal_fs` uses. The two are different situations: a wipe
+            // runs on a device that is already working and can report a
+            // failure to a caller, while this runs on a volume that has *no*
+            // content to fall back to — if the first-boot format does not
+            // succeed there is nothing to mount and nothing to serve, so the
+            // only outcomes are a device that comes up or one that does not.
+            // That is the boot path's existing discipline (see the format in
+            // `DeviceFsStore::boot`), not a new rule introduced here.
+            Filesystem::format(&mut *storage).expect("trussed: format flash FS");
+        }
+        alloc.write(Allocation::new());
+        let fs = Filesystem::mount(&mut *alloc.as_mut_ptr(), &mut *storage)
+            .expect("trussed: mount flash FS");
+        fs_slot.write(fs);
+        &*fs_slot.as_ptr()
+    }
+}
+
+/// One-shot migration of a populated pre-US-1536 window into the split
+/// geometry (US-1538).
+///
+/// # What this carries, and why it is no longer a byte copy
+///
+/// The window moved from `0x102_000` to `0x200_000` (US-1536) and was then
+/// split into `ifs` + `efs` (US-1538). A unit provisioned before either has a
+/// populated littlefs2 volume at `0x102_000` that is **256 blocks** wide, and
+/// this is what carries it across — otherwise the split is a silent wipe of
+/// every OpenPGP and PIV key on the unit.
+///
+/// Until US-1538 this function erased the new window and streamed the old
+/// bytes into it, which was exactly right while both windows had the same
+/// geometry. **littlefs2 stores `block_count` in the volume superblock and
+/// refuses to mount a volume whose geometry does not match the driver's**
+/// (`lfs.c:4523-4531`, `Invalid block count` → `LFS_ERR_INVAL`). A 256-block
+/// volume dropped into a [`TRUSSED_IFS_BLOCKS`]-block `ifs` is therefore not a
+/// volume with a truncated tail; it is an *unmountable* one, and the caller's
+/// `is_mountable` → `format` fall-through would erase it. That failure mode is
+/// executable and is pinned by
+/// `platform/tests/fs_store_backing.rs::a_legacy_volume_will_not_mount_in_the_split_window`,
+/// which runs the same refusal against the real C library.
+///
+/// So the contents cross as **files**: the destination is formatted at the new
+/// geometry, then every directory is recreated and every file's bytes are
+/// streamed across. littlefs2 offers no shrink — `lfs_fs_grow` only grows
+/// (`lfs.c:5180-5185`) — so re-creating the volume at the new size is the only
+/// way to keep the keys.
 ///
 /// # Why it is safe to run on every boot
 ///
-/// The legacy window is **read-only** here and never written. So the decision
-/// tree is naturally idempotent, with no marker record to keep in sync:
+/// The legacy window is **read-only** here and never written, so the decision
+/// tree is naturally idempotent with no marker record to keep in sync:
 ///
-/// 1. the current window mounts → nothing to do (the normal case, including
-///    every boot after a successful relocation);
-/// 2. the current window is empty **and** the legacy window mounts → copy,
+/// 1. the current `ifs` mounts → nothing to do (the normal case, including
+///    every boot after a successful migration);
+/// 2. the current `ifs` is empty **and** the legacy window mounts → migrate,
 ///    then let the caller's `is_mountable` check confirm the result;
 /// 3. neither mounts → the caller's first-boot format, i.e. an unprovisioned
-///    unit starting empty at the new offset.
+///    unit starting empty at the new geometry.
 ///
-/// A power cut mid-copy therefore leaves the source intact and the destination
+/// A power cut mid-migration leaves the source intact and the destination
 /// un-mountable, which lands on arm 2 again next boot. There is no state in
-/// which the relocation has to be "told" to run.
+/// which the migration has to be "told" to run.
+///
+/// A migration that *reports* failure erases its own partial destination for the
+/// same reason — a half-written volume is mountable, and a mountable volume is
+/// one the boot path would accept forever, so without the erase the unit would
+/// come up permanently missing whichever files did not make it across.
+///
+/// # The one way this fails for good
+///
+/// [`LegacyWindow`] refuses writes, so a legacy volume whose mount itself
+/// needs a `gstate` commit (`lfs_dir_fetchmatch` → `lfs_dir_commit`, taken when
+/// the volume's gstate is non-zero) cannot be mounted at all. That fails the
+/// migration on every boot and leaves the device empty with the source intact
+/// and reported — recoverable, not silent. It is not a state this firmware
+/// writes: the legacy window was written by this same littlefs2 (0.8, on-disk
+/// v2.0), whose mounts do not write. It is recorded rather than worked around,
+/// because the workaround — a writable legacy handle — would be the one change
+/// that could destroy the only copy of a user's keys.
 ///
 /// # Why failure falls through to a format rather than halting
 ///
-/// A copy that fails still leaves the caller's `is_mountable` false, which is
-/// the first-boot path: the unit comes up empty and reachable rather than
+/// A migration that fails still leaves the caller's `is_mountable` false, which
+/// is the first-boot path: the unit comes up empty and reachable rather than
 /// parked. The legacy window is left intact for recovery. Halting here would
 /// trade a recoverable, loudly-logged empty device for an unreachable one, and
 /// the boot path's whole discipline is that the board always reaches USB.
-fn relocate_legacy_window(storage: &mut DevFlashStorage) {
+///
+/// # The cost, stated rather than hidden
+///
+/// This holds two mounted volumes at once, which is the one place in the module
+/// where two handles alias the QSPI part ([`DevFlashStorage::alias`]), and it
+/// puts an [`Allocation`] (856 B, measured on x86_64) on the boot-path stack.
+///
+/// Both are bounded and both were taken knowingly:
+///
+/// * the stack cost is *transient* — the frame is gone before `Service` is
+///   constructed — and permanent `.bss` is the worse trade here, because on
+///   this board `.bss` growth moves `MSPLIM` and shrinks the main stack
+///   (DARK-BOOT-1, on the statics above). The measured margin is in
+///   `docs/size-report.md` ("Main-stack demand") and is enforced by
+///   `tests/scripts/check_boot_chain.py`.
+/// * the tree walk is depth-capped at [`MIGRATE_MAX_DEPTH`] so a pathological
+///   tree cannot become an unbounded boot-path loop (S8). Nothing trussed or
+///   opcard writes nests that deep; a tree that does is reported and the
+///   migration fails closed, which is the same outcome as any other failure
+///   here.
+fn migrate_legacy_window(storage: &mut DevFlashStorage, alloc: &mut Allocation<DevFlashStorage>) {
     if Filesystem::is_mountable(&mut *storage) {
         return;
     }
     // Probe the legacy window through a short-lived, stack-only handle.
     //
-    // It borrows the flash rather than owning it, which is what keeps
+    // It aliases the flash rather than owning it, which is what keeps
     // `DevFlashStorage` down to a single field: an `offset` field would have
     // cost 8 B of `.bss` on `IFS_STORAGE` (2 -> 8), and this board has 4 B of
     // unallocated SRAM in total — DARK-BOOT-1 territory, where RAM growth is a
-    // hardware risk and not merely a gate failure. The borrow ends before the
-    // handle is moved into the static, so there is never a second live
-    // `Flash`.
+    // hardware risk and not merely a gate failure.
     let legacy_mounts = {
-        let mut probe = LegacyWindow { flash: &mut storage.flash };
+        // SAFETY: `storage` is the live boot-path owner of the QSPI handle; the
+        // probe exists for the length of this call, writes nothing (both
+        // `write` and `erase` on `LegacyWindow` refuse), and no other handle is
+        // inside a flash transaction while it runs.
+        let mut probe = unsafe { LegacyWindow::new(storage.alias()) };
         Filesystem::is_mountable(&mut probe)
     };
     if !legacy_mounts {
@@ -547,65 +824,232 @@ fn relocate_legacy_window(storage: &mut DevFlashStorage) {
         return;
     }
 
-    defmt::info!("trussed: relocating the internal FS to the new offset");
-    let window = (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32;
-    if let Err(e) = relocate_copy(storage, window) {
-        defmt::error!("trussed: relocation failed ({=u8}); the legacy window is intact", e);
+    defmt::info!("trussed: migrating the legacy internal FS into the split window");
+    if Filesystem::format(&mut *storage).is_err() {
+        defmt::error!("trussed: migration failed (1); the legacy window is intact");
+        return;
+    }
+
+    let mut legacy_alloc = Allocation::new();
+    let migrated = {
+        // SAFETY: as the probe above. Two mounts are now alive — the legacy
+        // volume (read-only, `write`/`erase` refuse) and the freshly formatted
+        // destination — and both address the one QSPI handle. They alternate:
+        // each littlefs2 call completes before the next begins, no call
+        // re-enters flash, and this runs on the boot path before any task,
+        // client or service exists. That is the serialization
+        // `DevFlashStorage::alias` requires, and the only reason it is stated
+        // here and nowhere else.
+        let mut legacy_storage = unsafe { LegacyWindow::new(storage.alias()) };
+        let Ok(legacy) = Filesystem::mount(&mut legacy_alloc, &mut legacy_storage) else {
+            defmt::error!("trussed: migration failed (2); the legacy window is intact");
+            return;
+        };
+        let Ok(dst) = Filesystem::mount(&mut *alloc, &mut *storage) else {
+            defmt::error!("trussed: migration failed (3); the legacy window is intact");
+            return;
+        };
+        // No explicit sync, and none is needed: littlefs2 commits a file's
+        // metadata when the file handle closes (`lfs_file_close_` ends in
+        // `lfs_dir_commit` on the containing directory) and a directory's when
+        // it is created. The 0.8 Rust `Filesystem` exposes no `sync` because
+        // there is nothing left to flush by the time a call has returned, so a
+        // copy that returns `Ok` is already in flash.
+        let outcome = copy_tree(&legacy, &dst);
+        if outcome.is_err() {
+            defmt::error!("trussed: migration failed (4); the legacy window is intact");
+        }
+        outcome.is_ok()
+    };
+    // `dst` is gone; its borrow of `storage` and of the caller's `Allocation`
+    // ended with the block. The caller's mount gets a fresh allocation for the
+    // same reason `wipe_internal_fs` rewrites its own — the one in `alloc`
+    // belongs to the mount that has just been dropped.
+    *alloc = Allocation::new();
+    if !migrated {
+        // **Erase the partial destination.** This is the difference between a
+        // retryable migration and a silent key loss: a failed copy still leaves
+        // a *mountable* volume, because the format succeeded and some files
+        // made it across. If boot mounted that, the unit would come up with
+        // most of its OpenPGP keys missing and the legacy window would never be
+        // looked at again — a permanently half-provisioned device with no
+        // indication of why. Formatting the destination back leaves it
+        // un-mountable, which is exactly the state that sends the next boot to
+        // arm 2 and re-runs the whole copy from the intact source.
+        defmt::error!("trussed: migration incomplete; erasing the partial window to retry");
+        let _ = Filesystem::format(&mut *storage);
         return;
     }
     if Filesystem::is_mountable(&mut *storage) {
-        defmt::info!("trussed: relocation complete");
+        defmt::info!("trussed: migration complete");
     } else {
-        defmt::error!("trussed: relocated window does not mount; starting empty");
+        defmt::error!("trussed: migrated window does not mount; starting empty");
     }
 }
 
-/// Stream the legacy window into the current one.
+/// Copy every directory and file of one littlefs2 volume into another.
 ///
-/// Erase-then-program in [`WRITE_SIZE`]-aligned chunks — NOR flash cannot
-/// rewrite programmed bytes, and `WRITE_SIZE` is the flash page size, so a
-/// chunk is the largest unit that is always program-safe.
+/// # Why the file level and not the block level
 ///
-/// `Result<(), u8>` rather than `littlefs2::io::Result` because the error is
-/// only logged: the caller decides what an unmountable window means, and it is
-/// the first-boot path.
-fn relocate_copy(storage: &mut DevFlashStorage, window: u32) -> Result<(), u8> {
-    let mut buf = [0u8; RELOCATE_CHUNK];
-    for off in (0..window as usize).step_by(BLOCK_SIZE) {
-        storage
-            .flash
-            .blocking_erase(
-                TRUSSED_FS_OFFSET + off as u32,
-                TRUSSED_FS_OFFSET + (off + BLOCK_SIZE) as u32,
-            )
-            .map_err(|_| 1u8)?;
+/// littlefs2 addresses a file's data by CTZ skip-list over *block indices in
+/// `[0, block_count)`*, and the block count is part of the volume's identity
+/// (`lfs.c:4523-4531`). Shrinking a volume from 256 blocks to
+/// [`TRUSSED_IFS_BLOCKS`] therefore cannot be done by moving blocks around:
+/// there is nowhere for the live blocks above the new bound to go, and
+/// littlefs2 has no shrink. Re-creating the volume at the new geometry and
+/// replaying its contents is the whole of the fix.
+///
+/// The destination is the *front* of the window, which is why the paths here are
+/// the same on both sides — the migration moves content, not geometry.
+///
+/// `Result<(), u8>` rather than `littlefs2::io::Result` because the code is only
+/// logged: the caller decides what an unmountable window means, and that is the
+/// first-boot path.
+fn copy_tree(src: &dyn DynFilesystem, dst: &dyn DynFilesystem) -> Result<(), u8> {
+    let root = PathBuf::try_from("/").map_err(|_| MIGRATE_ERR_PATH)?;
+    copy_dir(src, dst, root.as_path(), 0)
+}
+
+/// Recursive half of [`copy_tree`].
+///
+/// Depth is capped at [`MIGRATE_MAX_DEPTH`] (S8: no unbounded loop on the boot
+/// path), and a failure at any entry stops the walk rather than continuing — a
+/// half-migrated key set is worse than a loudly-reported empty one, because the
+/// destination still has whatever did make it across, and the source is intact.
+fn copy_dir(
+    src: &dyn DynFilesystem,
+    dst: &dyn DynFilesystem,
+    path: &Path,
+    depth: usize,
+) -> Result<(), u8> {
+    if depth > MIGRATE_MAX_DEPTH {
+        defmt::error!("trussed: migration tree deeper than {=usize} levels", MIGRATE_MAX_DEPTH);
+        return Err(MIGRATE_ERR_DEPTH);
     }
-    let mut copied = 0usize;
-    while copied < window as usize {
-        let flash = &mut storage.flash;
-        flash
-            .blocking_read(crate::flashmap::LEGACY_TRUSSED_FS_OFFSET + copied as u32, &mut buf)
-            .map_err(|_| 2u8)?;
-        flash
-            .blocking_write(TRUSSED_FS_OFFSET + copied as u32, &buf)
-            .map_err(|_| 3u8)?;
-        copied += RELOCATE_CHUNK;
+    let mut failure: Option<u8> = None;
+    let listed = src.read_dir_and_then(path, &mut |entries| {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    failure = Some(MIGRATE_ERR_LIST);
+                    break;
+                }
+            };
+            // `.` and `..` are real directory entries in littlefs2, and
+            // `DirEntry::path()` builds `parent + "/" + name`
+            // (`littlefs2-0.8.1/src/fs.rs:1020`), so recursing into `.` asks
+            // the filesystem to list itself and hands back another `.` — an
+            // unbounded walk that the depth cap below would eventually turn
+            // into a failed migration rather than a completed one. Skip them.
+            let name = entry.file_name().as_ref();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let outcome = match entry.file_type() {
+                FileType::Dir => {
+                    if dst.create_dir_all(entry.path()).is_err() {
+                        Err(MIGRATE_ERR_MKDIR)
+                    } else {
+                        copy_dir(src, dst, entry.path(), depth + 1)
+                    }
+                }
+                FileType::File => copy_file(src, dst, entry.path(), entry.metadata().len()),
+            };
+            if let Err(code) = outcome {
+                failure = Some(code);
+                break;
+            }
+        }
+        Ok(())
+    });
+    // The callback cannot return the walk's own error code (the closure is
+    // `FnMut` over an iterator the library owns), so the code is carried out by
+    // `failure` and the `Ok(())` above keeps the directory iteration itself
+    // going long enough to record it.
+    failure.map_or_else(
+        || if listed.is_err() { Err(MIGRATE_ERR_LIST) } else { Ok(()) },
+        Err,
+    )
+}
+
+/// Copy one file's bytes across in [`MIGRATE_CHUNK`]-sized pieces.
+///
+/// `size` comes from the source's own metadata and is treated as a bound, not
+/// as a promise: a file that ends early is a copy failure, not a short file.
+/// Silently truncating a private key would leave a credential that reads back
+/// as corrupt much later, on the first signature, with nothing to connect it
+/// back to this boot.
+fn copy_file(
+    src: &dyn DynFilesystem,
+    dst: &dyn DynFilesystem,
+    path: &Path,
+    size: usize,
+) -> Result<(), u8> {
+    // Create the destination first, so a zero-length file still exists on the
+    // far side and a later chunked write has something to open.
+    if dst.write(path, &[]).is_err() {
+        return Err(MIGRATE_ERR_CREATE);
+    }
+    let mut buf = [0u8; MIGRATE_CHUNK];
+    let mut pos = 0usize;
+    let copied = src.open_file_and_then(path, &mut |file| {
+        while pos < size {
+            let read = match file.read(&mut buf) {
+                Ok(0) | Err(_) => return Err(littlefs2_core::Error::IO),
+                Ok(n) => n,
+            };
+            if dst
+                .write_chunk(path, &buf[..read], OpenSeekFrom::Start(pos as u32))
+                .is_err()
+            {
+                return Err(littlefs2_core::Error::IO);
+            }
+            pos += read;
+        }
+        Ok(())
+    });
+    if copied.is_err() {
+        return Err(MIGRATE_ERR_COPY);
     }
     Ok(())
 }
 
-/// Chunk size for the relocation copy: one flash page (`embassy-rp`
+/// Chunk size for the migration copy: one flash page (`embassy-rp`
 /// `PAGE_SIZE = 256`, which is also this driver's [`WRITE_SIZE`]).
 ///
-/// Deliberately a small **stack** buffer. The relocation runs on the boot path
-/// before any task exists, where the main stack zone is 5,056 B — a large
-/// buffer here would be a stack overflow found only on hardware.
-const RELOCATE_CHUNK: usize = WRITE_SIZE;
+/// Deliberately a small **stack** buffer. The migration runs on the boot path
+/// before any task exists, and a buffer sized to a whole block would be 16×
+/// this for no benefit — the destination is flash, so there is nothing to
+/// gain by holding more of it in RAM at once.
+const MIGRATE_CHUNK: usize = WRITE_SIZE;
+
+/// How deep [`copy_dir`] will descend.
+///
+/// Four levels (root + three) is far beyond anything trussed or opcard writes:
+/// a key file sits at `/<client>/<hash>` and the trussed-auth PIN credentials at
+/// `/auth/<hash>`. The cap exists so that a corrupted or hostile directory
+/// cannot turn the boot-path migration into an unbounded walk (S8), and it is
+/// reported rather than silently truncating the copy.
+const MIGRATE_MAX_DEPTH: usize = 3;
+
+/// Migration failure codes. Distinct so a device log says which step failed —
+/// they are the only trace a user with a dead key set will ever see.
+const MIGRATE_ERR_PATH: u8 = 1;
+const MIGRATE_ERR_LIST: u8 = 2;
+const MIGRATE_ERR_MKDIR: u8 = 3;
+const MIGRATE_ERR_CREATE: u8 = 4;
+const MIGRATE_ERR_COPY: u8 = 5;
+const MIGRATE_ERR_DEPTH: u8 = 6;
 
 /// Format + mount one RAM-backed filesystem into its static triple.
 ///
-/// The RAM stores are volatile, so they are **always formatted** at boot
-/// (fresh on every power-up — there is nothing to preserve).
+/// **The volatile store only** (US-1538). It used to build the external store
+/// too, and that is the difference the story exists to remove: a RAM volume
+/// that is reformatted on every boot is the right thing for
+/// `Location::Volatile` and the wrong thing for every other location. It is
+/// **always formatted** here (fresh on every power-up — there is nothing to
+/// preserve), which is exactly why it must not serve `Location::External`.
 ///
 /// The storage is a `MaybeUninit` slot (US-951) rather than a const-initialized
 /// `static`, so the `[0xFF; 32 KiB]` erase fill happens *here* instead of at
@@ -1073,20 +1517,33 @@ pub unsafe extern "C" fn strcpy(dst: *mut i8, src: *const i8) -> *mut i8 {
 // US-711 review finding 2: the factory wipe of the internal FS
 // ---------------------------------------------------------------------------
 
-/// US-711 review finding 2: factory-wipe the trussed internal filesystem —
-/// the OpenPGP PW1 flag + retry counter (opcard state files, trussed-auth
-/// PIN credentials) live here, outside the secure-store slots the RESET
-/// hook deletes. Formats the QSPI window and remounts it factory-fresh,
-/// overwriting the boot-path statics in place (littlefs2 0.8 has no
-/// unmount; the stale mount's RAM bookkeeping is discarded — the same
-/// statics the boot path wrote).
+/// US-711 review finding 2: factory-wipe the trussed filesystems — the
+/// OpenPGP PW1 flag + retry counter (opcard state files, trussed-auth
+/// PIN credentials) live in `ifs`, outside the secure-store slots the
+/// RESET hook deletes. Formats both flash windows and remounts them
+/// factory-fresh, overwriting the boot-path statics in place (littlefs2
+/// 0.8 has no unmount; the stale mount's RAM bookkeeping is discarded —
+/// the same statics the boot path wrote).
+///
+/// # Why `efs` is wiped too (US-1538)
+///
+/// Before this story `efs` was a RAM buffer that a power cycle erased on
+/// its own, so leaving it alone was leaving nothing behind. It is now a
+/// 256 KiB QSPI window, and anything written to `Location::External` — which
+/// is opcard's *default* storage (`vendor/opcard/src/card.rs:569`) — survives
+/// a reset unless this function says otherwise. A factory reset that wiped
+/// `ifs` and left `efs` would hand the next owner the previous owner's keys,
+/// which is the exact failure the RESET hook exists to prevent.
+///
+/// The volatile store is deliberately **not** touched: it is RAM, it is
+/// reformatted on the next boot regardless, and nothing durable lives there.
 ///
 /// # Safety
 /// Device builds only. Single-core serialized (the cooperative
 /// executor): the caller runs on a transport task between commands — no
 /// trussed syscall is in flight (opcard syscalls run synchronously
 /// inside app command processing and hold no open files across
-/// commands), so no other code can touch the IFS statics during the
+/// commands), so no other code can touch the IFS/EFS statics during the
 /// format. The next opcard command lazily re-creates its state in the
 /// fresh filesystem.
 pub fn wipe_internal_fs() -> bool {
@@ -1114,7 +1571,28 @@ pub fn wipe_internal_fs() -> bool {
             }
         };
         (*core::ptr::addr_of_mut!(IFS)).write(ifs);
+
+        // `efs`: same shape, same discipline, same fail-closed contract. It
+        // is a distinct window of the same part, addressed through the alias
+        // `DeviceFsStore::boot` installed, and it is not in flight either —
+        // a trussed request resolves exactly one `Location` at a time and no
+        // syscall is running here.
+        let efs_storage = (*core::ptr::addr_of_mut!(EFS_STORAGE)).as_mut_ptr();
+        if Filesystem::format(&mut *efs_storage).is_err() {
+            defmt::error!("trussed: external FS wipe format failed");
+            return false;
+        }
+        (*core::ptr::addr_of_mut!(EFS_ALLOC)).write(Allocation::new());
+        let efs_alloc = (*core::ptr::addr_of_mut!(EFS_ALLOC)).as_mut_ptr();
+        let efs = match Filesystem::mount(&mut *efs_alloc, &mut *efs_storage) {
+            Ok(efs) => efs,
+            Err(_) => {
+                defmt::error!("trussed: external FS wipe remount failed");
+                return false;
+            }
+        };
+        (*core::ptr::addr_of_mut!(EFS)).write(efs);
     }
-    defmt::info!("trussed: internal FS wiped (factory reset)");
+    defmt::info!("trussed: internal and external FS wiped (factory reset)");
     true
 }

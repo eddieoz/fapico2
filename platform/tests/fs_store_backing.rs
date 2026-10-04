@@ -39,10 +39,27 @@
 //! | [`a_location_resolves_to_the_filesystem_it_is_named_after`] | pass | the trussed mapping, executed |
 //! | [`the_internal_filesystem_is_flash_backed_on_the_device`] | pass | `ifs` = `DevFlashStorage` over the QSPI window |
 //! | [`the_volatile_filesystem_is_ram_on_the_device`] | pass | `vfs` = `RamFsStorage`, and that is *correct* |
-//! | [`external_resolves_to_flash_on_the_device`] | **RED, `#[ignore]`d** | `efs` is still `RamFsStorage` — US-1538 |
+//! | [`external_resolves_to_flash_on_the_device`] | pass | `efs` = `DevEfsStorage` over the QSPI window |
+//! | [`a_legacy_volume_will_not_mount_in_the_split_window`] | pass | why the migration is a **file** copy |
+//! | [`the_split_keeps_ifs_and_efs_disjoint_and_whole`] | pass | the carve tiles the window |
+//! | [`the_split_leaves_ifs_room_for_what_it_carries`] | pass | measured, not asserted |
+//!
+//! # What cannot be asserted from here, and why
+//!
+//! `DeviceFsStore::boot` and `migrate_legacy_window` are `cfg`-gated to
+//! `target_arch = "arm"` and cannot be linked into an x86_64 test, so the first
+//! four rows read `device.rs` as text and the last three **execute the real
+//! littlefs2 C library** over the same geometries the device uses. That
+//! covers the part that is easy to get wrong and silent — littlefs2's refusal
+//! to mount a volume whose geometry does not match its driver — but it is a
+//! model of the migration, not the migration itself. Running it needs a board.
 
 use std::path::{Path, PathBuf};
 
+use littlefs2::driver::Storage;
+use littlefs2::fs::Filesystem;
+use littlefs2::io::OpenSeekFrom;
+use littlefs2::path::{Path as LfsPath, PathBuf as LfsPathBuf};
 use trussed::store::{DynFilesystem, Store};
 use trussed_core::types::Location;
 
@@ -360,9 +377,7 @@ fn the_volatile_filesystem_is_ram_on_the_device() {
     );
 }
 
-/// # US-1537's red, parked until US-1538
-///
-/// **This is the whole reason the story was filed**, and it fails today.
+/// # US-1538's second clause: `External` is flash
 ///
 /// `Location::External` resolves to `efs` (asserted live, above), and on the
 /// RP2350 `efs` is a `RamFsStorage` built by `mount_ram_fs`, which calls
@@ -378,18 +393,9 @@ fn the_volatile_filesystem_is_ram_on_the_device() {
 /// (`apps/openpgp/src/device_shell.rs:123`, gated by
 /// `apps/openpgp/tests/key_storage_location.rs`). That override is
 /// load-bearing and US-1537 exists so the next refactor of `device_shell.rs`
-/// cannot drop it.
-///
-/// US-1538 moves `efs` onto flash. When it does, remove the `#[ignore]`
-/// below; nothing else in this file needs to change.
-///
-/// To watch it fail today:
-///
-/// ```text
-/// cargo test -p fapico2-platform --test fs_store_backing -- --ignored
-/// ```
+/// cannot drop it. US-1538 removes the trap rather than guarding against
+/// stepping on it.
 #[test]
-#[ignore = "RED until US-1538 moves `efs` off `RamFsStorage` onto flash; see the module docs"]
 fn external_resolves_to_flash_on_the_device() {
     let src = device_src();
     let efs = backing_type(&src, "EFS");
@@ -398,9 +404,9 @@ fn external_resolves_to_flash_on_the_device() {
         efs, "RamFsStorage",
         "EFS_STORAGE is declared `MaybeUninit<{efs}>` at {}. `Location::External` resolves to \
          `efs` (trussed-0.2.0/src/store.rs:138) and `vendor/opcard/src/card.rs:569` makes \
-         `External` the opcard default — so today an applet that trusted the default keeps its \
-         keys in RAM, in a filesystem `mount_ram_fs` reformats on every boot. This is the \
-         defect US-1537 was filed for and US-1538 fixes.",
+         `External` the opcard default — so an applet that trusts the default keeps its keys in \
+         RAM, in a filesystem `mount_ram_fs` reformats on every boot. This is the defect US-1537 \
+         was filed for and US-1538 fixes.",
         cite(&src, "static mut EFS_STORAGE:")
     );
 
@@ -417,4 +423,483 @@ fn external_resolves_to_flash_on_the_device() {
          store may still be built that way. `efs` is the external store and must be flash-backed.",
         cite(&src, "fn boot(flash: DevFlash)")
     );
+
+    // …and the new type must actually address a flash window, not be another
+    // name. This is the `ifs` row's "the name is not the proof" argument,
+    // applied to `efs`: a renamed driver that pointed at RAM would sail
+    // through the two assertions above.
+    let efs_impl = block(&src, "impl Storage for DevEfsStorage");
+    assert!(
+        efs_impl.contains("TRUSSED_EFS_OFFSET + off as u32"),
+        "DevEfsStorage's read/write must add the external window's offset ({}). Without it \
+         `DevEfsStorage` is a name, not a location, and a driver pointing at RAM passes the \
+         assertions above. The offset must also come from `crate::flashmap`, not a literal here \
+         — the same rule the `ifs` row enforces.",
+        cite(&src, "impl Storage for DevEfsStorage")
+    );
+    assert!(
+        efs_impl.contains("const BLOCK_COUNT: usize = TRUSSED_EFS_BLOCKS;"),
+        "DevEfsStorage must declare the external window's block count from flashmap ({}); a \
+         block count larger than the window is a second filesystem erasing the first one's \
+         blocks.",
+        cite(&src, "impl Storage for DevEfsStorage")
+    );
+
+    // A flash-backed `efs` that is still *formatted on every boot* would be
+    // the same defect wearing a different hat, so the format has to be
+    // guarded by a mountability probe.
+    let flash_mount = block(&src, "unsafe fn mount_flash_fs");
+    assert!(
+        flash_mount.contains("if !Filesystem::is_mountable("),
+        "mount_flash_fs ({}) formats unconditionally. It is reached by the external store, whose \
+         whole purpose is to survive a power cycle; formatting a flash volume on every boot is \
+         `mount_ram_fs`'s defect with a slower disk behind it.",
+        cite(&src, "unsafe fn mount_flash_fs")
+    );
+    let ram_mount = block(&src, "fn mount_ram_fs");
+    assert!(
+        !ram_mount.contains("is_mountable"),
+        "mount_ram_fs ({}) is now reached by the volatile store only, where an unconditional \
+         format is correct and expected.",
+        cite(&src, "fn mount_ram_fs")
+    );
+}
+
+/// # The fact the whole migration design rests on
+///
+/// Executed against the **real** littlefs2 C library, not asserted from a
+/// comment.
+///
+/// littlefs2 writes `block_count` into the volume superblock and compares it
+/// against the driver's on mount: `lfs.c:4523-4531`, `Invalid block count` →
+/// `LFS_ERR_INVAL`. So a volume formatted at one geometry is **not** a volume
+/// with a truncated tail at a smaller geometry — it is an unmountable one.
+///
+/// That is the whole reason `migrate_legacy_window` copies files rather than
+/// blocks. The byte-copy relocation US-1536 shipped was correct then, because
+/// the window had one geometry; US-1538's split makes `ifs` narrower, and the
+/// same code would erase every OpenPGP key on every provisioned unit at the
+/// `is_mountable` → `format` fall-through.
+///
+/// If this test ever goes red, littlefs2 has learned to mount a volume across
+/// a geometry change, and the migration can be simplified back to a block copy.
+/// Until then it is load-bearing.
+#[test]
+fn a_legacy_volume_will_not_mount_in_the_split_window() {
+    const LEGACY_BLOCKS: usize = 256; // the pre-split window, in full
+
+    // A volume written at the legacy geometry, with a file in it.
+    let legacy_buf = leak_buf(LEGACY_BLOCKS * 4096);
+    {
+        let fs = mount_fs::<LEGACY_BLOCKS>(legacy_buf);
+        fs.create_dir_all(littlefs2::path!("/opcard"))
+            .expect("the legacy volume must accept a directory");
+        fs.write(littlefs2::path!("/opcard/key"), &[0xA7u8; 3000])
+            .expect("the legacy volume must accept a file");
+    }
+
+    // The relocation's byte copy, unchanged: erase the destination **window**
+    // and stream the source's bytes into it. The window is still 256 blocks
+    // after the split — the split partitions it, it does not shorten it — so
+    // the copy is byte-for-byte identical to what US-1536 shipped.
+    let split_buf = leak_buf(LEGACY_BLOCKS * 4096);
+    copy_erased(legacy_buf, split_buf);
+
+    // And then the device declares a driver over the front of that window: the
+    // `ifs` half. 224 is what the 768 KiB / 256 KiB carve in `flashmap.rs`
+    // yields; the test is written against the *ratio* so it keeps its meaning if
+    // the carve moves.
+    const SPLIT_BLOCKS: usize = LEGACY_BLOCKS - (LEGACY_BLOCKS / 8);
+
+    // …and the device's own probe, run against the copy.
+    let storage: &'static mut LeakedStorage<SPLIT_BLOCKS> =
+        Box::leak(Box::new(LeakedStorage::new(split_buf)));
+    assert!(
+        !Filesystem::is_mountable(&mut *storage),
+        "a volume copied byte-for-byte out of a {LEGACY_BLOCKS}-block window mounted in a \
+         {SPLIT_BLOCKS}-block one. littlefs2 pins block_count in the superblock \
+         (lfs.c:4523-4531), so it must refuse — and while it refuses, \
+         `migrate_legacy_window` has to re-create the volume at the new geometry and copy the \
+         *files* across, because the byte copy `DeviceFsStore::boot` would otherwise fall \
+         through to `Filesystem::format` destroys every key on the unit."
+    );
+}
+
+/// The migration's strategy, executed: re-creating the volume at the smaller
+/// geometry and replaying its contents preserves them.
+///
+/// This is a **model** of `migrate_legacy_window` (which is arm-gated and
+/// cannot be linked here), written against the same littlefs2 the device
+/// uses, so the copy it performs is the copy the device performs. What it
+/// cannot prove is that `device.rs` performs it — that needs a board.
+#[test]
+fn the_file_level_migration_preserves_a_populated_legacy_volume() {
+    const LEGACY_BLOCKS: usize = 64;
+    const SPLIT_BLOCKS: usize = 48;
+
+    /// One realistic OpenPGP-shaped payload: a key blob, a sub-key blob and a
+    /// small state file, in a nested directory — the shape trussed writes.
+    fn populate(fs: &dyn DynFilesystem) {
+        // littlefs2's `write` does not create parents; trussed creates them
+        // first (`trussed-0.2.0/src/store.rs:189-190`, `create_directories`),
+        // and so does the migration, which is why the copy can nest.
+        fs.create_dir_all(littlefs2::path!("/opcard/0x9f"))
+            .expect("create dir");
+        fs.write(
+            littlefs2::path!("/opcard/0x9f/key-1"),
+            &[0x11u8; 4096],
+        )
+        .expect("key");
+        fs.write(
+            littlefs2::path!("/opcard/0x9f/key-2"),
+            &[0x22u8; 1500],
+        )
+        .expect("subkey");
+        fs.write(
+            littlefs2::path!("/opcard/0x9f/state"),
+            b"pw1-valid\x00\x03",
+        )
+        .expect("state");
+        // A zero-length file: the case a chunked copy that only writes on read
+        // would silently drop.
+        fs.write(littlefs2::path!("/opcard/0x9f/empty"), &[])
+            .expect("empty");
+    }
+
+    let legacy_buf = leak_buf(LEGACY_BLOCKS * 4096);
+    populate(mount_fs::<LEGACY_BLOCKS>(legacy_buf));
+
+    // …format the destination at the new geometry and copy the tree into it.
+    let split_buf = leak_buf(SPLIT_BLOCKS * 4096);
+    let destination = mount_fs::<SPLIT_BLOCKS>(split_buf);
+    let source = mount_fs::<LEGACY_BLOCKS>(legacy_buf);
+    migrate_for_test(source, destination);
+
+    // Read it back through a *fresh* mount of the destination — a remount, not
+    // the live handle — because "the copy returned Ok" is not the same claim
+    // as "the bytes are in flash".
+    let reopened = mount_fs::<SPLIT_BLOCKS>(split_buf);
+    for (path, expect) in [
+        (
+            littlefs2::path!("/opcard/0x9f/key-1"),
+            Some(vec![0x11u8; 4096]),
+        ),
+        (
+            littlefs2::path!("/opcard/0x9f/key-2"),
+            Some(vec![0x22u8; 1500]),
+        ),
+        (
+            littlefs2::path!("/opcard/0x9f/state"),
+            Some(b"pw1-valid\x00\x03".to_vec()),
+        ),
+        // Present, and empty — the assertion is `exists`, not "reads back".
+        (littlefs2::path!("/opcard/0x9f/empty"), None),
+    ] {
+        assert!(
+            reopened.exists(path),
+            "{path:?} did not survive the migration into the smaller volume. The destination is \
+             a fresh mount, so this is about the bytes, not about a cached handle."
+        );
+        if let Some(expect) = expect {
+            let got = read_all(reopened, path);
+            assert_eq!(
+                got.len(),
+                expect.len(),
+                "{path:?} came back {len} bytes, not the {want} it was written with",
+                len = got.len(),
+                want = expect.len()
+            );
+            assert!(got == expect, "{path:?} came back with different bytes");
+        }
+    }
+
+    // And the source is untouched: a migration that consumed its input would
+    // make a retry after a power cut impossible, which is the property the
+    // read-only `LegacyWindow` storage exists to provide.
+    let still_there = mount_fs::<LEGACY_BLOCKS>(legacy_buf);
+    assert!(
+        still_there.exists(littlefs2::path!("/opcard/0x9f/key-1")),
+        "the legacy volume lost a file during the migration. It must stay readable after a \
+         power cut mid-copy, or the retry has nothing to copy from."
+    );
+}
+
+/// The carve is a split, not a relocation: `ifs` and `efs` must tile the
+/// window exactly, and both must be non-empty.
+///
+/// Read from `flashmap.rs` rather than re-stated, so the numbers the test
+/// checks are the numbers the firmware compiles against. `flashmap.rs` asserts
+/// the same identities at compile time; this one exists because a reader
+/// arriving at `fs_store_backing.rs` should not have to go and find that.
+#[test]
+fn the_split_keeps_ifs_and_efs_disjoint_and_whole() {
+    let map = std::fs::read_to_string(workspace_root().join("platform/src/flashmap.rs"))
+        .expect("platform/src/flashmap.rs");
+    // `TRUSSED_EFS_BLOCKS` is written as the *difference* of two other
+    // constants, which is the point: the window is single-source and the carve
+    // is an expression of it. So the reader resolves identifiers rather than
+    // transcribing numbers, and a carve written as a literal still reads.
+    fn usize_const(map: &str, name: &str) -> usize {
+        let expr = map
+            .lines()
+            .find_map(|l| {
+                let rest = l.trim().strip_prefix(&format!("pub const {name}: usize = "))?;
+                rest.split(';').next().map(str::trim)
+            })
+            .unwrap_or_else(|| panic!("flashmap.rs no longer declares `pub const {name}: usize`"));
+        match expr.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                let (lhs, rhs) = expr
+                    .split_once(" - ")
+                    .unwrap_or_else(|| panic!("flashmap.rs: cannot read {name} = {expr:?}"));
+                usize_const(map, lhs.trim()) - usize_const(map, rhs.trim())
+            }
+        }
+    }
+    let block = usize_const(&map, "BLOCK_SIZE");
+    let window = usize_const(&map, "TRUSSED_FS_BLOCKS");
+    let ifs = usize_const(&map, "TRUSSED_IFS_BLOCKS");
+    let efs = usize_const(&map, "TRUSSED_EFS_BLOCKS");
+
+    assert!(ifs > 0, "ifs must not be empty — it is where the OpenPGP keys live");
+    assert!(efs > 0, "efs must not be empty — it is where `Location::External` now lives");
+    assert_eq!(
+        ifs + efs,
+        window,
+        "ifs ({ifs}) + efs ({efs}) must tile the {window}-block window exactly: a gap is flash \
+         nothing can use, an overlap is two littlefs2 filesystems erasing each other's blocks"
+    );
+    // The order is load-bearing, so assert it rather than assume it: `ifs` is
+    // the front of the window and `efs` the tail. littlefs2 pins `block_count`
+    // in the superblock, so a relocated volume's blocks 0 and 1 (its superblock
+    // pair) must land inside `ifs` — if the carve moved `efs` to the front, the
+    // byte copy would put the metadata pair in the wrong filesystem and
+    // `migrate_legacy_window` would have nothing to mount.
+    assert!(
+        map.contains("pub const TRUSSED_EFS_OFFSET: u32 =\n    TRUSSED_FS_OFFSET + (TRUSSED_IFS_BLOCKS * BLOCK_SIZE) as u32;")
+            || map.contains("TRUSSED_EFS_OFFSET: u32 = TRUSSED_FS_OFFSET + (TRUSSED_IFS_BLOCKS * BLOCK_SIZE) as u32"),
+        "flashmap.rs no longer places the external window immediately after the internal one at \
+         the window's base. `efs` must be the *tail*: the relocated legacy volume's superblock \
+         pair lives at blocks 0 and 1, and littlefs2 refuses a volume whose geometry does not \
+         match its driver, so those blocks have to stay inside `ifs`."
+    );
+}
+
+/// # The capacity half of the carve, measured rather than asserted
+///
+/// `docs/capacity.md` opens by insisting that a number here says where it came
+/// from, and `docs/tasks/EPIC-secure-storage.md` §2 records `ifs` as holding
+/// OpenPGP + PIV with "~770 KB spare" in the 1 MiB window. That is a figure
+/// about keys, not about a filesystem, and the carve in `flashmap.rs` is
+/// justified against it.
+///
+/// This writes a realistic `ifs` payload — one OpenPGP card's worth of key
+/// blobs, at the DER sizes the epic cites (three RSA-4096 private keys, 7–10 KB
+/// each) plus a little state — into a real littlefs2 volume, and reports what
+/// the volume *costs*, metadata and CTZ overhead included. That is the number
+/// the 768 KiB `ifs` has to clear, and it is measured rather than transcribed.
+#[test]
+fn the_split_leaves_ifs_room_for_what_it_carries() {
+    const BLOCKS: usize = 256; // the window the payload is sized against
+    const BLOCK: usize = 4096;
+
+    let buf = leak_buf(BLOCKS * BLOCK);
+    let fs = mount_fs::<BLOCKS>(buf);
+    fs.create_dir_all(littlefs2::path!("/opcard"))
+        .expect("the volume must accept a directory");
+    let before = fs.available_space().expect("a mounted volume reports its free space");
+
+    // Three RSA-4096 private keys at the DER sizes the epic cites, plus the
+    // state files a card keeps beside them.
+    for (path, len) in [
+        (littlefs2::path!("/opcard/key-0"), 10_000usize),
+        (littlefs2::path!("/opcard/key-1"), 8_000),
+        (littlefs2::path!("/opcard/key-2"), 7_000),
+    ] {
+        fs.write(path, &vec![0x5Au8; len])
+            .expect("the volume must accept a maximal key");
+    }
+    fs.write(littlefs2::path!("/opcard/state"), &[0u8; 256])
+        .expect("state");
+
+    let after = fs.available_space().expect("free space after the write");
+    let used = before - after;
+    // Visible with `--nocapture`; the number is the point of the test, so it is
+    // printed rather than only asserted against.
+    println!(
+        "ifs payload: {used} B for 3 RSA-4096 keys (25 KB of DER) + state, littlefs2 \
+         overhead included; carve gives ifs {} B ({}x) and efs {} B",
+        768 * 1024,
+        (768 * 1024) / used,
+        256 * 1024
+    );
+
+    // 768 KiB is what `flashmap.rs` gives `ifs`. Assert the carve against the
+    // measured cost with the epic's own multiple rather than a round number, so
+    // a regression in either the payload or the carve shows up here.
+    const IFS_BYTES: usize = 768 * 1024;
+    assert!(
+        used * 3 < IFS_BYTES,
+        "one OpenPGP card's key set costs {used} B of littlefs2 volume, so three card's worth \
+         ({triple} B) no longer fit `ifs`'s {IFS_BYTES} B. Either the carve is too small or the \
+         payload model above is wrong; both are findings, and the first is a flash decision, not \
+         a test to relax.",
+        triple = used * 3
+    );
+    // …and the whole point of the carve was that `efs` gets real flash too.
+    assert!(
+        used * 3 < IFS_BYTES && 256 * 1024 > used * 3,
+        "the external window (256 KiB) cannot hold three card's worth of keys either ({used} B \
+         each); the carve is sized for one card in `ifs` and a handful in `efs`, not for an \
+         unbounded number of applet keysets"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// littlefs2 helpers for the tests above
+// ---------------------------------------------------------------------------
+
+/// littlefs2 `Storage` over a leaked host buffer at a *fixed* block count.
+///
+/// `mount_fs` is parameterized and leaks everything; these tests need the same
+/// thing but also need to name the block count in a type position (to stand in
+/// for `DevFlashStorage` / `LegacyWindow`, whose geometries differ). Mirrors
+/// `fapico2_platform::trusted_backend::host::BufStorage`, which is not public.
+pub struct LeakedStorage<const BLOCKS: usize> {
+    buf: *mut [u8],
+}
+
+impl<const BLOCKS: usize> LeakedStorage<BLOCKS> {
+    fn new(buf: *mut [u8]) -> Self {
+        Self { buf }
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        // SAFETY: the buffer is leaked for the process lifetime and `&mut self`
+        // admits at most one in-flight driver call, exactly as `BufStorage` in
+        // `trusted_backend::host` does.
+        unsafe { &mut *self.buf }
+    }
+}
+
+impl<const BLOCKS: usize> Storage for LeakedStorage<BLOCKS> {
+    const READ_SIZE: usize = 256;
+    const WRITE_SIZE: usize = 256;
+    const BLOCK_SIZE: usize = 4096;
+    const BLOCK_COUNT: usize = BLOCKS;
+    const BLOCK_CYCLES: isize = -1;
+    type CACHE_SIZE = littlefs2::consts::U256;
+    type LOOKAHEAD_SIZE = littlefs2::consts::U8;
+
+    fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
+        let s = self.buf();
+        buf.copy_from_slice(&s[off..off + buf.len()]);
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, off: usize, data: &[u8]) -> littlefs2::io::Result<usize> {
+        let s = self.buf();
+        s[off..off + data.len()].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
+        let s = self.buf();
+        s[off..off + len].fill(0xFF);
+        Ok(len)
+    }
+}
+
+/// The relocation's old behaviour, reduced to its essence: erase the
+/// destination and stream the source's bytes into it.
+///
+/// Deliberately **not** littlefs2 — it is the raw flash move, which is what
+/// `relocate_copy` used to do on top of the same erase.
+fn copy_erased(src: *mut [u8], dst: *mut [u8]) {
+    // SAFETY: both buffers are leaked for the process lifetime and the host
+    // tests are single-threaded, so the two slices are never live at once.
+    let (src, dst) = unsafe { (&*src, &mut *dst) };
+    dst.fill(0xFF);
+    dst.copy_from_slice(src);
+}
+
+/// Read a file's whole contents out of a mounted volume.
+fn read_all(fs: &dyn DynFilesystem, path: &LfsPath) -> Vec<u8> {
+    let mut out = Vec::new();
+    fs.open_file_and_then(path, &mut |file| {
+        let mut buf = [0u8; 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .expect("the migrated file must open");
+    out
+}
+
+/// The migration [`migrate_legacy_window`] performs, on the host.
+///
+/// Deliberately the same shape as the device code — walk the tree, recreate the
+/// directories, stream each file across in chunks — so a change to one that is
+/// not made to the other shows up as a disagreement rather than as a surprise
+/// on hardware. It is a *model*: what this proves is that the strategy works
+/// against the real littlefs2, not that `device.rs` runs it.
+fn migrate_for_test(src: &dyn DynFilesystem, dst: &dyn DynFilesystem) {
+    let root = LfsPathBuf::try_from("/").expect("root path");
+    copy_dir_for_test(src, dst, root.as_path(), 0)
+}
+
+fn copy_dir_for_test(src: &dyn DynFilesystem, dst: &dyn DynFilesystem, path: &LfsPath, depth: usize) {
+    assert!(depth <= 3, "migration depth cap at {path:?}");
+    let entries: Vec<_> = src
+        .read_dir_and_then(path, &mut |it| {
+            let mut v = Vec::new();
+            for e in it {
+                v.push(e.expect("a readable directory entry"));
+            }
+            Ok(v)
+        })
+        .expect("the source directory must list");
+    for entry in entries {
+        // `.` and `..` are real entries here too, and `DirEntry::path()` is
+        // `parent + "/" + name` (littlefs2-0.8.1/src/fs.rs:1020), so recursing
+        // into `.` walks forever. The device migration skips them for the same
+        // reason; see `copy_dir` in `trusted_backend/device.rs`.
+        let name = entry.file_name().as_ref();
+        if name == "." || name == ".." {
+            continue;
+        }
+        match entry.file_type() {
+            littlefs2::fs::FileType::Dir => {
+                dst.create_dir_all(entry.path()).expect("create dir");
+                copy_dir_for_test(src, dst, entry.path(), depth + 1);
+            }
+            littlefs2::fs::FileType::File => {
+                dst.write(entry.path(), &[]).expect("create file");
+                let size = entry.metadata().len();
+                let mut pos = 0usize;
+                src.open_file_and_then(entry.path(), &mut |file| {
+                    let mut buf = [0u8; 256];
+                    while pos < size {
+                        let n = match file.read(&mut buf) {
+                            Ok(0) | Err(_) => return Ok(()),
+                            Ok(n) => n,
+                        };
+                        dst.write_chunk(
+                            entry.path(),
+                            &buf[..n],
+                            OpenSeekFrom::Start(pos as u32),
+                        )
+                        .expect("write chunk");
+                        pos += n;
+                    }
+                    Ok(())
+                })
+                .expect("the source file must open");
+            }
+        }
+    }
 }
