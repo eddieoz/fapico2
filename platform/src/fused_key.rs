@@ -83,10 +83,30 @@
 //!   ownership. The store's own paths go through [`KeySource::read`] and hold a
 //!   [`FusedRead`]; that trait method remains the by-copy seam.
 //! * The OATH seal (`ckey::OathSeal`, held by `OathApp` in a `static mut` and
-//!   derived once at `firmware/src/boot.rs:1211`) is the second instance of
-//!   this story's anti-pattern and lives entirely in files this story does not
-//!   own (`apps/oath`, `platform/src/ckey.rs`). It cannot be converted here; it
-//!   is the same conversion, and [`FusedKey`] is the type it needs.
+//!   derived once at boot by `boot::derive_oath_seal`) is the second instance
+//!   of this story's anti-pattern, and **US-1572's BDD names it** — so the
+//!   honest status is partial, not deferred. It is not "the same conversion",
+//!   and the difference is structural:
+//!
+//!   [`FusedKey`] fuses **one** `[u8; KEY_LEN]`, re-read per operation through
+//!   a closure. That works for the store key because the store *has a medium
+//!   to read it back from* — its own encrypted image. `OathSeal` has no such
+//!   medium and is not one value: it is a three-field derived struct
+//!   (`ckey.rs:394-402`) — `kenc` and `nonce_key` from two different
+//!   derivations over the same inputs, plus a 16-byte `aad` that is *not* key
+//!   material at all.
+//!
+//!   So the conversion needs a container for a derived **struct** (or three
+//!   fused sources), not a length-generic [`FusedKey`], and every use site in
+//!   `apps/oath` changes from `self.seal.x` to a per-operation handle. That is
+//!   a real piece of work across files this story does not own, and it is not
+//!   taken here rather than taken badly.
+//!
+//!   **What it would buy, stated so the trade is legible:** today the seal
+//!   sits in RAM for one session — 16 bytes plus a nonce root, cleared on drop
+//!   (`ckey.rs:390-393`). The store key's residual is the larger one, and it
+//!   is the one US-1572 closed. Naming the sizes is the point: this is a
+//!   bounded, stated exposure, not an unbounded root key.
 //!
 //! # The zeroize assertion, and how it is made
 //!

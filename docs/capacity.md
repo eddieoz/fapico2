@@ -225,3 +225,35 @@ stamps `Location::Volatile` on a generated private key while the keyref goes to
 flash — a real latent bug, reported with citations and parked as US-1537's
 call rather than fixed inside a tests-only story. What US-1537 *does* deliver
 is the gate: six passing tests that fail if the storage location moves.
+
+## Two stories that shipped partly, and why
+
+Recorded here rather than only in a module doc because this file is versioned
+and already read by the US-1563 gate. Both are **partial, not deferred**, and
+both name the specific thing that is missing rather than gesturing at it.
+
+**US-1572 — no resident session keys.** The store key is done and tested
+(`platform/tests/fused_key.rs`: `each_use_reads_derives_and_drops`,
+`a_store_that_cannot_read_its_key_refuses_rather_than_degrading`). The BDD's
+second half — "the OATH seal derived once and held for the session" becoming a
+per-operation read — is **not** done, and it is not the same conversion:
+
+`FusedKey` fuses **one** `[u8; 32]`, re-read per operation through a closure,
+and that works for the store key because the store has a medium to read it back
+from — its own encrypted image. `OathSeal` has no such medium and is not one
+value: it is a three-field derived struct (`platform/src/ckey.rs:394-402`) —
+`kenc` and `nonce_key` from two different derivations, plus a 16-byte `aad`
+that is not key material at all. Converting it needs a container for a derived
+*struct*, or three sources, and changes every `self.seal.*` use site in
+`apps/oath`. That is a real piece of work in files this story does not own.
+
+What it would buy, so the trade is legible: the seal is 16 bytes plus a nonce
+root, resident for one session and cleared on drop. The store key was the
+larger exposure and is the one US-1572 closed.
+
+**US-1564 — capacity constants derived.** Now fully gated. The corrections
+shipped earlier with nothing testing them; `capacity_boundary.rs`'s
+`the_capacity_document_does_not_present_a_constant_as_a_capacity` now fails if
+a table row re-presents `DEVICE_MAX_CREDS`, `MAX_LOGICAL_LEN` or OATH's 68 as a
+ceiling, **and** requires the caveats to be present — deleting them would
+satisfy a forbidden-wording check while making the document worse.
