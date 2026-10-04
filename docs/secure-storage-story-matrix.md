@@ -107,3 +107,48 @@ mutation-verified — the test named in the row fails when the fix is reverted.
 * [`erase-budget.md`](erase-budget.md) §4c — per-record wear, measured.
 * [`docs/adr/0002-provisioning-policy.md`](adr/0002-provisioning-policy.md),
   [`docs/adr/0003-trustzone.md`](adr/0003-trustzone.md) — US-1567, US-1576.
+## The OATH default access code — what shipped, and the residual
+
+Not part of the 43 stories; it is the resolution of a conflict between two of
+them (US-1553 and the red-team findings) and is recorded here because it changes
+what an OATH device is.
+
+A device provisions the OATH access code **`123456`** at boot — the same default
+the owner already types for OpenPGP's user PIN. SELECT therefore advertises a
+`74` challenge, both `yubikit` and picoforge authenticate, and an
+unauthenticated session is refused `0x6982`.
+
+**Why a default was needed at all.** US-901 granted a session only to a *virgin*
+applet. Both clients decide whether to authenticate from the SELECT response
+alone (`yubikit/oath.py`: `_has_key = self._challenge is not None`;
+picoforge: `info.password_set()`), so on a device holding credentials and no
+access code they skipped VALIDATE and were answered `6982` by every credential
+command — with `SET_CODE` itself behind the same gate, leaving a factory reset
+as the only exit. Relaxing the grant to "no code, no PIN" fixed the clients and
+reopened red-team finding #2 (unauthenticated `LIST` of every credential name
+and `CALC_ALL` of every live TOTP digest).
+
+### The residual, stated plainly
+
+**Until the owner changes it, anyone holding the token who tries `123456` gets
+in.** This is defence in depth *absent*, not present: it is the OpenPGP
+default-PIN posture, adopted because the protection a user relies on is a
+credential they have changed, and a documented default is visible where a hidden
+lockout is not. The owner changes it from either GUI.
+
+### The default is not persisted
+
+`provision_default_access_code` does not mark `dirty`. The value is a constant,
+so a boot that finds no code re-derives it exactly. Persisting it would add a
+store write to the boot path and grow the secure partition on every device for
+no behavioural difference — and that growth is observable:
+`test_rescue_read.py` asserts `FlashInfo.used` equals the partition file's
+length. An owner-chosen code *is* persisted; `cmd_set_code` sets `dirty` itself.
+
+### Evidence
+
+| Property | Where |
+|---|---|
+| Both GUIs authenticate and manage OATH | `oath_keyregion.rs::a_device_with_no_access_code_is_usable_on_both_paths` (host); `test_070_oath.py::test_a_credential_survives_a_new_session_without_an_access_code` (raw CCID wire) |
+| Unauthenticated session is still refused | `test_redteam.py::test_oath_unauth_dump_refused`, `::test_oath_unauth_tamper_refused` — 5 passed, 0 failed |
+| The default is what closes it | mutation: removing provisioning → 3 failed; wrong default → 13 of 14 emulator OATH tests fail |
