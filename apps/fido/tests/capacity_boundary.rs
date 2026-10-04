@@ -60,13 +60,12 @@ use fapico2_fido::device_keystore::{
     DevicePinState, PrivateScalar, RegionCredentialError, RegionCredentials, RegionKeys,
 };
 use fapico2_platform::keyregion::crypto;
-use fapico2_platform::keyregion::fido_store::FidoStoreError;
 use fapico2_platform::keyregion::host::FileKeyRegion;
 use fapico2_platform::keyregion::on_demand::CredentialWindow;
 use fapico2_platform::keyregion::record;
 use fapico2_platform::keyregion::slotmap::{is_erased, SlotImage};
 use fapico2_platform::keyregion::{
-    commit, KeyRegion, Slot, SlotRead, FIDO_CAPACITY, FIDO_RECORD_MAX, FIDO_SLOT_LIMIT,
+    KeyRegion, Slot, SlotRead, FIDO_CAPACITY, FIDO_RECORD_MAX, FIDO_SLOT_LIMIT,
     SLOTS_PER_SECTOR, TOTAL_SLOTS,
 };
 
@@ -163,19 +162,6 @@ fn keys() -> RegionKeys {
     }
 }
 
-/// The applet's PIN secret, recomputed so a delete/put cycle in one test uses
-/// the same key twice — a test that silently re-derived a *different* key would
-/// see every lookup fail and could mistake that for a delete bug.
-fn keys_for(pin_state: &DevicePinState, device_random: &[u8; 32]) -> RegionKeys {
-    let row = otp_row();
-    let root = crypto::derive_otp_root(&row, &chip_id()).expect("a non-zero OTP row");
-    let secret = region_pin_secret(pin_state, device_random);
-    RegionKeys {
-        index: crypto::derive_index_key_from_root(&root),
-        payload: crypto::derive_payload_key_from_root(&root, &secret),
-    }
-}
-
 /// A fresh GCM nonce for the `n`-th write.
 ///
 /// Unique per write, which `record::seal` requires and this file holds itself to
@@ -185,7 +171,7 @@ fn keys_for(pin_state: &DevicePinState, device_random: &[u8; 32]) -> RegionKeys 
 /// equivalent.
 fn nonce(n: u32) -> [u8; record::NONCE_LEN] {
     let mut out = [0u8; record::NONCE_LEN];
-    out[..4].copy_from_slice(&(n as u32).to_le_bytes());
+    out[..4].copy_from_slice(&n.to_le_bytes());
     out[4..].copy_from_slice(&b"us1563nonce!!"[..record::NONCE_LEN - 4]);
     out
 }

@@ -312,7 +312,7 @@ fn fill_fido(probe: &Probe, key: &PayloadKey) {
     let mut i = FIDO_FIRST_SLOT;
     while filled < FIDO_CAPACITY {
         assert!(
-            (i as u32) < FIDO_FIRST_SLOT + FIDO_CAPACITY,
+            i < FIDO_FIRST_SLOT + FIDO_CAPACITY,
             "ran out of slots with {filled} of {FIDO_CAPACITY} filled — FIDO's reservation does \
              not start where this story says it does"
         );

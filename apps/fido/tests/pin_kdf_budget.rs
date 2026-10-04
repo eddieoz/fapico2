@@ -662,10 +662,12 @@ fn the_legacy_migration_window_is_a_single_comparison_and_it_gates_admission() {
     );
     // Release 0 shipped the raised count with the window open, so grace cannot
     // be revoked from it (a `const _` assertion in crypto.rs).
-    assert!(
-        crypto::PIN_VERIFIER_LEGACY_GRACE_RELEASE >= 1,
-        "grace release 0 is not revocable"
-    );
+    const {
+        assert!(
+            crypto::PIN_VERIFIER_LEGACY_GRACE_RELEASE >= 1,
+            "grace release 0 is not revocable"
+        );
+    }
 
     // While the window is open, a legacy record is admitted...
     assert!(

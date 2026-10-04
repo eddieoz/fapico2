@@ -283,7 +283,7 @@ fn thirty_one_assertions_erase_nothing_and_the_thirty_second_costs_one_live_sect
     let _guard = lock();
     let (region_file, mut device) = region_device("erase-profile");
     let keys = keys_of(&mut device);
-    for n in 0..SLOTS_PER_SECTOR as u32 {
+    for n in 0..SLOTS_PER_SECTOR {
         enrol(&region_file, &keys, n);
     }
     let (target, _) = record_of(&region_file, &keys, 0);

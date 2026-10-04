@@ -195,7 +195,7 @@ fn load_phy_agrees_with_a_full_load_in_every_state() {
         ("a fully-populated record", full),
     ] {
         let mut ks = fresh_keystore();
-        ks.phy = phy.clone();
+        ks.phy = phy;
         ks.vendor = populated();
         let mut store = fapico2_platform::secure_store::HostSecureStore::new();
         assert!(ks.persist(&mut store).is_ok(), "{what} must persist");

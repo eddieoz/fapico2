@@ -101,7 +101,7 @@ fn keys() -> RegionKeys {
 
 fn nonce(n: u32) -> [u8; record::NONCE_LEN] {
     let mut out = [0u8; record::NONCE_LEN];
-    out[..4].copy_from_slice(&(n as u32).to_le_bytes());
+    out[..4].copy_from_slice(&n.to_le_bytes());
     out[4..].copy_from_slice(&b"us1556nonce!!"[..record::NONCE_LEN - 4]);
     out
 }
@@ -368,7 +368,7 @@ fn a_delete_advances_the_generation_so_the_tombstone_cannot_be_replayed() {
 /// would be a claim the device cannot make.
 #[test]
 fn a_full_region_and_an_unreachable_region_are_different_answers() {
-    let (_tmp, mut region) = fresh("distinct");
+    let (_tmp, _region) = fresh("distinct");
 
     // Unreachable: every read fails.
     let mut broken = FileKeyRegion::open(_tmp.path()).expect("reopen");
@@ -402,10 +402,12 @@ fn a_full_region_and_an_unreachable_region_are_different_answers() {
     // `capacity_boundary.rs` measures `Full` at the real boundary, and this test
     // measures `Unreachable` for a sick region. Both are `0x28`-shaped answers
     // that must not be confused.
-    assert!(
-        FIDO_CAPACITY > 0,
-        "a capacity of zero would make the Full arm of this test unreachable"
-    );
+    const {
+        assert!(
+            FIDO_CAPACITY > 0,
+            "a capacity of zero would make the Full arm of this test unreachable"
+        );
+    }
 }
 
 /// **A tombstone cannot be mistaken for a credential** — the property the
@@ -438,7 +440,7 @@ fn a_tombstone_is_not_a_credential_and_an_erased_slot_is_not_a_tombstone() {
     // this is why — an erased slot reads as all-`0xFF`, which is the same byte
     // pattern, and treating the two as one would make "never written" and
     // "deleted" indistinguishable to a caller counting live credentials.
-    let mut erased = [0xFFu8; 64];
+    let erased = [0xFFu8; 64];
     assert!(
         !is_deleted_body(&erased),
         "an erased slot must not read as a tombstone — the check is on opened plaintext"
@@ -477,7 +479,7 @@ fn a_delete_finds_its_credential_without_being_told_the_relying_party() {
         for n in 0..9u32 {
             creds.put(&nonce(n), &credential(n, true)).expect("enrol");
         }
-        let report = creds
+        let _report = creds
             .delete(&nonce(50), &credential_id(7))
             .expect("a by-ID delete with no rp_id_hash must find its credential");
         assert_eq!(creds.used(), Some(8));
@@ -706,12 +708,13 @@ fn setting_a_pin_does_not_invalidate_credentials_enrolled_without_one() {
     };
     let mut creds = RegionCredentials::new(&mut region, &no_pin_keys);
     creds.put(&nonce(1), &credential(1, true)).expect("enrol on a PIN-less device");
-    drop(creds);
 
     // The user sets a PIN.
-    let mut with_pin = DevicePinState::default();
-    with_pin.pin_hash = Some([0x77; 16]);
-    with_pin.pin_salt = Some([0x31; 16]);
+    let with_pin = DevicePinState {
+        pin_hash: Some([0x77; 16]),
+        pin_salt: Some([0x31; 16]),
+        ..DevicePinState::default()
+    };
     let after_pin = {
         let row = otp_row();
         let root = crypto::derive_otp_root(&row, &chip_id()).unwrap();

@@ -391,7 +391,6 @@ impl Dev {
     /// and `enumerateRpsBegin`, `subCommand ‖ CBOR(subCommandParams)` for
     /// everything else" and that rule belongs in the parity script's shape, not
     /// in a second implementation of it here.
-
     fn cm(&mut self, subcommand: u8, params: Option<Value>) -> (u8, Vec<u8>) {
         let mut auth_msg: Vec<u8> = vec![subcommand];
         if let Some(p) = params.as_ref() {

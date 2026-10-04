@@ -64,6 +64,10 @@ use trussed::store::{DynFilesystem, Store};
 use trussed_core::types::Location;
 
 use fapico2_platform::trusted_backend::host::{leak_buf, mount_fs, HostStore};
+use fapico2_platform::flashmap::{BLOCK_SIZE, TRUSSED_EFS_BLOCKS};
+
+/// The external window's size, read from the carve rather than restated.
+const TRUSSED_EFS_BYTES: usize = TRUSSED_EFS_BLOCKS * BLOCK_SIZE;
 
 /// The device store this file is about. `cfg(target_arch = "arm")`, so it is
 /// read, never linked — see the module docs.
@@ -657,7 +661,6 @@ fn the_split_keeps_ifs_and_efs_disjoint_and_whole() {
             }
         }
     }
-    let block = usize_const(&map, "BLOCK_SIZE");
     let window = usize_const(&map, "TRUSSED_FS_BLOCKS");
     let ifs = usize_const(&map, "TRUSSED_IFS_BLOCKS");
     let efs = usize_const(&map, "TRUSSED_EFS_BLOCKS");
@@ -747,12 +750,18 @@ fn the_split_leaves_ifs_room_for_what_it_carries() {
          a test to relax.",
         triple = used * 3
     );
-    // …and the whole point of the carve was that `efs` gets real flash too.
+    // …and the whole point of the carve was that `efs` gets real flash too. This
+    // is stated against `efs`'s **own** window rather than as a second clause of the
+    // assertion above: `ifs` is 768 KiB and `efs` 256 KiB, so a conjunct repeating
+    // the `ifs` bound would be subsumed by it and would only look like a second
+    // check. Read the carve rather than restating 256 KiB, so a future re-split
+    // has to re-answer the question instead of passing on a stale literal.
+    let efs_bytes = TRUSSED_EFS_BYTES;
     assert!(
-        used * 3 < IFS_BYTES && 256 * 1024 > used * 3,
-        "the external window (256 KiB) cannot hold three card's worth of keys either ({used} B \
-         each); the carve is sized for one card in `ifs` and a handful in `efs`, not for an \
-         unbounded number of applet keysets"
+        used * 3 < efs_bytes,
+        "the external window ({efs_bytes} B) cannot hold three card's worth of keys either \
+         ({used} B each); the carve is sized for one card in `ifs` and a handful in `efs`, not \
+         for an unbounded number of applet keysets"
     );
 }
 
