@@ -667,9 +667,16 @@ impl FidoApp {
     /// snapshot leaves the in-RAM record untouched rather than clearing it —
     /// a failed read is not evidence of an absent record).
     pub fn sync_phy(&mut self, store: &mut dyn SecureStore) -> bool {
-        match DeviceKeystore::load(store) {
-            Ok(Some(ks)) => {
-                self.keystore.phy = ks.phy;
+        // `load_phy`, not `load(store).map(|ks| ks.phy)`: this runs inside the
+        // HID task's per-command generation check, and binding a 12-KiB
+        // `DeviceKeystore` in order to read one ~40-byte record cost 19,904 B
+        // of that task's poll frame. `DeviceKeystore::load_phy`'s doc comment
+        // carries the measurement and the reason a droppable keystore cannot
+        // be elided; it enforces the same accept/reject rules, one credential
+        // at a time, and never builds the array.
+        match DeviceKeystore::load_phy(store) {
+            Some(phy) => {
+                self.keystore.phy = phy;
                 true
             }
             _ => false,

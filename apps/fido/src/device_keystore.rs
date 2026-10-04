@@ -911,8 +911,8 @@ impl DeviceCredential {
         let mut raw_large_blob: Option<&[u8]> = None;
         let mut raw_hmac: Option<&[u8]> = None;
         for _ in 0.. {
-            let key_num = match p.next().ok()? {
-                Item::U(k) => k,
+            let key_num = match p.next() {
+                Ok(Item::U(k)) => k,
                 _ => return None,
             };
             match key_num {
@@ -1553,6 +1553,13 @@ impl DeviceKeystore {
     /// A rejection sampler (`p256::SecretKey::random`) has the opposite
     /// symptom — it loops rather than yielding zeros — and was fixed
     /// separately under US-1007. Both are real; only this one is silent.
+    ///
+    /// `#[inline(never)]` because the value is a 12-KiB `DeviceKeystore`
+    /// and `boot_in_place` binds one to hold the result: inlined, its
+    /// `VendorState::default` (~2,700 B) and the struct literal land in the
+    /// caller's frame on top of it. Measured on this tree, outlining it
+    /// took the async-main boot chain from 101,756 B to 99,028 B.
+    #[inline(never)]
     pub fn fresh<R: fapico2_platform::trng::Trng>(
         trng: &mut R,
     ) -> Result<Self, fapico2_platform::trng::TrngError> {
@@ -1661,10 +1668,134 @@ impl DeviceKeystore {
         // is a SECOND copy of it on the stack (measured — the boot chain grew
         // by exactly one keystore, 91,964 -> 106,048 B, and `load`'s own
         // frame went to 57 KB), and the return value has to be moved into the
-        // caller's slot regardless. `decode` builds the value once, in place.
-        Self::decode(&bytes[..n], key.as_ref(), Decode::Restore)
-            .ok_or(SecureStoreError::Corrupt)
-            .map(Some)
+        // caller's slot regardless. `decode_into` builds the value once, in
+        // place — including the credential array, which is the other copy
+        // that used to sit inside `decode`'s frame (8,640 B of reservation for
+        // however many credentials are present).
+        let mut out = None;
+        if !Self::decode_into(&bytes[..n], key.as_ref(), Decode::Restore, &mut out) {
+            return Err(SecureStoreError::Corrupt);
+        }
+        Ok(out)
+    }
+
+    /// Read **only** the physical-config record (auth-map key 6) out of the
+    /// stored snapshot, without ever building a [`DeviceKeystore`].
+    ///
+    /// # Why this exists rather than `load(store)?.map(|ks| ks.phy)`
+    ///
+    /// US-1550 made `DeviceCredential::private_key` a `PrivateScalar`, which
+    /// zeroizes on drop — and drop glue is contagious: it gives
+    /// `DeviceCredential` a `Drop`, and therefore `DeviceKeystore` one too. A
+    /// droppable 12-KiB value is no longer a `memcpy` a compiler may elide
+    /// into its destination, so every frame that *binds* one reserves one.
+    /// Measured on this tree: removing the drop glue alone took
+    /// `hid_task`'s poll frame from 29,344 B to 16,096 B and the boot chain
+    /// from 101,756 B to 91,444 B — the whole of this epic's regression, with
+    /// the zeroization left in place.
+    ///
+    /// The victim was `FidoApp::sync_phy`, called from the HID task's
+    /// per-command generation check (`firmware/src/tasks.rs`'s
+    /// `DeviceFido::sync_generations`). It wanted a ~40-byte `PhyConfig` and
+    /// paid a 12-KiB keystore for it: that one `let ks = ...` was 19,904 B of
+    /// the poll frame (27,616 B → 7,712 B once it stopped being materialized).
+    ///
+    /// **Not a shortcut on validation.** The walk below is `decode`'s own
+    /// top-level scan and `decode_auth` unchanged — so every sealed-field,
+    /// out-of-range and unknown-key rule is enforced exactly as a full load
+    /// enforces it — and each credential is decoded and dropped. The only
+    /// difference from `load` is that no
+    /// `HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS>` is ever built: peak
+    /// scratch is one 720-byte `DeviceCredential` instead of twelve, and no
+    /// keystore at all.
+    ///
+    /// `None` means exactly what `sync_phy` already read as "nothing to
+    /// adopt": no snapshot in the slot, or one this build refuses to parse.
+    /// It is deliberately **not** an error — refusing to adopt leaves the
+    /// in-RAM copy alone, which is the fail-safe direction
+    /// (`sync_phy`'s own doc comment).
+    pub fn load_phy(store: &mut dyn SecureStore) -> Option<crate::vendorff::PhyConfig> {
+        Self::scan_phy(store).map(|(_, _, _, _, _, phy, _)| phy)
+    }
+
+    /// The scan behind [`Self::load_phy`]: the whole-document walk plus
+    /// `decode_auth`, with the credentials validated and discarded.
+    ///
+    /// `#[inline(never)]` for the same reason `load` and `decode` carry it —
+    /// its scratch is the 5,952-byte chunked buffer and `decode_auth`'s
+    /// bounded one, and inlining that into the HID poll would fold ~10 KiB of
+    /// decode scratch into the async frame.
+    #[inline(never)]
+    fn scan_phy(store: &mut dyn SecureStore) -> Option<AuthParts> {
+        if !chunked::contains_chunked(store, KEYSTORE_SLOT) {
+            return None;
+        }
+        let mut bytes = [0u8; chunked::MAX_LOGICAL_LEN];
+        let n = chunked::read_chunked(store, KEYSTORE_SLOT, &mut bytes).ok()?;
+        let key = store.store_key();
+
+        // Pass 0 — `decode`'s own scan, rule for rule: the sealed flag has to
+        // be known before any field is opened, and a sealed document with no
+        // store key is unopenable.
+        let mut p = Parser::new(&bytes[..n]);
+        let n_entries = match p.next().ok()? {
+            Item::Map(n) if (1..=2).contains(&n) => n,
+            _ => return None,
+        };
+        let mut sealed = false;
+        let mut auth_b: Option<&[u8]> = None;
+        let mut creds_b: Option<&[u8]> = None;
+        for _ in 0..n_entries {
+            let key_num = match p.next() {
+                Ok(Item::U(k)) => k,
+                _ => return None,
+            };
+            match key_num {
+                1 => {
+                    let Item::Array(3) = p.next().ok()? else { return None };
+                    // `max_creds` is checked for shape only. Its bound is
+                    // `decode`'s business, and this reader has no array to
+                    // bound — reading a value it cannot use would make a
+                    // perfectly good `phy` unreadable.
+                    let Item::B(_) = p.next().ok()? else { return None };
+                    let Item::B(b) = p.next().ok()? else { return None };
+                    auth_b = Some(b);
+                    let Item::B(b) = p.next().ok()? else { return None };
+                    creds_b = Some(b);
+                }
+                snapshot_crypt::SEALED_MARKER_KEY => {
+                    match p.next() {
+                        Ok(Item::U(u)) if u == snapshot_crypt::SEALED_MARKER_VALUE => {}
+                        _ => return None,
+                    }
+                    sealed = true;
+                }
+                _ => return None,
+            }
+        }
+        if p.remaining() != 0 || auth_b.is_none() {
+            return None;
+        }
+        if sealed && key.is_none() {
+            // The same refusal `decode` makes: a sealed snapshot with no
+            // store key cannot be opened.
+            return None;
+        }
+        let auth = Self::decode_auth(auth_b?, key.as_ref(), sealed)?;
+        // Each credential is decoded and immediately dropped. This is what
+        // keeps `load`'s "one unopenable credential fails the whole snapshot"
+        // rule without holding more than one of them at a time — the vector is
+        // the 8,640 bytes, and it is the vector this reader refuses to build.
+        let mut q = Parser::new(creds_b?);
+        let count = match q.next().ok()? {
+            Item::Array(n) => n,
+            _ => return None,
+        };
+        for _ in 0..count {
+            let Item::B(c) = q.next().ok()? else { return None };
+            let _ = DeviceCredential::decode(c, key.as_ref(), sealed)?;
+        }
+        Some(auth)
     }
 
     /// Parse a snapshot in the host `fido.keystore.v1` CBOR map format:
@@ -1700,55 +1831,61 @@ impl DeviceKeystore {
     /// are on top of it, so inlining this into a caller that also holds one
     /// would put two on the stack at once.
     #[inline(never)]
-    fn decode(bytes: &[u8], key: Option<&[u8; 32]>, mode: Decode) -> Option<Self> {
+    fn decode_into(
+        bytes: &[u8],
+        key: Option<&[u8; 32]>,
+        mode: Decode,
+        out: &mut Option<Self>,
+    ) -> bool {
         let (slack, counter_unpersisted) = mode.slack_and_window();
         // Pass 0 — scan the top-level map (1 or 2 entries, either key
         // order) so the sealed flag is known before any credential is
         // decoded. The borrowed slices survive the pass (zero-copy).
         let mut p = Parser::new(bytes);
-        let n_entries = match p.next().ok()? {
-            Item::Map(n) if (1..=2).contains(&n) => n as usize,
-            _ => return None,
+        let n_entries = match p.next() {
+            Ok(Item::Map(n)) if (1..=2).contains(&n) => n as usize,
+            _ => return false,
         };
         let mut sealed = false;
         let mut max_b: Option<&[u8]> = None;
         let mut auth_b: Option<&[u8]> = None;
         let mut creds_b: Option<&[u8]> = None;
         for _ in 0..n_entries {
-            let key_num = match p.next().ok()? {
-                Item::U(k) => k,
-                _ => return None,
+            let key_num = match p.next() {
+                Ok(Item::U(k)) => k,
+                _ => return false,
             };
             match key_num {
                 1 => {
-                    let Item::Array(3) = p.next().ok()? else { return None };
-                    let Item::B(b) = p.next().ok()? else { return None };
+                    let Ok(Item::Array(3)) = p.next() else { return false };
+                    let Ok(Item::B(b)) = p.next() else { return false };
                     max_b = Some(b);
-                    let Item::B(b) = p.next().ok()? else { return None };
+                    let Ok(Item::B(b)) = p.next() else { return false };
                     auth_b = Some(b);
-                    let Item::B(b) = p.next().ok()? else { return None };
+                    let Ok(Item::B(b)) = p.next() else { return false };
                     creds_b = Some(b);
                 }
                 snapshot_crypt::SEALED_MARKER_KEY => {
-                    match p.next().ok()? {
-                        Item::U(u) if u == snapshot_crypt::SEALED_MARKER_VALUE => {}
-                        _ => return None,
+                    match p.next() {
+                        Ok(Item::U(u)) if u == snapshot_crypt::SEALED_MARKER_VALUE => {}
+                        _ => return false,
                     }
                     sealed = true;
                 }
-                _ => return None,
+                _ => return false,
             }
         }
         if p.remaining() != 0 || max_b.is_none() {
-            return None;
+            return false;
         }
         if sealed && key.is_none() {
             // A sealed snapshot without its store key cannot be opened.
-            return None;
+            return false;
         }
         let max_creds = {
-            let mut q = Parser::new(max_b?);
-            match q.next().ok()? {
+            let Some(max_b) = max_b else { return false };
+            let mut q = Parser::new(max_b);
+            match q.next() {
                 // The snapshot's own bound, not the store's capacity: this is
                 // a whole-image CBOR document, so the array it decodes into is
                 // sized by the chunked slot's payload. Reading `maxCreds` from
@@ -1760,32 +1897,31 @@ impl DeviceKeystore {
                 // by a build with a different `maxCreds` cannot leave this one
                 // advertising a capacity it will not honour on the wire
                 // (`DeviceKeystore::fresh`, and AGENTS.md §4).
-                Item::U(u) => (u as usize).min(SNAPSHOT_MAX_CREDS),
-                _ => return None,
+                Ok(Item::U(u)) => (u as usize).min(SNAPSHOT_MAX_CREDS),
+                _ => return false,
             }
         };
+        let Some(auth_b) = auth_b else { return false };
         let (pin_state, cred_counter, device_random, large_blob_array, vault_state, phy, vendor) =
-            Self::decode_auth(auth_b?, key, sealed)?;
-        let mut creds: HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS> = HeaplessVec::new();
-        let mut q = Parser::new(creds_b?);
-        let n = match q.next().ok()? {
-            Item::Array(n) => n,
-            _ => return None,
-        };
-        for _ in 0..n {
-            let Item::B(c) = q.next().ok()? else { return None };
-            creds.push(DeviceCredential::decode(c, key, sealed)?).ok()?;
-        }
-        // US-1012's slack, folded in here so the value is built once (see
-        // `load`). `0` from `from_cbor`: nothing granted, nothing spent, the
-        // stored bytes as they are.
-        let cred_counter = cred_counter.saturating_add(slack);
-        for c in &mut creds {
-            c.counter = c.counter.saturating_add(slack);
-        }
-        Some(Self {
+            match Self::decode_auth(auth_b, key, sealed) {
+                Some(parts) => parts,
+                None => return false,
+            };
+        // Credentials go **straight into their destination** rather than
+        // through a local `HeaplessVec` (US-951: the boot chain carries three
+        // copies of a 12-KiB keystore, and this one is pure duplication —
+        // `HeaplessVec<DeviceCredential, SNAPSHOT_MAX_CREDS>` is 8,640 B of
+        // reservation for however many credentials are actually present).
+        //
+        // The value is written whole, and only once every fallible step before
+        // it has succeeded, so there is exactly one failure window left — the
+        // credential loop — and it ends by putting `*out` back to `None`. A
+        // half-built keystore can never escape: `Option`'s `None` is a state
+        // that needs no initialization, and dropping it runs no
+        // `DeviceCredential::drop` over uninitialized memory.
+        *out = Some(Self {
             pin_state,
-            credentials: creds,
+            credentials: HeaplessVec::new(),
             cred_counter,
             device_random,
             large_blob_array,
@@ -1817,7 +1953,80 @@ impl DeviceKeystore {
             // never *repeat*, never that it advance by one), and the cost is one
             // spare counter value on a credential that has no history to repeat.
             counter_window: CounterWindow::restored(),
-        })
+        });
+        // The credential loop — the only remaining fallible step, and the one
+        // the block scope exists for: the `&mut` borrow of `*out` has to end
+        // before a failure can put it back to `None`.
+        let ok = {
+            let Some(ks) = out.as_mut() else {
+                return false;
+            };
+            let Some(creds_b) = creds_b else { return false };
+            let mut q = Parser::new(creds_b);
+            let mut ok = true;
+            let n = match q.next() {
+                Ok(Item::Array(n)) => n,
+                _ => {
+                    ok = false;
+                    0
+                }
+            };
+            for _ in 0..n {
+                if !ok {
+                    break;
+                }
+                let cred = match q.next() {
+                    Ok(Item::B(c)) => match DeviceCredential::decode(c, key, sealed) {
+                        Some(v) => v,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                if ks.credentials.push(cred).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            // US-1012's slack, folded in here so the value is built once (see
+            // `load`). `0` from `from_cbor`: nothing granted, nothing spent,
+            // the stored bytes as they are.
+            if ok {
+                ks.cred_counter = ks.cred_counter.saturating_add(slack);
+                for c in &mut ks.credentials {
+                    c.counter = c.counter.saturating_add(slack);
+                }
+            }
+            ok
+        };
+        if !ok {
+            *out = None;
+            return false;
+        }
+        true
+    }
+
+    /// [`Self::decode_into`] in value position: the by-value form, for the
+    /// callers that genuinely want a `DeviceKeystore` back.
+    ///
+    /// Only `from_cbor` uses this — the host interchange decoder, which is not
+    /// on the boot chain. `load` calls `decode_into` directly so that the
+    /// credentials are built into the slot `load` already has to own, rather
+    /// than through a second 8,640-byte vector that `decode_into`'s caller
+    /// would then have to hold alongside it.
+    #[inline(never)]
+    fn decode(bytes: &[u8], key: Option<&[u8; 32]>, mode: Decode) -> Option<Self> {
+        let mut out = None;
+        if Self::decode_into(bytes, key, mode, &mut out) {
+            out
+        } else {
+            None
+        }
     }
 
     /// auth map: `{1?: pin, 2?: cred_counter, 3?: large_blob_array,
@@ -1825,6 +2034,21 @@ impl DeviceKeystore {
     /// under `key` when `sealed`; ANY open failure fails the whole snapshot
     /// (`None` = Corrupt, fatal per FX-440) — the stateless master is never
     /// garbage.
+    ///
+    /// `#[inline(always)]`, against the grain, because of what a **second**
+    /// call site does to the boot chain. `scan_phy` reads the same auth map
+    /// (see `load_phy`), and with one caller LLVM folds this body into
+    /// `decode_into` — where its scratch overlaps the caller's live state and
+    /// costs nothing extra. With two callers it stops folding, becomes its own
+    /// 13,368-byte frame, and that frame is *added* to the chain rather than
+    /// merged: measured, the async-main boot chain went 91,120 B -> 102,172 B,
+    /// over the 98,304 B ceiling.
+    ///
+    /// That is the same trade the `#[inline(never)]`s above make in the other
+    /// direction, and it is worth stating plainly because it is not a
+    /// readability choice: a third caller, or an LLVM that stops honouring the
+    /// attribute, puts the gate red again with the fix intact in the source.
+    #[inline(always)]
     fn decode_auth(
         bytes: &[u8],
         key: Option<&[u8; 32]>,
@@ -1851,8 +2075,8 @@ impl DeviceKeystore {
         // US-911: one bounded scratch serves every sealed field open.
         let mut scratch = [0u8; MAX_FIELD_PT + FIELD_OVERHEAD];
         for _ in 0.. {
-            let key_num = match p.next().ok()? {
-                Item::U(k) => k,
+            let key_num = match p.next() {
+                Ok(Item::U(k)) => k,
                 _ => return None,
             };
             match key_num {
