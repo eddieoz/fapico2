@@ -8,30 +8,34 @@ both twins and answers `InvalidSubcommand` (0x3E) immediately — no presence
 window — matching the C reference's fall-through at
 `pico-fido2/src/fido/cbor_client_pin.c:909`. GetInfo is unchanged. See
 `.superpowers/sdd/report-0x06-refusal.md`.)
-**US-1536/1539/1540 — the flash map and the key region.** `text` 817,960 →
-**818,476 B** (+516 B: `flashmap` and `keyregion` geometry, their compile-time
-assertions, and the trussed-window relocation); `.rodata` 18,716 → 18,732 B
-(+16 B); Berkeley `.bss` **421,768 B (0)**; RAM statics **421,964 B (0)**; main
-stack zone **110,512 B (0)**.
+**US-1544/1545/1546, US-1547-1554, US-1552/1553/1557/1572 — the key region.**
+`text` 817,960 → **838,348 B**; `.rodata` 18,732 → 19,244 B. UF2 **3073 → 3150
+blocks**, 1,573,248 → **1,612,800 bytes**. Shipping sha256 → **`c8c9c57867ea…`**.
 
-**bss did not move, and that was not free.** The first cut added an `offset:
-u32` field to `DevFlashStorage` so the relocation could address two windows,
-which grew `IFS_STORAGE` from 2 to 8 bytes and `.bss` to 421,776 — on a board
-with 4 bytes of unallocated SRAM in total, where DARK-BOOT-1 established that
-bss growth moves `MSPLIM` and shrinks the main stack. Replacing it with a
-stack-only `LegacyWindow` that borrows the flash put `.bss` back at exactly
-420,744 raw / 421,768 Berkeley. Measured against a clean build of 4132c5f:
-`.bss` 420,744 → 420,744, `.text` 766,108 → 766,484.
+**RAM is the number that matters here, and it went down.**
 
-**The linker's reach moved, and that is the real change.** `FLASH LENGTH` went
-from 4,032 KiB to 2,048 KiB, with TRUSSED and KEYREGION declared between the
-firmware and the secure partition. A firmware image that grows into a
-persistent region is now a **link error** rather than something only this gate
-and the CI ratchet stand between — see `platform/src/flashmap.rs`.
+| | pre-epic (`4132c5f`) | now | delta |
+|---|---:|---:|---:|
+| `.bss` | 420,744 | **407,168** | **−13,576** |
+| `.data` | 196 | **13,780** | +13,584 |
+| `.uninit` | 1,024 | 1,024 | 0 |
+| **RAM statics** | **421,964** | **421,972** | **+8** |
 
-UF2 **3070 → 3073 blocks** (1 absolute preamble + 3072 ARM_S payload),
-1,571,840 → **1,573,248 bytes**. Shipping sha256 `f7ec146c440a…` →
-**`785d6e100309841636c95a53d0426c864bdd56939e1dbcff57aeb440b587a3f2`.**
+The `.bss`/`.data` movement is large and real: roughly 13.5 KB of what the linker
+used to place in `.bss` now lands in `.data`, which holds RAM-resident code
+(`firmware/src/button.rs:62` puts a function in `.data.ram_func`, and `.data`
+absorbs it). What matters physically is the total, and the total moved by **8
+bytes** — `Option<Box<OathRegion>>` plus a degraded flag, the OATH adapter's
+region handle, which is pinned by the existing size test rather than reclaimed
+with a static.
+
+`.bss` itself fell by 13,576 bytes because the 12-entry resident credential array
+is no longer the only way a credential is held. That is the point of US-1554: a
+resident array of the derived 856 credentials would be ~616 KB on a part with
+532,480 B of RAM.
+
+UF2 sha256 and block count are the shipping image's, re-measured by the gate's
+own `uf2_facts()`.
 Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
 `measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
 
@@ -1393,12 +1397,12 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 766,484 | `0x10000200` | no (flash) |
-| `.rodata` | 18,732 | `0x100bb418` | no (flash) |
-| `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfe20` | non-alloc, not in Berkeley `text` |
-| `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20066c50` | yes |
+| `.text` | 772,260 | `0x10000200` | no (flash) |
+| `.rodata` | 19,244 | `0x100bcaa8` | no (flash) |
+| `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
+| `.gnu.sgstubs` | 0 | `0x100c4bc0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 407,168 | `0x200035d8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20066c58` | yes |
 | `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1407,13 +1411,13 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 Berkeley `text` = 765,984 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **818,476**. That identity is stated so a reader can check
+the `X` flag) = **838,348**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 818,476 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 838,348 B** · **`.data` = 13,780 B** · **`.bss` = 408,192 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
+**RAM statics = 421,972 B** (421,976 B address-to-address: `__sheap` `0x20067058` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067058` → **main stack zone = 110,504 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->

@@ -799,6 +799,39 @@ async fn main(spawner: Spawner) -> ! {
     // SAFETY: `Peri::clone_unchecked` — as for the TRNG above: stateless
     // driver, documented HAL duplication, disjoint-region single-core use.
     let backend_flash: boot::DevFlash = Flash::new_blocking(unsafe { p.FLASH.clone_unchecked() });
+
+    // US-1559: the per-record key region needs a THIRD `Flash` handle over the
+    // same peripheral, on exactly the terms `backend_flash` above sets out —
+    // the driver is stateless (`dma: None` + `PhantomData`), and this one
+    // addresses `flashmap::KEY_REGION_OFFSET .. +KEY_REGION_BYTES`, a window
+    // `flashmap.rs:145-160` asserts is disjoint from both other consumers'
+    // (the trussed FS window and the secure image slots).
+    //
+    // **Constructed here, released later.** `p.FLASH` is consumed on the next
+    // line and a `Flash` cannot be built without a `Peri`, so this is the only
+    // place the handle can be made. Nothing is read: `Flash::new_blocking`
+    // stores `Option::None` plus a `PhantomData`
+    // (`embassy-rp-0.10.0/src/flash.rs:255-260`) and `init_key_region` only
+    // parks the value in its write-once slot. The handle stays unreachable
+    // until `release_key_region` runs, below `mark!(RUNG_USB)` — which is the
+    // S8/S9 guarantee, enforced at runtime rather than by source order.
+    //
+    // A third *handle* rather than a second `&mut` to `FLASH_DEV`: two `&mut`
+    // to one object is UB whether or not the non-overlap argument holds (the
+    // `DRBG_SEED_PROBE` doc in `boot.rs` says so), and the alternative to a
+    // new handle was aliasing the secure-partition driver.
+    //
+    // SAFETY: `Peri::clone_unchecked` — as for the TRNG and for `backend_flash`
+    // above: stateless driver, documented HAL duplication, disjoint-region
+    // single-core use. `boot::init_key_region` — single-core boot path, before
+    // any task exists; the slot is written exactly once here and not read until
+    // `release_key_region`.
+    unsafe {
+        boot::init_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
     let flash: boot::DevFlash = Flash::new_blocking(p.FLASH);
     // S-701-3: hand the flash handle to the write-once static (single init,
     // boot path) so the HID task can persist FIDO keystore changes too.
@@ -1091,6 +1124,18 @@ async fn main(spawner: Spawner) -> ! {
     // until `main` awaits, so this marker and `release()` below still own the
     // pin.
     mark!(fapico2_firmware::bootphase::RUNG_USB);
+    // US-1559: publish the per-record key region. **This is the wiring, and it
+    // is deliberately the first thing after `RUNG_USB`.** The handle was built
+    // up at the other `Flash::new_blocking` block (it has to be — `p.FLASH` dies
+    // there) but stayed unreachable until this line: before it, `boot::
+    // key_region()` answers `None`, so no boot-path caller can read the region
+    // even if one appears (S8/S9). After it, the region belongs to the applets
+    // and the first read happens in whichever applet operation runs first.
+    //
+    // Nothing here can fail: the release flips one flag. An applet that finds
+    // the region unreadable gets an empty key set and a clean CTAP error (S10),
+    // never a halt.
+    boot::release_key_region();
     // US-929 boot ladder, stage 3 (dbg-log builds only): the USB device is
     // constructed and `usb_task` spawned — configuration completes when the
     // executor first polls `usb_task` (stage 4's record proves that poll

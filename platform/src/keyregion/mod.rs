@@ -542,6 +542,10 @@ impl<T> SlotRead<T> {
 /// [`SLOTS_PER_SECTOR`] slots share one erase.
 pub mod commit;
 pub mod crypto;
+/// The QSPI-backed key region, arm only (US-1541). Declared unconditionally so
+/// the module's own gate lives in `device_region.rs` next to the reasons for
+/// it — the same convention `host.rs` follows, for the same reason.
+pub mod device_region;
 pub mod fido_store;
 pub mod host;
 pub mod index;
