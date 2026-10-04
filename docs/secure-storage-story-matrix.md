@@ -56,22 +56,49 @@ fully contiguous.
 | US-1576 | TrustZone ADR | `4f24bc3` | `docs/adr/0003-trustzone.md`, indexed in `docs/adr/README.md` | verified (doc) |
 
 **41 verified, 1 partial, 0 unverified.**
-
 ## The partial: US-1572
 
-The store key is fused and tested. The BDD's second half — the OATH seal
-becoming a per-operation read — is not done, and it is not "the same
-conversion". `FusedKey` fuses **one** `[u8; 32]` per operation, which works for
-the store key because the store has a medium to read it back from — its own
-encrypted image. `OathSeal` has no such medium and is not one value: it is a
-three-field derived struct (`platform/src/ckey.rs:394-402`). Converting it needs
-a container for a derived *struct*, and changes every `self.seal.*` use site in
-`apps/oath`.
+**Still partial. This was not resolved by the OATH compatibility work, which
+fixed a different problem** — client access and the credential-dump finding, not
+where the seal lives.
 
-The exposure it would remove is bounded and stated: 16 bytes plus a nonce root,
-resident for one session and cleared on drop. The store key was the larger
-exposure and is the one US-1572 closed. Recorded in `platform/src/fused_key.rs`
-and in [`capacity.md`](capacity.md) §"Two stories that shipped partly".
+| Half | State | Evidence |
+|---|---|---|
+| Store key, per-operation fused read | **done** | `platform/tests/fused_key.rs`, 7 tests: `each_use_reads_derives_and_drops`, `a_store_that_cannot_read_its_key_refuses_rather_than_degrading` |
+| OATH seal, per-operation fused read | **not done** | `apps/oath/src/oath_core.rs:940` still holds `seal: OathSeal` in the applet's `static mut` |
+
+### Why the conversion is not "the same conversion"
+
+`FusedKey` fuses **one** `[u8; 32]` per operation, which works for the store key
+because the store has a medium to read it back from — its own encrypted image.
+`OathSeal` has no such medium and is not one value: it is a three-field derived
+struct (`platform/src/ckey.rs:394-402`) — `kenc` and `nonce_key` from two
+different derivations over the same inputs, plus a 16-byte `aad` that is not key
+material at all. Converting it needs a container for a derived *struct*, and
+changes every `self.seal.*` use site in `apps/oath`.
+
+### Why it is recommended **out of scope** rather than done
+
+Because it would not close the exposure it appears to close. `OathApp` decrypts
+**every** credential into RAM at mount (`oath_core.rs:1543`,
+`self.slots[i] = self.cred_from_record(&record)`) into `Cred.key`, and nothing
+zeroizes that table — there is no `slots.*zeroize` in the file.
+
+So the secrets the seal protects are already resident in the clear for exactly
+the same window as the seal. Fusing the seal would close one of two doors to the
+same plaintext, at the cost of a new container type, changes across two crates,
+and a per-operation OTP fuse read on the command path that no test covers.
+
+**What would actually help** is the opposite direction: decrypt one credential
+per operation and zeroize it afterwards — the US-1554 `CredentialWindow` shape
+FIDO already uses. That is a different piece of work in `apps/oath`, and it is
+explicitly **not** what US-1572 asks for.
+
+The exposure that would remain: 16 bytes of seal plus a nonce root, resident for
+one session and cleared on drop (`ckey.rs:390-393`). The store key was the
+larger exposure, and it is the one US-1572 closed. Also recorded in
+`platform/src/fused_key.rs` and in [`capacity.md`](capacity.md) §"Two stories that
+shipped partly".
 
 ## Four BDDs reconciled rather than met as written
 
