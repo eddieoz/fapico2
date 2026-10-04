@@ -534,3 +534,59 @@ fn capacity_docs_carry_the_measured_number() {
          region have drifted apart"
     );
 }
+
+/// **The document does not present a non-capacity as one** — US-1564's other
+/// half, and the half its own gate was missing.
+///
+/// [`capacity_docs_carry_the_measured_number`] checks that the measured figure
+/// is *present*. That is necessary and not sufficient: the defect US-1564 fixed
+/// was a constant that looked like a capacity claim, and a document can carry
+/// the right number while still presenting a wrong one as a capacity. Nothing
+/// failed when the old wording was there, which is why this exists.
+///
+/// Each forbidden fragment is the shape of the claim rather than the claim's
+/// subject, so a legitimate sentence that merely mentions the constant passes
+/// and only a *table row* or an equivalent assertion fails. The two OATH
+/// constants are included because US-1564 named them too: the `MAX_CREDS = 68`
+/// row is a **reservation**, and `MAX_LOGICAL_LEN`'s 5,952 B is a
+/// single-generation width, not a storeable size.
+#[test]
+fn the_capacity_document_does_not_present_a_constant_as_a_capacity() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/capacity.md");
+    let text = std::fs::read_to_string(&docs)
+        .unwrap_or_else(|e| panic!("docs/capacity.md must be readable: {e}"));
+
+    for forbidden in [
+        "| `DEVICE_MAX_CREDS` | 12 ",
+        "| FIDO credentials | 12 ",
+        "| OATH credentials | 68 ",
+        "| OATH **capacity** | 68 ",
+        "| `MAX_LOGICAL_LEN` | 5,952 |",
+        "DEVICE_MAX_CREDS` | 12",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "docs/capacity.md presents `{forbidden}` as a capacity. US-1564 removed these rows: \
+             `DEVICE_MAX_CREDS` was a literal no region could contradict, `MAX_LOGICAL_LEN` is a \
+             single-generation width rather than a storeable size, and OATH's 68 is a reservation \
+             until an enrolment count is run to its boundary. Restate the row; do not delete the \
+             caveat."
+        );
+    }
+
+    // The positive half: the document must say what the three numbers *are*,
+    // or deleting a caveat would satisfy the assertions above vacuously.
+    for required in [
+        "single-generation",
+        "reservation",
+        FIDO_CAPACITY.to_string().as_str(),
+    ] {
+        assert!(
+            text.contains(required),
+            "docs/capacity.md must state `{required}`. The forbidden-wording assertions above \
+             would pass on a document that had simply deleted the caveats, which is not the same \
+             as correcting them."
+        );
+    }
+}
