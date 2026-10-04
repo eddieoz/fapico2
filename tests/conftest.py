@@ -687,11 +687,22 @@ def select_oath(ccid_card):
 
 @pytest.fixture(scope="class")
 def reset_oath(select_oath):
-    # Phase A US-901 shim: once anything is provisioned, SELECT leaves the
-    # OATH session locked and every credential command is refused with 6982.
-    # Re-virginize the OATH app first via the management app factory RESET
-    # (INS 0x1E, presence auto-acks in the emulator; the US-711 factory_wipe
-    # hook clears OATH durable state), then the OATH flow runs as before.
+    # Re-virginize the OATH applet before each class: the management app
+    # factory RESET (INS 0x1E, presence auto-acks in the emulator; the US-711
+    # factory_wipe hook clears OATH durable state) and then the applet's own
+    # RESET. **This is test isolation, not a workaround** — that distinction
+    # used to be blurred, and it mattered.
+    #
+    # The previous comment here called it a "US-901 shim" and explained it as
+    # necessary because "once anything is provisioned, SELECT leaves the OATH
+    # session locked and every credential command is refused with 6982". That
+    # was true, and it is why the whole suite was **blind** to the defect: every
+    # OATH test began by re-virginizing, so none of them ever held a credential
+    # across a SELECT — which is the only state picoforge and ykman reach. The
+    # lockout is gone (a device with no access code is granted, because there is
+    # no secret to authenticate with), and `test_070_oath.py::
+    # a_credential_survives_a_new_session_without_an_access_code` now exercises
+    # the path these fixtures used to route around.
     #
     # US-132 (PICOForge-COMPAT): OATH RESET (04/DE/AD) is NOT in that list any
     # more — its US-903 session gate was removed so the reference client's

@@ -488,3 +488,70 @@ def test_reset_without_validate(reset_oath):
     assert [sw1, sw2] == [0x90, 0x00]
     assert 0x74 not in resp, "the access code survived the RESET"
     assert list_apdu(reset_oath) == [], "credentials survived the RESET"
+
+
+def reselect_oath(ccid_card):
+    """Re-SELECT the OATH AID — a fresh applet session, as a client reconnect.
+
+    This is the step the whole suite used to avoid. `reset_oath` re-virginizes
+    before every class, so no test here ever held a credential across a SELECT
+    — which is precisely the state a GUI reaches, and precisely the state the
+    lockout broke.
+    """
+    aid = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
+    resp, sw1, sw2 = ccid_card.connection.transmit(
+        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, len(aid)] + aid + [0x00, 0x00]
+    )
+    assert [sw1, sw2] == [0x90, 0x00], "OATH re-SELECT failed: %02X%02X" % (sw1, sw2)
+    return resp
+
+
+def test_a_credential_survives_a_new_session_without_an_access_code(reset_oath):
+    """The picoforge / ykman flow, end to end, with no access code set.
+
+    Both clients decide whether to authenticate from the SELECT response alone
+    (`yubikit/oath.py`: `_has_key = self._challenge is not None`; picoforge:
+    `info.password_set()`). No access code means no challenge, so both skip
+    VALIDATE and go straight to LIST / PUT / CALCULATE. Every one of those used
+    to be answered 6982 once a credential existed — and no test here could see
+    it, because `reset_oath` wiped the applet first.
+    """
+    name = [ord('G'), ord('i'), ord('t'), ord('H'), ord('u'), ord('b')]
+    put = [TAG_NAME, len(name)] + name + [TAG_KEY, 0x08, 0x21, 6, 1, 2, 3, 4, 5, 6]
+
+    # 1. Register, in the first session.
+    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=list(put))
+    assert len(resp) == 0
+
+    # 2. A NEW session, without any reset. This is the step that used to lock.
+    sel = reselect_oath(reset_oath)
+
+    # 3. Retrieve. 6982 here is the defect this test exists for.
+    listed = list_apdu(reset_oath)
+    assert len(listed) > 0, (
+        "LIST must answer with the credential still present: a client with no "
+        "access code has no way to authenticate and would render an empty "
+        "account list"
+    )
+    assert TAG_NAME_LIST in listed, "LIST entries carry a 72 name tag: %02X" % listed[0]
+
+    # 4. Use it — a named TOTP calculate, the request both clients issue.
+    calc = [TAG_NAME, len(name)] + name + data_chal
+    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=list(calc))
+    assert len(resp) > 0 and resp[0] == TAG_T_RESPONSE, (
+        "CALCULATE must answer with a 76 truncated response, got %02X" % resp[0]
+    )
+
+    # 5. Rename and delete still work in that unlocked state.
+    renamed = [TAG_NAME, len(name)] + name + [TAG_NAME, len(name) - 1] + name[:-1]
+    resp = send_apdu(reset_oath, INS_RENAME, p1=0, p2=0, data=list(renamed))
+    assert len(resp) == 0
+    resp = send_apdu(
+        reset_oath, INS_DELETE, p1=0, p2=0,
+        data=[TAG_NAME, len(name) - 1] + name[:-1]
+    )
+    assert len(resp) == 0
+
+    # 6. And the table is genuinely empty afterwards — the session stayed
+    #    usable throughout, so this is the applet's state, not a refusal.
+    assert len(list_apdu(reset_oath)) == 0
