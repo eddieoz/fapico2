@@ -280,8 +280,21 @@ fn the_internal_filesystem_is_flash_backed_on_the_device() {
     );
 
     // The name is not the proof: `DevFlashStorage` must actually address the
-    // QSPI window. It carries a window offset, that offset is the trussed
-    // window constant, and both `read` and `write` apply it.
+    // QSPI window, and both `read` and `write` must add the window's offset.
+    //
+    // **This assertion was rewritten**, and the reason is worth keeping. It
+    // originally required the offset to arrive through a `self.offset` *field*,
+    // which is how the relocation addressed two windows from one handle. That
+    // field cost 8 bytes of `.bss` (IFS_STORAGE went 2 -> 8) on a board with 4
+    // bytes of unallocated SRAM in total, where DARK-BOOT-1 established that
+    // bss growth moves MSPLIM and shrinks the main stack. The relocation now
+    // probes the legacy window through a stack-only `LegacyWindow` that borrows
+    // the flash, so `DevFlashStorage` is back to one field and its offset is
+    // the constant.
+    //
+    // The property this gate protects is unchanged, and is what the assertion
+    // now states: the driver adds the trussed window's offset, from wherever it
+    // comes. A renamed driver pointing at RAM still fails here.
     let dev = block(&src, "impl Storage for DevFlashStorage");
     for arm in ["fn read(", "fn write("] {
         assert!(
@@ -292,18 +305,24 @@ fn the_internal_filesystem_is_flash_backed_on_the_device() {
         );
     }
     assert!(
-        dev.contains("self.offset + off as u32"),
-        "DevFlashStorage's read/write must address the QSPI window through its `offset` field \
-         ({}). Without that, `DevFlashStorage` is a name, not a location, and a renamed driver \
-         pointing at RAM would sail through the assertion above.",
+        dev.contains("TRUSSED_FS_OFFSET + off as u32"),
+        "DevFlashStorage's read/write must add the trussed window's offset ({}) — through a \
+         field or through the constant, either is fine. Without it, `DevFlashStorage` is a \
+         name, not a location, and a renamed driver pointing at RAM would sail through the \
+         assertion above.",
         cite(&src, "impl Storage for DevFlashStorage")
     );
-    let ctor = block(&src, "impl DevFlashStorage {");
+    // The offset has to come from the one place it is written down. It used to
+    // be a field set by the constructor; it is now the constant itself, so the
+    // thing worth gating moved up a level: `device.rs` must not restate the
+    // window's offset, or there are two numbers again and this is exactly the
+    // drift US-1536 removed.
     assert!(
-        ctor.contains("offset: TRUSSED_FS_OFFSET"),
-        "DevFlashStorage::new must set its window offset to TRUSSED_FS_OFFSET ({}); it currently \
-         sets something else, so `self.offset + off` is an address nobody chose.",
-        cite(&src, "impl DevFlashStorage {")
+        src.contains("pub use crate::flashmap::"),
+        "device.rs must take TRUSSED_FS_OFFSET from crate::flashmap ({}) rather than \
+         restating it. The flash map owns every persistent region's offset; a second literal \
+         here is the defect US-1536 closed.",
+        cite(&src, "pub use crate::flashmap")
     );
 
     // …and `ifs` is the QSPI-mounted triple, not the RAM helper's product.
