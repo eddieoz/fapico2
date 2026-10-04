@@ -827,6 +827,39 @@ impl FidoApp {
         Some(f(&mut crate::device_keystore::RegionCredentials::new(region, keys?)))
     }
 
+    /// Destroy every FIDO credential record in the key region (US-1546).
+    ///
+    /// **Needs no keys and no secure store.** A whole-domain erase has nothing
+    /// to open — it erases sectors, it does not decrypt records — so this
+    /// deliberately does not go through [`Self::with_region`], which requires
+    /// `RegionKeys` and would therefore be unreachable from
+    /// [`Self::factory_reset`](crate::device_app::FidoApp::factory_reset) (that
+    /// entry point runs with `store = None`, and a wipe that quietly skipped
+    /// there would leave the exact hole this story closes).
+    ///
+    /// Three answers, and the middle one is the point:
+    ///
+    /// - `None` — no region is installed. The snapshot is this device's store,
+    ///   and [`DeviceKeystore::reset_from_seed`] has already cleared it. Not a
+    ///   failure, and not to be reported as one (S10).
+    /// - `Some(Ok(n))` — `n` sectors erased.
+    /// - `Some(Err(_))` — the region is present and could not be wiped. The
+    ///   caller must **refuse**, because the alternative is a device that reports
+    ///   an empty credential store over records still on flash — a wire claim
+    ///   the device cannot honour.
+    pub(crate) fn wipe_region_credentials(
+        &mut self,
+    ) -> Option<Result<u32, crate::device_keystore::RegionCredentialError>> {
+        let region = crate::device_app::key_region()?;
+        let mut store =
+            fapico2_platform::keyregion::fido_store::FidoRecordStore::new(&mut *region);
+        Some(
+            store
+                .wipe_fido_range()
+                .map_err(crate::device_keystore::RegionCredentialError::Store),
+        )
+    }
+
     /// Are this device's credentials in the key region rather than the snapshot?
     ///
     /// **The one predicate that decides it**, derived rather than stored so it
@@ -2524,6 +2557,35 @@ impl FidoApp {
     // ------------------------------------------------------------------
     pub(crate) fn handle_reset(&mut self, out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>) -> usize {
         out.clear();
+
+        // US-1546: destroy the records on the medium **before** clearing the RAM
+        // state, and answer a refusal rather than an ack.
+        //
+        // The ordering is [`OathApp::cmd_reset`]'s (`apps/oath/src/oath_core.rs`,
+        // `US-1553`): a press is the owner's consent to destroy, so the durable
+        // erasure happens first and only then does the in-RAM state follow.
+        // `reset_from_seed` rotates `device_random` and therefore the payload
+        // key, so erasing afterwards would stage bytes under a key the records
+        // were not written with.
+        //
+        // `None` — no region installed, so the snapshot was this device's store
+        // and the `reset_from_seed` below already cleared it. That is not a
+        // failure and must not be reported as one (S10, "degrade, never halt").
+        if let Some(Err(_)) = self.wipe_region_credentials() {
+            // `0x21 PROCESSING`, which is what the reference answers for a reset
+            // whose storage erase failed (`../pico-fido2/src/fido/cbor_reset.c`:
+            // `if (fido_reset_storage() != PICOKEYS_OK) return CTAP2_ERR_PROCESSING`).
+            //
+            // Refusing is the whole point. Acking would leave a device that
+            // reports an empty credential set over records still on flash, and
+            // `getCredsMetadata`'s `existingResidentCredentialsCount` is
+            // device-rooted and PIN-free (`crypto::derive_index_key_from_root`),
+            // so the index survives the reset intact and enumerable — the owner
+            // would see their pre-reset count come back on the next command.
+            out.push(Ctap2Response::Processing.code()).ok();
+            return out.len();
+        }
+
         // Fresh device random + credential wipe (the hkey is regenerated on
         // the next boot from the store — the snapshot the reset writes is
         // entirely new state).
@@ -2533,10 +2595,15 @@ impl FidoApp {
         // Regenerate the persistent hkey from the pool (TRNG-derived).
         // US-1007: bounded for the same reason as the makeCredential arm —
         // this was a bare rejection loop over a draw that cannot report
-        // failure. `handle_reset` returns a byte count rather than a
-        // `Result`, so a refusal cannot be propagated as a status; it
-        // leaves `hkey` at its current value, which is what the `if let Ok`
-        // below already did for the parse. The residual is real and is
+        // failure. `try_fill_valid_with` has no channel to say *why* it gave
+        // up, so a refusal here leaves `hkey` at its current value, which is
+        // what the `if let Ok` below already did for the parse. Note this is
+        // narrower than it reads: `handle_reset` returns a byte count, but
+        // `out[0]` is the CTAP2 status byte, so a refusal *can* be propagated
+        // and the region-wipe arm above does exactly that. This particular
+        // residual is a failed draw, not an inexpressible outcome.
+        //
+        // The residual is real and is
         // stated rather than hidden: a reset taken while the pool cannot
         // produce does not rotate the `hkey`. That is strictly better than
         // the alternative, which is a request that never returns, and the

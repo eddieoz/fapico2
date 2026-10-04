@@ -1565,9 +1565,101 @@ impl FidoRecordStore<'_> {
     /// first… and calls this afterwards"), and a whole-region erase is what
     /// makes the second half true. Not atomic across sectors and cannot be
     /// (`commit::wipe`, "What `wipe` promises").
+    ///
+    /// **This erases the whole region, OATH's range included.** It is the right
+    /// primitive for a *device-wide* wipe and the wrong one for CTAP2
+    /// [`Self::wipe_fido_range`] — see the note there for why that distinction
+    /// matters more than it looks.
     pub fn wipe(&mut self) -> Result<u32, FidoStoreError> {
         commit::wipe(self.region).map_err(FidoStoreError::RegionUnreadable)
     }
+
+    /// Erase only what **FIDO** owns: its record slots and the whole index.
+    ///
+    /// CTAP2 `authenticatorReset` resets the FIDO authenticator, so it must not
+    /// reach OATH's credentials — and OATH owns the region's head
+    /// ([`OATH_FIRST_SLOT`] = 0), so [`Self::wipe`], which starts at slot 0,
+    /// destroys exactly the records a scoped reset is required to preserve.
+    /// Scoping is not a refinement here: the two reservations are adjacent, so
+    /// an unscoped erase is one `erase_sector` away from destroying another
+    /// applet's keys.
+    ///
+    /// # Order: index first, then the records
+    ///
+    /// This follows [`commit::wipe`]'s "What a caller must still do": a caller
+    /// that needs **"the reset is complete or nothing happened"** removes the
+    /// index first and calls the record erase afterwards as the reclamation
+    /// step. The failure direction is what makes the non-atomicity acceptable
+    /// — a power cut between the two phases leaves records with no index
+    /// entries, which are **unfindable**, rather than index entries naming
+    /// erased slots. `getCredsMetadata` then reports fewer credentials than
+    /// the owner had, which is the direction a reset is allowed to fail in.
+    /// Erasing records first could leave the reverse: entries that name
+    /// nothing, so a device reports credentials it no longer holds.
+    ///
+    /// # Scope is sector-granular, and the geometry is asserted
+    ///
+    /// A NOR sector is [`SLOTS_PER_SECTOR`] slots, so this erases every sector
+    /// that **intersects** FIDO's range — including a sector that also holds
+    /// OATH slots, which would destroy a credential. The compile-time
+    /// assertion in this module's "Compile-time assertions" block is what
+    /// makes that impossible rather than merely unlikely: FIDO's range starts
+    /// on a sector boundary, so no erase can reach back into OATH's.
+    pub fn wipe_fido_range(&mut self) -> Result<u32, FidoStoreError> {
+        let mut erased = 0u32;
+
+        // Phase 1: the index. `[INDEX_FIRST_SLOT, TOTAL_SLOTS)` is the tail of
+        // the region, so it is the last `INDEX_SLOT_COUNT / SLOTS_PER_SECTOR`
+        // sectors — asserted sector-aligned in this module's `const _` block.
+        for sector in index_sectors() {
+            self.region
+                .erase_sector(sector_head(sector))
+                .map_err(FidoStoreError::RegionUnreadable)?;
+            erased += 1;
+        }
+
+        // Phase 2: FIDO's records. `[FIDO_FIRST_SLOT, FIDO_SLOT_LIMIT)`, which
+        // is sector-aligned at both ends by the same assertion.
+        for sector in fido_sectors() {
+            self.region
+                .erase_sector(sector_head(sector))
+                .map_err(FidoStoreError::RegionUnreadable)?;
+            erased += 1;
+        }
+
+        Ok(erased)
+    }
+}
+
+/// The head slot of sector `sector`.
+///
+/// `expect` rather than an `Err`: `Slot::new` rejects an index the region
+/// cannot hold, and the sector indices here are derived from the region size by
+/// constant arithmetic, so a rejection is a geometry that no longer matches the
+/// partitions above it. That is a build-time bug, not a runtime condition, and
+/// the compile-time assertions in this module catch the cases that can be
+/// stated in advance.
+fn sector_head(sector: u32) -> Slot {
+    Slot::new((sector * SLOTS_PER_SECTOR) as u16)
+        .expect("a sector derived from the region's own size is inside the region")
+}
+
+/// The sector indices [`FidoRecordStore::wipe_fido_range`] erases for the index,
+/// low to high.
+///
+/// The index is the region's tail, so this is arithmetic rather than a scan —
+/// and a scan here would be a hazard: the range stops before the last sector
+/// precisely because a stop *past* it would erase the same bytes twice.
+fn index_sectors() -> impl Iterator<Item = u32> {
+    let first = INDEX_FIRST_SLOT / SLOTS_PER_SECTOR;
+    let last = (INDEX_FIRST_SLOT + INDEX_SLOT_COUNT) / SLOTS_PER_SECTOR;
+    first..last
+}
+
+/// The sector indices [`FidoRecordStore::wipe_fido_range`] erases for FIDO's
+/// records, low to high.
+fn fido_sectors() -> impl Iterator<Item = u32> {
+    (FIDO_FIRST_SLOT / SLOTS_PER_SECTOR)..(FIDO_SLOT_LIMIT / SLOTS_PER_SECTOR)
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,5 +2092,40 @@ const _: () = {
         FIDO_SLOT_LIMIT <= u16::MAX as u32,
         "FIDO's slot range must fit Slot's u16 index or fido_slot_at wraps and allocates from \
          the wrong slot"
+    );
+
+    // `wipe_fido_range` erases whole sectors, so it can only be a *scoped* erase
+    // — one that leaves OATH's credentials alone — if FIDO's range is aligned
+    // to sector boundaries at both ends. Without this, a re-partition that moved
+    // FIDO's start one slot earlier would make the wipe's first erase reach
+    // back into OATH's tail and destroy a credential for an authenticatorReset.
+    // The check is arithmetic rather than a comment because a comment is not
+    // re-evaluated when the numbers under it change.
+    assert!(
+        FIDO_FIRST_SLOT.is_multiple_of(SLOTS_PER_SECTOR),
+        "FIDO's range must start on a sector boundary or a scoped erase reaches into the \
+         reservation before it"
+    );
+    assert!(
+        FIDO_SLOT_LIMIT.is_multiple_of(SLOTS_PER_SECTOR),
+        "FIDO's range must end on a sector boundary or a scoped erase reaches past it"
+    );
+    assert!(
+        INDEX_FIRST_SLOT.is_multiple_of(SLOTS_PER_SECTOR)
+            && INDEX_SLOT_COUNT.is_multiple_of(SLOTS_PER_SECTOR),
+        "the index reservation must tile whole sectors or the scoped wipe's phase 1 either \
+         misses index slots or erases past the region"
+    );
+    // And the ranges must not overlap, which is what makes "erase the index,
+    // then erase FIDO's records" two disjoint passes rather than one erase
+    // performed twice.
+    assert!(
+        FIDO_SLOT_LIMIT <= INDEX_FIRST_SLOT,
+        "FIDO's records and the index must not share a slot or the scoped wipe double-erases"
+    );
+    assert!(
+        super::OATH_FIRST_SLOT + super::OATH_CAPACITY <= FIDO_FIRST_SLOT,
+        "OATH's reservation must end before FIDO's begins or a scoped wipe erases another \
+         applet's credentials"
     );
 };
