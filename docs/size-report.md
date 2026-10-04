@@ -8,16 +8,35 @@ both twins and answers `InvalidSubcommand` (0x3E) immediately — no presence
 window — matching the C reference's fall-through at
 `pico-fido2/src/fido/cbor_client_pin.c:909`. GetInfo is unchanged. See
 `.superpowers/sdd/report-0x06-refusal.md`.)
-**Measured: `text` 818,436 → 817,960 B (**−476 B**); `.rodata` 18,716 B
-(**0**); Berkeley `.bss` 421,768 B (**0**); RAM statics 421,964 B (**0**); main
-stack zone 110,512 B (**0**). UF2 **3072 → 3070 blocks** (1 absolute preamble
-+ 3069 ARM_S payload), 1,572,864 → **1,571,840 bytes**. Shipping sha256
-`6590ef49748f…` → **`f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da`.**
+**US-1536/1539/1540 — the flash map and the key region.** `text` 817,960 →
+**818,476 B** (+516 B: `flashmap` and `keyregion` geometry, their compile-time
+assertions, and the trussed-window relocation); `.rodata` 18,716 → 18,732 B
+(+16 B); Berkeley `.bss` **421,768 B (0)**; RAM statics **421,964 B (0)**; main
+stack zone **110,512 B (0)**.
+
+**bss did not move, and that was not free.** The first cut added an `offset:
+u32` field to `DevFlashStorage` so the relocation could address two windows,
+which grew `IFS_STORAGE` from 2 to 8 bytes and `.bss` to 421,776 — on a board
+with 4 bytes of unallocated SRAM in total, where DARK-BOOT-1 established that
+bss growth moves `MSPLIM` and shrinks the main stack. Replacing it with a
+stack-only `LegacyWindow` that borrows the flash put `.bss` back at exactly
+420,744 raw / 421,768 Berkeley. Measured against a clean build of 4132c5f:
+`.bss` 420,744 → 420,744, `.text` 766,108 → 766,484.
+
+**The linker's reach moved, and that is the real change.** `FLASH LENGTH` went
+from 4,032 KiB to 2,048 KiB, with TRUSSED and KEYREGION declared between the
+firmware and the secure partition. A firmware image that grows into a
+persistent region is now a **link error** rather than something only this gate
+and the CI ratchet stand between — see `platform/src/flashmap.rs`.
+
+UF2 **3070 → 3073 blocks** (1 absolute preamble + 3072 ARM_S payload),
+1,571,840 → **1,573,248 bytes**. Shipping sha256 `f7ec146c440a…` →
+**`785d6e100309841636c95a53d0426c864bdd56939e1dbcff57aeb440b587a3f2`.**
 Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
 `measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
 
 ```
-firmware/fapico2.uf2: 3070 blocks (1 absolute preamble + 3069 ARM_S payload), 1571840 bytes
+firmware/fapico2.uf2: 3073 blocks (1 absolute preamble + 3072 ARM_S payload), 1573248 bytes
 f7ec146c440a0dde0d2fec561aa6c01f7b80efbbcc8195032f15de45a83396da  firmware/fapico2.uf2
 ```
 
@@ -1369,13 +1388,13 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 765,984 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb220` | no (flash) |
+| `.text` | 766,484 | `0x10000200` | no (flash) |
+| `.rodata` | 18,732 | `0x100bb418` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfc00` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfe20` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
-| `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.defmt` | 34 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 48 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
@@ -1383,11 +1402,11 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 Berkeley `text` = 765,984 (`.text`) + 18,716 (`.rodata`) + 276
 (`.vector_table`) + 20 (`.start_block`) + 32,768 (`.secure_partition`) + 196
 (`.data`, which Berkeley classifies as code because the ELF gives the section
-the `X` flag) = **817,960**. That identity is stated so a reader can check
+the `X` flag) = **818,476**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 817,960 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,476 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
