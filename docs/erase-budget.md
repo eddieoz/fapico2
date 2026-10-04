@@ -676,7 +676,7 @@ ERASE_BUDGET_RECORD max_erases_per_sector_per_counter_write=4
 ERASE_BUDGET_RECORD erase_profile_per_counter_write=17:4,18:1,232:1
 ERASE_BUDGET_RECORD unchanged_sector_erases=0
 ERASE_BUDGET_RECORD second_update_sector_erases=6
-ERASE_BUDGET_RECORD measured_slot_programs_per_counter_write=16
+ERASE_BUDGET_RECORD measured_slot_programs_per_counter_write=10
 ```
 
 Two controls ride along, and they are what make the measurement able to *fail*:
@@ -705,10 +705,24 @@ The indices are geometry and the gate does not parse them; the **counts** are
 the profile, and they are what `max_erases_per_sector_per_counter_write = 4` is
 the maximum of.
 
-`measured_slot_programs_per_counter_write = 16` is the other half of the write's
-cost and is a **program** count, not an erase count: four slots staged and four
-reprogrammed, twice over (record, then index). Programs do not consume erase
-cycles, which is why the lifetime above divides only the six.
+`measured_slot_programs_per_counter_write = 10` is the other half of the write's
+cost and is a **program** count, not an erase count. Programs do not consume
+erase cycles, which is why the lifetime above divides only the six — this figure
+bounds the *write bandwidth* of a counter write, not the wear.
+
+The shape is the record commit (four live slots staged into the scratchpad and
+four reprogrammed live) plus the index rewrite, which since the slot-aware
+splice fix is **one** slot staged and **one** reprogrammed rather than four
+and four: the entry belongs to one index slot, and the unguarded splice was
+writing it into all four mates as well. That defect cost six programs per
+counter write and, worse, corrupted three unrelated entries. A figure that was
+measuring the bug is the useful part of this note — the gate caught a
+correctness regression as a wear regression, which is the accident that makes
+it worth running.
+
+`live_slot_programs_per_counter_write = 4` is the record half alone, and it is
+the reason the fixture enrols `SLOTS_PER_SECTOR` credentials: a sector holding
+one record programs one slot, and the worst case for wear is the full sector.
 
 ### 4c.3 "One erase and one program", read at sector granularity
 
