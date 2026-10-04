@@ -37,7 +37,7 @@ def test_Check_that_AT_flag_is_not_set(GARes):
     assert (GARes['res'].get_response(0).response.authenticator_data.flags & 0xF8) == 0
 
 def test_that_user_credential_and_numberOfCredentials_are_not_present(device, MCRes):
-    res = device.GA(allow_list=[
+    res = device.GA_with_pin(allow_list=[
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ])
     assert res['res'].user == None
@@ -54,7 +54,7 @@ def test_empty_allowList(device):
 def test_algorithms(device, info, alg):
     if ({'alg': alg, 'type': 'public-key'} in info.algorithms):
         MCRes = device.doMC(key_params=[{"alg": alg, "type": "public-key"}])
-        res = device.GA(allow_list=[
+        res = device.GA_with_pin(allow_list=[
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ])
         verify(MCRes['res'].attestation_object, res['res'], res['req']['client_data_hash'])
@@ -119,7 +119,7 @@ def test_get_next_assertion_rejects_a_different_channel(device):
             "displayName": "Channel user"
         })
 
-    result = device.GA(rp_id=rp["id"])["res"]
+    result = device.GA_with_pin(rp_id=rp["id"])["res"]
     assert result.number_of_credentials == 3
     old_cid = device.cid()
     other_cid = (old_cid + 1) & 0xffffffff
@@ -148,7 +148,7 @@ def test_mismatched_rp(device, GARes):
     rp_id += ".com"
 
     with pytest.raises(CtapError) as e:
-        device.GA(rp_id=rp_id)
+        device.GA_with_pin(rp_id=rp_id)
     assert e.value.code == CtapError.ERR.NO_CREDENTIALS
 
 def test_missing_rp(device):
@@ -181,7 +181,7 @@ def test_bad_allow_list_item(device, MCRes):
         )
 
 def test_unknown_option(device, MCRes):
-    device.GA(options={"unknown": True}, allow_list=[
+    device.GA_with_pin(options={"unknown": True}, allow_list=[
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ])
 
@@ -198,7 +198,7 @@ def test_option_up(device, info, GARes):
             assert res.auth_data.flags & (1 << 0)
 
 def test_allow_list_fake_item(device, MCRes):
-    device.GA(allow_list=[{"type": "rot13", "id": b"1234"}]
+    device.GA_with_pin(allow_list=[{"type": "rot13", "id": b"1234"}]
             + [
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ],
@@ -235,7 +235,7 @@ def test_allow_list_missing_id(device, MCRes):
         )
 
 def test_silent_ok(device, MCRes):
-    res = device.GA(options={"up": False}, allow_list=[
+    res = device.GA_with_pin(options={"up": False}, allow_list=[
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ])
     assert (res['res'].auth_data.flags & (1 << 0)) == 0
@@ -243,7 +243,7 @@ def test_silent_ok(device, MCRes):
 def test_silent_ko(device, MCRes):
     cred = MCRes['res'].attestation_object.auth_data.credential_data.credential_id + b'\x00'
     with pytest.raises(CtapError) as e:
-        res = device.GA(options={"up": False}, allow_list=[
+        res = device.GA_with_pin(options={"up": False}, allow_list=[
                 {"id": cred, "type": "public-key"}
             ])
     assert e.value.code == CtapError.ERR.NO_CREDENTIALS

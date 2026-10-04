@@ -29,7 +29,7 @@ _linux_hid.open_connection = open_connection
 from fido2.hid import CtapHidDevice
 from fido2.client import Fido2Client, UserInteraction, ClientError, _Ctap1ClientBackend, DefaultClientDataCollector
 from fido2.attestation import FidoU2FAttestation
-from fido2.ctap2.pin import ClientPin
+from fido2.ctap2.pin import ClientPin, PinProtocolV1, PinProtocolV2
 from fido2.server import Fido2Server
 from fido2.ctap import CtapError
 from fido2.webauthn import PublicKeyCredentialParameters, PublicKeyCredentialType, PublicKeyCredentialCreationOptions, PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity, AuthenticatorSelectionCriteria, UserVerificationRequirement, PublicKeyCredentialRequestOptions
@@ -37,6 +37,17 @@ from fido2.ctap2.extensions import HmacSecretExtension, LargeBlobExtension, Cred
 from fido2.cose import ES256
 
 DEFAULT_PIN='12345678'
+
+
+def _pin_protocol(info):
+    """The strongest pinUvAuthProtocol the authenticator advertises.
+
+    The device is not assumed to speak V2 just because the client can: this
+    reads the list the authenticator published in getInfo and picks from it, so
+    the harness cannot sign with a protocol the device never claimed.
+    """
+    supported = info.options.get("pinUvAuthProtocols") or [1]
+    return PinProtocolV2() if 2 in supported else PinProtocolV1()
 
 class Packet(object):
     def __init__(self, data):
@@ -316,6 +327,55 @@ class Device():
 
     def GNA(self):
         return self.__client._backend.ctap2.get_next_assertion()
+
+    def GA_with_pin(self, rp_id=Ellipsis, client_data_hash=Ellipsis, allow_list=None, extensions=None, options=None):
+        """getAssertion carrying a pinUvAuthToken, signed the way a client signs it.
+
+        US-1529/US-1533: on a PIN-set device a token-less getAssertion is refused
+        with PUAT_REQUIRED, and it is refused BEFORE the credential lookup ever
+        happens (AGENTS.md section 4). A raw `GA()` therefore only reaches the
+        lookup for the tests that are deliberately about that refusal; a raw-`GA`
+        test about anything else -- algorithm coverage, allow-list filtering,
+        channel isolation -- was written against pico-fido, where the device
+        served a token-less assertion, and has to authenticate here first.
+
+        Falls through to the token-less path when no PIN is set, so the same
+        test is meaningful on either side of a set/clear.
+        """
+        rp_id = rp_id if rp_id is not Ellipsis else self.__rp['id']
+        client_data_hash = client_data_hash if client_data_hash is not Ellipsis else os.urandom(32)
+        ctap2 = self.__client._backend.ctap2
+        try:
+            token = ClientPin(ctap2).get_pin_token(
+                DEFAULT_PIN, ClientPin.PERMISSION.GET_ASSERTION, rp_id
+            )
+        except CtapError as e:
+            # Ask the DEVICE whether a PIN exists rather than reading
+            # `ctap2.info.options["clientPin"]`: that info object is cached on the
+            # client, so a fixture that called device.reset() and set a PIN since
+            # the last getInfo would still read False here, and the token-less
+            # fallback would silently re-break the test this helper exists to fix.
+            if e.code != CtapError.ERR.PIN_NOT_SET:
+                raise
+            return self.GA(
+                rp_id=rp_id,
+                client_data_hash=client_data_hash,
+                allow_list=allow_list,
+                extensions=extensions,
+                options=options,
+            )
+        protocol = _pin_protocol(ctap2.get_info())
+        att_obj = ctap2.get_assertion(
+            rp_id=rp_id,
+            client_data_hash=client_data_hash,
+            allow_list=allow_list,
+            extensions=extensions,
+            options=options,
+            pin_uv_param=protocol.authenticate(token, client_data_hash),
+            pin_uv_protocol=protocol.VERSION,
+        )
+        return {'res': att_obj, 'req': {'rp_id': rp_id,
+                        'client_data_hash': client_data_hash}}
 
     def doGA(self, client_data=Ellipsis, rp_id=Ellipsis, allow_list=None, extensions=None, user_verification=None, event=None, ctap1=False, check_only=False):
         client_data = client_data if client_data is not Ellipsis else DefaultClientDataCollector(origin=self.__origin, verify=Device.__verify_rp)

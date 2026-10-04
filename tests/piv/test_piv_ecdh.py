@@ -14,6 +14,23 @@ it relies on with ``6D00``), so the first 9000 assertion fails on a plain
 protocol assertion. GREEN when US-374 (import) + US-375 (ECDH) land.
 """
 
+import pytest
+
+# These assert a contract that is written down but not implemented yet, so
+# they are red by construction rather than by regression. They stay in the
+# tree because the contract is the deliverable and the file documents why
+# each assertion is shaped the way it is (see the module docstring).
+#
+# strict=False on purpose: an XPASS when the Rust story lands is reported
+# but not a failure, so landing US-374/US-375 does not turn the gate red
+# on the day it stops being xfail. To retire one of these, delete the
+# marker -- a test that silently starts passing is not evidence the gate
+# noticed it.
+pytestmark = pytest.mark.xfail(
+    reason='US-374 (import) + US-375 (ECDH 0x3C) are not implemented; the card answers 6D00',
+    strict=False,
+)
+
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from conftest import (

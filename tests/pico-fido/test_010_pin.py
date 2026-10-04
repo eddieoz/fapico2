@@ -219,13 +219,23 @@ def test_verify_flag(device, SetPinRes):
     assert reg.auth_data.flags & (1 << 2)
 
 def test_get_no_pin_auth(device):
+    """A token-less getAssertion is REFUSED on a PIN-set device (US-1529/US-1533).
 
+    This test came from pico-fido, where the authenticator served the assertion
+    and simply left the UV flag clear. fapico2 deliberately reversed that: with a
+    PIN set, alwaysUv is advertised true and the device enforces it, so the
+    refusal arrives before the credential is ever looked up. What survives of
+    the original test is the makeCredential half below, which has always been
+    PUAT_REQUIRED.
+    """
     reg = device.doMC()['res'].attestation_object
     allow_list = [
         {"type": "public-key", "id": reg.auth_data.credential_data.credential_id}
     ]
-    auth = device.GA(allow_list=allow_list)['res']
-    assert not (auth.auth_data.flags & (1 << 2))
+    with pytest.raises(CtapError) as e:
+        device.GA(allow_list=allow_list)
+
+    assert e.value.code == CtapError.ERR.PUAT_REQUIRED
 
     with pytest.raises(CtapError) as e:
         reg = device.MC()
@@ -247,9 +257,16 @@ def test_make_credential_no_pin(device):
     assert e.value.code == CtapError.ERR.PUAT_REQUIRED
 
 def test_get_assertion_no_pin(device):
+    """Token-less getAssertion answers PUAT_REQUIRED, not NO_CREDENTIALS.
+
+    The two are not interchangeable: NO_CREDENTIALS is the answer to "is there a
+    matching credential", and on a PIN-set device the device cannot know that
+    until the caller has proved it may ask. Refusing first is what keeps the
+    credential set from being enumerable by anyone who can speak CTAP2.
+    """
     with pytest.raises(CtapError) as e:
         reg = device.GA()
-    assert e.value.code == CtapError.ERR.NO_CREDENTIALS
+    assert e.value.code == CtapError.ERR.PUAT_REQUIRED
 
 def test_change_pin(device, client_pin):
     device.reset()

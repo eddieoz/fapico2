@@ -182,6 +182,10 @@ def test_make_credential_hmac_secret_mc(device, protocol_type, salt_count):
     assert len(protocol.decrypt(shared_secret, result)) == len(salt)
 
 def test_bad_auth(device,  MCHmacSecret):
+    # The token is valid; the saltAuth in the hmac-secret extension is not.
+    # Authenticating first is what makes this the test it claims to be -- sent
+    # token-less, the device refuses at the UV gate with PUAT_REQUIRED and the
+    # salt is never examined (US-1529/US-1533).
 
     key_agreement = {
             1: 2,
@@ -192,7 +196,7 @@ def test_bad_auth(device,  MCHmacSecret):
         }
 
     with pytest.raises(CtapError) as e:
-        device.GA(extensions={"hmac-secret": {1: key_agreement, 2: b'\x00'*80, 3: b'\x00'*32, 4: 2}})
+        device.GA_with_pin(extensions={"hmac-secret": {1: key_agreement, 2: b'\x00'*80, 3: b'\x00'*32, 4: 2}})
     assert e.value.code == CtapError.ERR.PIN_AUTH_INVALID
 
 @pytest.mark.parametrize("salt_auth_len", [0, 8, 15, 17, 31, 33])
@@ -257,14 +261,20 @@ def test_get_next_assertion_has_extension(
 
 
 def test_hmac_secret_different_with_uv(device, MCHmacSecret):
+    """On a PIN-set device there is no "without UV" leg, and that is the contract.
+
+    The upstream test compared a discouraged getAssertion against a
+    user-verification-required one and expected different secrets. US-1529 and
+    US-1533 removed that distinction: alwaysUv is advertised true whenever a PIN
+    is set, so the discouraged leg performs UV too. What is left to assert is that
+    property directly -- the UV flag is set on the leg that did not ask for it.
+    """
     salts = [salt1]
-    if (len(salts) == 2):
-        hout = {"salt1":salts[0],"salt2":salts[1]}
-    else:
-        hout = {"salt1":salts[0]}
+    hout = {"salt1": salts[0]}
 
     auth_no_uv = device.doGA(extensions={"hmacGetSecret": hout})['res'].get_response(0)
-    assert (auth_no_uv.response.authenticator_data.flags & (1 << 2)) == 0
+    assert auth_no_uv.response.authenticator_data.flags & (1 << 2), \
+        "alwaysUv is advertised true, so a discouraged getAssertion still verifies"
 
     ext_no_uv = auth_no_uv.response.authenticator_data.extensions
     assert ext_no_uv
@@ -273,9 +283,6 @@ def test_hmac_secret_different_with_uv(device, MCHmacSecret):
     assert len(ext_no_uv["hmac-secret"]) == len(salts) * 32 + 16
 
     # Now get same auth with UV
-    hout = {'salt1':salts[0]}
-    if (len(salts) > 1):
-        hout['salt2'] = salts[1]
     auth_uv = device.doGA(extensions={"hmacGetSecret": hout}, user_verification=UserVerificationRequirement.REQUIRED)['res'].get_response(0)
 
     assert auth_uv.response.authenticator_data.flags & (1 << 2)
