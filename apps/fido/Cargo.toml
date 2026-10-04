@@ -48,6 +48,13 @@ device = [
 fapico2-platform = { path = "../../platform" }
 rand_core = "0.6"
 heapless = "0.8"
+# US-1550: the credential private scalar lives in a `Zeroizing<[u8; 32]>` so it
+# is cleared when it goes out of scope (`device_keystore::PrivateScalar`).
+# Same version and same `default-features = false` as `platform/Cargo.toml:85`:
+# the applet half and the region half must clear key material under one
+# dependency's guarantees rather than two, and `alloc`'s `Zeroize for Vec`
+# impl is off, so a heap buffer is still cleared through its slice.
+zeroize = { version = "1", default-features = false }
 # Always on (no_std-safe): the device shell derives its persistent P-256
 # key-agreement key (hkey) with these. `default-features = false` is
 # load-bearing: p256's defaults enable `std` + `pem`, which break the
@@ -148,4 +155,46 @@ required-features = ["host"]
 
 [[test]]
 name = "r2_keystore_decode"
+required-features = ["host"]
+
+# US-1563: the measured capacity boundary. Runs the region to its limit and
+# checks the refusal, so the number in `docs/capacity.md` is a measurement and
+# not an assertion. Deliberately **not** `#[ignore]`d — an unrun measurement is
+# an assertion, which is the defect this file exists to close.
+[[test]]
+name = "capacity_boundary"
+required-features = ["host"]
+
+# US-1556: delete, tombstone and compaction on the region, through the applet's
+# own credential codec rather than synthetic blobs.
+[[test]]
+name = "region_delete_compaction"
+required-features = ["host"]
+
+# US-1558: the snapshot -> records migration, and the "the boot path does not
+# touch the region" / "a cold OTP row still enumerates" clauses S8/S9/S12 ask
+# for. Shares its fixtures with `region_degradation` through
+# `tests/region_boot/mod.rs`.
+[[test]]
+name = "snapshot_migration"
+required-features = ["host"]
+
+# US-1560: a key-region failure degrades to an empty key set rather than
+# halting, and the `fatal_boot` call-site count is unchanged.
+[[test]]
+name = "region_degradation"
+required-features = ["host"]
+
+# US-1550: credential private keys are zeroized when the credential goes out of
+# scope, asserted through the applet's own host witness with a `was_nonzero`
+# flag so the assertion cannot be satisfied by a buffer that was never written.
+[[test]]
+name = "credential_zeroize"
+required-features = ["host"]
+
+# US-1557: `app.rs` and `device_app.rs` driven through one script — same status
+# bytes, same CBOR key sets, same boundary error — with the capacity divergence
+# made explicit rather than incidental.
+[[test]]
+name = "twin_parity"
 required-features = ["host"]

@@ -37,6 +37,14 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 # does. A dev-dependency only; the device build never sees it.
 hex-literal = "0.4"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha1"] }
+# US-1553: `tests/oath_keyregion.rs` computes the reference HOTP a recovered
+# credential has to produce, so the durability assertion is a statement about
+# the secret surviving the medium rather than a snapshot of what this build
+# happened to print. The same crates at the same pins as the applet's own
+# dependencies above — a different version here would make the two computations
+# disagree for a reason that has nothing to do with the key region.
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
 
 [features]
 default = ["host"]

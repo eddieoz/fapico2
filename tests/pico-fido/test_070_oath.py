@@ -19,6 +19,11 @@
 
 import pytest
 from utils import *
+from conftest import (
+    authenticate_oath,
+    oath_select_challenge,
+    select_oath_aid,
+)
 import hmac, hashlib
 
 INS_PUT = 0x01
@@ -67,28 +72,44 @@ PROP_REQUIRE_TOUCH = 0x02
 ## Based on tests on https://github.com/Yubico/ykneo-oath/blob/master/test/test/pkgYkneoOathTest/YkneoOathTest.java
 
 def test_select_oath(select_oath):
-    pass
+    """SELECT succeeds and advertises a VALIDATE challenge.
 
-def test_otp_pin_set_verify_and_change(reset_oath):
+    This asserted nothing at all until the default access code landed, when it
+    became the one place that can state the *positive* half of the new
+    contract: both first-party clients decide whether to authenticate from the
+    SELECT response alone (`yubikit/oath.py`: `_has_key = self._challenge is not
+    None`; picoforge: `info.password_set()`), so a SELECT that stopped serving
+    the challenge would silently strand every one of them.
+    """
+    body = select_oath_aid(select_oath)
+    chal = oath_select_challenge(body)
+    assert chal is not None and len(chal) == 8, (
+        "SELECT served no VALIDATE challenge, so a client would provision "
+        "straight into 6982: %s" % bytes(body).hex()
+    )
+
+def test_otp_pin_set_verify_and_change(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     old_pin = list(b"123456")
     new_pin = list(b"654321")
 
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_SET_PIN,
         p1=0,
         p2=0,
         data=[TAG_PASSWORD, len(old_pin)] + old_pin,
     )
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_VERIFY_PIN,
         p1=0,
         p2=0,
         data=[TAG_PASSWORD, len(old_pin)] + old_pin,
     )
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_CHANGE_PIN,
         p1=0,
         p2=0,
@@ -100,7 +121,7 @@ def test_otp_pin_set_verify_and_change(reset_oath):
 
     with pytest.raises(APDUResponse) as e:
         send_apdu(
-            reset_oath,
+            oath_session,
             INS_VERIFY_PIN,
             p1=0,
             p2=0,
@@ -109,20 +130,22 @@ def test_otp_pin_set_verify_and_change(reset_oath):
     assert [e.value.sw1, e.value.sw2] == [0x69, 0x82]
 
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_VERIFY_PIN,
         p1=0,
         p2=0,
         data=[TAG_PASSWORD, len(new_pin)] + new_pin,
     )
 
-def test_otp_pin_change_stops_at_retry_floor(reset_oath):
+def test_otp_pin_change_stops_at_retry_floor(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     old_pin = list(b"123456")
     new_pin = list(b"654321")
     wrong_pin = list(b"000000")
 
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_SET_PIN,
         p1=0,
         p2=0,
@@ -131,7 +154,7 @@ def test_otp_pin_change_stops_at_retry_floor(reset_oath):
     for _ in range(3):
         with pytest.raises(APDUResponse) as e:
             send_apdu(
-                reset_oath,
+                oath_session,
                 INS_CHANGE_PIN,
                 p1=0,
                 p2=0,
@@ -144,7 +167,7 @@ def test_otp_pin_change_stops_at_retry_floor(reset_oath):
 
     with pytest.raises(APDUResponse) as e:
         send_apdu(
-            reset_oath,
+            oath_session,
             INS_CHANGE_PIN,
             p1=0,
             p2=0,
@@ -155,9 +178,13 @@ def test_otp_pin_change_stops_at_retry_floor(reset_oath):
         )
     assert [e.value.sw1, e.value.sw2] == [0x69, 0x82]
 
-    send_apdu(reset_oath, INS_RESET, p1=0xde, p2=0xad)
+    send_apdu(oath_session, INS_RESET, p1=0xde, p2=0xad)
+    # The RESET cleared the OTP PIN and re-ran the virginity rule, so the
+    # session is unvalidated again; the owner re-authenticates (the client
+    # flow: SELECT + VALIDATE) before re-arming a PIN.
+    authenticate_oath(oath_session)
     send_apdu(
-        reset_oath,
+        oath_session,
         INS_SET_PIN,
         p1=0,
         p2=0,
@@ -173,65 +200,75 @@ data_name = [TAG_NAME] + [len(name_kaka)] + name_kaka
 data_key = [TAG_KEY, 0x16, 0x21, 0x06, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b]
 data_chal = [TAG_CHALLENGE, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
 
-def test_life(reset_oath):
+def test_life(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     data = data_name + data_key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=list(data))
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=list(data))
     assert(len(resp) == 0)
-    resp = list_apdu(reset_oath)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, 5, 0x21] + name_kaka
     assert(resp == exp)
 
     data = data_name + data_chal
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=0, data=data)
     exp = [TAG_RESPONSE, 0x15, 0x06, 0xb3, 0x99, 0xbd, 0xfc, 0x9d, 0x05, 0xd1, 0x2a, 0xc4, 0x35, 0xc4, 0xc8, 0xd6, 0xcb, 0xd2, 0x47, 0xc4, 0x0a, 0x30, 0xf1]
     assert(resp == exp)
 
     data = data_name
-    resp = send_apdu(reset_oath, INS_DELETE, p1=0, p2=0, data=data)
-    resp = list_apdu(reset_oath)
+    resp = send_apdu(oath_session, INS_DELETE, p1=0, p2=0, data=data)
+    resp = list_apdu(oath_session)
     assert(len(resp) == 0)
 
 
-def test_rename_prefix_extension(reset_oath):
+def test_rename_prefix_extension(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     old_name = b"30/test"
     new_name = b"30/test2"
     key = list(bytes(b"foo bar"))
 
     put_data = [TAG_NAME, len(old_name)] + list(old_name)
     put_data += [TAG_KEY, len(key) + 2, TYPE_TOTP | ALG_SHA1, 6] + key
-    send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=put_data)
+    send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=put_data)
 
     rename_data = [TAG_NAME, len(old_name)] + list(old_name)
     rename_data += [TAG_NAME, len(new_name)] + list(new_name)
-    send_apdu(reset_oath, INS_RENAME, p1=0, p2=0, data=rename_data)
+    send_apdu(oath_session, INS_RENAME, p1=0, p2=0, data=rename_data)
 
-    resp = list_apdu(reset_oath)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, len(new_name) + 1, TYPE_TOTP | ALG_SHA1] + list(new_name)
     assert resp == exp
 
-def test_overwrite(reset_oath):
+def test_overwrite(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     data = data_name + data_key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=list(data))
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=list(data))
     assert(len(resp) == 0)
-    resp = list_apdu(reset_oath)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, 5, 0x21] + name_kaka
     assert(resp == exp)
 
     data = data_name + [TAG_CHALLENGE, 0x8] + list(bytes(b'\xff'*8))
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=0, data=data)
     exp = [TAG_RESPONSE, 0x15, 0x06, 0x79, 0x3e, 0x1b, 0xbd, 0xbf, 0xa7, 0x75, 0xa8, 0x63,0xcc, 0x80, 0x02, 0xce, 0xe4, 0xbd, 0x6c, 0xd7, 0xce, 0xb8, 0xcd]
     assert(resp == exp)
 
-    resp = list_apdu(reset_oath)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, 5, 0x21] + name_kaka
     assert(resp == exp)
 
     data = data_name + [TAG_CHALLENGE, 0x8] + list(bytes(b'\xff\x00'*4))
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=0, data=data)
     exp = [TAG_RESPONSE, 0x15, 0x06, 0x3b, 0x0e, 0x3c, 0x63, 0x1c, 0x01, 0x67, 0xb0, 0x93, 0xa5, 0xec, 0xb9, 0x09, 0x7d, 0x0b, 0x8e, 0x9a, 0xcc, 0x2f, 0x7f]
     assert(resp == exp)
 
-def test_auth(reset_oath):
+def test_auth(oath_session):
+    # `oath_session` = re-virginized + authenticated (SELECT + VALIDATE, the
+    # client flow), so SET_CODE — which is itself gated — is reachable. The
+    # lockout this test is about is the one *after* the reconnect() below.
+    reset_oath = oath_session
     key = list(bytes(b'kaka blahonga'))
     chal = [1,2,3,4,5,6,7,8]
     resp = [0x0c, 0x42, 0x8e, 0x9c, 0xba, 0xa3, 0xb3, 0xab, 0x18, 0x53, 0xd8, 0x79, 0xb9, 0xd2, 0x26, 0xf7, 0xce, 0xcc, 0x4a, 0x7a]
@@ -274,66 +311,74 @@ def test_auth(reset_oath):
         list_apdu(reset_oath)
     assert [e.value.sw1, e.value.sw2] == [0x69, 0x82]
 
-def test_bothoath(reset_oath):
+def test_bothoath(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     digits = 6
     tname = list(bytes(b'totp'))
     data = [TAG_NAME, len(tname)] + tname + [TAG_KEY, 9, TYPE_TOTP | ALG_SHA1, digits] + list(bytes(b'foo bar'))
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
     data[2] = ord('h')
     data[8] = TYPE_HOTP | ALG_SHA1
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
 
     hname = tname[:]
     hname[0] = ord('h')
     data = [TAG_CHALLENGE, 8, 0, 0, 0, 0, 0x02, 0xbc, 0xad, 0xc8]
-    resp = send_apdu(reset_oath, INS_CALC_ALL, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALC_ALL, p1=0, p2=1, data=data)
     exp = [TAG_NAME, len(tname)] + tname + [TAG_T_RESPONSE, 5, digits, 0x3d, 0xc6, 0xbf, 0x3d] + [TAG_NAME, len(hname)] + hname + [TAG_NO_RESPONSE, 0x01, digits]
     assert(exp == resp)
 
     data = [TAG_NAME, len(hname)] + hname + [TAG_CHALLENGE]
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, digits, 0x17, 0xfa, 0x2d, 0x40]
     assert(resp == exp)
 
-def test_imf_overwrite(reset_oath):
+def test_imf_overwrite(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     key = list(bytes(b'kaka'))
     imf = [0xff, 0x00, 0xff, 0xff]
     name = list(bytes(b'kaka'))
 
     data = [TAG_NAME, len(name)] + name + [TAG_KEY, len(key)+2, ALG_SHA1 | TYPE_HOTP, 6] + key + [TAG_IMF, len(imf)] + imf
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
     data = [TAG_NAME, len(name)] + name + [TAG_CHALLENGE]
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, 6, 0x45, 0xd9, 0x0f, 0x25]
     assert(exp == resp)
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, 6, 0x1b, 0xc5, 0x4a, 0x85]
     assert(exp == resp)
 
     data = [TAG_NAME, len(name)] + name + [TAG_KEY, len(key)+2, ALG_SHA1 | TYPE_HOTP, 6] + key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
     data = [TAG_NAME, len(name)] + name + [TAG_CHALLENGE]
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, 6, 0x16, 0x53, 0x24, 0xdb]
     assert(exp == resp)
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, 6, 0x53, 0xed, 0x5e, 0xb2]
     assert(exp == resp)
 
-def test_imf_more(reset_oath):
+def test_imf_more(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     key = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30,
 				0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30]
     imf = [0, 0, 0, 1]
     name = list(bytes(b'kaka'))
 
     data = [TAG_NAME, len(name)] + name + [TAG_KEY, len(key)+2, ALG_SHA1 | TYPE_HOTP, 6] + key + [TAG_IMF, len(imf)] + imf
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
     data = [TAG_NAME, len(name)] + name + [TAG_CHALLENGE]
-    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=data)
+    resp = send_apdu(oath_session, INS_CALCULATE, p1=0, p2=1, data=data)
     exp = [TAG_T_RESPONSE, 5, 6, 0x41, 0x39, 0x7e, 0xea]
     assert(exp == resp)
 
-def test_delete(reset_oath):
+def test_delete(oath_session):
+    # `oath_session` = re-virginized + authenticated, i.e. the client flow
+    # (SELECT then VALIDATE); the default access code locks a bare session.
     key = list(bytes(b'blahonga!'))
     firstname = list(bytes(b'one'))
     secondname = list(bytes(b'two'))
@@ -341,26 +386,37 @@ def test_delete(reset_oath):
     type = ALG_SHA1 | TYPE_TOTP
 
     data = [TAG_NAME, len(firstname)] + firstname + [TAG_KEY, len(key)+2, type, 6] + key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
     data = [TAG_NAME, len(secondname)] + secondname + [TAG_KEY, len(key)+2, type, 6] + key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
-    resp = list_apdu(reset_oath)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, len(firstname)+1, type] + firstname + [TAG_NAME_LIST, len(secondname)+1, type] + secondname
     assert(exp == resp)
 
     data = [TAG_NAME, len(firstname)] + firstname
-    resp = send_apdu(reset_oath, INS_DELETE, p1=0, p2=0, data=data)
-    resp = list_apdu(reset_oath)
+    resp = send_apdu(oath_session, INS_DELETE, p1=0, p2=0, data=data)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, len(secondname)+1, type] + secondname
     assert(exp == resp)
 
     data = [TAG_NAME, len(thirdname)] + thirdname + [TAG_KEY, len(key)+2, type, 6] + key
-    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=data)
-    resp = list_apdu(reset_oath)
+    resp = send_apdu(oath_session, INS_PUT, p1=0, p2=0, data=data)
+    resp = list_apdu(oath_session)
     exp = [TAG_NAME_LIST, len(thirdname)+1, type] + thirdname + [TAG_NAME_LIST, len(secondname)+1, type] + secondname
     assert(exp == resp)
 
 def test_noauth(reset_oath):
+    """Every credential command is refused from an unvalidated session.
+
+    **Deliberately NOT the `oath_session` fixture.** The only authentication
+    here is the SET_CODE setup below, and it exists because SET_CODE is itself
+    gated — the owner changing their access code is a legitimate, validated
+    action, exactly as it is in a GUI. Everything after the `reconnect()` runs
+    from a session that has proved nothing, and that is the state under test.
+    """
+    # Setup only: the client flow (SELECT + VALIDATE) is what makes SET_CODE
+    # reachable at all, since the applet provisions a default access code.
+    authenticate_oath(reset_oath)
     key = list(bytes(b'kaka blahonga'))
     chal = [1,2,3,4,5,6,7,8]
     resp = [0x0c, 0x42, 0x8e, 0x9c, 0xba, 0xa3, 0xb3, 0xab, 0x18, 0x53, 0xd8, 0x79, 0xb9, 0xd2, 0x26, 0xf7, 0xce, 0xcc, 0x4a, 0x7a]
@@ -459,11 +515,21 @@ def test_reset_without_validate(reset_oath):
     four-byte, Le-less form picoforge actually puts on the wire is covered by
     `picoforge_four_byte_reset_reaches_the_applet_and_wipes` in
     apps/oath/tests/device_oath.rs.
+
+    Note the post-RESET state is no longer "virgin and open". A factory reset
+    returns the applet to the state a fresh device is in, and *that* state
+    carries the documented default access code (`reset_state` re-provisions it
+    rather than leaving the most-protected configuration out of reach), so the
+    assertions below ask the sharper question — **is the code the owner had
+    chosen still there?** — instead of "is there any code at all".
     """
     key = list(bytes(b'kaka blahonga'))
     chal = [1, 2, 3, 4, 5, 6, 7, 8]
     proof = [0x0c, 0x42, 0x8e, 0x9c, 0xba, 0xa3, 0xb3, 0xab, 0x18, 0x53, 0xd8, 0x79, 0xb9, 0xd2, 0x26, 0xf7, 0xce, 0xcc, 0x4a, 0x7a]
     data = [TAG_KEY, len(key) + 1, ALG_SHA1 | TYPE_TOTP] + key + [TAG_CHALLENGE, len(chal)] + chal + [TAG_RESPONSE, len(proof)] + proof
+    # Setup only: SET_CODE is itself gated, so the owner runs the client flow
+    # (SELECT + VALIDATE) to reach it.
+    authenticate_oath(reset_oath)
     send_apdu(reset_oath, INS_SET_CODE, p1=0, p2=0, data=data)
     # No PUT here: SET_CODE locks the session by design, so a credential could
     # not be added afterwards without a VALIDATE handshake. The access code
@@ -478,13 +544,116 @@ def test_reset_without_validate(reset_oath):
     # The bare RESET: no VALIDATE, no unlock. It must now succeed.
     send_apdu(reset_oath, INS_RESET, p1=0xde, p2=0xad, data=None)
 
-    # Wiped: the applet is virgin again, so LIST is granted and empty — and
-    # the access code is gone, so SELECT no longer serves a challenge.
-    resp, sw1, sw2 = reset_oath.connection.transmit(
-        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, 0x07]
-        + [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
-        + [0x00, 0x00]
+    # Wiped. A fresh SELECT serves a challenge again — the applet is back to a
+    # factory-fresh state, which carries the *default* code, not an open one.
+    body = select_oath_aid(reset_oath)
+    chal_now = oath_select_challenge(body)
+    assert chal_now is not None and len(chal_now) == 8, (
+        "a wiped OATH applet must serve a VALIDATE challenge again: %s"
+        % bytes(body).hex()
     )
-    assert [sw1, sw2] == [0x90, 0x00]
-    assert 0x74 not in resp, "the access code survived the RESET"
+
+    # The owner's code is the thing the RESET has to destroy. Answering the
+    # fresh challenge with it must be refused — before the default-code change
+    # this was checked as "SELECT serves no challenge", which no longer holds
+    # and would have gone green on an applet that simply forgot to wipe.
+    stale = list(hmac.digest(bytes(key), chal_now, 'sha1'))
+    stale_apdu = ([TAG_CHALLENGE, len(chal_now)] + list(chal_now)
+                  + [TAG_RESPONSE, len(stale)] + stale)
+    resp, sw1, sw2 = reset_oath.connection.transmit(
+        [0x00, INS_VALIDATE, 0x00, 0x00, len(stale_apdu)] + stale_apdu + [0x00, 0x00]
+    )
+    assert [sw1, sw2] != [0x90, 0x00], (
+        "the access code the owner chose survived the RESET: %02X%02X"
+        % (sw1, sw2)
+    )
+
+    # And behind the default code the table is genuinely empty.
+    authenticate_oath(reset_oath)  # the client flow: SELECT + VALIDATE
     assert list_apdu(reset_oath) == [], "credentials survived the RESET"
+
+
+def reselect_oath(ccid_card):
+    """Re-SELECT the OATH AID — a fresh applet session, as a client reconnect.
+
+    This is the step the whole suite used to avoid: `reset_oath` re-virginizes
+    before every test, so nothing here ever held a credential across a SELECT —
+    which is precisely the state a GUI reaches on every launch, and precisely
+    the state the lockout affected. A host-issued SELECT recomputes the grant
+    from scratch (US-901), so a re-SELECT is an unauthenticated session until
+    the client answers the challenge it serves.
+    """
+    return select_oath_aid(ccid_card)
+
+
+def test_a_credential_survives_a_new_session_across_the_client_handshake(oath_session):
+    """The picoforge / ykman flow, end to end, on a device that has a code.
+
+    Both clients decide whether to authenticate from the SELECT response alone
+    (`yubikit/oath.py`: `_has_key = self._challenge is not None`; picoforge:
+    `info.password_set()`) and then run the same SELECT → VALIDATE handshake
+    this test runs. This applet always has a secret to authenticate against —
+    `OathApp::boot_in_place` provisions `DEFAULT_ACCESS_CODE` — so the `74`
+    challenge is always served and the skip-VALIDATE branch no longer exists.
+
+    What is left, and what this test still exists for, is the part that was
+    invisible while `reset_oath` wiped the applet first: **a credential must
+    survive a brand-new applet session**, granted only by the handshake, with
+    LIST, CALCULATE, RENAME and DELETE all answering. That sequence is exactly
+    what a GUI runs on every open, and every one of those commands used to be
+    answered 6982 in it.
+    """
+    reset_oath = oath_session
+    name = [ord('G'), ord('i'), ord('t'), ord('H'), ord('u'), ord('b')]
+    put = [TAG_NAME, len(name)] + name + [TAG_KEY, 0x08, 0x21, 6, 1, 2, 3, 4, 5, 6]
+
+    # 1. Register, in the first session.
+    resp = send_apdu(reset_oath, INS_PUT, p1=0, p2=0, data=list(put))
+    assert len(resp) == 0
+
+    # 2. A NEW session, without any reset. This is the step that used to lock.
+    #    The SELECT alone is not enough any more — the applet re-arms the
+    #    default code — so this is where the client handshake belongs.
+    sel = reselect_oath(reset_oath)
+    chal = oath_select_challenge(sel)
+    assert chal is not None and len(chal) == 8, (
+        "SELECT must serve a VALIDATE challenge while a code is on file: %s"
+        % bytes(sel).hex()
+    )
+    with pytest.raises(APDUResponse) as e:
+        list_apdu(reset_oath)
+    assert [e.value.sw1, e.value.sw2] == [0x69, 0x82], (
+        "precondition: a session that skipped VALIDATE must still be refused"
+    )
+    # Mirrors the client flow: SELECT, then answer the challenge it served.
+    authenticate_oath(reset_oath)
+
+    # 3. Retrieve. 6982 here is the defect this test exists for.
+    listed = list_apdu(reset_oath)
+    assert len(listed) > 0, (
+        "LIST must answer with the credential still present once the client "
+        "has authenticated: a GUI that got 6982 would render an empty account "
+        "list for a token that holds one"
+    )
+    assert TAG_NAME_LIST in listed, "LIST entries carry a 72 name tag: %02X" % listed[0]
+
+    # 4. Use it — a named TOTP calculate, the request both clients issue.
+    calc = [TAG_NAME, len(name)] + name + data_chal
+    resp = send_apdu(reset_oath, INS_CALCULATE, p1=0, p2=1, data=list(calc))
+    assert len(resp) > 0 and resp[0] == TAG_T_RESPONSE, (
+        "CALCULATE must answer with a 76 truncated response, got %02X" % resp[0]
+    )
+
+    # 5. Rename and delete still work in that authenticated state.
+    renamed = [TAG_NAME, len(name)] + name + [TAG_NAME, len(name) - 1] + name[:-1]
+    resp = send_apdu(reset_oath, INS_RENAME, p1=0, p2=0, data=list(renamed))
+    assert len(resp) == 0
+    resp = send_apdu(
+        reset_oath, INS_DELETE, p1=0, p2=0,
+        data=[TAG_NAME, len(name) - 1] + name[:-1]
+    )
+    assert len(resp) == 0
+
+    # 6. And the table is genuinely empty afterwards — the session stayed
+    #    usable throughout, so this is the applet's state, not a refusal.
+    assert len(list_apdu(reset_oath)) == 0

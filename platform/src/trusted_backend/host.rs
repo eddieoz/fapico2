@@ -35,10 +35,19 @@ use super::dispatch::{MigrationAuthority, OpcardDispatch};
 use super::runner::{with_backend, Client};
 use crate::{migration::MigrationError, secure_store::SecureStore};
 
-/// Internal-FS size: the device's trussed FS window
-/// (`device::TRUSSED_FS_BLOCKS` × 4 KiB = 1 MiB).
+/// Internal-FS size, in 4 KiB blocks.
+///
+/// **This no longer mirrors the device.** US-1538 split the device's 1 MiB
+/// trussed window into `ifs` 192 blocks (768 KiB) and `efs` 64 blocks (256 KiB),
+/// so the device's `ifs` is 192, not 256. The host twin still allocates 256 for
+/// `ifs` and 8 for `efs`/`vfs`, which is a deliberate divergence rather than an
+/// oversight: the twin exists to exercise card logic, and its sizes are chosen
+/// to be obviously large enough rather than to match. Anything that depends on
+/// the device geometry must read `device::TRUSSED_IFS_BLOCKS` /
+/// `device::TRUSSED_EFS_BLOCKS`, never these.
 const INTERNAL_BLOCKS: usize = 256;
-/// efs/vfs size: the device's RAM stores (8 × 4 KiB).
+/// efs/vfs size: the host's RAM stores (8 × 4 KiB). On device `efs` is flash
+/// (US-1538) and only `vfs` is RAM.
 const RAM_BLOCKS: usize = 8;
 
 /// littlefs2 `Storage` over a (leaked, host-only) heap buffer.

@@ -14,6 +14,15 @@
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
+// US-1553: `OathApp` owns a boxed key-region handle for the length of its
+// session, so the applet needs the allocator. It is **not** used before
+// `platform::rsa_heap::init()` — the handle is constructed at first applet use,
+// after `RUNG_USB` and therefore after boot — so the US-961 heap gate
+// (`tests/scripts/check_heap_gate.py`) is unaffected. The alternative was a
+// second key held in the applet's static, and `ckey.rs` already holds
+// `OathSeal` there for the same reason.
+extern crate alloc;
+
 pub mod oath_core;
 pub mod otp;
 

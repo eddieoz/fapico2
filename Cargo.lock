@@ -1350,6 +1350,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "x448",
+ "zeroize",
 ]
 
 [[package]]

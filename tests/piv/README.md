@@ -16,16 +16,23 @@ files assert the wire protocol. It does **not** touch any Rust source.
 |---|---|---|
 | `test_piv_status.py` | US-371/372/373 — SELECT/FCI, version, serial, PIN lifecycle, mgm AUTHENTICATE, missing-object 6A82 | **GREEN** |
 | `test_piv_objects.py` | US-373 — GET/PUT DATA (roundtrip, `81 xx`/`82 hi lo` long forms, clear, unknown fid 6581, oversize 6700, no-mgm 6982) | **GREEN** |
-| `test_piv_keygen.py` | US-374 — GEN KEY (0x47) P-256/9A + P-384/9C, attestation cert, GET METADATA (0xF7), negatives | **RED** |
-| `test_piv_import.py` | US-374 — IMPORT (0xFE) known-scalar, metadata pubkey == d·G, negatives | **RED** |
-| `test_piv_sign.py` | US-375 — slot sign (0x87) P-256/9C + P-384/9D, Python-side ECDSA verify, no-key 6581, algo mismatch 6700 | **RED** |
-| `test_piv_ecdh.py` | US-375 — ECDH (0x3C) shared secret vs Python x-coordinate | **RED** |
-| `test_piv_persistence.py` | US-374 — key + object survive an emulator restart (same keystore); mgm session does not | **RED** |
+| `test_piv_keygen.py` | US-374 — GEN KEY (0x47) P-256/9A + P-384/9C, attestation cert, GET METADATA (0xF7), negatives | **XFAIL** |
+| `test_piv_import.py` | US-374 — IMPORT (0xFE) known-scalar, metadata pubkey == d·G, negatives | **XFAIL** |
+| `test_piv_sign.py` | US-375 — slot sign (0x87) P-256/9C + P-384/9D, Python-side ECDSA verify, no-key 6581, algo mismatch 6700 | **XFAIL** |
+| `test_piv_ecdh.py` | US-375 — ECDH (0x3C) shared secret vs Python x-coordinate | **XFAIL** |
+| `test_piv_persistence.py` | US-374 — key + object survive an emulator restart (same keystore); mgm session does not | **XFAIL** |
 
-The RED tests are a **TDD record**: they assert the US-374/375 contract and fail
+The XFAIL tests are a **TDD record**: they assert the US-374/375 contract and fail
 on plain protocol assertions (an `assert sw == 0x9000` that sees `0x6D00`/`0x6A81`).
-They are deliberately **not** `@pytest.mark.skip`/`xfail` — they turn GREEN the
-moment the Rust stories land, and they never crash on a fixture/timeout.
+
+They used to be left unmarked, on the reasoning that a red test is a louder
+reminder than a skipped one. That stopped being true the moment this suite ran
+in CI: 17 permanently-red tests were indistinguishable from 17 regressions, and
+a gate that is always red is a gate nobody reads. Each of the five now carries a
+module-level `pytestmark = pytest.mark.xfail(..., strict=False)` naming the story
+that has to land. The contract is still executed on every run — `xfail` runs the
+test, it does not skip it — and when US-374/US-375 land each reports XPASS
+rather than failing, which is the signal to delete the marker.
 
 ---
 

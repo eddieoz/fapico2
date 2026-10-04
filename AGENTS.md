@@ -252,12 +252,32 @@ that already work with Yubico software.
 
 ## Build, flash, test
 
+**Tag convention ([ADR 0002](docs/adr/0002-provisioning-policy.md)):** release tags carry a `-release` suffix (`vX.Y.Z-release`).
+Alpha/beta images keep the debug port available and burn nothing irreversible; `-release` images
+are the boundary where the `DEBUG_DISABLE` closure will apply. The repository carries **no tags
+yet** — `git tag -l` returns empty as of 2026-10-04 — so the convention binds from the first
+one, and no tag is created by ADR 0002.
+
 ```bash
 ./build.sh                     # release UF2 for RP2350 -> firmware/fapico2.uf2
 cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
-./run_tests.sh                 # clippy + gates + pytest (needs the ../pico-fido2/.test-venv
-                                 # interpreter; override with PICO_FIDO2_VENV=/path/to/python)
+./run_tests.sh                 # clippy + gates + pytest (needs a pytest interpreter;
+                                 # see "The pytest interpreter" below)
+./run_tests.sh --suites-only   # just the emulator suites — what ci.yml's pytest-gate runs
 ```
+
+**The pytest interpreter.** The suites live in this repository (`tests/`) and
+their dependencies are declared in `tests/requirements.txt`. `run_tests.sh`
+takes the interpreter from `PICO_FIDO2_VENV`, defaulting to the sibling
+`../pico-fido2/.test-venv`; to use an in-repo one:
+
+```bash
+python -m venv .test-venv
+./.test-venv/bin/pip install -r tests/requirements.txt   # needs libpcsclite-dev for pyscard
+PICO_FIDO2_VENV=$PWD/.test-venv/bin/python ./run_tests.sh
+```
+
+CI builds that venv from `tests/requirements.txt` and passes it the same way.
 
 `build.sh` must produce the UF2 through `firmware/uf2gen.py`. Plain
 `elf2uf2` output **silently does nothing** on this bootrom — it lacks the

@@ -58,6 +58,42 @@ That last one is the load-bearing check and it is arithmetic, not a
 string-match, so editing the constant in either place without the other is a
 red gate rather than a stale sentence. The derivation is the document's own:
 `ceiling x interval / per-sector-erases-per-persist`.
+
+The per-record constants (US-1561, US-1562)
+--------------------------------------------
+
+The key region replaced the whole-snapshot store for FIDO credentials, so a
+signature-counter bump is now a **record commit plus an index rewrite**
+(`FidoRecordStore::update`) rather than a whole-image persist. That is a
+different write pattern with a different cost, and §4c of the document is where
+it is priced.
+
+So the gate does for it exactly what it did for `COUNTER_PERSIST_INTERVAL`: it
+**reads the constants out of the source** and refuses a document that disagrees.
+
+* `SCRATCHPAD_ERASES_PER_COMMIT` and `LIVE_ERASES_PER_COMMIT` are read by regex
+  from `platform/src/keyregion/commit.rs`. Those are the only two literals in
+  the derivation — everything else in `commit.rs` and `fido_store.rs` is
+  *derived* from them, which is the point, and a gate that read four derived
+  numbers would be reading four restatements of two.
+* Every derived figure is then **re-derived here from those two literals, with
+  the source's own formulas**, and each one is compared against what
+  `platform/tests/key_region_counter_budget.rs` measured over the real store.
+  Three parties, one number: the literal, the measurement, and the document.
+* The lifetime is re-derived per **sector**, as before, and the divisor is the
+  *busiest* sector rather than a per-write operation count — the mistake §3.4
+  withdrew. The gate refuses a document whose per-record divisor is not the
+  measured maximum.
+
+The negative test (`--self-test`)
+---------------------------------
+
+A gate nobody has watched fail is a gate nobody knows works. `--self-test`
+re-runs the evaluator against deliberately broken copies of the document and
+the sources and asserts that each named check fires — a stale interval, a
+flipped divisor, a removed figure, a document that has stopped labelling the
+100,000 as literature. It prints which check each mutation tripped, so a
+reviewer can see that the checks are load-bearing rather than merely present.
 """
 import pathlib
 import re
@@ -101,6 +137,59 @@ HARNESS = [
 # drift in the same sense a value mismatch is.
 FIGURE_RE = re.compile(r"^ERASE_BUDGET\s+([a-z_]+)=(\d+)\s*$", re.M)
 
+# The per-record instrument and its own prefix. A SEPARATE prefix, not a
+# different value for the same key: the two measurements are of different code
+# paths over different media, and a document figure set that could describe
+# either is a document nobody can check.
+RECORD_HARNESS = [
+    "cargo",
+    "test",
+    "-p",
+    "fapico2-platform",
+    "--target",
+    "x86_64-unknown-linux-gnu",
+    "--test",
+    "key_region_counter_budget",
+    "erase_budget_record_figures",
+    "--",
+    "--exact",
+    "--nocapture",
+]
+RECORD_FIGURE_RE = re.compile(r"^ERASE_BUDGET_RECORD\s+([a-z_]+)=(\d+)\s*$", re.M)
+
+# The two literals the per-record wear derivation is built from. Read by regex
+# out of the source for the same reason `COUNTER_PERSIST_INTERVAL` is: the code
+# is the single source of truth and the document is what has to follow it.
+COMMIT_SRC = ROOT / "platform" / "src" / "keyregion" / "commit.rs"
+SCRATCHPAD_ERASES_RE = re.compile(
+    r"^pub\s+const\s+SCRATCHPAD_ERASES_PER_COMMIT\s*:\s*u\d+\s*=\s*([0-9]+)\s*;",
+    re.M,
+)
+LIVE_ERASES_RE = re.compile(
+    r"^pub\s+const\s+LIVE_ERASES_PER_COMMIT\s*:\s*u\d+\s*=\s*([0-9]+)\s*;",
+    re.M,
+)
+
+# The keys the per-record document block must carry. Every one is mandatory in
+# both the instrument output and the document, for the same reason the snapshot
+# figures are.
+RECORD_REQUIRED = (
+    "sector_erases_per_record_commit",
+    "scratchpad_erases_per_record_commit",
+    "live_erases_per_record_commit",
+    "sector_erases_per_index_entry_write",
+    "sector_erases_per_counter_write",
+    "measured_sector_erases_per_counter_write",
+    "live_sector_erases_per_counter_write",
+    "live_slot_programs_per_counter_write",
+    "distinct_sectors_erased_per_counter_write",
+    "max_erases_per_sector_per_counter_write",
+    "unchanged_sector_erases",
+    "second_update_sector_erases",
+    "measured_slot_programs_per_counter_write",
+    "slots_per_sector",
+)
+
 
 def measure():
     """Run the host instrument and return its `key -> value` figures."""
@@ -114,8 +203,63 @@ def measure():
     return figures
 
 
+def measure_record():
+    """Run the per-record instrument and return its `key -> value` figures."""
+    r = subprocess.run(RECORD_HARNESS, capture_output=True, text=True, cwd=ROOT)
+    out = r.stdout + r.stderr
+    figures = {m.group(1): int(m.group(2)) for m in RECORD_FIGURE_RE.finditer(out)}
+    if r.returncode != 0 or not figures:
+        print("FAIL: the per-record erase-budget instrument did not run clean")
+        print(out[-3000:])
+        sys.exit(1)
+    return figures
+
+
 def doc_figures(doc):
     return {m.group(1): int(m.group(2)) for m in FIGURE_RE.finditer(doc)}
+
+
+def doc_record_figures(doc):
+    return {m.group(1): int(m.group(2)) for m in RECORD_FIGURE_RE.finditer(doc)}
+
+
+def record_constants():
+    """The two wear literals out of `commit.rs`, or `None` if either is gone.
+
+    Read from **source text**, not from a duplicate here, and `None` rather than
+    a default when a regex stops matching: a rename or a type change has to be
+    reflected in this script rather than silently ungating the derivation.
+    """
+    if not COMMIT_SRC.exists():
+        return None
+    text = COMMIT_SRC.read_text(encoding="utf-8")
+    scratch = SCRATCHPAD_ERASES_RE.search(text)
+    live = LIVE_ERASES_RE.search(text)
+    if not scratch or not live:
+        return None
+    return int(scratch.group(1)), int(live.group(1))
+
+
+def derive_record(scratchpad, live):
+    """The per-record wear figures, from the source's own formulas.
+
+    Written out rather than imported so a reader can check that this script and
+    `keyregion/{commit,fido_store}.rs` are doing the same arithmetic; the gate's
+    job is to notice when they stop.
+
+    | figure | formula | why |
+    |---|---|---|
+    | `sector_erases_per_record_commit` | `scratchpad + live` | `commit.rs`: prepare + retire, then the live erase |
+    | `sector_erases_per_index_entry_write` | `scratchpad + live` | the same three-phase shape, run over an index sector |
+    | `sector_erases_per_counter_write` | the two above, added | a durable counter write is a record commit *and* an index rewrite |
+    | `max_erases_per_sector_per_counter_write` | `scratchpad + scratchpad` | **both writes stage through the same scratchpad sector**, so it collects both prepare-and-retire pairs |
+    """
+    return {
+        "sector_erases_per_record_commit": scratchpad + live,
+        "sector_erases_per_index_entry_write": scratchpad + live,
+        "sector_erases_per_counter_write": 2 * (scratchpad + live),
+        "max_erases_per_sector_per_counter_write": scratchpad + scratchpad,
+    }
 
 
 def doc_int(doc, key):
@@ -172,15 +316,21 @@ def code_interval():
     return int(m.group(1)) if m else None
 
 
-def main() -> int:
-    if not DOC.exists():
-        print("FAIL: docs/erase-budget.md missing")
-        return 1
-    doc = DOC.read_text(encoding="utf-8")
-    measured = measure()
-    published = doc_figures(doc)
+def evaluate(doc, measured, interval, measured_record, record_figs):
+    """Every check the gate makes, as a list of human-readable failures.
 
+    Split out from `main` so `--self-test` can run the *same* code against
+    deliberately broken inputs. A gate whose checks only exist inside a function
+    that also touches the filesystem cannot be tested, and a gate that has never
+    been tested is a gate nobody knows fails.
+
+    `interval` is the code's `COUNTER_PERSIST_INTERVAL` (or `None` if the regex
+    stopped matching) and `record_figs` is the pair of wear literals out of
+    `commit.rs` (or `None`), so this function reads nothing itself and every
+    input a mutation can reach is a parameter.
+    """
     failures = []
+    published = doc_figures(doc)
 
     # --- the measurement must be recorded, and recorded correctly ----------
     for key, want in sorted(measured.items()):
@@ -284,7 +434,6 @@ def main() -> int:
     # The code is the source of truth (read above); the document follows. Both
     # a stale document and a missing one are failures, and the ceiling is
     # re-derived rather than string-matched, so a one-sided edit cannot pass.
-    interval = code_interval()
     doc_interval = doc_int(doc, "COUNTER_PERSIST_INTERVAL")
     doc_batched, doc_batched_says = doc_expr(doc, "batched_assertion_ceiling")
     if interval is None:
@@ -341,20 +490,341 @@ def main() -> int:
             f"claims do not hold"
         )
 
+    failures.extend(
+        record_failures(doc, measured_record, record_figs, cycles, interval)
+    )
+    return failures
+
+
+def record_failures(doc, measured, record_figs, cycles, interval):
+    """The US-1561/US-1562 half: the per-record counter write's budget.
+
+    Three sources have to agree — the literals in `commit.rs`, the measurement
+    over the real store, and the document's own arithmetic — and this checks all
+    three against each other. The interesting property is not that they agree
+    today but that any one of them moving makes the gate red.
+    """
+    failures = []
+    published = doc_record_figures(doc)
+
+    # --- the measurement must be recorded, and recorded correctly ----------
+    for key in RECORD_REQUIRED:
+        want = measured.get(key)
+        if want is None:
+            failures.append(
+                f"record: the instrument did not emit `{key}` — §4c's figures cannot be checked"
+            )
+        elif key not in published:
+            failures.append(f"record: doc: no `{key}` figure recorded (measured {want})")
+        elif published[key] != want:
+            failures.append(f"record: doc: {key} = {published[key]}, measured {want}")
+    for key in sorted(set(published) - set(measured)):
+        failures.append(
+            f"record: doc: `{key}` is not a figure the per-record instrument emits — stale"
+        )
+
+    # --- the literals in the source, and what they derive ------------------
+    if record_figs is None:
+        failures.append(
+            f"code: no `SCRATCHPAD_ERASES_PER_COMMIT` / `LIVE_ERASES_PER_COMMIT` literal found "
+            f"in {COMMIT_SRC.relative_to(ROOT)} — the gate derives the per-record budget from "
+            f"those two, so a rename or a type change has to be reflected here rather than "
+            f"silently ungating it"
+        )
+        return failures
+
+    scratchpad, live = record_figs
+    derived = derive_record(scratchpad, live)
+
+    # Literal against measurement: the source says what the protocol issues, the
+    # instrument says what it issued. If the commit path grows a fourth erase,
+    # this is where it shows.
+    for key, want in sorted(derived.items()):
+        got = measured.get(key)
+        if got is not None and got != want:
+            failures.append(
+                f"record: measured {key} = {got}, but commit.rs's literals "
+                f"(scratchpad {scratchpad}, live {live}) derive {want} — the protocol changed "
+                f"and docs/erase-budget.md §4c is now a stale measurement"
+            )
+    # And the document has to carry the derived value, not just the measured
+    # one, so a reader can check the arithmetic.
+    for key, want in sorted(derived.items()):
+        if key in published and published[key] != want:
+            failures.append(
+                f"record: doc: {key} = {published[key]}, derived {want} from commit.rs"
+            )
+
+    # --- the distribution, which is where this path differs ---------------
+    #
+    # The snapshot path's premise was `distinct == total`: uniform, one erase
+    # per sector. This path is **not** uniform — both the record commit and the
+    # index rewrite stage through the same scratchpad — so the check that matters
+    # is that the sum adds up and that the divisor is the maximum, which is the
+    # mistake §3.4 of the document withdrew.
+    per_write = measured.get("sector_erases_per_counter_write")
+    busiest = measured.get("max_erases_per_sector_per_counter_write")
+    distinct = measured.get("distinct_sectors_erased_per_counter_write")
+    live_sector = measured.get("live_sector_erases_per_counter_write")
+    slots = measured.get("slots_per_sector")
+    if per_write is None or busiest is None or distinct is None:
+        return failures
+    if busiest > per_write:
+        failures.append(
+            f"record: max_erases_per_sector_per_counter_write {busiest} exceeds the total "
+            f"{per_write} — one sector cannot take more erases than the write issues"
+        )
+    if busiest * distinct < per_write:
+        failures.append(
+            f"record: the distribution does not add up: {busiest} erases on each of {distinct} "
+            f"sectors is at least {busiest * distinct}, more than the {per_write} the write issues"
+        )
+    if live_sector is not None and live_sector != live:
+        failures.append(
+            f"record: live_sector_erases_per_counter_write {live_sector} != LIVE_ERASES_PER_COMMIT "
+            f"{live} — the acceptance criterion counts one erase of the record's own sector"
+        )
+    if slots is not None:
+        programs = measured.get("live_slot_programs_per_counter_write")
+        if programs is not None and programs != slots:
+            failures.append(
+                f"record: live_slot_programs_per_counter_write {programs} != slots_per_sector "
+                f"{slots} — 'one program' is one sector reprogram, which is this many slot programs"
+            )
+
+    # --- the controls that make the measurement able to fail ---------------
+    unchanged = measured.get("unchanged_sector_erases")
+    if unchanged is not None and unchanged != 0:
+        failures.append(
+            f"record: unchanged_sector_erases = {unchanged}; reading a record must erase nothing, "
+            f"and this is the control that proves there is a path that touches no medium"
+        )
+    second = measured.get("second_update_sector_erases")
+    if second is not None and per_write is not None and second != per_write:
+        failures.append(
+            f"record: second_update_sector_erases {second} != "
+            f"sector_erases_per_counter_write {per_write} — a durable counter write must cost the "
+            f"same every time, or the per-write rate published below is not the rate"
+        )
+
+    # --- the lifetime, per sector, exactly as §3.3 does it ----------------
+    doc_record_ceiling = doc_int(doc, "per_record_counter_write_ceiling")
+    if doc_record_ceiling is None:
+        failures.append("record: doc: no `per_record_counter_write_ceiling` figure recorded")
+    elif cycles and busiest:
+        want = cycles // busiest
+        if doc_record_ceiling != want:
+            failures.append(
+                f"record: doc: per_record_counter_write_ceiling {doc_record_ceiling} != "
+                f"{cycles} cycles / {busiest} erases on the busiest sector per write = {want}"
+            )
+
+    # `doc_expr`, not `doc_int`, for the same reason §4a's batched ceiling uses
+    # it: the document writes this figure as the arithmetic that produced it,
+    # and `doc_int` on that line returns the *first term* (100,000), not the
+    # result. Evaluating the line and comparing the published result separately
+    # is what catches a document whose own arithmetic disagrees with its own
+    # headline.
+    doc_batched_record, doc_batched_record_says = doc_expr(
+        doc, "batched_per_record_assertion_ceiling"
+    )
+    if doc_batched_record is None:
+        failures.append("record: doc: no `batched_per_record_assertion_ceiling` figure recorded")
+    elif cycles and busiest and interval:
+        want = cycles * interval // busiest
+        if doc_batched_record != want:
+            failures.append(
+                f"record: doc: batched_per_record_assertion_ceiling {doc_batched_record} != "
+                f"{cycles} x {interval} (COUNTER_PERSIST_INTERVAL) / {busiest} = {want}"
+            )
+        elif doc_batched_record_says is not None and doc_batched_record_says != doc_batched_record:
+            failures.append(
+                f"record: doc: batched_per_record_assertion_ceiling's own arithmetic evaluates to "
+                f"{doc_batched_record} but the line states {doc_batched_record_says} — the document "
+                f"contradicts itself about the figure the interval is argued from"
+            )
+
+    # The withdrawn 12,500 must not reappear under the per-record key either.
+    for key in ("per_record_counter_write_ceiling", "batched_per_record_assertion_ceiling"):
+        if re.search(rf"^\s*{key}\s*=\s*12[,_]?500", doc, re.M):
+            failures.append(
+                f"record: {key} = 12500 is the withdrawn double-count under a new name"
+            )
+    return failures
+
+
+# The mutations `self_test` applies. Each is `(name, doc-edit, expected
+# substring in the failure)`: a broken input, and the failure that broken input
+# must produce. A mutation that produces no failure fails the self-test, which
+# is the point — it is how a check that has stopped checking is caught.
+def _mutate_interval(doc):
+    """The document's interval is stale — the code moved, the prose did not."""
+    return re.sub(r"(?m)^(COUNTER_PERSIST_INTERVAL\s*=\s*)32", r"\g<1>16", doc)
+
+
+def _mutate_batched(doc):
+    """The batched ceiling was recomputed with the old divisor."""
+    return re.sub(
+        r"(?m)^(batched_assertion_ceiling\s*=\s*)100000 \* 32",
+        r"\g<1>100000 * 64",
+        doc,
+    )
+
+
+def _mutate_record_divisor(doc):
+    """The per-record lifetime divided by the per-write **total** (6) rather than
+    by the busiest sector (4) — §3.4's withdrawn double-count under a new key.
+
+    `100000 / 6 = 16,666`, which is what a reader who copied §3.3's shape
+    without re-deriving the divisor would publish.
+    """
+    return re.sub(
+        r"(?m)^per_record_counter_write_ceiling = 25000$",
+        "per_record_counter_write_ceiling = 16666",
+        doc,
+    )
+
+
+def _mutate_record_measured(doc):
+    """A measured per-record figure the instrument does not emit."""
+    return re.sub(
+        r"(?m)^(ERASE_BUDGET_RECORD\s+max_erases_per_sector_per_counter_write=)\d+",
+        r"\g<1>2",
+        doc,
+    )
+
+
+def _mutate_record_missing(doc):
+    """A required per-record figure removed from the document entirely."""
+    return re.sub(r"(?m)^ERASE_BUDGET_RECORD\s+live_slot_programs_per_counter_write=\d+\n", "", doc)
+
+
+def _mutate_no_literature(doc):
+    """The document drops the word entirely."""
+    return re.sub(r"(?i)literature", "a figure", doc)
+
+
+# name -> (doc edit, source edit or None, expected substring in the failures)
+MUTATIONS = (
+    ("stale COUNTER_PERSIST_INTERVAL in the doc", _mutate_interval, "COUNTER_PERSIST_INTERVAL"),
+    ("batched ceiling computed with the wrong interval", _mutate_batched, "batched_assertion_ceiling"),
+    (
+        "per-record lifetime divided by the per-write total",
+        _mutate_record_divisor,
+        "per_record_counter_write_ceiling",
+    ),
+    (
+        "per-record figure that contradicts the measurement",
+        _mutate_record_measured,
+        "max_erases_per_sector_per_counter_write",
+    ),
+    (
+        "required per-record figure missing from the doc",
+        _mutate_record_missing,
+        "live_slot_programs_per_counter_write",
+    ),
+    ("the word 'literature' removed from the doc", _mutate_no_literature, "literature"),
+)
+
+
+def self_test() -> int:
+    """Prove the gate fails when it should, and passes when it should.
+
+    The mutations below each break one thing in the document and assert that the
+    named check fires. A check that cannot be made to fire is a check that is
+    not load-bearing, and this is how that is discovered.
+    """
+    doc = DOC.read_text(encoding="utf-8")
+    measured = measure()
+    measured_record = measure_record()
+    interval = code_interval()
+    record_figs = record_constants()
+
+    base = evaluate(doc, measured, interval, measured_record, record_figs)
+    if base:
+        print("FAIL: self-test — the unmutated document does not pass, so every mutation below")
+        print("       would 'fail' for the wrong reason:")
+        for f in base:
+            print(f"  - {f}")
+        return 1
+    print(f"  baseline: PASS (interval {interval}, record figures {record_figs})")
+
+    bad = 0
+    for name, doc_edit, expect in MUTATIONS:
+        mutated = doc_edit(doc)
+        if mutated == doc:
+            print(f"FAIL: self-test — mutation `{name}` did not change the document at all, so")
+            print("       it is testing nothing")
+            bad += 1
+            continue
+        failures = evaluate(mutated, measured, interval, measured_record, record_figs)
+        if not failures:
+            print(f"FAIL: self-test — `{name}` produced NO failure; that check is not load-bearing")
+            bad += 1
+        elif not any(expect in f for f in failures):
+            print(f"FAIL: self-test — `{name}` failed, but not for the expected reason")
+            print(f"       (expected a failure mentioning {expect!r}; got)")
+            for f in failures:
+                print(f"         - {f}")
+            bad += 1
+        else:
+            print(f"  tripped: {name}")
+
+    # The source-side check: if the literals in commit.rs stop matching, the gate
+    # must notice rather than keep dividing by a remembered 2 and 1.
+    none_figs = evaluate(doc, measured, interval, measured_record, None)
+    if not any("SCRATCHPAD_ERASES_PER_COMMIT" in f for f in none_figs):
+        print("FAIL: self-test — removing the source literals produced no failure; the gate")
+        print("       would silently keep using the last constants it read")
+        bad += 1
+    else:
+        print("  tripped: source literals missing from commit.rs")
+
+    if bad:
+        print(f"FAIL: check_erase_budget self-test — {bad} mutation(s) not caught")
+        return 1
+    print("PASS: check_erase_budget self-test — every mutation tripped its named check")
+    return 0
+
+
+def main() -> int:
+    if not DOC.exists():
+        print("FAIL: docs/erase-budget.md missing")
+        return 1
+    doc = DOC.read_text(encoding="utf-8")
+    measured = measure()
+    measured_record = measure_record()
+    interval = code_interval()
+    record_figs = record_constants()
+
+    failures = evaluate(doc, measured, interval, measured_record, record_figs)
+
     if failures:
-        print("FAIL: check_erase_budget (US-1010/1011)")
+        print("FAIL: check_erase_budget (US-1010/1011/1561/1562)")
         for f in failures:
             print(f"  - {f}")
         return 1
+
+    pub = doc_figures(doc)
+    rpub = doc_record_figures(doc)
     print(
-        f"PASS: check_erase_budget (US-1010/1011) — {per_persist} sector "
-        f"erasures per persist across {distinct} distinct sectors, {per_sector} "
-        f"per sector, ceiling {ceiling} assertions (per-sector model); "
-        f"COUNTER_PERSIST_INTERVAL {interval} (code) = {doc_interval} (doc), "
-        f"batched ceiling {doc_batched}"
+        f"PASS: check_erase_budget (US-1010/1011/1561/1562)"
+        f"\n  snapshot persist: {pub['changed_sector_erasures_per_persist']} sector erasures across "
+        f"{pub['changed_distinct_sectors_erased_per_persist']} distinct sectors, "
+        f"{pub['changed_max_erases_per_sector_per_persist']} on the busiest, "
+        f"ceiling {doc_int(doc, 'assertion_ceiling')} assertions; "
+        f"COUNTER_PERSIST_INTERVAL {interval}, batched ceiling "
+        f"{doc_expr(doc, 'batched_assertion_ceiling')[0]}"
+        f"\n  per-record counter write: {rpub['sector_erases_per_counter_write']} sector erasures "
+        f"across {rpub['distinct_sectors_erased_per_counter_write']} distinct sectors, "
+        f"{rpub['max_erases_per_sector_per_counter_write']} on the busiest (the scratchpad), "
+        f"ceiling {doc_int(doc, 'per_record_counter_write_ceiling')} durable writes; batched "
+        f"{doc_expr(doc, 'batched_per_record_assertion_ceiling')[0]} assertions"
     )
     return 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
     sys.exit(main())

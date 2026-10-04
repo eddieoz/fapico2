@@ -136,6 +136,49 @@ HID_PORT = 36109  # private; nothing else may listen on it
 # ---------------------------------------------------------------------------
 OPENPGP_AID = bytes.fromhex("D27600012401")       # openpgp/src/device_shell.rs:29
 OATH_AID = bytes.fromhex("A0000005272101")      # oath/src/oath.rs:389
+
+# The device provisions a default OATH access code on boot, so every credential
+# command needs the same SELECT + VALIDATE handshake both first-party clients
+# perform. Same two steps yubikit and picoforge take; see `conftest.py`'s
+# `authenticate_oath` for the relay-transport twin.
+OATH_DEFAULT_ACCESS_CODE = b"123456"
+
+
+def _oath_device_id(select_body: bytes) -> bytes:
+    i = 0
+    while i + 1 < len(select_body):
+        tag, ln = select_body[i], select_body[i + 1]
+        if tag == 0x71:
+            return select_body[i + 2:i + 2 + ln]
+        i += 2 + ln
+    raise AssertionError(f"OATH SELECT served no 71 device-id: {select_body.hex()}")
+
+
+def _oath_challenge(select_body: bytes) -> bytes:
+    i = 0
+    while i + 1 < len(select_body):
+        tag, ln = select_body[i], select_body[i + 1]
+        if tag == 0x74:
+            return select_body[i + 2:i + 2 + ln]
+        i += 2 + ln
+    raise AssertionError(f"OATH SELECT served no challenge: {select_body.hex()}")
+
+
+def authenticate_oath(emu) -> None:
+    """SELECT the OATH applet and VALIDATE with the default access code.
+
+    The device stores `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)` and the
+    salt is the `71` device-id TLV from this same SELECT — the derivation both
+    clients perform before they ever send a proof.
+    """
+    sel = emu.select(OATH_AID)
+    chal = _oath_challenge(sel)
+    device_id = _oath_device_id(sel)
+    key = hashlib.pbkdf2_hmac("sha1", OATH_DEFAULT_ACCESS_CODE, device_id, 1000, 16)
+    mac = hmac.new(key, chal, hashlib.sha1).digest()
+    data = bytes([0x74, len(chal)]) + chal + bytes([0x75, len(mac)]) + mac
+    _, sw = emu.transmit(bytes([0x00, 0xA3, 0x00, 0x00, len(data)]) + data)
+    assert sw == 0x9000, f"OATH VALIDATE failed: SW={sw:04X}"
 OTP_AID = bytes.fromhex("A0000005272001")       # oath/src/otp.rs:955
 MGMT_AID = bytes.fromhex("A000000527471117")    # mgmt/src/lib.rs:43
 PIV_AID = bytes.fromhex("A000000308")           # piv/src/lib.rs:30
@@ -554,7 +597,7 @@ def test_paged_responses_honour_6c_and_61(emu):
     # =====================================================================
     # Block 2 — OATH: pages, but at its own cap, not at `Le`.
     # =====================================================================
-    emu.select(OATH_AID)
+    authenticate_oath(emu)
 
     # 32 TOTP/SHA1 credentials. Each CALC ALL entry is
     # `71 <len> <name> 75 15 06 <20-byte HMAC>` = 65 bytes, so 32 of them

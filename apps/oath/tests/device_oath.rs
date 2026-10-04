@@ -7,7 +7,7 @@
 //! stream reproduces the C device's OUTPUTS byte for byte.
 
 use fapico2_oath::oath_core::{
-    device_id_from_chipid, OathApp, DEVICE_ID_LEN, EMULATION_CHIPID, OATH_AID,
+    device_id_from_chipid, OathApp, DEFAULT_ACCESS_CODE, DEVICE_ID_LEN, EMULATION_CHIPID, OATH_AID,
 };
 use fapico2_oath::OathSeal;
 use fapico2_platform::dispatch::{App, MAX_RESPONSE};
@@ -124,6 +124,39 @@ fn select_with_chipid(chipid: Option<u64>) -> Vec<u8> {
     let device_id = device_id_from_chipid(chipid.unwrap_or(EMULATION_CHIPID));
     let mut app = OathApp::new(&mut HostTrng::new(), device_id, OathSeal::emul());
     select(&mut app)
+}
+
+/// SELECT, then VALIDATE with the documented default access code
+/// ([`DEFAULT_ACCESS_CODE`]).
+///
+/// This is the picoforge / ykman flow, and the only way into an applet that
+/// `boot` or `reset_state` provisioned. It is setup, not a claim: the
+/// access code is `123456`, and the point of provisioning one is that
+/// "unauthenticated" is never "open" — so every test that authenticates
+/// here still has to earn its `0x9000` on the other side.
+fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
+    let sel = select(app);
+    let chal = tlv_find(&sel, 0x74)
+        .expect("an app carrying an access code must advertise a 74 challenge TLV");
+    assert_eq!(chal.len(), 8, "the 74 challenge is 8 bytes");
+    // Derive the way the clients do — `PBKDF2-HMAC-SHA1(password, device_id,
+    // 1000, 16)` — not HMAC with the raw password. The password only ever
+    // validates against a device that wrongly stores it.
+    let mac = hmac_sha1(
+        &picoforge_access_key(DEFAULT_ACCESS_CODE, &emul_device_id()),
+        &chal,
+    );
+    let mut data = vec![0x74, 8];
+    data.extend_from_slice(&chal);
+    data.extend_from_slice(&[0x75, mac.len() as u8]);
+    data.extend_from_slice(&mac);
+    let (body, sw) = drive(app, &apdu(0xA3, 0, 0, &data));
+    assert_eq!(
+        sw, 0x9000,
+        "VALIDATE with the documented default access code must grant — this is the \
+         flow both first-party clients run"
+    );
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +560,10 @@ fn reboot_preserves_creds_and_access_code() {
         OathSeal::emul(),
     )
     .expect("boot fresh");
+
+    // `boot` provisioned the default access code, so this session starts
+    // unvalidated and every PUT below would answer 0x6982.
+    authenticate_with_default(&mut app);
 
     // 20 TOTP creds + 1 HOTP with IMF — large enough to span two chunked
     // parts, so the reboot crosses a multi-part set.
@@ -957,24 +994,23 @@ fn select_returns_version_deviceid_and_challenge() {
 
     // The trigger is the OATH *access code*, not the OTP PIN. A PIN-only
     // applet must still report `password_set() == false`, or a host prompts
-    // for a password that was never set. Boot one from a stream carrying a
-    // well-formed salted PIN record (49 B: counter, 16-byte salt, 32-byte
-    // verifier) and nothing else.
-    let mut pin_store = HostSecureStore::new();
-    write_migration_stream(&mut pin_store, &record(0xBA44, &[0x09u8; 49]));
-    let mut pin_app = OathApp::boot(
-        &mut HostTrng::new(),
-        &mut pin_store,
-        emul_device_id(),
-        OathSeal::emul(),
-    )
-    .expect("boot with OTP PIN");
-    // The record must actually have decoded into a PIN, or the case is void.
-    let (_, sw) = drive(&mut pin_app, &apdu(0xA1, 0, 0, &[]));
-    assert_eq!(
-        sw, 0x6982,
-        "the PIN record decoded (a PIN locks the session) — otherwise this \
-         sub-case proves nothing"
+    // for a password that was never set.
+    //
+    // `OathApp::new` is the one constructor that does **not** provision the
+    // default access code, and SET_PIN needs only a validated session — which
+    // a code-less applet has. So this is the reachable way to reach the state
+    // the claim is about: a PIN with nothing else on file. (Booting a PIN
+    // record instead no longer reaches it at all, because `boot` provisions
+    // a code — see the converse case below.)
+    let mut pin_app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul());
+    let mut pin_data = vec![0x80, 3];
+    pin_data.extend_from_slice(b"123");
+    let (_, sw) = drive(&mut pin_app, &apdu(0xB4, 0, 0, &pin_data));
+    assert_eq!(sw, 0x9000, "SET_PIN on the code-less applet");
+    // The PIN must actually be on file, or the case is void.
+    assert!(
+        pin_app.otp_pin_record().is_some(),
+        "the PIN record decoded — otherwise this sub-case proves nothing"
     );
     let pin_tags: Vec<u8> = tlvs(&select(&mut pin_app))
         .into_iter()
@@ -984,6 +1020,38 @@ fn select_returns_version_deviceid_and_challenge() {
         pin_tags,
         vec![0x79, 0x71],
         "an OTP PIN is not an OATH access code: still no challenge"
+    );
+
+    // The converse, which is what the default code changed: a device that
+    // *boots* with a PIN record now **does** advertise a challenge — because
+    // `boot` provisioned an access code, not because of the PIN. The
+    // attribution is what is worth asserting, so answer the challenge with
+    // the access code and show the PIN neither grants nor is needed for.
+    let mut pin_store = HostSecureStore::new();
+    write_migration_stream(&mut pin_store, &record(0xBA44, &[0x09u8; 49]));
+    let mut booted = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut pin_store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot with OTP PIN");
+    assert!(
+        booted.otp_pin_record().is_some(),
+        "the PIN record decoded from the stream"
+    );
+    let sel = select(&mut booted);
+    assert_eq!(
+        tlvs(&sel).iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![0x79, 0x71, 0x74],
+        "a booted device carries the default access code, so SELECT advertises a \
+         challenge — this is the password a host must answer, not the OTP PIN"
+    );
+    authenticate_with_default(&mut booted);
+    let (_, sw) = drive(&mut booted, &apdu(0xA1, 0, 0, &[]));
+    assert_eq!(
+        sw, 0x9000,
+        "the challenge answers to the access code: VALIDATE with it unlocks the session"
     );
 }
 
@@ -1397,7 +1465,9 @@ fn hex_bytes(s: &str) -> Vec<u8> {
 /// `Apdu::write(CLA_ISO, INS_RESET, 0xDE, 0xAD, &[])` and **no** VALIDATE.
 /// Since US-132 dropped the session gate, that call reaches the applet: with
 /// the `0xDE`/`0xAD` magic and a user-presence grant — the two gates that
-/// remain — the bare RESET wipes the table (0x9000) and leaves a virgin applet.
+/// remain — the bare RESET wipes the table (0x9000) and leaves the applet in
+/// the state a factory-fresh device is in: no credentials, and the
+/// **documented default** access code rather than no code at all.
 ///
 /// The APDU here is the 5-byte form `00 04 DE AD 00` (the harness's
 /// case-1 + Le=0 encoding, which is what the C reference's own suite sends).
@@ -1424,7 +1494,7 @@ fn picoforge_bare_reset_wipes_without_validate() {
         let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
         assert_eq!(sw, 0x9000, "PUT before commissioning");
     }
-    let _key = picoforge_commission(&mut app);
+    let owner_key = picoforge_commission(&mut app);
     let _ = select(&mut app);
     // Unvalidated: LIST refuses. This is the gate US-132 removed for RESET.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
@@ -1437,15 +1507,34 @@ fn picoforge_bare_reset_wipes_without_validate() {
         "US-132: a bare 00 04 DE AD with a touch must succeed"
     );
 
-    // Wiped: virgin again, so LIST is granted and empty, and SELECT no longer
-    // advertises a challenge (the access code is gone too).
+    // The owner's access code is gone: VALIDATE with the key the applet was
+    // commissioned under must now fail.
+    let chal = select_challenge(&select(&mut app));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(&owner_key, &chal, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the owner's access code did not survive the reset"
+    );
+
+    // What a reset leaves is the **documented default** access code, not an
+    // open applet — so the device is locked again and must authenticate
+    // before it will list anything.
+    assert!(
+        tlv_find(&select(&mut app), 0x74).is_some(),
+        "the reset left the default access code in place, so SELECT advertises a challenge"
+    );
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(
-        !select(&mut app).contains(&0x74),
-        "the access code was wiped"
-    );
 }
 
 /// US-132: the same bare RESET with the touch withheld is refused (0x6985)
@@ -1497,7 +1586,7 @@ fn picoforge_bare_reset_without_presence_is_refused() {
 
 /// US-132, the test that makes the story real: picoforge's **exact wire
 /// bytes**, no padding added, with a presence grant and **no prior VALIDATE**
-/// → `0x9000`, credential table wiped, access code wiped.
+/// → `0x9000`, credential table wiped, the owner's access code wiped.
 #[test]
 fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
     let mut app = OathApp::new(&mut HostTrng::new(), emul_device_id(), OathSeal::emul())
@@ -1510,7 +1599,7 @@ fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
         let (_, sw) = drive(&mut app, &apdu(0x01, 0, 0, &data));
         assert_eq!(sw, 0x9000, "PUT before commissioning");
     }
-    let _key = picoforge_commission(&mut app);
+    let owner_key = picoforge_commission(&mut app);
     let _ = select(&mut app);
     // Unvalidated: the session gate US-132 removed is the one in play here.
     let (_, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
@@ -1525,14 +1614,34 @@ fn picoforge_four_byte_reset_reaches_the_applet_and_wipes() {
         "US-132: picoforge's 4-byte 00 04 DE AD must reach cmd_reset and wipe"
     );
 
-    // The wipe really ran: virgin applet, no credentials, no access code.
+    // The owner's access code is gone: VALIDATE with the key the applet was
+    // commissioned under must now fail.
+    let chal = select_challenge(&select(&mut app));
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(&owner_key, &chal, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the owner's access code did not survive the reset"
+    );
+
+    // What a reset leaves is the **documented default** access code, not an
+    // open applet — so the device is locked again and must authenticate
+    // before it will list anything.
+    assert!(
+        tlv_find(&select(&mut app), 0x74).is_some(),
+        "the reset left the default access code in place, so SELECT advertises a challenge"
+    );
+    authenticate_with_default(&mut app);
     let (body, sw) = drive(&mut app, &apdu(0xA1, 0, 0, &[]));
     assert_eq!(sw, 0x9000);
     assert!(body.is_empty(), "the credential table was wiped");
-    assert!(
-        !select(&mut app).contains(&0x74),
-        "the access code was wiped"
-    );
 }
 
 /// A frame too short to carry even a case-1 header is still garbage: 3 bytes
@@ -1574,6 +1683,9 @@ fn other_apdu_lengths_are_unaffected_by_the_case1_fix() {
     ] {
         let (_, sw) = drive(&mut app, &frame);
         assert_eq!(sw, 0x9000, "{name} RESET still reaches cmd_reset");
+        // The RESET left the documented default access code, so the session
+        // must authenticate before the table can be written back.
+        authenticate_with_default(&mut app);
         put_kaka(&mut app); // restore the wiped table for the next case
     }
 
@@ -1876,12 +1988,30 @@ fn calc_all_cannot_bypass_require_touch() {
 /// by a byte fails here rather than in a stack measurement three stories
 /// later. The app lives in a `static mut` (US-939/US-956), not on a task
 /// frame, so +96 B is RAM, not stack.
+///
+/// **US-1553 moves it by 16 B on this target, and 16 is not the number that
+/// matters.** The key-region handle is `Option<Box<OathRegion>>` — a pointer,
+/// 8 B here and **4 B on `thumbv8m`** — plus the one-byte `region_degraded`
+/// flag and the tail padding the pointer's alignment forces. Everything the
+/// handle *points at* (the region box and the 32-byte `PayloadKey`) is heap,
+/// allocated after `platform::rsa_heap::init()`, so it is not in `bss` and not
+/// in this figure.
+///
+/// The number was chosen to be the smallest one that keeps the accounting
+/// honest: the alternative was carrying the handle's contents inline, which
+/// would put a 33-byte key in a `static` for the whole life of the process
+/// (`ckey.rs` says keys are "per-operation: derive, use, drop"), or reaching a
+/// global, which is a worse design than 16 bytes. 16 B of an 11.3 KiB static
+/// is 0.14 %; the record it buys — credentials that are per-record, per-sector
+/// and per-slot instead of one 12-part snapshot — is the whole of US-1553.
 #[test]
 fn adding_the_property_bit_cost_no_ram() {
     assert_eq!(
         core::mem::size_of::<OathApp>(),
-        11400,
-        "US-1030: the only permitted growth is the 96 B seal context"
+        11416,
+        "US-1030 added the 96 B seal context; US-1553 adds 16 B on this target (4 B pointer + \
+         1 B flag + tail padding; 8 B of it is 64-bit pointer width, and on thumbv8m the whole \
+         delta is 8 B). Nothing else may grow the applet."
     );
 }
 
@@ -2495,5 +2625,140 @@ fn reset_gates_are_the_magic_and_the_touch_and_nothing_else() {
     );
     let (_, sw) = drive(&mut app, &[0x00, 0x04, 0xDE, 0xAD, 0x00]);
     assert_eq!(sw, 0x9000, "magic + touch and nothing else is required");
+    // The wipe left the documented default access code, so the emptied table
+    // can only be read through an authenticated session.
+    authenticate_with_default(&mut app);
     assert!(table(&mut app).is_empty(), "the table really was wiped");
+}
+
+// ---------------------------------------------------------------------------
+// The provisioned default access code is the key the CLIENTS derive
+// ---------------------------------------------------------------------------
+
+/// The documented default password.
+const DEFAULT_OATH_PASSWORD: &[u8] = b"123456";
+
+/// **A device with no access code on file must hold the key picoforge and
+/// yubikit will hand it — not the password.**
+///
+/// This is the whole point of US-131 and the reason it is worth pinning at the
+/// provisioning site rather than only at `SET_CODE`. Both first-party clients
+/// derive the access key **host-side** and send the derived bytes:
+///
+/// * picoforge `derive_access_key` — `PBKDF2-HMAC-SHA1(password, device_id,
+///   1000, 16)`;
+/// * `yubikit/oath.py` — `_derive_key(salt, passphrase)`, byte-identical.
+///
+/// `apps/oath/Cargo.toml` states the contract in as many words: *"the applet
+/// stores a **derived** key, never the password"*. So the default code is not
+/// the string `123456`; it is `PBKDF2-HMAC-SHA1("123456", device_id, 1000, 16)`,
+/// and provisioning it with the raw password produces a device that advertises
+/// a challenge and then rejects the only key any client will ever send it.
+///
+/// **Observed on hardware, not hypothesised:** with the password stored raw,
+/// SELECT advertised the `74` challenge — so the GUI reported "needs
+/// authentication" — and every VALIDATE was refused `0x6984`
+/// (`SW_DATA_INVALID`, `cmd_validate`'s proof check).
+#[test]
+fn the_default_access_code_is_the_key_the_clients_derive() {
+    let mut store = HostSecureStore::new();
+    // A store with no OATH record: the not-found boot path, which is what a
+    // freshly-nuked device presents.
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
+
+    let sel = select(&mut app);
+    let challenge = select_challenge(&sel);
+
+    // Exactly what picoforge/yubikit send after the owner types `123456`.
+    let key = picoforge_access_key(DEFAULT_OATH_PASSWORD, &emul_device_id());
+    let (body, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &picoforge_validate_data(&key, &challenge, &[7u8; 8])),
+    );
+    assert_eq!(
+        sw, 0x9000,
+        "VALIDATE with the client-derived key must grant. Got {sw:#04x} / {body:02x?} — the \
+         device is holding something other than `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`",
+    );
+}
+
+/// **The raw password must not work** — the negative half, and the assertion
+/// that would have caught this in the first place.
+///
+/// Without it, a device that stored the password would still answer `0x9000`
+/// here and fail only against a real GUI, where the client always derives.
+#[test]
+fn the_raw_password_does_not_unlock_the_default_code() {
+    let mut store = HostSecureStore::new();
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
+    let sel = select(&mut app);
+    let challenge = select_challenge(&sel);
+
+    let (body, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(DEFAULT_OATH_PASSWORD, &challenge, &[7u8; 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the password itself must not validate — the applet stores a derived key, never the \
+         password (apps/oath/Cargo.toml). If this answers 0x9000 the device is storing the \
+         password and no real client will ever get in. Got {sw:#04x} / {body:02x?}",
+    );
+}
+
+/// **A store slot that is *present but empty* still provisions the default.**
+///
+/// The emulator boots over a store with no `oath.keystore.v1` entry at all, so
+/// it exercises the `NotFound` arm of `boot_in_place`. A **nuked** device is
+/// the other case: the partition has been erased but the entry may still be
+/// *present with zero length*, which takes the `Ok(0)` arm — `load_stream` on an
+/// empty slice, then provision. That second arm had no coverage at all.
+///
+/// Both must end with the same thing: the documented default access key, which
+/// is the only key a client can ever present.
+#[test]
+fn an_empty_but_present_keystore_slot_still_provisions_the_default() {
+    let mut store = HostSecureStore::new();
+    // Present, zero length.
+    store
+        .write(b"oath.keystore.v1", &[])
+        .expect("an empty record can be written");
+
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot over a present-but-empty slot must not fail");
+
+    let sel = select(&mut app);
+    let chal = select_challenge(&sel);
+    let key = picoforge_access_key(DEFAULT_ACCESS_CODE, &emul_device_id());
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &picoforge_validate_data(&key, &chal, &[3u8; 8])),
+    );
+    assert_eq!(
+        sw, 0x9000,
+        "a nuked-device boot must end up holding the client-derived default, whichever \\
+         `boot_in_place` arm it took"
+    );
 }

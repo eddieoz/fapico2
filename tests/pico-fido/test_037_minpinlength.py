@@ -111,15 +111,31 @@ def test_setminpin_too_many_rpids(device):
 
 
 def test_toggle_always_uv_config_subcommand(device):
+    """toggleAlwaysUv cannot turn alwaysUv OFF while a PIN is set.
+
+    alwaysUv is derived as `pin_set || config_0x02` (AGENTS.md section 4), so on a
+    PIN-set board it is true regardless of the config byte. The upstream test
+    asserted that toggling flips the advertisement; that is the behaviour the
+    deliberate policy removed, because a false here is a wire claim the device
+    would not honour -- it still refuses a token-less assertion. Clearing the PIN
+    is what clears all three advertised options at once.
+    """
     device.reset()
     ClientPin(device.client()._backend.ctap2).set_pin(PIN)
     cfg = FidoConfig(device)
     ctap = device.client()._backend.ctap2
-    before = ctap.get_info().options["alwaysUv"]
+
+    assert ctap.get_info().options["alwaysUv"] is True
 
     cfg.toggle_always_uv()
 
-    assert ctap.get_info().options["alwaysUv"] is not before
+    assert ctap.get_info().options["alwaysUv"] is True, \
+        "a PIN-set device must keep advertising alwaysUv after toggleAlwaysUv"
+
+    # Toggling back must not leave it latched either.
+    cfg.toggle_always_uv()
+
+    assert ctap.get_info().options["alwaysUv"] is True
 
 
 def test_pin_complexity_policy_extension(device):

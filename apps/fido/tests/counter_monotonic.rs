@@ -37,7 +37,7 @@
 //! counter scheme that broke the signature would be no consolation.
 
 use fapico2_fido::FidoApp;
-use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential, DeviceKeystore};
+use fapico2_fido::device_keystore::{DeviceCoseKey, DeviceCredential, DeviceKeystore, PrivateScalar};
 use fapico2_platform::secure_store::rp2350::Rp2350SecureStore;
 use fapico2_platform::trng::HostTrng;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
@@ -86,7 +86,7 @@ fn fixture_credential(id: &[u8; 32]) -> DeviceCredential {
     DeviceCredential {
         credential_id: cid,
         public_key: DeviceCoseKey::es256([1; 32], [2; 32]),
-        private_key: FIXTURE_SCALAR,
+        private_key: PrivateScalar::from_bytes(FIXTURE_SCALAR),
         rp_id_hash: APP_PARAM,
         rp_id: heapless::Vec::new(),
         user_handle: heapless::Vec::new(),

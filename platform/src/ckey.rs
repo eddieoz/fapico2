@@ -183,10 +183,32 @@ pub fn derive_kbase(
     let hk = Hkdf::<Sha256>::new(Some(&salt), otp_key_1);
     salt.zeroize();
     let mut out = [0u8; KEY_LEN];
-    hk.expand(b"DEVICE/ROOT", &mut out)
+    hk.expand(KBASE_LABEL, &mut out)
         .map_err(|_| CKeyError::BadFormat)?;
     Ok(out)
 }
+
+/// The bound device root's HKDF info label (US-1575).
+///
+/// **This is not `"DEVICE/ROOT"`, and that is the point.** [`derive_kbase`] and
+/// [`derive_kbase_c`] both ran the same KDF over the same IKM (`otp_key_1`)
+/// with the same info label, separated only by their salts. Domain separation
+/// by salt alone is not separation: a caller holding one root reaches the other
+/// by deriving with the other salt, and nothing in the API or the type system
+/// says which is which. It was mitigated only by a doc comment calling
+/// `derive_kbase_c` "open-only" — a convention, one refactor from violation.
+///
+/// The C label is **immutable**: `"DEVICE/ROOT"` is what the C firmware used
+/// (`crypto_utils.c:34-42`), and reproducing it bit-exactly is the entire
+/// reason `derive_kbase_c` exists. So the Rust-native root moves instead.
+///
+/// **What this invalidates:** material already derived from the bound root on a
+/// device that has booted with the old label — in practice the migration
+/// authority (`migration.rs`), which is its only consumer. A device captured
+/// mid-C-migration under the old root will not verify under the new one. That
+/// is the price of making the two roots genuinely distinct, and it is cheaper
+/// now, before there is a release tag, than after a migration cohort exists.
+pub const KBASE_LABEL: &[u8] = b"DEVICE/ROOT/BOUND";
 
 /// US-1003: the DRBG seed label — domain-separates the generator's seed
 /// from every other key this device derives over the *same* input
@@ -1127,11 +1149,16 @@ mod tests {
         );
         // KAT generated with an independent HKDF-SHA256 (Python hmac):
         // salt = serial_hash ‖ chipid BE ‖ 32 × 0xA5.
+        //
+        // US-1575 changed the vector with the label: the bound root's info is
+        // now "DEVICE/ROOT/BOUND" (see KBASE_LABEL). The same generator still
+        // reproduces 6bcd…60f4 under the old label, so this remains a check on
+        // the derivation rather than on the code's current output.
         let entropy = [0xA5u8; BOOT_ENTROPY_LEN];
         let kbase = derive_kbase(&otp, &sh, 0x0102_0304_0506_0708, Some(&entropy)).unwrap();
         assert_eq!(
             kbase.as_slice(),
-            h("6bdcd5495c109ab2c85b49d92627f3e772363ae1b03cd4e268fb5d737f9e60f4").as_slice()
+            h("83651163da62972b5ba9f53f49567366776e35ab5ba87c217c56668fd019fff8").as_slice()
         );
     }
 

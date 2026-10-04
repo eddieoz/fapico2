@@ -61,6 +61,58 @@
 /// this is a silicon constant rather than a board choice.
 pub const FLASH_ORIGIN: u32 = 0x1000_0000;
 
+/// The data partition: everything below this offset belongs to persistent
+/// storage and **must not** be reachable by linking firmware (US-1539).
+///
+/// On the shipping 4 MiB `pico2` board the layout below it is
+///
+/// ```text
+/// 0x200_000 .. 0x300_000   trussed internal FS (OpenPGP/PIV) 1,024 KiB
+/// 0x300_000 .. 0x3F0_000   per-record key store                 960 KiB
+/// 0x3F0_000 .. 0x400_000   secure partition                       64 KiB
+/// ```
+///
+/// and above it `0x000_000 .. 0x180_000` is the firmware image, with
+/// `0x180_000 .. 0x200_000` of unreferenced growth headroom.
+///
+/// **Why the linker's reach stops here rather than at the secure partition.**
+/// Before US-1539, `FLASH LENGTH` was `app_flash_kb` — everything below the
+/// secure reservation — so the linker would have accepted a 3.5 MiB image, and
+/// only `check_size_report.py`'s 3.5 MiB ceiling and the CI ratchet's 1,536
+/// KiB stood between a link and someone's keystore. Those are gates, and gates
+/// are read by the people who read them. Truncating `FLASH` at the data
+/// partition makes the overlap a **link error**, which nobody can ship past.
+///
+/// The secure region is unaffected and must stay exactly where it is: its
+/// offset is a provisioned unit's keystore address (see [`SECURE_RESERVE_KB`]).
+pub const DATA_PARTITION_OFFSET: u32 = 0x20_0000;
+
+/// The **minimum** per-record key store, in KiB — the shipping `pico2` board's
+/// actual size, and the floor a board must not fall below (US-1539; the stride
+/// inside the region is derived by US-1540).
+///
+/// A larger part gets a larger store: [`Board::key_region_kb`] is the
+/// remainder after firmware, the trussed window and the secure reservation, so
+/// the four regions tile the part exactly on any board. This constant is what
+/// that remainder must be **at least**.
+pub const KEY_REGION_KB: u32 = 960;
+
+/// The trussed internal-filesystem window, in KiB, at the head of the data
+/// partition (US-1536).
+pub const TRUSSED_FS_KB: u32 = 1024;
+
+/// The CI flash-budget ratchet in KiB (`FIRMWARE_FLASH_BUDGET_KIB` in
+/// `.github/workflows/ci.yml`), mirrored so the generated linker script can
+/// print the headroom it leaves.
+///
+/// **This is a mirror, not the source of truth** — `platform::flashmap` owns
+/// `FIRMWARE_FLASH_BUDGET_BYTES` and `tests/scripts/check_flash_budget.py`
+/// (US-1534) fails the build if the two disagree. It is here because this file
+/// is compiled into both build scripts without the `platform` crate, so it
+/// cannot import the constant. A comment in a generated linker script is a
+/// cheap thing to be approximate about; the gate is not.
+pub const FIRMWARE_FLASH_BUDGET_KIB: u32 = 1536;
+
 /// The reserved secure-partition region, in KiB, at the **top** of flash.
 ///
 /// US-388 reserved 64 KiB at `0x103F0000` on a 4 MiB part so the keystore
@@ -77,12 +129,17 @@ pub const SECURE_RESERVE_KB: u32 = 64;
 
 /// The smallest `flash_size_kb` this tree will link.
 ///
-/// A floor, not a preference: it is the smallest flash that still leaves room
-/// for the shipping image (measured ~1,518 KiB, see `docs/size-report.md`) plus
-/// the 64 KiB secure region plus a margin, and a board below it would link an
-/// image that cannot be flashed. A future smaller part raises this
-/// deliberately, with a size report, rather than discovering it at BOOTSEL.
-pub const MIN_FLASH_SIZE_KB: u32 = 2048;
+/// **US-1539 raised this from 2,048 to 4,096.** The layout now tiles the space
+/// between the linker's reach and the secure reservation with two persistent
+/// regions — the 1,024 KiB trussed window and the 960 KiB key store — so a
+/// smaller part has nowhere to put them. `2,048 + 1,024 + 960 + 64 = 4,096`,
+/// and [`validate`] refuses any board whose regions do not exactly fill the
+/// space, so this constant states the floor rather than deriving it.
+///
+/// A future smaller part shrinks the key region or the trussed window
+/// deliberately, with a capacity measurement, rather than discovering the
+/// problem at BOOTSEL.
+pub const MIN_FLASH_SIZE_KB: u32 = 4096;
 
 /// The largest `flash_size_kb` this tree will link. 16 MiB is the largest
 /// QSPI part the RP2350 address space and the UF2 window both cover
@@ -152,6 +209,26 @@ impl Board {
     /// that store unreadable rather than merely misplaced.
     pub fn secure_offset(&self) -> u32 {
         self.app_flash_kb() * 1024
+    }
+
+    /// The per-record key store for **this** board, in KiB.
+    ///
+    /// Derived as the remainder so the four regions *exactly tile* the part —
+    /// firmware, trussed window, key region, secure reservation. A larger part
+    /// therefore gets a larger key store rather than a gap, which is the right
+    /// answer for both reasons: the spare flash is capacity (more resident
+    /// credentials, which is what US-1540 derives from the region), and an
+    /// exact tiling is what makes "no two regions overlap" a checkable
+    /// statement rather than a hope.
+    ///
+    /// The trussed window does **not** scale: it is a fixed 1 MiB because it
+    /// carries OpenPGP and PIV material, which is bounded by key size rather
+    /// than by part size.
+    pub fn key_region_kb(&self) -> u32 {
+        self.flash_size_kb
+            - (DATA_PARTITION_OFFSET / 1024)
+            - TRUSSED_FS_KB
+            - SECURE_RESERVE_KB
     }
 
     /// Absolute origin of the secure-partition region.
@@ -453,6 +530,40 @@ fn validate(label: &str, b: &Board) -> Result<(), BoardError> {
             ),
         ));
     }
+    // US-1539: the data partition's three regions must tile the space between
+    // the linker's reach and the secure reservation exactly. An overlap is a
+    // key store the firmware can be linked over; a gap is flash nothing can
+    // use. Both are refused at parse time, on the board file that caused them,
+    // rather than discovered on a board.
+    let data_kb = DATA_PARTITION_OFFSET / 1024;
+    let key_kb = b.key_region_kb();
+    if key_kb < KEY_REGION_KB {
+        return Err(err(
+            label,
+            0,
+            format!(
+                "a {}-KiB part leaves a {key_kb} KiB key region, below the {KEY_REGION_KB} \
+                 KiB the shipping layout needs (firmware {data_kb} + trussed {TRUSSED_FS_KB} \
+                 + key region {KEY_REGION_KB} + secure {SECURE_RESERVE_KB} = {min}). A \
+                 smaller part has to shrink a region deliberately, with a capacity \
+                 measurement — not silently",
+                b.flash_size_kb,
+                min = data_kb + TRUSSED_FS_KB + KEY_REGION_KB + SECURE_RESERVE_KB
+            ),
+        ));
+    }
+    if data_kb <= FIRMWARE_FLASH_BUDGET_KIB {
+        return Err(err(
+            label,
+            0,
+            format!(
+                "the data partition starts at {data_kb} KiB, which is not above the \
+                 {FIRMWARE_FLASH_BUDGET_KIB} KiB CI flash budget. A firmware image the \
+                 ratchet accepts could reach the trussed filesystem and the key region; \
+                 move DATA_PARTITION_OFFSET up, or lower the budget deliberately"
+            ),
+        ));
+    }
     for (what, s) in [("product", &b.product), ("manufacturer", &b.manufacturer)] {
         if s.is_empty() {
             return Err(err(label, 0, format!("usb.{what} must not be empty")));
@@ -522,8 +633,15 @@ fn err(label: &str, lineno: usize, msg: String) -> BoardError {
 /// workarounds, carried over verbatim: the RP2350 bootrom only scans the first
 /// 4 KiB for the IMAGE_DEF, and 256-byte UF2 blocks must not straddle it.
 pub fn render_memory_x(b: &Board) -> String {
-    let app_kb = b.app_flash_kb();
     let secure_origin = b.secure_origin();
+    // US-1539: the linker's reach stops at the data partition, so firmware
+    // cannot be linked into the trussed window or the key region even in
+    // principle. `app_kb` is still what places SECURE at the top, and that
+    // value must not move.
+    let link_kb = DATA_PARTITION_OFFSET / 1024;
+    let trussed_origin = FLASH_ORIGIN + DATA_PARTITION_OFFSET;
+    let key_region_kb = b.key_region_kb();
+    let key_region_origin = trussed_origin + TRUSSED_FS_KB * 1024;
     format!(
         "\
 /* GENERATED by firmware/build.rs from the board file — do not edit, and do not
@@ -532,13 +650,26 @@ pub fn render_memory_x(b: &Board) -> String {
  * partition arithmetic and the two US-391 anchor comments below are the same
  * ones it carried. */
 MEMORY {{
-    /* App flash: {flash} KiB of QSPI minus the {reserve} KiB secure-partition
-     * region reserved at the top (US-388), so the app-text region can never
-     * overlap the keystore partition. On this board the region sits at
-     * {secure:#010x}. `main.rs` links the secure-partition image into the
-     * `.secure_partition` section and the flash driver programs the runtime
-     * snapshot back into it. */
-    FLASH : ORIGIN = {flash_origin:#010x}, LENGTH = {app_kb}K
+    /* Firmware: the first {link} KiB of a {flash} KiB part. US-1539 truncated
+     * this at the data partition rather than at the secure reservation, so a
+     * firmware image that grows into a persistent region is a **link error**
+     * rather than something only a CI gate stands between. The shipping image
+     * measures ~818 KiB and the CI ratchet admits {budget} KiB, leaving
+     * {headroom} KiB of headroom above the ratchet.
+     * On this board the data partition starts at {data:#010x}. */
+    FLASH : ORIGIN = {flash_origin:#010x}, LENGTH = {link}K
+    /* The data partition, in three regions. All three are read-only in the
+     * linker and none of them is written by the shipping UF2: erased flash is
+     * 0xFF, and these windows hold whatever the device programmed into them.
+     *
+     * TRUSSED is littlefs2 for OpenPGP and PIV, formatted by the trussed
+     * backend rather than linked. KEYREGION is the per-record key store
+     * (US-1539/US-1540), written by the flash driver at applet time and never
+     * linked. SECURE is the two image slots the keystore lives in
+     * (`firmware/src/boot.rs`); `main.rs` links the secure-partition image into
+     * `.secure_partition` and the driver programs the runtime snapshot back. */
+    TRUSSED (r) : ORIGIN = {trussed:#010x}, LENGTH = {trussed_kb}K
+    KEYREGION (r) : ORIGIN = {key_region:#010x}, LENGTH = {key_kb}K
     SECURE (r) : ORIGIN = {secure:#010x}, LENGTH = {reserve}K
     /* SRAM per the RP2350 SDK address map — all of it is contiguous and mapped
      * on every part in the family:
@@ -551,11 +682,16 @@ MEMORY {{
 }}
 
 SECTIONS {{
+    /* The per-record key store: the address space the region occupies, reserved
+     * so nothing can be linked into it. (NOLOAD) because erased flash is 0xFF,
+     * the shipping UF2 must not pre-bake the region, and crt0's zero/copy
+     * ranges must stay untouched. */
+    .key_region (NOLOAD) : {{
+        KEEP(*(.key_region))
+    }} > KEYREGION
+
     /* The secure-partition image: erased flash is 0xFF (an empty store); boot
-     * reads the keystore directly from here. (NOLOAD): the app-only shipping
-     * UF2 must not pre-bake the region, and crt0's zero/copy ranges stay
-     * untouched. The volatile boot read reads the live flash window
-     * regardless. */
+     * reads the keystore directly from here. (NOLOAD) for the same reasons. */
     .secure_partition (NOLOAD) : {{
         KEEP(*(.secure_partition))
     }} > SECURE
@@ -582,7 +718,14 @@ SECTIONS {{
         flash = b.flash_size_kb,
         flash_origin = FLASH_ORIGIN,
         reserve = SECURE_RESERVE_KB,
-        app_kb = app_kb,
+        link = link_kb,
+        data = DATA_PARTITION_OFFSET,
+        trussed = trussed_origin,
+        trussed_kb = TRUSSED_FS_KB,
+        key_region = key_region_origin,
+        key_kb = key_region_kb,
+        budget = FIRMWARE_FLASH_BUDGET_KIB,
+        headroom = link_kb - FIRMWARE_FLASH_BUDGET_KIB,
         secure = secure_origin,
         ram_origin = RAM_ORIGIN,
         ram = RAM_SIZE_BYTES / 1024,

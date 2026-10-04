@@ -132,6 +132,322 @@ fn a_populated_state_round_trips_through_the_device_keystore() {
     );
 }
 
+/// [`DeviceKeystore::load_phy`] answers **exactly** what
+/// `load(..).map(|ks| ks.phy)` does — for a populated record, for the default,
+/// for an absent snapshot, and above all for a corrupt one.
+///
+/// # Why the equivalence needs pinning
+///
+/// `load_phy` exists because binding a whole 12-KiB `DeviceKeystore` in order
+/// to read one ~40-byte record cost 19,904 B of the HID task's poll frame
+/// (US-1550's `Drop` on `DeviceCredential` stops a droppable 12-KiB value from
+/// being elided into its destination — see `load_phy`'s own doc comment). It
+/// reaches the same answer by a different route: `decode`'s top-level scan,
+/// `decode_auth` unchanged, and each credential decoded and discarded so no
+/// 8,640-byte array is ever built.
+///
+/// **A narrow reader that is only nearly equivalent is worse than none at
+/// all.** `sync_phy` feeds its answer straight into the next persist, so a
+/// `phy` read out of a snapshot the full load would have *refused* would
+/// overwrite good durable state with a value out of a corrupt document. That
+/// is the arm the sweep below exists for; the others keep the two readers from
+/// drifting on the ordinary paths.
+#[test]
+fn load_phy_agrees_with_a_full_load_in_every_state() {
+    use fapico2_platform::secure_store::chunked;
+
+    let full = fapico2_fido::vendorff::PhyConfig {
+        vid_pid: Some(0x1209_0001),
+        led_gpio: Some(0x0C),
+        led_brightness: Some(80),
+        options: Some(0x0002),
+        enabled_usb_itf: Some(0x03AB),
+        led_conf: Some(fapico2_fido::vendorff::LedConf([0x11; 17])),
+        product: Some(
+            fapico2_fido::vendorff::IdentityName::new("Acme Token").expect("9 bytes"),
+        ),
+        manufacturer: Some(
+            fapico2_fido::vendorff::IdentityName::new("The BLOCO Community")
+                .expect("19 bytes"),
+        ),
+    };
+
+    // --- absent: no snapshot in the slot at all. Both must decline, and
+    //     `sync_phy` reads that decline as "nothing to adopt" — never as an
+    //     absent record it would then clear.
+    {
+        let mut store = fapico2_platform::secure_store::HostSecureStore::new();
+        assert!(
+            DeviceKeystore::load(&mut store).expect("load").is_none(),
+            "control: a fresh store holds no snapshot"
+        );
+        assert_eq!(
+            DeviceKeystore::load_phy(&mut store),
+            None,
+            "load_phy must decline exactly where a full load finds no snapshot"
+        );
+    }
+
+    // --- present: default and fully-populated records agree, and the control
+    //     itself round-trips, so a passing arm is not vacuous.
+    for (what, phy) in [
+        ("the default record", fapico2_fido::vendorff::PhyConfig::default()),
+        ("a fully-populated record", full),
+    ] {
+        let mut ks = fresh_keystore();
+        ks.phy = phy;
+        ks.vendor = populated();
+        let mut store = fapico2_platform::secure_store::HostSecureStore::new();
+        assert!(ks.persist(&mut store).is_ok(), "{what} must persist");
+
+        let full = DeviceKeystore::load(&mut store)
+            .expect("load")
+            .expect("a snapshot is present")
+            .phy;
+        assert_eq!(full, phy, "{what}: the control itself must round-trip");
+        assert_eq!(
+            DeviceKeystore::load_phy(&mut store),
+            Some(phy),
+            "{what}: load_phy must return exactly the record a full load would"
+        );
+    }
+
+    // --- structural damage: the arm `sync_phy`'s safety rests on. Every
+    //     document a full load refuses must also yield `None` from
+    //     `load_phy`.
+    //
+    //     **Structural, not bit-flips.** A one-bit flip in the stored image is
+    //     caught by the chunked layer's CRC before either decoder sees it, so
+    //     a bit sweep proves nothing about the two readers — it only proves
+    //     both of them say no to a corrupt chunk. These variants are encoded
+    //     whole and written back with a valid CRC, so they reach the decoders.
+    //
+    //     The credential rows are the ones that matter most: `load_phy` walks
+    //     the credential array to keep `load`'s "one unopenable credential
+    //     fails the whole snapshot" rule, and dropping that walk is exactly
+    //     the shortcut this test exists to forbid.
+    {
+        use fapico2_fido::cbor::no_heap as nh;
+        use fapico2_fido::cbor::Value as V;
+
+        // Lift the three envelope members out of a **persisted** snapshot,
+        // not out of a `to_cbor(None, ..)` one: the persisted image is the one
+        // both readers are built to open (it is sealed under the store key),
+        // and an unsealed hand-built image is refused by both — which would
+        // make every variant below refuse for the wrong reason.
+        let mut ks = fresh_keystore();
+        ks.phy = full;
+        ks.vendor = populated();
+        let mut store = fapico2_platform::secure_store::HostSecureStore::new();
+        assert!(ks.persist(&mut store).is_ok(), "the control must persist");
+        let slot = device_keystore::KEYSTORE_SLOT;
+        let mut image = [0u8; { chunked::MAX_LOGICAL_LEN }];
+        let n = chunked::read_chunked(&mut store, slot, &mut image[..]).expect("the control reads");
+
+        // A persisted envelope is `{1: [max, auth, creds], 2: 2}` — two
+        // entries, the second being the sealed marker. Walk it rather than
+        // assuming a shape, so this stays true if the marker moves.
+        let mut q = nh::Parser::new(&image[..n]);
+        let n_entries = match q.next() {
+            Ok(nh::Item::Map(k)) => k,
+            _ => panic!("the envelope must be a map"),
+        };
+        assert!((1..=2).contains(&n_entries), "one or two envelope entries");
+        let mut max_b: Option<Vec<u8>> = None;
+        let mut auth_b: Option<Vec<u8>> = None;
+        let mut creds_b: Option<Vec<u8>> = None;
+        for _ in 0..n_entries {
+            let key = match q.next() {
+                Ok(nh::Item::U(k)) => k,
+                _ => panic!("every envelope key must be an integer"),
+            };
+            if key != 1 {
+                continue; // the sealed marker, and its value
+            }
+            assert!(matches!(q.next(), Ok(nh::Item::Array(3))), "[max, auth, creds]");
+            for (name, slot_out) in [
+                ("max", &mut max_b),
+                ("auth", &mut auth_b),
+                ("creds", &mut creds_b),
+            ] {
+                match q.next() {
+                    Ok(nh::Item::B(b)) => *slot_out = Some(b.to_vec()),
+                    _ => panic!("envelope member `{name}` must be a byte string"),
+                }
+            }
+        }
+        let (max_b, auth_b, creds_b) = (
+            max_b.expect("max"),
+            auth_b.expect("auth"),
+            creds_b.expect("creds"),
+        );
+
+        // The envelope's third member is a byte string *containing* the
+        // credential array — which is why each member is encoded first and
+        // wrapped, rather than dropped into the array as a bare `Value`.
+        let empty = || V::A(Vec::new());
+        // The sealed marker travels with the envelope, and it has to: the auth
+        // map lifted out of a persisted image is sealed, so a variant that
+        // rebuilt the envelope without the marker would be refused by both
+        // readers for a reason that has nothing to do with its damage.
+        let sealed_value = {
+            let decoded = fapico2_fido::cbor::decode(&image[..n])
+                .expect("the control envelope must decode")
+                .0;
+            let V::M(entries) = decoded else {
+                panic!("the envelope must be a map")
+            };
+            entries
+                .into_iter()
+                .find(|(k, _)| {
+                    matches!(k, V::U(fapico2_fido::snapshot_crypt::SEALED_MARKER_KEY))
+                })
+                .map(|(_, v)| v)
+                .expect("a persisted snapshot carries the sealed marker")
+        };
+        let envelope = |auth: V, creds: V| -> Vec<u8> {
+            fapico2_fido::cbor::encode(&V::M(vec![
+                (
+                    V::U(1),
+                    V::A(vec![
+                        V::B(max_b.clone()),
+                        V::B(fapico2_fido::cbor::encode(&auth)),
+                        V::B(fapico2_fido::cbor::encode(&creds)),
+                    ]),
+                ),
+                (
+                    V::U(fapico2_fido::snapshot_crypt::SEALED_MARKER_KEY),
+                    sealed_value.clone(),
+                ),
+            ]))
+        };
+
+        // The control's own auth map, lifted as a `Value` so a variant can
+        // damage one field and keep the rest. A sealed map survives this: the
+        // sealed members are opaque byte strings either way.
+        let auth_map = || {
+            fapico2_fido::cbor::decode(&auth_b)
+                .expect("the control's auth map must decode")
+                .0
+        };
+        let variants: Vec<(&str, Vec<u8>)> = vec![
+            // --- the credential array, which `load_phy` walks and a narrow
+            //     reader that skipped it would not.
+            (
+                "a credential entry that is an integer, not a byte string",
+                envelope(auth_map(), V::A(vec![V::U(42)])),
+            ),
+            (
+                "a credential body that is not a credential record",
+                envelope(auth_map(), V::A(vec![V::B(vec![0xA1, 0x01, 0x02])])),
+            ),
+            (
+                "a credential body that is truncated CBOR",
+                envelope(auth_map(), V::A(vec![V::B(vec![0xA2])])),
+            ),
+            // --- the auth map, which `load_phy` shares with `load` verbatim.
+            (
+                "key 6 (the phy record) that is not a map",
+                envelope(V::M(vec![(V::U(6), V::U(1))]), empty()),
+            ),
+            (
+                "a key-6 field outside its stored width",
+                envelope(
+                    V::M(vec![(V::U(6), V::M(vec![(V::U(1), V::U(0x1_0000_0001))]))]),
+                    empty(),
+                ),
+            ),
+            (
+                "the sealed marker carrying the wrong value",
+                fapico2_fido::cbor::encode(&V::M(vec![
+                    (
+                        V::U(1),
+                        V::A(vec![
+                            V::B(max_b.clone()),
+                            V::B(auth_b.clone()),
+                            V::B(creds_b.clone()),
+                        ]),
+                    ),
+                    (V::U(fapico2_fido::snapshot_crypt::SEALED_MARKER_KEY),
+                     V::U(fapico2_fido::snapshot_crypt::SEALED_MARKER_VALUE + 1)),
+                ])),
+            ),
+            (
+                "a sealed document whose key-6 record was left sealed",
+                envelope(V::M(vec![(V::U(6), sealed_value.clone())]), empty()),
+            ),
+            // --- the envelope itself.
+            (
+                "an envelope with an unknown key",
+                fapico2_fido::cbor::encode(&V::M(vec![
+                    (
+                        V::U(1),
+                        V::A(vec![
+                            V::B(max_b.clone()),
+                            V::B(auth_b.clone()),
+                            V::B(creds_b.clone()),
+                        ]),
+                    ),
+                    (
+                        V::U(fapico2_fido::snapshot_crypt::SEALED_MARKER_KEY),
+                        sealed_value.clone(),
+                    ),
+                    (V::U(9), V::U(1)),
+                ])),
+            ),
+            (
+                "a truncated document",
+                envelope(auth_map(), empty())[..6].to_vec(),
+            ),
+        ];
+
+        // **Positive control first.** The untouched reconstruction must load,
+        // or every "both readers refuse" assertion below is vacuous — which is
+        // the failure this test has already had once, when the control image
+        // was hand-built unsealed and both readers refused it for a reason that
+        // had nothing to do with the damage.
+        {
+            let bytes = envelope(auth_map(), V::A(Vec::new()));
+            let mut ctl = fapico2_platform::secure_store::HostSecureStore::new();
+            chunked::write_chunked(&mut ctl, slot, &bytes)
+                .expect("the control must fit the chunked slot");
+            assert!(
+                matches!(DeviceKeystore::load(&mut ctl), Ok(Some(_))),
+                "control: the reconstruction must itself be loadable"
+            );
+            assert_eq!(
+                DeviceKeystore::load_phy(&mut ctl),
+                Some(full),
+                "control: both readers must agree on the untouched document"
+            );
+        }
+
+        let total_variants = variants.len();
+        let mut exercised = 0usize;
+        for (what, bytes) in variants {
+            let mut store = fapico2_platform::secure_store::HostSecureStore::new();
+            chunked::write_chunked(&mut store, slot, &bytes)
+                .expect("the variant must fit the chunked slot");
+            assert!(
+                !matches!(DeviceKeystore::load(&mut store), Ok(Some(_))),
+                "control: a full load must refuse {what} — if it does not, this \
+                 variant is not testing what its name claims"
+            );
+            assert_eq!(
+                DeviceKeystore::load_phy(&mut store),
+                None,
+                "a document a full load refuses must not yield a phy through \
+                 load_phy: {what}"
+            );
+            exercised += 1;
+        }
+        assert!(
+            exercised >= total_variants,
+            "control: every damage variant must have run, saw {exercised} of {total_variants}"
+        );
+    }
+}
+
 /// The same, through the **host** codec, so the two stacks cannot drift.
 ///
 /// The two codecs are separate functions over one key numbering; this is what
@@ -877,7 +1193,12 @@ fn the_ring_evicts_into_the_epoch_and_the_head_covers_everything() {
 /// No MSE session is a refusal, never a zero key.
 #[test]
 fn no_mse_session_is_a_refusal_not_a_zero_key() {
-    let ks = fresh_keystore();
+    // US-1550: borrowed directly rather than through `ks.clone()`. A clone of
+    // `DeviceKeystore` is a clone of every credential private key it holds, and
+    // `DeviceKeystore` therefore no longer derives `Clone` — this test is the
+    // only caller that needed one, and it did not: the keystore is not read
+    // after `with_keystore_ops` returns.
+    let mut ks = fresh_keystore();
     let session = VendorSession::default();
     let mut counter = 0u8;
     let mut random = move |b: &mut [u8]| {
@@ -889,7 +1210,7 @@ fn no_mse_session_is_a_refusal_not_a_zero_key() {
     let mut store: Option<&mut dyn SecureStore> = None;
     let mut out = MseChannel { key: [0; 32], aad: [0; P256_POINT_LEN] };
     vendor_state::with_keystore_ops(
-        &mut ks.clone(),
+        &mut ks,
         &mut { session },
         &mut store,
         &mut random,

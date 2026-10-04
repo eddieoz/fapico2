@@ -68,6 +68,29 @@ if [ ! -x "$VENV" ]; then
     exit 1
 fi
 
+# --suites-only: build the emulator and run the pytest suites, and nothing else.
+#
+# The gates above are not redundant with anything — they are what a local run is
+# for. But CI runs each of them in its own job (clippy, host-tests, and the
+# structural gate jobs), so invoking this script in full from the pytest-gate job
+# would repeat `cargo clippy` and a full `cargo test` on every push to buy
+# nothing. The emulator/relay/keystore sequence below is NOT duplicated in
+# ci.yml, because that sequence is the part that is easy to get subtly wrong
+# (the emulator dials the relay once at start-up; the keystore and secure
+# partition are two files, not one; each suite's conftest resolves separately).
+SUITES_ONLY=false
+if [ "${1:-}" = "--suites-only" ]; then
+    SUITES_ONLY=true
+    shift
+fi
+
+if [ "$SUITES_ONLY" = true ]; then
+    echo "== --suites-only: skipping clippy, the gate scripts and the firmware cargo test (CI runs those as their own jobs)"
+fi
+
+# Everything from here to the closing `fi` is a gate CI already owns a job for.
+if [ "$SUITES_ONLY" != true ]; then
+
 # Lint gate (FX-416): clippy must be warning-free for the fido crate.
 cargo clippy -p fapico2-fido --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
@@ -128,6 +151,8 @@ python3 tests/scripts/check_acceptance_exit_code.py
 # `… | tail -3` reports TAIL's status, and this step was observed printing
 # `FAILED. 68 passed; 25 failed` while the script exited 0.
 step 3 cargo test -p fapico2-firmware --lib --features device,emulation --target x86_64-unknown-linux-gnu -- --test-threads=1
+
+fi   # end of the gates block skipped by --suites-only
 
 # Build the emulator
 step 3 cargo build -p fapico2-firmware --bin fapico2-emulation --no-default-features --features emulation --target x86_64-unknown-linux-gnu

@@ -1,0 +1,27 @@
+# Python dependencies for fapico2's OWN emulator test suites.
+#
+# These suites live in this repository (tests/pico-fido, tests/piv, tests/openpgp,
+# tests/harness, tests/test_openpgp_*.py) and are run by run_tests.sh and by the
+# `pytest-gate` job in .github/workflows/ci.yml. Nothing here comes from a
+# sibling checkout: an earlier revision of that job pulled its suites from an
+# external `pico-fido2` repository, and because that repository was never
+# published the checkout failed silently behind `continue-on-error`, the steps
+# guarded on its requirements.txt never ran, and the job reported green having
+# executed nothing. The suites are ours; the dependencies are listed here.
+#
+#   pytest        the runner
+#   fido2         the CTAP2 client. 2.2.1 is what ykman and Yubico
+#                 Authenticator are built on, and its constants are the ones
+#                 this firmware's dialect follows (AGENTS.md section 2) -- so
+#                 this is a compatibility pin, not just an import.
+#   pyscard       the PC/SC API surface the CCID suites are written against
+#                 (tests/pico-fido/utils.py). Needs libpcsclite headers to
+#                 build; ci.yml installs them.
+#   cryptography  the ECC the OpenPGP and PIV suites verify against in Python.
+#
+# Upper bounds are deliberate and match what the suites are written against; a
+# major bump changes the client behaviour they assert on.
+pytest>=8,<9
+fido2>=2,<3
+pyscard>=2,<3
+cryptography>=43,<47

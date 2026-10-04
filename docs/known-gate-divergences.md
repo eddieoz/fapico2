@@ -145,13 +145,36 @@ Two pre-existing device behaviours produce all 179 failures; they are not 179
 independent defects.
 
 1. **The US-912 factory-PIN gate contradicts the suite's starting assumption.**
-   The suite personalises a fresh card directly — e.g.
-   `card_test_personalize_reset.py:65` calls
-   `change_passwd(3, PW3_TEST0, FACTORY_PASSPHRASE_PW3)`. US-912 deliberately
-   refuses PIN changes and key operations while the factory PINs are in force,
-   so those calls return a non-`9000` status word. This is a **policy
-   divergence by design**, not a bug: the gate exists so an unpersonalised card
-   cannot be used for key operations.
+   **Corrected 2026-10-04 — the mechanism stated here was wrong, and it has been
+   re-verified against the code and the suite.**
+
+   The claim was that US-912 "refuses PIN changes and key operations while the
+   factory PINs are in force, so those calls return a non-`9000` status word".
+   Two parts of that are false:
+
+   * **`change_passwd` is not gated.** `change_reference_data`
+     (`vendor/opcard/src/command.rs:411`) is INS `0x24` CHANGE REFERENCE DATA,
+     and it carries no `factory_defaults_in_force()` check. Only key operations
+     — `PSO:SIGN` (`pso.rs:79`), `PSO:DECIPHER` (`pso.rs:292`), `INT-AUTH`
+     (`pso.rs:379`), `GENERATE` (`command.rs:500`) — and `TERMINATE DF`
+     (`command.rs:521`) are. Personalisation is always available, which is what
+     lets an owner escape this state at all.
+   * **The suite lifts the gate before it needs the operations.**
+     `card_test_personalize_reset.py:65` changes PW3 and `:73` changes PW1, in
+     that order. `State::set_pin` (`state.rs:1449-1458`) sets each `*_changed`
+     flag to `new_pin != DEFAULT`, so once both have been moved away from their
+     defaults `factory_defaults_in_force()` (`state.rs:1417`) returns `false` and
+     the gate is open for the rest of the run.
+
+   What is *not* established here is whether US-912 contributes to the 179
+   failures by some other route — the second root cause below (a panic that
+   kills the emulator, which would also explain the 128 `TimeoutError`s) is a
+   live candidate and may account for them alone. That is a separate
+   root-cause cycle, and it is still open. **The correction matters now because
+   this paragraph was the recorded justification for the gate being a deliberate
+   divergence from the suite**: if it had been read literally, the tempting
+   response would have been to ungate the key operations, removing a security
+   control on the strength of a claim about a code path that does not exist.
 
 2. **A panic in `set_reset_code` kills the emulator mid-run.**
    `vendor/opcard/src/state.rs:471-473`:

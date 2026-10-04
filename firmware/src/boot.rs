@@ -313,6 +313,217 @@ static mut MIG_BUFS: MigrationBuffers = MigrationBuffers::new();
 /// never across an await point.
 pub static mut FLASH_DEV: core::mem::MaybeUninit<DevFlash> = core::mem::MaybeUninit::uninit();
 
+// ---------------------------------------------------------------------------
+// US-1559: the per-record key region
+// ---------------------------------------------------------------------------
+
+/// The key region's handle type, named once.
+///
+/// FIDO and OATH credentials live in `flashmap::KEY_REGION_OFFSET ..+
+/// KEY_REGION_BYTES` (`platform/src/keyregion/device_region.rs`), a window
+/// disjoint from both other QSPI consumers by `flashmap.rs`'s compile-time
+/// boundary asserts.
+pub type KeyRegionHandle = fapico2_platform::keyregion::device_region::DeviceKeyRegion;
+
+/// US-1559: the key region, in its own write-once slot.
+///
+/// **Two words of `.bss`** and nothing else — `DeviceKeyRegion` is one
+/// `embassy_rp` `Flash`, which in *blocking* mode is `Option<Channel> = None`
+/// plus a `PhantomData` (`embassy-rp-0.10.0/src/flash.rs:115-118`). The boot
+/// path is the wrong place to spend RAM: DARK-BOOT-1 established that `.bss`
+/// growth moves `MSPLIM` and shrinks the main stack, which is a hardware risk
+/// and not merely a gate failure.
+///
+/// Separate from [`FLASH_DEV`] rather than a second `&mut` to it, on purpose.
+/// Two `&mut` to one object is UB whether or not an aliasing argument holds —
+/// the `DRBG_SEED_PROBE` doc below states that in as many words — and the
+/// alternative to a second handle would have been to alias the secure-partition
+/// driver's.
+///
+/// SAFETY: single-core cooperative scheduling — the region is used only inside
+/// a synchronous applet command section (every `KeyRegion` method is a blocking
+/// QSPI call with no `.await` in it), never across an await point.
+pub static mut KEY_REGION: core::mem::MaybeUninit<KeyRegionHandle> = core::mem::MaybeUninit::uninit();
+
+/// `true` once [`release_key_region`] has run — the handle in [`KEY_REGION`] is
+/// initialized and reachable.
+///
+/// **The S8/S9 gate, as runtime state rather than as a convention.** S8/S9
+/// forbid the boot path from *reading* the key region, and the honest way to
+/// enforce that is to make the region unreachable before `RUNG_USB`: a caller
+/// that asked too early gets `None`, and its caller turns that into an empty key
+/// set and a clean CTAP error. A source-order convention would only catch the
+/// call sites that exist today.
+///
+/// One byte, const-initialized to `false`, so it lands in `.bss` and not
+/// `.data`. `Relaxed` is the right ordering here and not laziness: there is one
+/// core and no other observer of this flag — the release and the first read are
+/// both on the boot path, and every later read is after them in program order.
+static KEY_REGION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stage the key region's handle into its write-once slot.
+///
+/// # Why this is separate from [`release_key_region`]
+///
+/// The handle has to be *built* on the boot path while `p.FLASH` is still live
+/// (`firmware/src/main.rs`, beside the other two `Flash::new_blocking` calls) and
+/// is only allowed to be *reached* after `RUNG_USB`. Splitting the two makes
+/// both facts visible at their own call sites, and lets [`key_region`] refuse a
+/// caller that arrives too early instead of trusting it not to.
+///
+/// It performs no flash access: `Flash::new_blocking` stores `Option::None` and
+/// a `PhantomData` (`embassy-rp-0.10.0/src/flash.rs:255-260`), so "the handle
+/// exists" and "the region has been touched" are not the same event.
+///
+/// # Safety
+///
+/// Single-core boot path, before any task exists — the `FLASH_DEV` /
+/// `init_static_slot` discipline. `KEY_REGION` is written exactly once here and
+/// not read until [`release_key_region`], so no reference to it exists while it
+/// is uninitialized. The caller owns the `Flash` handle it passes and must not
+/// keep using it.
+pub unsafe fn init_key_region(region: KeyRegionHandle) {
+    // The write is `ptr::write` into the slot, so no `&mut` to the region
+    // exists at any point before `release_key_region` mints the first one.
+    unsafe { (*core::ptr::addr_of_mut!(KEY_REGION)).write(region) };
+}
+
+/// US-1553: OATH's **own** key-region handle, and the only way to get at it.
+///
+/// **A second `DeviceKeyRegion`, not a second `&mut` to [`KEY_REGION`].** The
+/// distinction is not tidiness, it is the difference between sound and UB.
+///
+/// [`key_region`] mints a fresh `&'static mut` on **every call**, which is sound
+/// because each is dropped before the next is made and no region method ever
+/// yields. `OathApp::attach_region` does the opposite: it takes ownership of
+/// the handle and holds it for the life of the process. Handing it the same
+/// handle FIDO re-mints per CTAP2 command would put a permanent `&mut` beside a
+/// stream of transient ones over one object, and the rule quoted on
+/// [`KEY_REGION`] settles it — *two `&mut` to one object is UB whether or not
+/// the non-overlap argument holds*.
+///
+/// So this is a fourth handle over the same physical window, with disjoint slot
+/// ranges by geometry (`OATH_CAPACITY` at the head, asserted exact in
+/// `keyregion/mod.rs`) and the same single-core no-yield serialization. The same
+/// shape as `backend_flash` beside [`FLASH_DEV`].
+///
+/// # Why `Option`
+///
+/// The handle is **taken**, not borrowed, and an `Option` in the slot makes the
+/// take once-only: a second call reads `None` rather than moving a moved value.
+/// A bare `MaybeUninit<KeyRegionHandle>` would make double-take a silent
+/// double-move.
+pub static mut OATH_KEY_REGION: core::mem::MaybeUninit<Option<KeyRegionHandle>> =
+    core::mem::MaybeUninit::uninit();
+
+/// Stage OATH's key-region handle. Single-core boot path, once, before any
+/// task exists — the [`init_key_region`] discipline.
+pub unsafe fn init_oath_key_region(region: KeyRegionHandle) {
+    unsafe { (*core::ptr::addr_of_mut!(OATH_KEY_REGION)).write(Some(region)) };
+}
+
+/// Take OATH's region handle by value, once.
+///
+/// Shares [`KEY_REGION_READY`] rather than carrying its own flag: one release
+/// publishes both, and a second flag would be a second thing to get out of step
+/// with `mark!(RUNG_USB)`.
+pub fn take_oath_key_region() -> Option<KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `init_oath_key_region` wrote the slot exactly once on the boot
+    // path before any task existed, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that. The `Option` is `.take()`n, so at most
+    // one caller ever moves the value out and any later caller reads `None`.
+    unsafe { (*core::ptr::addr_of_mut!(OATH_KEY_REGION)).assume_init_mut().take() }
+}
+
+/// US-1553: the key the OATH region's records are sealed under.
+///
+/// **`Option`, never [`fatal_boot`]** — and the difference from
+/// [`derive_oath_seal`] below is the *fallback*, not caution. A missing seal
+/// leaves an OATH app that cannot re-seal a migrated credential, so that halt is
+/// US-130's reasoning and stands. A missing payload key does not: the legacy
+/// chunked store is still there, is still readable, and is exactly what this
+/// firmware ran before. So an unavailable OTP row or chipid degrades OATH to
+/// the path it always had and the applet keeps answering APDUs (S10 — degrade,
+/// never halt).
+///
+/// Same root as every other store key on the device
+/// (`store_v3::derive_store_key(otp_key_1, chipid)`), reached without the
+/// secure-store round trip because the OTP row is already in hand here.
+#[inline(never)]
+pub fn derive_oath_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
+    let otp_key_1 = read_otp_key_1()?;
+    let chipid = embassy_rp::otp::get_chipid().ok()?;
+    fapico2_platform::keyregion::crypto::derive_payload_key(
+        &otp_key_1,
+        &chipid.to_be_bytes(),
+        &fapico2_platform::keyregion::oath_store::OATH_PAYLOAD_SECRET,
+    )
+}
+
+/// Publish the staged key region. **Called once, after `mark!(RUNG_USB)`.**
+///
+/// The call site is the claim that the boot path is done touching persistent
+/// media the board cannot verify: everything below this line is applet use, and
+/// the first region read happens in whichever applet operation runs first.
+///
+/// Idempotent, because a boot path that reached `RUNG_USB` and then found this
+/// already set has simply been re-entered by a caller that means the same
+/// thing; failing there would be a halt over nothing (S10).
+pub fn release_key_region() {
+    KEY_REGION_READY.store(true, core::sync::atomic::Ordering::Relaxed);
+    defmt::info!("key region: released for applet use (first read is on demand)");
+}
+
+/// The key region, or `None` if the boot path has not released it yet.
+///
+/// **`None` is a normal answer, not an error.** It means "the boot path has not
+/// released the region", and the caller's obligation under S10 is to report an
+/// empty key set and a clean CTAP error — never to panic and never to
+/// `fatal_boot`. A key store that cannot be reached is an unusable
+/// authenticator; a token that refuses to enumerate at all is a brick.
+///
+/// # The sharing discipline
+///
+/// Each call mints a fresh `&'static mut`, exactly as [`store_handle`] does for
+/// the secure store and exactly as `main.rs` does for `FLASH_DEV` before handing
+/// the CCID and HID serve loops their handles. It is sound under this tree's
+/// single-core cooperative executor because **no region method ever yields** —
+/// `read_slot`, `erase_sector` and `program` are blocking QSPI calls with no
+/// await point — so at most one caller can be inside a region operation at any
+/// moment. A caller that stores the handle across an `.await` breaks that, and
+/// the reason it is written here rather than left to the applets is that the
+/// reason is invisible at the call site.
+///
+/// # Who calls this
+///
+/// The **FIDO** adapter. `main.rs` installs
+/// `fapico2_fido::device_app::install_region_provider` right after
+/// [`release_key_region`], and its provider forwards here, minting a fresh
+/// handle per CTAP2 command.
+///
+/// **OATH does not come through this accessor**, and that is deliberate rather
+/// than an omission. `OathApp::attach_region` takes ownership of its handle and
+/// holds it for the life of the process, so it gets its own
+/// [`take_oath_key_region`] rather than a second `&mut` to what this returns —
+/// the permanent-beside-transient shape [`KEY_REGION`]'s doc rules out. Both
+/// handles address the same window over disjoint slot ranges.
+pub fn key_region() -> Option<&'static mut KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `KEY_REGION` is written exactly once by `init_key_region` on the
+    // boot path before any task exists, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that — so a load that observes `true` is
+    // ordered after a completed write to a live object, and the slot is never
+    // written again. Single-core, so no other task can be inside a region
+    // operation: every `KeyRegion` method is blocking with no yield point (see
+    // the sharing discipline above).
+    Some(unsafe { (*core::ptr::addr_of_mut!(KEY_REGION)).assume_init_mut() })
+}
+
 /// US-413 S-413-6: management-APDU migration completion hook state. The
 /// store/buffers are reached through `static mut` at call time (same
 /// single-threaded boot/CCID-task ownership as [`STORE`]).

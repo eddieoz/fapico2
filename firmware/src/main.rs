@@ -24,6 +24,9 @@
 #![no_std]
 #![no_main]
 
+// US-1553: `Box::new` for `OathRegion::new`, which owns its `KeyRegion`.
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use defmt_rtt as _;
@@ -218,6 +221,32 @@ fn boot_fido<T: Trng>(
 /// outside the declared construction sites, so the next app's boot helper has
 /// to declare itself instead of compiling.
 #[inline(never)]
+/// US-1553: hand the OATH applet its key region.
+///
+/// A `fn` item, not a closure, because `oath_core::install_region_provider`
+/// stores a **code address** in its `AtomicPtr` — the same constraint the FIDO
+/// provider's comment above states.
+///
+/// Two orders inside, and the sequence is not incidental:
+///
+/// 1. **Derive the key first.** A derivation that fails (cold OTP row, or an
+///    all-zero root) must leave the handle in place, so a later call can still
+///    succeed. Taking the handle first and then failing would consume the only
+///    one that exists and permanently pin OATH to the legacy path.
+/// 2. **Then take the handle**, which is `Option` precisely so that only this
+///    first successful call moves it (see `boot::take_oath_key_region`).
+///
+/// `None` in any case means "no region", and the applet answers APDUs from the
+/// legacy chunked store — never `fatal_boot`. S10: degrade, never halt.
+fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
+    let key = boot::derive_oath_payload_key()?;
+    let region = boot::take_oath_key_region()?;
+    Some(fapico2_oath::oath_core::OathRegion::new(
+        ::alloc::boxed::Box::new(region),
+        key,
+    ))
+}
+
 fn boot_oath<T: Trng>(
     trng: &mut T,
     store: &mut boot::DeviceStore,
@@ -799,6 +828,66 @@ async fn main(spawner: Spawner) -> ! {
     // SAFETY: `Peri::clone_unchecked` — as for the TRNG above: stateless
     // driver, documented HAL duplication, disjoint-region single-core use.
     let backend_flash: boot::DevFlash = Flash::new_blocking(unsafe { p.FLASH.clone_unchecked() });
+
+    // US-1559: the per-record key region needs a THIRD `Flash` handle over the
+    // same peripheral, on exactly the terms `backend_flash` above sets out —
+    // the driver is stateless (`dma: None` + `PhantomData`), and this one
+    // addresses `flashmap::KEY_REGION_OFFSET .. +KEY_REGION_BYTES`, a window
+    // `flashmap.rs:145-160` asserts is disjoint from both other consumers'
+    // (the trussed FS window and the secure image slots).
+    //
+    // **Constructed here, released later.** `p.FLASH` is consumed on the next
+    // line and a `Flash` cannot be built without a `Peri`, so this is the only
+    // place the handle can be made. Nothing is read: `Flash::new_blocking`
+    // stores `Option::None` plus a `PhantomData`
+    // (`embassy-rp-0.10.0/src/flash.rs:255-260`) and `init_key_region` only
+    // parks the value in its write-once slot. The handle stays unreachable
+    // until `release_key_region` runs, below `mark!(RUNG_USB)` — which is the
+    // S8/S9 guarantee, enforced at runtime rather than by source order.
+    //
+    // A third *handle* rather than a second `&mut` to `FLASH_DEV`: two `&mut`
+    // to one object is UB whether or not the non-overlap argument holds (the
+    // `DRBG_SEED_PROBE` doc in `boot.rs` says so), and the alternative to a
+    // new handle was aliasing the secure-partition driver.
+    //
+    // SAFETY: `Peri::clone_unchecked` — as for the TRNG and for `backend_flash`
+    // above: stateless driver, documented HAL duplication, disjoint-region
+    // single-core use. `boot::init_key_region` — single-core boot path, before
+    // any task exists; the slot is written exactly once here and not read until
+    // `release_key_region`.
+    unsafe {
+        boot::init_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
+    // US-1553: OATH needs a **FOURTH** handle, not a second `&mut` to the one
+    // above. `OathApp::attach_region` takes ownership and holds the handle for
+    // the life of the process, while the FIDO accessor mints a fresh
+    // `&'static mut` for every CTAP2 command — a permanent `&mut` beside a
+    // stream of transient ones over one object is UB whether or not the
+    // non-overlap argument holds, which is the `DRBG_SEED_PROBE` rule stated
+    // twice in `boot.rs`.
+    //
+    // (`key_region_boot_gate.rs` scans this file for the FIDO accessor's
+    // spelling and fails on any occurrence before `RUNG_USB` — *including
+    // inside a comment*, which is how this sentence had to be written twice.)
+    //
+    // A second handle over the same physical window, with disjoint slot ranges:
+    // OATH owns `[0, OATH_CAPACITY)` at the head and FIDO starts after the
+    // scratchpad, asserted exact by `keyregion/mod.rs`'s compile-time tiling
+    // check. Same serialization as every other handle here — single core, no
+    // region method ever yields.
+    //
+    // SAFETY: as for the third handle above. `boot::init_oath_key_region` —
+    // single-core boot path, before any task exists; the slot is written once
+    // here and not read until `release_key_region`.
+    unsafe {
+        boot::init_oath_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
     let flash: boot::DevFlash = Flash::new_blocking(p.FLASH);
     // S-701-3: hand the flash handle to the write-once static (single init,
     // boot path) so the HID task can persist FIDO keystore changes too.
@@ -1091,6 +1180,35 @@ async fn main(spawner: Spawner) -> ! {
     // until `main` awaits, so this marker and `release()` below still own the
     // pin.
     mark!(fapico2_firmware::bootphase::RUNG_USB);
+    // US-1559: publish the per-record key region. **This is the wiring, and it
+    // is deliberately the first thing after `RUNG_USB`.** The handle was built
+    // up at the other `Flash::new_blocking` block (it has to be — `p.FLASH` dies
+    // there) but stayed unreachable until this line: before it, `boot::
+    // key_region()` answers `None`, so no boot-path caller can read the region
+    // even if one appears (S8/S9). After it, the region belongs to the applets
+    // and the first read happens in whichever applet operation runs first.
+    //
+    // Nothing here can fail: the release flips one flag. An applet that finds
+    // the region unreadable gets an empty key set and a clean CTAP error (S10),
+    // never a halt.
+    boot::release_key_region();
+    // US-1552: hand the region to the FIDO applet. **This is the line that makes
+    // the migration take effect on hardware** — without it nothing calls the
+    // region path, LTO proves `REGION_PROVIDER` is never written, and the whole
+    // key-region implementation is linked out of the image.
+    //
+    // A `fn` pointer rather than a closure, because `REGION_PROVIDER` stores the
+    // provider's code address (`device_app.rs::install_region_provider`) and a
+    // capturing closure would not be one. It asks `boot::key_region()` at every
+    // call, which is what makes "before RUNG_USB it answers None" a guarantee
+    // rather than a comment.
+    fapico2_fido::device_app::install_region_provider(|| {
+        boot::key_region().map(|r| r as &'static mut dyn fapico2_platform::keyregion::KeyRegion)
+    });
+    // US-1553: the same line for OATH, and it is just as load-bearing — without
+    // it nothing calls `attach_region`, LTO proves `REGION_PROVIDER` is never
+    // written, and OATH's 68 reserved slots stay flash nothing reads.
+    fapico2_oath::oath_core::install_region_provider(oath_region);
     // US-929 boot ladder, stage 3 (dbg-log builds only): the USB device is
     // constructed and `usb_task` spawned — configuration completes when the
     // executor first polls `usb_task` (stage 4's record proves that poll

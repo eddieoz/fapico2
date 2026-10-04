@@ -9,6 +9,19 @@ produced by `build-signed.sh` or is public.
 
 ---
 
+## Provisioning policy (current decision)
+
+**Nothing in this procedure is wired to an automated flow, and nothing has been burned yet.**
+The board-security posture is defined in
+[`docs/adr/0002-provisioning-policy.md`](adr/0002-provisioning-policy.md): alpha/beta images
+keep the debug port available and burn nothing irreversible; images from `-release` tags are
+the boundary where `DEBUG_DISABLE` and the remaining `CRIT1` flags will apply, with the
+mechanism decided when the system is more mature. Software debug is already stripped from
+release images (`dbg-log` is release-forbidden) — that is build state, and it is separate from
+the debug *port*, which is device state sampled from OTP at reset. The device-side provisioner
+(`platform/src/boot_key.rs`) is dead code with a row map that does not match the bootrom;
+reconciling it is the recorded prerequisite for any burn.
+
 ## What this does, and what it does not
 
 **Does:** makes the RP2350 bootrom refuse any image not signed by the key

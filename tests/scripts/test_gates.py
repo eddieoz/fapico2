@@ -247,6 +247,27 @@ _B_DEBUG_STRIP = Break(
     "flashed image no longer matches a clean tree (S-391-13)",
 )
 
+# US-1534. The break is the operator's most likely mistake, and it is a
+# one-line edit: raising the ratchet without touching the Rust constant that
+# describes the layout the ratchet has to stay clear of. The gate reports the
+# disagreement rather than the geometry in this state, which is the honest
+# outcome — the second edit (moving the window down, or raising the Rust
+# constant too) is what turns this into the real defect, and by then the gate
+# has already refused the first one.
+#
+# The pre-gate tree had no way to notice at all: the budget was a workflow
+# variable and the window was a Rust literal, and nothing read both.
+_B_FLASH_BUDGET = Break(
+    ".github/workflows/ci.yml",
+    "  FIRMWARE_FLASH_BUDGET_KIB: 1536",
+    "  FIRMWARE_FLASH_BUDGET_KIB: 2200",
+    "the flash-budget ratchet is raised to 2,200 KiB — past the 2,048 KiB "
+    "growth boundary, so an image the ratchet accepts could link over the "
+    "trussed filesystem holding every OpenPGP and PIV key — without the Rust "
+    "constant that describes the layout being moved to match. Before US-1534 "
+    "nothing related the two numbers and the build stayed green",
+)
+
 _B_README = Break(
     "README.md",
     "[`docs/bootsel.md`](docs/bootsel.md)",
@@ -586,6 +607,11 @@ GATES: tuple[Gate, ...] = (
     Gate(
         "check_debug_strip.py",
         breaks=(_B_DEBUG_STRIP,),
+    ),
+    Gate(
+        "check_flash_budget.py",
+        breaks=(_B_FLASH_BUDGET,),
+        note="cross-file constant agreement, then budget-vs-region geometry",
     ),
     Gate(
         "check_readme.py",

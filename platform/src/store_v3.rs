@@ -63,6 +63,8 @@ use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::Aes256Gcm;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+// US-1572: the OTP row transits `derive_store_key`'s IKM buffer.
+use zeroize::Zeroize;
 
 /// Secure-partition image magic, format v3 — LE bytes `"PS3F"`.
 pub const PARTITION_IMAGE_MAGIC_V3: u32 = 0x4633_5350;
@@ -102,6 +104,12 @@ pub fn derive_store_key(otp_key_1: &[u8; 32], chipid: &[u8; 8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(b"PS3F"), &ikm);
     let mut out = [0u8; 32];
     hk.expand(b"store", &mut out).expect("32 okm");
+    // US-1572: the IKM is `otp_key_1 ‖ chipid` — the OTP key row itself, in a
+    // stack slot this function does not control the lifetime of. Clearing it
+    // here costs one line and closes a 40-byte window that used to survive
+    // until the caller's next write to that frame. `hk` borrows `ikm`, so the
+    // zeroize has to follow the expand, not precede it.
+    ikm.zeroize();
     out
 }
 

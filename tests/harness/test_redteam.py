@@ -192,6 +192,13 @@ def _set_code_tlv(code=ACCESS_CODE, chal=bytes(range(1, 9))):
 
 
 def _validate_tlv(code, chal):
+    """Proof over the challenge, using the **derived** access key.
+
+    `code` here is the raw password; the device holds
+    `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`, so the proof must be
+    made with that derivation and not with the password. Callers pass the
+    already-derived key (see `_authenticate`).
+    """
     proof = hmac.new(code, chal, hashlib.sha1).digest()[:20]
     return (
         bytes([TAG_CHALLENGE, len(chal)])
@@ -203,6 +210,42 @@ def _validate_tlv(code, chal):
 
 SELECT_OATH = bytes([0x00, 0xA4, 0x04, 0x00, len(OATH_AID)]) + OATH_AID
 CALC_ALL_CHAL = bytes([TAG_CHALLENGE, 8]) + bytes(8)
+
+# The applet provisions a documented default access code on boot and on factory
+# reset (`oath_core.rs::provision_default_access_code`), so "no access code" is
+# not a reachable state and every fresh session starts unvalidated. Only the
+# *setup* below authenticates — planting the victim credential is the
+# legitimate owner acting, and it is what both first-party clients do.
+DEFAULT_ACCESS_CODE = b"123456"
+
+
+def _authenticate(client, code=DEFAULT_ACCESS_CODE):
+    """SELECT, then answer the `74` challenge with HMAC-SHA1 of the code.
+
+    The handshake ykman/yubikit and picoforge both run (`_has_key =
+    self._challenge is not None` / `info.password_set()`, then VALIDATE). Note
+    this *grants* the session and so is used only to build a state; every case
+    below then re-SELECTs and attacks from an unvalidated one.
+    """
+    # Mirrors the client flow: SELECT, then VALIDATE with the access code.
+    resp = _ccid(client, SELECT_OATH)
+    if _sw(resp) != SW_OK:
+        raise AssertionError(f"setup: SELECT failed: {resp.hex()}")
+    body = resp[:-2]
+    chal = _tlv(body, TAG_CHALLENGE)
+    if chal is None or len(chal) != 8:
+        raise AssertionError(f"setup: SELECT served no VALIDATE challenge: {resp.hex()}")
+    # The device stores `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`; the
+    # salt is the `71` device-id TLV from this same SELECT. Deriving is what
+    # makes this the client handshake rather than a guess.
+    device_id = _tlv(body, TAG_NAME)
+    if device_id is None:
+        raise AssertionError(f"setup: SELECT served no 71 device-id TLV: {resp.hex()}")
+    key = hashlib.pbkdf2_hmac("sha1", code, device_id, 1000, 16)
+    validate = _oath_apdu(INS_VALIDATE, data=_validate_tlv(key, chal))
+    resp = _ccid(client, validate)
+    if _sw(resp) != SW_OK:
+        raise AssertionError(f"setup: VALIDATE failed: {resp.hex()}")
 
 
 def _recv_exact(sock, n):
@@ -302,24 +345,32 @@ def _redteam_device(tmp_path, monkeypatch, tag, hid_port, env=None):
 
 
 def _plant_victim_credential(client):
-    """Setup: plant a victim credential through the *virgin* grant.
+    """Setup: plant a victim credential through an authenticated session.
 
-    The landed US-901 rule deliberately keeps the C-firmware parity: an app
-    with no access code, no OTP PIN and no credentials is grantable so a
-    legitimate user can provision it. This is the documented design
-    allowance (see the US-923 report), not a regression; the attacks under
-    test are the credential *dump/tamper/wipe* against a seeded store.
+    The US-901 rule this suite originally leaned on was the C-firmware
+    parity grant: an app with no access code, no OTP PIN and no credentials is
+    grantable, so a legitimate user can provision it. That grant is no longer
+    reachable — the applet provisions a default access code on boot — but the
+    design allowance it recorded is still why the *setup* below may act as an
+    owner. What is under test is unchanged: the credential
+    *dump/tamper/wipe* against a seeded store.
+
+    Provisioning is the owner acting, so it authenticates the way both
+    first-party clients do (SELECT + VALIDATE). That is setup, not a weakening:
+    the session the attacks run from is the unvalidated one the closing SELECT
+    leaves behind, and it is *more* locked than the virgin one this originally
+    relied on — an access code is now on file for the whole attack.
     """
-    assert _sw(_ccid(client, SELECT_OATH)) == SW_OK
+    _authenticate(client)
     put = _oath_apdu(INS_PUT, data=_put_tlv(VICTIM_NAME, VICTIM_KEY))
     assert _sw(_ccid(client, put)) == SW_OK
     # Control: in the (still-validated) planting session the credential is
     # readable — the refusals below are the session gate, not a broken app.
     listed = _ccid(client, _oath_apdu(INS_LIST))
     assert _sw(listed) == SW_OK and VICTIM_NAME in listed, listed.hex()
-    # A host-issued SELECT recomputes the session grant (US-901): with a
-    # credential on file the app is non-virgin, so the fresh session is
-    # UNvalidated — the state every attacker session below replays.
+    # A host-issued SELECT recomputes the session grant (US-901): with an
+    # access code on file the fresh session is UNvalidated — the state every
+    # attacker session below replays.
     assert _sw(_ccid(client, SELECT_OATH)) == SW_OK
 
 
@@ -334,8 +385,10 @@ def test_oath_unauth_dump_refused(tmp_path, monkeypatch):
     ``redteam/out/oath_codes_dump.bin``.
 
     Red: report R2 (oath.rs self-granting sessions) + evidence row #2.
-    Green: US-901 makes every non-virgin session start unvalidated, so
-    both dump commands must answer 6982 before touching any credential.
+    Green: US-901 makes every non-virgin session start unvalidated, and the
+    default access code takes that from "almost every session" to *every*
+    host-issued SELECT — so both dump commands must answer 6982 before
+    touching any credential.
     """
     with _redteam_device(tmp_path, monkeypatch, "rt_dump", HID_PORT_DUMP) as client:
         _plant_victim_credential(client)
@@ -431,9 +484,10 @@ def test_oath_reset_without_presence_refused(tmp_path, monkeypatch):
         tmp_path, monkeypatch, "rt_nopresence", HID_PORT_PRESENCE,
         env=OATH_PRESENCE_DENY,
     ) as client:
-        # Virgin session: an app with nothing on file is grantable (US-901),
-        # so the setup below is a legitimate provisioning run, not a bypass.
-        assert _sw(_ccid(client, SELECT_OATH)) == SW_OK
+        # Legitimate provisioning run, not a bypass: the owner authenticates
+        # (SELECT + VALIDATE, the client flow) because the applet provisions a
+        # default access code and refuses everything else until VALIDATE.
+        _authenticate(client)
         put = _oath_apdu(INS_PUT, data=_put_tlv(VICTIM_NAME, VICTIM_KEY))
         assert _sw(_ccid(client, put)) == SW_OK, "setup: the victim PUT failed"
         # Commission the applet. SET_CODE locks the session by design, so the

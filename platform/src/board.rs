@@ -148,6 +148,20 @@ pub const FLASH_SIZE_BYTES: usize = (FLASH_SIZE_KB * 1024) as usize;
 /// layout cannot drift apart.
 pub const SECURE_PARTITION_OFFSET: u32 = APP_FLASH_KB * 1024;
 
+/// The per-record key store: everything between the trussed window and the
+/// secure partition (US-1539).
+///
+/// Board-derived by subtraction, which is what makes the four regions tile the
+/// part exactly — see `platform/board_def.rs::Board::key_region_kb`, which the
+/// linker script uses independently. 960 KiB on the shipping 4 MiB `pico2`
+/// part; a larger part gets more, because the spare flash is credential
+/// capacity, which is exactly what US-1540 derives its ceilings from.
+pub const KEY_REGION_BYTES: u32 = (FLASH_SIZE_KB
+    - crate::flashmap::FIRMWARE_GROWTH_END / 1024
+    - crate::flashmap::TRUSSED_FS_KB
+    - SECURE_RESERVE_KB)
+    * 1024;
+
 /// Compile-time cross-checks tying the reservation to the store it exists for.
 ///
 /// `firmware/src/boot.rs` lays out two image slots in the region —

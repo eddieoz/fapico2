@@ -15,6 +15,9 @@
 //! SecureStore keystore (US-387) and reboot persistence (US-388); live-USB
 //! `lsusb`/SELECT acceptance is Phase 6.
 
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use fapico2_platform::keyregion::KeyRegion;
 use fapico2_platform::secure_store::{SecureStore, SecureStoreError};
 use crate::crypto::TrngAdapter;
 use crate::device_keystore::DeviceKeystore;
@@ -37,7 +40,7 @@ const CTAP2_ERR_INVALID_COMMAND: u8 = 0x01;
 /// Pending getAssertion enumeration state (S-701-4): remaining credential
 /// IDs served one-per-getNextAssertion on the same channel.
 pub struct DeviceGaState {
-    pub(crate) remaining: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) remaining: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) client_data_hash: [u8; 32],
     pub(crate) uv: bool,
     pub(crate) do_up: bool,
@@ -134,6 +137,144 @@ pub fn presence_tag_from_channel(channel: [u8; 4]) -> u32 {
     0x8000_0000 | u32::from_be_bytes(channel)
 }
 
+// ---------------------------------------------------------------------------
+// US-1555 / US-1563 — the key region's reachability seam
+// ---------------------------------------------------------------------------
+
+/// How the FIDO applet obtains the per-record key region, if it can.
+///
+/// **A function pointer, and not a stored handle**, for two reasons that both
+/// come from the boot path not being allowed near the region:
+///
+/// * `FidoApp::boot` runs long **before** `firmware/src/main.rs` calls
+///   `boot::release_key_region()` — the applet is constructed, its keystore is
+///   restored, and the whole boot path runs to completion before the region is
+///   reachable at all. A handle captured at construction would therefore be a
+///   handle to nothing, or a `None` that could never become a `Some`;
+/// * S8/S9 forbid the boot path from **reading** the region, and "reads nothing
+///   at construction" is much easier to state about an indirect call than about a
+///   struct field. [`RegionCredentials::new`](crate::device_keystore::RegionCredentials::new)
+///   is a one-field assignment for the same reason.
+///
+/// So the applet asks at **first use**, which is by construction after
+/// `RUNG_USB`. Until something installs a provider — or while the provider
+/// answers `None` — the applet degrades to an empty credential set and a clean
+/// CTAP error, which is S10's obligation and never a panic or a `fatal_boot`.
+pub type RegionProvider = fn() -> Option<&'static mut dyn KeyRegion>;
+
+/// The installed provider, or `None`.
+///
+/// A `static` rather than a field on [`FidoApp`] because the region outlives no
+/// particular app activation and `FidoApp` is built during boot, before the
+/// provider exists. Four bytes of `.bss`, const-initialised, and it is the only
+/// piece of state this seam adds.
+static REGION_PROVIDER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the applet's key-region provider.
+///
+/// Called by the firmware **after** `mark!(RUNG_USB)` and
+/// `boot::release_key_region()`, with a function that forwards to
+/// `boot::key_region`. That is the whole contract, and it is why the accessor
+/// lives here rather than in `apps/fido` calling into the firmware crate: the
+/// dependency runs the other way, so the direction has to be inverted.
+///
+/// **Idempotent**, because a boot path that reached `RUNG_USB` and found one
+/// already installed has simply been re-entered by a caller that means the same
+/// thing — and failing there would be a halt over nothing (S10).
+///
+/// # Safety of the indirection
+///
+/// A `fn` pointer is a code address, so calling it cannot be a use-after-free
+/// the way calling a stale data pointer could. The provider's *return value* is
+/// a `&'static mut dyn KeyRegion`, which the firmware mints from its own
+/// write-once `KEY_REGION` slot and which `boot.rs` already documents the
+/// sharing discipline for (single-core, no region method ever yields). This
+/// function therefore introduces no new aliasing rule — it names an existing
+/// one.
+///
+/// # What is NOT here, and why
+///
+/// No handle is cached in [`FidoApp`], no `once` wrapper, and no "have I looked
+/// yet" flag. A cached `Option<&'static mut …>` would have to be refreshed when
+/// the provider starts answering `Some`, which is exactly the boot-order problem
+/// the function pointer exists to avoid. The cost is one indirect call per
+/// applet operation, against a command that already performs hundreds of
+/// flash reads.
+pub fn install_region_provider(provider: RegionProvider) {
+    REGION_PROVIDER.store(provider as *mut (), Ordering::Release);
+}
+
+/// The key region, or `None` when the applet cannot reach one.
+///
+/// **`None` is a normal answer.** It means "no provider installed, or the
+/// provider says the boot path has not released the region", and the caller's
+/// obligation under S10 is to report an empty credential set and a clean CTAP
+/// error — never to panic and never to `fatal_boot`. A key store that cannot be
+/// reached is an unusable authenticator; a token that refuses to enumerate at
+/// all is a brick.
+///
+/// Called at applet use, **not** on the boot path: this is the accessor S8/S9
+/// exist to protect, and a boot-path caller gets `None` rather than a handle it
+/// should not have.
+pub fn key_region() -> Option<&'static mut dyn KeyRegion> {
+    let provider = REGION_PROVIDER.load(Ordering::Acquire);
+    if provider.is_null() {
+        return None;
+    }
+    // SAFETY: the slot holds either null or a `fn` pointer installed by
+    // `install_region_provider`, and a `fn` pointer's representation is its
+    // code address. `Ordering::Release`/`Acquire` pairs the store with this
+    // load, so a non-null value is one this module published.
+    let provider: RegionProvider = unsafe { core::mem::transmute(provider) };
+    provider()
+}
+
+/// The region keys, derived from the secure store's own key, or `None`.
+///
+/// # Why the store key is the right input, and this is not a shortcut
+///
+/// `crypto::derive_otp_root(otp_key_1, chipid)` is *defined* as
+/// `store_v3::derive_store_key(otp_key_1, chipid)` (`crypto.rs`, "Why the root
+/// is not a new OTP-rooted HKDF"), and on the device
+/// [`SecureStore::store_key`] returns exactly that: `main.rs` derives it with
+/// `boot::derive_boot_store_key()` and installs it with `set_store_key`, and
+/// `fused_key::rp2350_store_key()` is the same expression. So the applet reads
+/// the **same root the key region's own derivation would produce**, by a route
+/// that needs no firmware change and keeps no OTP row in the applet.
+///
+/// That last part is the point worth defending: taking the OTP row instead would
+/// mean 32 bytes of *device root* in the FIDO applet's hands — the row unlocks
+/// every other store on the device — against 32 bytes of *derived key*, which
+/// unlocks one area. `crypto.rs` calls the same trade "strictly the worse of
+/// the two".
+///
+/// `None` when the store does not seal at all (an unkeyed store, which is the
+/// host emulation and the pre-US-915 device shape). The applet then reports an
+/// empty credential set: a device that cannot derive its key must not present a
+/// credential set it cannot back.
+///
+/// The payload key is **device-rooted, not PIN-gated** — see
+/// [`crate::device_keystore::region_pin_secret`], which names both why and what
+/// that gives up. The index key is PIN-free either way.
+///
+/// `keystore` is taken for its `device_random`, which is what the payload key's
+/// `pin_secret` is mixed from; it is the TRNG draw the snapshot already persists
+/// in its sealed auth map (key 5), so it is available on every boot and does not
+/// change when a PIN is set.
+pub fn region_keys(
+    store: &dyn SecureStore,
+    keystore: &DeviceKeystore,
+) -> Option<crate::device_keystore::RegionKeys> {
+    use fapico2_platform::keyregion::crypto;
+    let root = store.store_key()?;
+    let secret =
+        crate::device_keystore::region_pin_secret(&keystore.pin_state, keystore.device_random());
+    Some(crate::device_keystore::RegionKeys {
+        index: crypto::derive_index_key_from_root(&root),
+        payload: crypto::derive_payload_key_from_root(&root, &secret),
+    })
+}
+
 /// US-426: FIDO satisfies the same `App::persist_state` contract as
 /// OATH/OTP/mgmt/OpenPGP, so registering it into any dispatcher persists it
 /// through the platform persist gate automatically — zero per-transport
@@ -202,7 +343,7 @@ impl fapico2_platform::dispatch::App for FidoApp {
 
 /// credMgmt RP enumeration state.
 pub struct CmRpState {
-    pub(crate) rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) cursor: usize,
     pub(crate) channel: [u8; 4],
     /// The dialect of the `enumerateRpsBegin` that armed this enumeration.
@@ -217,7 +358,7 @@ pub struct CmRpState {
 
 /// credMgmt credential enumeration state.
 pub struct CmCredState {
-    pub(crate) creds: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }>,
+    pub(crate) creds: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) total: usize,
     pub(crate) channel: [u8; 4],
     /// See [`CmRpState::dialect`] — `enumerateCredentialsGetNextCredential`
@@ -526,9 +667,16 @@ impl FidoApp {
     /// snapshot leaves the in-RAM record untouched rather than clearing it —
     /// a failed read is not evidence of an absent record).
     pub fn sync_phy(&mut self, store: &mut dyn SecureStore) -> bool {
-        match DeviceKeystore::load(store) {
-            Ok(Some(ks)) => {
-                self.keystore.phy = ks.phy;
+        // `load_phy`, not `load(store).map(|ks| ks.phy)`: this runs inside the
+        // HID task's per-command generation check, and binding a 12-KiB
+        // `DeviceKeystore` in order to read one ~40-byte record cost 19,904 B
+        // of that task's poll frame. `DeviceKeystore::load_phy`'s doc comment
+        // carries the measurement and the reason a droppable keystore cannot
+        // be elided; it enforces the same accept/reject rules, one credential
+        // at a time, and never builds the array.
+        match DeviceKeystore::load_phy(store) {
+            Some(phy) => {
+                self.keystore.phy = phy;
                 true
             }
             _ => false,
@@ -601,6 +749,17 @@ impl FidoApp {
         mut store: Option<&mut dyn SecureStore>,
     ) -> usize {
         self.current_channel = channel;
+        // US-1558: migrate the snapshot into records **before** the dispatch
+        // below decides which backend to answer from.
+        //
+        // This is the *first applet use after `RUNG_USB`*: `process_ctap2` is
+        // reached only from the HID and CCID tasks, and `FidoApp::boot` — which
+        // restored the snapshot — ran long before `boot::release_key_region()`.
+        // Putting the call inside a dispatch arm would be a bug: the arm has
+        // already computed `region_keys_for` by then, so the first command
+        // after an upgrade would read an empty region and report zero
+        // credentials — exactly the loss this story exists to prevent.
+        self.migrate_snapshot_to_region(store.as_deref_mut());
         match command {
             0x04 => self.handle_get_info(out),
             0x01 => self.handle_make_credential(data, out, store),
@@ -608,7 +767,7 @@ impl FidoApp {
             0x06 => self.handle_client_pin(data, out),
             0x07 => self.handle_reset(out),
             0x08 => self.handle_get_next_assertion(out, store),
-            0x0A => self.handle_cred_mgmt(data, out),
+            0x0A => self.handle_cred_mgmt(data, out, store),
             // US-1514: authenticatorSelection. This arm is what made the
             // emulator able to do something the board could not — the host
             // twin had `0x0B` since FX-415 and this dispatch fell through to
@@ -825,8 +984,19 @@ impl FidoApp {
         &mut self,
         apdu: &[u8],
         out: &mut heapless::Vec<u8, { crate::CTAP2_MAX_MSG }>,
-        store: Option<&mut dyn SecureStore>,
+        mut store: Option<&mut dyn SecureStore>,
     ) -> usize {
+        // US-1558, the same call CTAP2 gets, and for the same reason: `U2F
+        // AUTHENTICATE` takes the region path whenever a region is reachable
+        // (`device_core.rs::u2f_authenticate` calls `region_keys_for`), so a
+        // device whose only traffic is CTAP1 would read an empty region and
+        // report every legacy key as unknown. The migration has to happen on
+        // whichever applet surface is used first, not on the one that happens
+        // to be more common.
+        //
+        // Idempotent, so the second of the two surfaces to be used pays one
+        // `len()` and nothing else.
+        self.migrate_snapshot_to_region(store.as_deref_mut());
         self.handle_u2f(apdu, out, store)
     }
 

@@ -789,14 +789,167 @@ pub fn pin_hash(pin: &[u8]) -> [u8; 16] {
 }
 
 // ------------------------------------------------------------------
-// US-910: salted, stretched PIN verifier
+// US-910 salted, stretched PIN verifier; US-1570 raises the floor on the
+// RP2350 SHA-256 accelerator (US-1569)
 // ------------------------------------------------------------------
 
-/// Iteration count for the stretched PIN verifier (US-910). Device-measured
-/// budget: 4096 iterated SHA-256 rounds target well under 200 ms per
-/// verification on the RP2350 (Cortex-M33). Both host and device use this
-/// same constant — host tests can afford it.
-pub const PIN_VERIFIER_ROUNDS: u32 = 4096;
+// ===========================================================================
+// US-1570 — the cost model
+// ===========================================================================
+//
+// **This is arithmetic over four published constants, not a measurement, and
+// the difference matters.** There is no RP2350 in this repository's loop
+// (`platform/src/sha256_accel.rs`, "What is measured and what is not": the
+// register layer is unreviewed-by-execution, only its padding and
+// block-assembly logic are tested). So nothing below may be quoted as "the
+// verification latency is N ms on hardware". What it *is* is the derivation
+// that says which constant to pick, plus a compile-time assertion that the
+// chosen count fits the budget **under the pessimistic per-round figure**.
+//
+// The four constants, and where each comes from:
+//
+// | symbol | value | source |
+// |---|---|---|
+// | [`RP2350_CLK_SYS_HZ`] | 150 MHz | the RP2350's stock `clk_sys`; what `embassy-rp` 0.10.0's `rp235xa` `Config::default()` programs (`clk_sys: Def::new(150_000_000)`) |
+// | [`PIN_VERIFY_BUDGET_MS`] | 200 ms | the budget the pre-US-1570 comment already claimed for the whole verification; carried forward unchanged so the *new* number is comparable with the old one rather than a redefinition |
+// | [`SHA256_BLOCK_DIGEST_CYCLES`] | 57 | the RP2350 datasheet, carried on the register itself in `rp-pac`'s SVD text for `CSR.WDATA_RDY`: *"After writing 16 words, this flag will go low for 57 cycles whilst the core completes its digest."* One 512-bit compression. |
+// | [`PIN_VERIFIER_CYCLES_PER_ROUND_POLLED`] | 384 | **ours, and the only genuinely estimated figure.** See below. |
+//
+// The 384 is the load-bearing number and it is deliberately pessimistic. Per
+// accelerated round the CPU pays, on top of the block's own 57 cycles:
+//
+// * `hash_into`'s block assembly — one 64-byte `Block` copy per push;
+// * `BlockSink::begin` — a `RESETS.RESET_DONE` read and a read-modify-write on
+//   `CSR` (clear `ERR_WDATA_NOT_RDY`, set `BSWAP`/`DMA_SIZE`, strobe `START`);
+// * 16 stores to `WDATA`, each budgeted at **4 cycles** rather than the 1 an
+//   idealised store would take, because the driver assembles each word from
+//   four byte loads (`u32::from_le_bytes(block.0[i*4..])`,
+//   `sha256_accel.rs:668-674`) and `WDATA` is on the peripheral bus;
+// * `BlockSink::finish` — poll `SUM_VLD` and read eight `SUM` registers.
+//
+// Summed honestly that is nearer 200 cycles; 384 is roughly a 1:3 host:digest
+// ratio on the block's *own* figure, chosen so the assertion below still holds
+// if the compiler generates the byte-assembly as written rather than folding
+// it into one aligned load. **The `sum` of the four bullets, and the poll-loop
+// trip counts, are the part that needs hardware.** The block's 57 cycles and
+// the 150 MHz clock are datasheet figures; the multiplication is arithmetic.
+//
+// Consequence, which is the honest headline: **100,000 rounds does not fit
+// this budget on the polled path** — 100,000 x 384 = 38.4 M cycles = 256 ms.
+// It *would* fit the DMA path ([`PIN_VERIFIER_CYCLES_PER_ROUND_DMA`], where
+// sixteen CPU stores become one channel trigger: 100,000 x 128 = 12.8 M
+// cycles = 85 ms), but the DMA register path is the part `sha256_accel` most
+// explicitly declines to claim has been executed, so the count chosen below is
+// the one the *pessimistic, polled* derivation supports. Raising it to 100k is
+// a one-constant edit once a board can measure it.
+
+/// Wall-clock budget for **one** PIN verification on the RP2350.
+///
+/// Carried forward verbatim from the pre-US-1570 `PIN_VERIFIER_ROUNDS` comment
+/// ("target well under 200 ms per verification"). Changing the budget and the
+/// round count together would make the round count unfalsifiable: nothing
+/// downstream could tell a KDF that got 32x stronger from one that merely got
+/// a laxer deadline.
+pub const PIN_VERIFY_BUDGET_MS: u64 = 200;
+
+/// The RP2350's stock `clk_sys`. `embassy-rp` 0.10.0's RP2350 `Config::default()`
+/// programs this (`clk_sys: Def::new(150_000_000)`), and nothing in this
+/// firmware overrides it — there is no clock-`set` call anywhere in
+/// `firmware/src/`. If a board is clocked differently this constant is wrong
+/// in the *optimistic* direction, which is why
+/// [`PIN_VERIFIER_CYCLES_PER_ROUND_POLLED`] carries a 3x margin rather than
+/// being a tight estimate.
+pub const RP2350_CLK_SYS_HZ: u64 = 150_000_000;
+
+/// Cycles the RP2350 SHA-256 block spends on **one** 512-bit compression.
+///
+/// Datasheet figure, quoted from the register description `rp-pac` carries
+/// from `svd/rp235x.svd` for `CSR.WDATA_RDY` (see the module docs of
+/// `platform::sha256_accel`, "The register names in the story brief are
+/// RP2040's, not RP2350's"): after the sixteenth word is written the flag goes
+/// low "for 57 cycles whilst the core completes its digest".
+///
+/// It is 57 cycles for the *compression*, not for the whole round — the word
+/// writes and the begin/finish bookkeeping are the CPU's, and are budgeted in
+/// [`PIN_VERIFIER_CYCLES_PER_ROUND_POLLED`] instead.
+pub const SHA256_BLOCK_DIGEST_CYCLES: u32 = 57;
+
+/// CPU cycles per accelerated verification round, **polled** driver — the
+/// pessimistic figure the round count is chosen against. See the module
+/// section above for how 384 is built from the four costs.
+///
+/// Deliberately a round number and deliberately pessimistic: the point of the
+/// constant is to be an upper bound a reader can check by adding four small
+/// numbers, not a measurement.
+pub const PIN_VERIFIER_CYCLES_PER_ROUND_POLLED: u32 = 384;
+
+/// CPU cycles per accelerated verification round on the **DMA** driver, for
+/// comparison only. Sixteen `WDATA` stores collapse into one
+/// `CTRL_TRIG.EN` trigger plus the transfer, and `push_dma` waits on
+/// `CTRL.BUSY` instead of `WDATA_RDY` per word
+/// (`sha256_accel.rs:686-702`). Budgeted at roughly 2x the block's own figure
+/// for the two DMA waits and the address writes.
+///
+/// **Not used by the round count.** The DMA path is the one `sha256_accel` is
+/// least willing to claim works, and a KDF whose affordable round count
+/// depends on it would be a claim about unexecuted code.
+pub const PIN_VERIFIER_CYCLES_PER_ROUND_DMA: u32 = 128;
+
+/// [`PIN_VERIFY_BUDGET_MS`] expressed in `clk_sys` cycles. The division is
+/// exact at these values (30 MHz-cycles per millisecond), so no rounding
+/// stands between the budget and the assertion below.
+pub const PIN_VERIFY_BUDGET_CYCLES: u64 = PIN_VERIFY_BUDGET_MS * RP2350_CLK_SYS_HZ / 1_000;
+
+/// Iteration count for the stretched PIN verifier (US-910), raised by US-1570
+/// from 4096 to **65,536** — a 16x increase, and the largest power of two
+/// whose *pessimistic polled* derivation still fits [`PIN_VERIFY_BUDGET_CYCLES`]:
+///
+/// ```text
+///   65,536 x 384 cycles = 25,165,824 cycles
+///                     / 150,000,000 Hz = 167.8 ms   (budget: 200 ms, 16% margin)
+/// ```
+///
+/// Rounds are whole SHA-256 **evaluations** of the running 32-byte digest, and
+/// a 32-byte message is exactly one 512-bit block, so the block count is
+/// `rounds + 1`: the extra block is round 0's input, which is
+/// `DOMAIN || salt || SHA256(PIN)[..16]` — 60 bytes, and 60 > 55, so FIPS 180-4
+/// §5.1.1 pads it across **two** blocks (`sha256_accel::SHA256_MAX_TAIL_BLOCKS`).
+/// That double block is inside the figure above: 65,537 blocks, of which 65,536
+/// are one-block messages.
+///
+/// The security argument is the reason for the change and it is worth stating
+/// plainly, because 4096 was never a strong number: **every one of the four
+/// reference implementations spends three to five hash operations per PIN
+/// guess** (`pico-fido2/src/fido/crypto_utils.c:44-56`; RS-Key
+/// `src/pico_crypt/kdf.rs:92-106`; see `docs/secure-storage-comparison.md`
+/// §5.2). 65,536 is 14 orders of magnitude more work per guess than 3, and the
+/// increment is only affordable because the work moved from the Cortex-M33's
+/// software SHA-256 onto the block that all five references ignore.
+///
+/// Both host and device use this same constant — host tests can afford it, and
+/// a build that tested a different number than it ships would test nothing.
+pub const PIN_VERIFIER_ROUNDS: u32 = 65_536;
+
+/// The budget assertion, as a **build failure**.
+///
+/// The two numbers that must agree — the round count and the decode ceiling
+/// that refuses anything above it — live in different modules on purpose (the
+/// ceiling is a parse rule in `device_keystore.rs`/`keystore.rs`, the count is
+/// a cost decision here), and for the life of US-910 they were two independent
+/// literals that nothing in the type system checked. This is the check that a
+/// future edit to either one cannot silently break the other's promise: raising
+/// the count past the budget, or lowering the budget past the count, fails the
+/// build with the arithmetic in the message.
+const _: () = {
+    assert!(
+        (PIN_VERIFIER_ROUNDS as u64) * (PIN_VERIFIER_CYCLES_PER_ROUND_POLLED as u64)
+            <= PIN_VERIFY_BUDGET_CYCLES,
+        "PIN_VERIFIER_ROUNDS does not fit PIN_VERIFY_BUDGET_MS at \
+         PIN_VERIFIER_CYCLES_PER_ROUND_POLLED: the PIN verification would \
+         overrun its budget. Either lower the round count, or re-derive \
+         PIN_VERIFIER_CYCLES_PER_ROUND_POLLED against a measured board."
+    );
+};
 
 /// Verifier format stamp (US-910): `0` = legacy unsalted
 /// `SHA256(PIN)[..16]`, `1` = salted stretched (see
@@ -808,18 +961,299 @@ pub const PIN_VERIFIER_FORMAT_STRETCHED: u8 = 1;
 /// replayed as a KDF output anywhere else.
 const PIN_VERIFIER_DOMAIN: &[u8] = b"fapico2.fido.pin-verifier.v1";
 
-/// US-910 stretched PIN verifier: `SHA256` iterated `rounds` times over
-/// `DOMAIN || salt || SHA256(PIN)[..16]`, truncated to 16 bytes.
+/// `DOMAIN || salt || SHA256(PIN)[..16]` — 60 bytes, and therefore **two**
+/// padded SHA-256 blocks, not one (60 > 55, FIPS 180-4 §5.1.1). Named so the
+/// "rounds + 1 block" arithmetic in [`PIN_VERIFIER_ROUNDS`] is checkable
+/// rather than remembered.
+pub const PIN_VERIFIER_INPUT_LEN: usize = PIN_VERIFIER_DOMAIN.len() + 16 + 16;
+
+/// Bytes the first evaluation of the verifier hashes, as a compile-time
+/// constant so [`sha256_fixed_via`] can derive the bit length without an
+/// overflow check: a fixed-size array's length cannot reach 2^61 bytes.
+const _: () = assert!(
+    (PIN_VERIFIER_INPUT_LEN as u64) * 8 < (1u64 << 61),
+    "SHA-256's length field counts bits; a fixed-size input must stay under \
+     2^61 bytes or `msg.len() * 8` wraps into a different message's digest"
+);
+
+// ===========================================================================
+// US-1570 — the migration window for legacy-format verifiers
+// ===========================================================================
+
+/// The first release index at which a **legacy-format** (`format == 0`) PIN
+/// verifier stops being admitted (the window is **open** while
+/// [`PIN_VERIFIER_RELEASE_INDEX`] is strictly below it). Release `0` is the one
+/// that first shipped
+/// [`PIN_VERIFIER_ROUNDS`] at its current value with the window open, so the
+/// first release that may refuse legacy records is `1` — hence `1` here.
 ///
-/// The input is the CTAP2 16-byte PIN-hash candidate (the client sends
-/// `SHA256(PIN)[..16]` over the pinUv shared secret — the raw PIN never
-/// reaches the authenticator in the getPinToken path), so the verifier is a
-/// function of the client-visible candidate. The per-device TRNG salt plus
-/// the iteration count remove the shared offline-table weakness of the
-/// legacy form: an attacker with the snapshot must redo `rounds` hashes per
-/// PIN guess, per device.
-pub fn pin_verifier_stretched(pin_hash: &[u8; 16], salt: &[u8; 16], rounds: u32) -> [u8; 16] {
-    let mut input = [0u8; PIN_VERIFIER_DOMAIN.len() + 16 + 16];
+/// # Why a release window and not a counter
+///
+/// The migration is triggered by the only event that can migrate a record
+/// safely — a *successful* PIN verification (`pin_verifier_upgrade`, reached
+/// from `PinProtocol::migrate_legacy_pin_verifier` and the device twin's
+/// success arm; a wrong PIN never reaches it and therefore never migrates).
+/// A failed attempt leaves no trace of having happened, so a record cannot
+/// count its own window: any per-record counter would have to live in a new
+/// snapshot key, and there is nowhere honest to put one that a torn write could
+/// not roll back (US-1571 measures exactly that rollback, and finds the rollback
+/// *restores* a count — a window counter living there would be a window an
+/// attacker could rewind).
+///
+/// So the window is measured in the only unit that survives a failed attempt:
+/// **firmware releases**. It has a real cost and it should be stated here
+/// rather than discovered in the field: closing it refuses the PIN outright for
+/// a device whose owner has not typed the PIN since the upgrade. That is the
+/// intended outcome — such a device is running an unsalted `SHA256(PIN)[..16]`
+/// and the KDF this story exists to strengthen has not reached it — but it is a
+/// user-visible lockout and belongs behind a deliberate, announced bump of this
+/// constant, not a refactor.
+pub const PIN_VERIFIER_LEGACY_GRACE_RELEASE: u32 = 1;
+
+/// This build's index in the migration window. Below
+/// [`PIN_VERIFIER_LEGACY_GRACE_RELEASE`] today, so the window is **open**:
+/// legacy records still verify and still migrate. The release process bumps
+/// it; nothing else may.
+///
+/// Strictly `<` and not `<=`, so that "this build is release 0, the minimum"
+/// is a statement about the *window* rather than a tautology about `u32`:
+/// `clippy::absurd_extreme_comparisons` rejects `<=` here for exactly that
+/// reason, and a comparison that is always true is not one that can be
+/// reasoned about when the release index moves.
+pub const PIN_VERIFIER_RELEASE_INDEX: u32 = 0;
+
+/// Whether this build still admits a legacy-format verifier — the single
+/// place the window is decided, so the admission check and the migration
+/// trigger cannot be changed in two files that disagree about whether the
+/// window is open.
+pub const PIN_VERIFIER_LEGACY_WINDOW_OPEN: bool =
+    PIN_VERIFIER_RELEASE_INDEX < PIN_VERIFIER_LEGACY_GRACE_RELEASE;
+
+/// The build-time half of the legacy window: release 1 is the first build
+/// that refuses legacy verifiers. Asserting the comparison *and* spelling out
+/// what it would take to close the window is the point — a reader who wants
+/// to close it has to edit two constants and re-derive this.
+const _: () = assert!(
+    PIN_VERIFIER_LEGACY_GRACE_RELEASE >= 1,
+    "release 0 shipped with the raised PIN_VERIFIER_ROUNDS and admitted \
+     legacy verifiers, so grace cannot be revoked from it: a legacy record \
+     on such a device has already had its migration opportunity"
+);
+
+/// Why a stored PIN verifier was refused **before** any PIN guess was spent.
+///
+/// This is a separate step from [`pin_verifier_matches`] on purpose. The
+/// comparison is where a wrong PIN is detected and costs a retry; admission is
+/// where a *record* is found not to be one this build is willing to verify
+/// against at all, and answering it must not cost the user anything — there is
+/// no guess involved and there is nothing to learn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinVerifierRefusal {
+    /// The record is in the pre-US-910 format (bare `SHA256(PIN)[..16]`,
+    /// unsalted, unstretched) and the migration window is closed. The PIN is
+    /// not refused because it is wrong — it is refused because the record no
+    /// longer describes a verifier this build will run. The owner's remedy is
+    /// a `setPIN`, which requires no old PIN (`CTAP2_ERR_NOT_ALLOWED` only
+    /// applies when one is already set, and the recovery is the factory-reset
+    /// path).
+    LegacyWindowClosed,
+    /// The record claims more rounds than [`PIN_VERIFIER_ROUNDS`].
+    ///
+    /// **This is a defence in depth, not the first line.** Both snapshot
+    /// decoders already refuse such a record at parse time — a non-zero exit,
+    /// not a clamp — in `device_keystore.rs` (`Item::U(u) if
+    /// u <= crypto::PIN_VERIFIER_ROUNDS`, "corrupt input is refused, never
+    /// truncated") and in `keystore.rs` (`if i > crypto::PIN_VERIFIER_ROUNDS
+    /// as u64 { return None }`). They are the right place for it: an
+    /// attacker-crafted iteration count is a *parse* hazard (FX-440), and a
+    /// parse-time refusal cannot be reached by any code path at all.
+    ///
+    /// Repeating the check here is cheap and is stated as what it is. The
+    /// reason it is not redundant is that it is the copy that moves when the
+    /// constant moves: US-1570 raises `PIN_VERIFIER_ROUNDS` 16x, and the two
+    /// decoders read that constant rather than hard-coding 4096, so there is
+    /// no second number to forget. What this adds is that a caller which
+    /// assembles a verifier **without** going through a snapshot decoder — a
+    /// restored backup, a vendor `0x41` import, a future migration path —
+    /// still gets the refusal.
+    IterationsOverBudget {
+        /// The count the record asked for.
+        claimed: u32,
+    },
+    /// The record claims the stretched format but carries no salt. Unverifiable
+    /// by construction: `pin_verifier_matches` has no salt to re-derive with,
+    /// and its fallback arm compares the candidate directly, which is the
+    /// legacy comparison wearing a stretched flag — a record that would verify
+    /// a bare PIN hash. Refused here so that fallback can only ever be reached
+    /// by a record that says it is legacy.
+    Malformed,
+}
+
+/// Decide whether this build will verify against a stored PIN verifier at all,
+/// from the record's own fields.
+///
+/// This is the admission gate US-1570 adds on top of US-910's parse-time
+/// ceilings, and it is the expression of the two clauses of the story that the
+/// decoders cannot express:
+///
+/// * **"the snapshot-decode ceiling refuses any iteration count the new budget
+///   cannot serve"** — the decoders refuse at *parse* time; this refuses the
+///   same condition for a verifier that did not arrive through a snapshot, and
+///   it refuses it with a **distinguishable** value rather than a `bool`, so a
+///   caller can answer the client with a different status for "this record is
+///   not verifiable" than for "this PIN is wrong". Collapsing the two is what
+///   lets an attacker spend nothing while probing which records exist.
+/// * **"legacy-format verifiers are refused after the migration window"** —
+///   the window itself ([`PIN_VERIFIER_LEGACY_WINDOW_OPEN`]), which is the one
+///   half of the migration story the snapshot format has nowhere to record.
+///
+/// `format == 0` with the window open is admitted and must be migrated on the
+/// next successful verification; every other shape is either accepted or
+/// refused here, never "accepted and quietly verified some other way".
+pub fn pin_verifier_admission(
+    format: u8,
+    pin_iter: u32,
+    salt: Option<&[u8; 16]>,
+) -> Result<(), PinVerifierRefusal> {
+    if format == PIN_VERIFIER_FORMAT_STRETCHED {
+        // Order matters: a stretched record with no salt is corrupt whatever
+        // its count says, and reporting the count first would tell an attacker
+        // crafting records which of their two defects the decoder noticed.
+        if salt.is_none() {
+            return Err(PinVerifierRefusal::Malformed);
+        }
+        if pin_iter > PIN_VERIFIER_ROUNDS {
+            return Err(PinVerifierRefusal::IterationsOverBudget { claimed: pin_iter });
+        }
+        return Ok(());
+    }
+    // Any non-`1` format byte is a legacy record. There is no third value to
+    // handle separately, and inventing one here would be inventing a format
+    // no encoder emits.
+    if !PIN_VERIFIER_LEGACY_WINDOW_OPEN {
+        return Err(PinVerifierRefusal::LegacyWindowClosed);
+    }
+    Ok(())
+}
+
+/// SHA-256 of a **fixed-size** message, through `sink`.
+///
+/// The fixed size is not a style choice, it is the point: it makes the bit
+/// length a compile-time constant, so there is no runtime `len * 8` to
+/// overflow. SHA-256's length field counts **bits**, so the largest encodable
+/// message is 2^61 − 1 bytes and a runtime `len * 8` silently wraps into a
+/// well-formed digest of a *different* message — the failure
+/// `platform::sha256_accel` refuses to wrap (its `Sha256Error::TooLong`, an
+/// arm-only type, hence prose rather than a link).
+///
+/// The multiply below is therefore total rather than checked: `N` is a `usize`
+/// and Rust caps a slice's length at `isize::MAX` bytes on every target this
+/// firmware builds for, which is far below the 2^61 that would wrap a `u64`.
+/// A PIN verifier's inputs are 60 bytes and 32 bytes; making that structural
+/// means the check cannot be dropped in a later edit without the type changing
+/// with it, and the `debug_assert` keeps the bound visible to a reader rather
+/// than leaving it to be remembered.
+fn sha256_fixed_via<const N: usize, S: fapico2_platform::sha256_accel::BlockSink>(
+    msg: &[u8; N],
+    sink: &mut S,
+) -> Result<[u8; 32], S::Error> {
+    // `1 << 61` rather than a bare 0: `absurd_extreme_comparisons` aside, the
+    // named bound is the one the SHA-256 length field imposes, and this is the
+    // line a reader checks it against.
+    debug_assert!(N <= (1usize << 61), "SHA-256 cannot encode a 2^61-byte message");
+    fapico2_platform::sha256_accel::hash_into(msg, (N as u64) * 8, sink)
+}
+
+/// US-1570: the stretched verifier's round loop, routed through a
+/// [`BlockSink`](fapico2_platform::sha256_accel::BlockSink).
+///
+/// # Why the loop and not the sink are the portable part
+///
+/// The RP2350 SHA-256 block is a **compression-function** accelerator: it takes
+/// 512-bit blocks, maintains the chaining state internally, and does not know
+/// what a message is (`sha256_accel` module docs, quoting `WDATA`: *"Software
+/// is responsible for ensuring the data is correctly padded and terminated"*).
+/// It cannot therefore absorb an iterated hash the way a streaming hasher
+/// would. Each round here is a fresh one-shot SHA-256 whose 32-byte output is
+/// the next round's input, so the loop lives on this side of the seam and the
+/// sink only ever sees single-block messages.
+///
+/// That is also why the block count is exactly `rounds + 1` and not `rounds`:
+/// round 0's message is the 60-byte domain-separated input, and 60 > 55 forces
+/// two padded blocks.
+///
+/// # Errors
+///
+/// Whatever `sink` reports. On the device that is the arm-only
+/// `platform::sha256_accel::Sha256Error` and, per that module's rule, every
+/// variant is a *detectable* failure — never a digest the caller cannot
+/// distinguish from a real one. [`pin_verifier_stretched`] turns any of them
+/// into the software path rather than into a verifier value.
+pub fn pin_verifier_stretched_via<S: fapico2_platform::sha256_accel::BlockSink>(
+    pin_hash: &[u8; 16],
+    salt: &[u8; 16],
+    rounds: u32,
+    sink: &mut S,
+) -> Result<[u8; 16], S::Error> {
+    let mut input = [0u8; PIN_VERIFIER_INPUT_LEN];
+    input[..PIN_VERIFIER_DOMAIN.len()].copy_from_slice(PIN_VERIFIER_DOMAIN);
+    let mut off = PIN_VERIFIER_DOMAIN.len();
+    input[off..off + 16].copy_from_slice(salt);
+    off += 16;
+    input[off..off + 16].copy_from_slice(pin_hash);
+
+    let mut h = sha256_fixed_via(&input, sink)?;
+    // `rounds.max(1)`, matching US-910's `for _ in 1..rounds.max(1)`: the
+    // count is a total of SHA-256 evaluations, so round 0 above is the first
+    // of them rather than one in addition to them. `max(1)` also keeps a
+    // corrupt zero from degenerating into "hash nothing and return the domain
+    // separator's digest" — the same refusal-not-truncation rule the snapshot
+    // decoders apply to the count on the way in.
+    for _ in 1..rounds.max(1) {
+        h = sha256_fixed_via(&h, sink)?;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h[..16]);
+    Ok(out)
+}
+
+/// US-910 stretched PIN verifier in **software**: `SHA256` iterated `rounds`
+/// times over `DOMAIN || salt || SHA256(PIN)[..16]`, truncated to 16 bytes.
+///
+/// This is US-910's loop, unchanged, and it is the definition of the digest
+/// that every other path must reproduce.
+///
+/// # Why it is not routed through a `BlockSink`
+///
+/// It is tempting to give the software path a `BlockSink` over stock `sha2`
+/// and run both paths through the same loop, so that "same digest" is
+/// structural rather than tested. That does not work, and the reason is worth
+/// recording because it is a trap any future sink implementation walks into.
+///
+/// [`fapico2_platform::sha256_accel::hash_into`] hands a sink blocks that are
+/// **already padded** — `padding_blocks` runs before the first `push`. The
+/// high-level `sha2::Digest` API is a *message* API: `update(block)` buffers and
+/// `finalize()` appends `0x80`, the zeroes and the length field itself. Feeding
+/// it a padded block and finalising therefore computes
+/// `SHA256(padded_block)` — a 64-byte **message** with its own padding — and
+/// not the compression of that block onto the chaining state. The digest is
+/// well-formed and wrong, which is the worst shape a wrong answer can have:
+/// nothing refuses it.
+///
+/// The high-level API exposes no way to say "this block is final, compress it
+/// now", so a software sink would have to be the compression function itself.
+/// Keeping the software path as an ordinary `sha256` call is the boring answer,
+/// and it is also the faster one — no block copy per round. The equivalence
+/// between this function and the accelerated one is therefore *tested*, not
+/// assumed: `apps/fido/tests/pin_kdf_budget.rs` drives
+/// [`pin_verifier_stretched_via`] through an independent raw-compression sink
+/// and requires the same 16 bytes.
+pub fn pin_verifier_stretched_software(
+    pin_hash: &[u8; 16],
+    salt: &[u8; 16],
+    rounds: u32,
+) -> [u8; 16] {
+    let mut input = [0u8; PIN_VERIFIER_INPUT_LEN];
     input[..PIN_VERIFIER_DOMAIN.len()].copy_from_slice(PIN_VERIFIER_DOMAIN);
     let mut off = PIN_VERIFIER_DOMAIN.len();
     input[off..off + 16].copy_from_slice(salt);
@@ -835,11 +1269,83 @@ pub fn pin_verifier_stretched(pin_hash: &[u8; 16], salt: &[u8; 16], rounds: u32)
     out
 }
 
+/// US-910 stretched PIN verifier: `SHA256` iterated `rounds` times over
+/// `DOMAIN || salt || SHA256(PIN)[..16]`, truncated to 16 bytes.
+///
+/// The input is the CTAP2 16-byte PIN-hash candidate (the client sends
+/// `SHA256(PIN)[..16]` over the pinUv shared secret — the raw PIN never
+/// reaches the authenticator in the getPinToken path), so the verifier is a
+/// function of the client-visible candidate. The per-device TRNG salt plus
+/// the iteration count remove the shared offline-table weakness of the
+/// legacy form: an attacker with the snapshot must redo `rounds` hashes per
+/// PIN guess, per device.
+///
+/// # US-1570: on the RP2350 this runs on the hardware block, not in software
+///
+/// The accelerated path is the **default** on a device build, and it is the
+/// only reason [`PIN_VERIFIER_ROUNDS`] can be 65,536 rather than 4096: 65,536
+/// software SHA-256 evaluations on a Cortex-M33 is minutes, not the
+/// [`PIN_VERIFY_BUDGET_MS`] budget.
+///
+/// **The fallback is to software, not to an error, and the reason is
+/// specific.** `sha256_accel` insists that a broken accelerator produce "a
+/// distinguishable failure, never a plausible-looking hash", and that is
+/// right for anything whose output is compared against an attacker-visible
+/// MAC — there, a wrong digest is a forgery. Here the fallback is not a
+/// different answer, it is *the same answer computed elsewhere*, because the
+/// block is specified to be SHA-256 and its block assembly is differentially
+/// tested against stock `sha2`
+/// (`platform/tests/sha256_accel.rs`). So an `Err` from the accelerator means
+/// "this board's block did not do the thing", and the correct response to that
+/// is the slow path, not a refusal: refusing would turn a performance fault
+/// into a bricked PIN, and letting the value through unclamped would be the
+/// actual bug. `tests/pin_kdf_budget.rs::an_accelerator_that_stops_working_falls_back_rather_than_lying`
+/// pins the fallback against a sink that fails mid-verification.
+///
+/// The signature is unchanged from US-910, so every existing caller
+/// (`PinProtocol`, the device twin's `client_pin_inner`) gets the accelerated
+/// path without a call-site edit.
+pub fn pin_verifier_stretched(pin_hash: &[u8; 16], salt: &[u8; 16], rounds: u32) -> [u8; 16] {
+    #[cfg(all(feature = "device", target_arch = "arm"))]
+    {
+        // `polled`, deliberately: `Sha256Accel::with_dma` needs a channel index
+        // this crate cannot prove it owns (the RP2350 `PERIORS` arbitration is
+        // not published by `rp-pac`, `sha256_accel`'s module docs), and
+        // `PIN_VERIFIER_CYCLES_PER_ROUND_POLLED` is the figure the round count
+        // was derived against — so this is both the safer driver and the one
+        // the cost model describes.
+        let mut accel = fapico2_platform::sha256_accel::Sha256Accel::polled();
+        if let Ok(v) = pin_verifier_stretched_via(pin_hash, salt, rounds, &mut accel) {
+            return v;
+        }
+    }
+    pin_verifier_stretched_software(pin_hash, salt, rounds)
+}
+
+
 /// Verify a PIN-hash candidate against the stored verifier in either
 /// format (US-910). `format` is the persisted `pin_verifier_format` value;
 /// legacy (`0`) records compare the candidate directly, stretched (`1`)
 /// records re-derive with the stored salt and iteration count. Comparison
 /// is constant-time in both cases.
+///
+/// # US-1570: this does **not** include the admission check
+///
+/// [`pin_verifier_admission`] is a separate, prior step and it is not folded
+/// in here, for a reason worth being explicit about: this function's contract
+/// is "is this candidate the right one", and its answer is a `bool` that the
+/// caller turns into a *spent retry*. Admission is "will this build verify
+/// against this record at all", and folding it in would mean a record the
+/// device has declined to verify reports the same thing as a wrong PIN —
+/// which is both a wrong error status on the wire and an invitation to treat a
+/// refusal as a guess.
+///
+/// The `_ => ct_eq(candidate, stored)` arm below is the reason that separation
+/// matters: a stretched record with no salt lands there and is compared
+/// *directly*, i.e. as a legacy record. That is correct for a record that
+/// says it is legacy and a hole for one that says otherwise, so admission is
+/// what refuses the latter before this is reached. A caller on a new code path
+/// must call it.
 pub fn pin_verifier_matches(
     stored: &[u8; 16],
     format: u8,
@@ -864,6 +1370,17 @@ pub fn pin_verifier_matches(
 /// set/change-PIN. The salt source is the platform TRNG seam: host builds
 /// use `crypto::random_bytes` (OS entropy), the device command path draws
 /// from its boot-time TRNG pool (`draw_random`).
+///
+/// # US-1570: this is also the round count's single emitter
+///
+/// The returned count is [`PIN_VERIFIER_ROUNDS`] and the returned verifier is
+/// exactly that many rounds over the same salt — so a record written through
+/// this function is by construction one the snapshot decoders accept, with no
+/// gap between "the strongest verifier this build can produce" and "the
+/// strongest verifier this build will read". `tests/pin_kdf_budget.rs`
+/// asserts the two numbers are equal rather than merely close, because the
+/// failure mode that would matter is a mismatch in the *other* direction:
+/// writing a record the decoder later refuses is an unrecoverable PIN.
 pub fn pin_verifier_upgrade(candidate: &[u8; 16], salt: &[u8; 16]) -> ([u8; 16], u32) {
     (
         pin_verifier_stretched(candidate, salt, PIN_VERIFIER_ROUNDS),

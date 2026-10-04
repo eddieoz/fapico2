@@ -10,13 +10,16 @@
 use crate::cbor::no_heap::{self, Item, Parser};
 use crate::crypto;
 use crate::device_app::FidoApp;
-use crate::device_keystore::{DeviceCoseKey, DeviceCredential, DEVICE_MAX_CREDS};
+use crate::device_keystore::{
+    DeviceCoseKey, DeviceCredential, MAX_PENDING_CREDENTIAL_IDS,
+};
 use crate::ctap2::Ctap2Response;
 use crate::stateless;
 use crate::{AAGUID, CTAP1_VERSION};
 use fapico2_platform::secure_store::SecureStore;
 use fapico2_platform::trng::Trng;
 use heapless::Vec as HeaplessVec;
+use zeroize::Zeroizing;
 
 /// pinUvAuthPermission bits (host `app.rs` parity).
 pub const PERM_MC: u8 = 0x01;
@@ -786,6 +789,342 @@ impl FidoApp {
         out.len()
     }
 
+    // ------------------------------------------------------------------
+    // US-1555 / US-1563 — the per-record key region
+    // ------------------------------------------------------------------
+
+    /// Run `f` over the key region's credential store, or answer `None`.
+    ///
+    /// # The ways this says `None`
+    ///
+    /// 1. **no secure store was handed in** — the dispatcher bridge path, whose
+    ///    persist gate runs after `App::process`;
+    /// 2. **no provider installed**, or the boot path has not released the region
+    ///    yet (`device_app::key_region` answers `None`);
+    /// 3. **the store does not seal**, so there is no root to derive the keys
+    ///    from (`device_app::region_keys`).
+    ///
+    /// All three are the **same answer for the caller**: this device's
+    /// credentials live in the snapshot, not the region. They are one answer
+    /// because the applet's contract is a *behaviour*, and the behaviour is the
+    /// same in every one of them — see [`Self::region_backed`].
+    ///
+    /// # Why the region borrow is taken here and nowhere else
+    ///
+    /// `FidoRecordStore` holds `&mut dyn KeyRegion` for its whole life and is
+    /// deliberately stateless, so it must not outlive one command — and `FidoApp`
+    /// must not carry a region handle across an await point, which is the
+    /// sharing discipline `firmware/src/boot.rs`'s `key_region` documents. A
+    /// closure that takes the borrow and drops it is the only shape that
+    /// guarantees both without putting a lifetime parameter on every command
+    /// handler.
+    fn with_region<R>(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        f: impl FnOnce(&mut crate::device_keystore::RegionCredentials<'_, '_>) -> R,
+    ) -> Option<R> {
+        let region = crate::device_app::key_region()?;
+        Some(f(&mut crate::device_keystore::RegionCredentials::new(region, keys?)))
+    }
+
+    /// Destroy every FIDO credential record in the key region (US-1546).
+    ///
+    /// **Needs no keys and no secure store.** A whole-domain erase has nothing
+    /// to open — it erases sectors, it does not decrypt records — so this
+    /// deliberately does not go through [`Self::with_region`], which requires
+    /// `RegionKeys` and would therefore be unreachable from
+    /// [`Self::factory_reset`](crate::device_app::FidoApp::factory_reset) (that
+    /// entry point runs with `store = None`, and a wipe that quietly skipped
+    /// there would leave the exact hole this story closes).
+    ///
+    /// Three answers, and the middle one is the point:
+    ///
+    /// - `None` — no region is installed. The snapshot is this device's store,
+    ///   and [`DeviceKeystore::reset_from_seed`] has already cleared it. Not a
+    ///   failure, and not to be reported as one (S10).
+    /// - `Some(Ok(n))` — `n` sectors erased.
+    /// - `Some(Err(_))` — the region is present and could not be wiped. The
+    ///   caller must **refuse**, because the alternative is a device that reports
+    ///   an empty credential store over records still on flash — a wire claim
+    ///   the device cannot honour.
+    pub(crate) fn wipe_region_credentials(
+        &mut self,
+    ) -> Option<Result<u32, crate::device_keystore::RegionCredentialError>> {
+        let region = crate::device_app::key_region()?;
+        let mut store =
+            fapico2_platform::keyregion::fido_store::FidoRecordStore::new(&mut *region);
+        Some(
+            store
+                .wipe_fido_range()
+                .map_err(crate::device_keystore::RegionCredentialError::Store),
+        )
+    }
+
+    /// Are this device's credentials in the key region rather than the snapshot?
+    ///
+    /// **The one predicate that decides it**, derived rather than stored so it
+    /// cannot disagree with what the command path actually does — the
+    /// `AGENTS.md` §4 rule ("derive each option from the state it describes, and
+    /// let the gates and the advertisement come from the same accessor"). A
+    /// stored `bool` would be a claim about the backend, and a claim that stops
+    /// being true the moment the provider is installed.
+    ///
+    /// Requires the secure store, because the keys come from it — so a caller
+    /// with `store = None` reports **not** region-backed and falls back to the
+    /// snapshot. That is the conservative direction: the snapshot is the store
+    /// this device has always used, and answering "I am not region-backed" when
+    /// we cannot tell keeps the two paths consistent with each other.
+    pub(crate) fn region_keys_for(
+        &self,
+        store: Option<&dyn SecureStore>,
+    ) -> Option<crate::device_keystore::RegionKeys> {
+        let store = store?;
+        // `?` rather than an `if … return None`: the check is "the region is
+        // reachable", and an `if` over a `bool` says the same thing while making
+        // the reader look for a branch that could do something different.
+        crate::device_app::key_region()?;
+        crate::device_app::region_keys(store, &self.keystore)
+    }
+
+    /// Which store this app is answering credential-capacity questions from
+    /// (US-1557).
+    ///
+    /// **Derived from the same seam the command path uses**, never stored: the
+    /// region is reachable or it is not, and
+    /// [`Self::with_region`](Self::with_region) asks the identical question on
+    /// every command. A cached answer would be a claim about the backend, and
+    /// `AGENTS.md` §4's rule is that the advertisement and the command path come
+    /// from one accessor.
+    ///
+    /// It deliberately does **not** take a `&dyn SecureStore`. The keys are
+    /// part of "is this app region-backed", but a capacity *claim* is about the
+    /// region, and a caller asking "which store is this?" wants that answer
+    /// without also having to supply a store to get it. A board with no provider
+    /// installed answers [`CredentialBackend::Snapshot`](crate::device_keystore::CredentialBackend::Snapshot),
+    /// which is the truth: that board's credentials are in the snapshot.
+    pub fn credential_backend(&self) -> crate::device_keystore::CredentialBackend {
+        // SAFETY of the call: `key_region()` hands back a `&'static mut` and
+        // this binding is dropped at the end of the expression, so nothing
+        // region-shaped escapes. The alternative — threading a store in — would
+        // make the accessor unable to answer on a bridge that has none.
+        match crate::device_app::key_region() {
+            Some(_) => crate::device_keystore::CredentialBackend::KeyRegion,
+            None => crate::device_keystore::CredentialBackend::Snapshot,
+        }
+    }
+
+    /// Load one credential, owned by the caller.
+    ///
+    /// `None` for "no such credential", "not region-backed", **and** "the region
+    /// could not be read" — deliberately collapsed, and the reason is in the call
+    /// sites: every one of them answers `CTAP2_ERR_NO_CREDENTIALS`, and inventing
+    /// a distinct error for a sick flash would tell a user their passkey is gone
+    /// when the device simply cannot read it. The three-state distinction is
+    /// preserved one level down, in `RegionCredentials`' own return types and in
+    /// [`Self::with_region`]'s `None`.
+    ///
+    /// **Owned, not borrowed, and that is the RAM win.** A `DeviceCredential` is
+    /// 720 B; the old path returned a `&` into a resident array of twelve, which
+    /// is 8,640 B of `.bss` and a ceiling of twelve. Returning one by value costs
+    /// 720 B of *stack* for the duration of one call and nothing at all between
+    /// calls, which is what makes 856 credentials fit in 532 KB of RAM.
+    fn region_credential(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+    ) -> Option<DeviceCredential> {
+        self.region_credential_at(keys, rp_id_hash, credential_id)
+            .map(|(cred, _slot)| cred)
+    }
+
+    /// US-1562: [`Self::region_credential`] **and the slot the record occupies**.
+    ///
+    /// The two answers come from one `on_demand::load`
+    /// ([`RegionCredentials::load_by_id_at`]), which is why this is not
+    /// [`Self::region_credential`] followed by a locator call: the counter bump
+    /// is addressed by slot, and a second walk of the index to learn the slot
+    /// the first walk had already computed would be a second answer to a
+    /// question that can have two (`region_delete_compaction.rs`'s compaction
+    /// half is exactly the case where it would).
+    ///
+    /// `None` for the same three reasons [`Self::region_credential`] answers
+    /// `None` — no keys, no region, and "not there / could not be read" — plus
+    /// the same deliberate collapse of the last two.
+    fn region_credential_at(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+    ) -> Option<(DeviceCredential, fapico2_platform::keyregion::Slot)> {
+        let mut window = fapico2_platform::keyregion::on_demand::CredentialWindow::new();
+        self.with_region(keys, |creds| {
+            let slot = match creds.load_by_id_at(rp_id_hash, credential_id, &mut window) {
+                fapico2_platform::keyregion::SlotRead::Present(slot) => slot,
+                _ => return None,
+            };
+            crate::device_keystore::credential_from_record_body(window.as_slice())
+                .map(|cred| (cred, slot))
+        })
+        .flatten()
+    }
+
+    /// US-1562: the signature counter an assertion or a U2F authenticate must
+    /// sign, batched over whichever store holds the credential.
+    ///
+    /// **The one place the two backends are told apart**, and it is told apart by
+    /// the same accessor every other region/snapshot decision in this file uses —
+    /// [`Self::region_keys_for`] — rather than by a second predicate. A command
+    /// that decided "am I region-backed?" one way to load the credential and
+    /// another way to bump it would be the twin trap one level down: it passes
+    /// until the two disagree, and the symptom is a signed assertion whose
+    /// `signCount` came from a different store than the key that signed it.
+    ///
+    /// `slot` is `Some` exactly when `keys` is `Some` — the two arrive together
+    /// from [`Self::region_credential_at`], and a mismatch is treated as "not
+    /// region-backed" rather than as a panic, because every caller has a working
+    /// snapshot answer to fall back to.
+    ///
+    /// `None` means the credential could not be read at all, and every caller
+    /// maps it to its own "no such credential" answer — the same refusal the
+    /// snapshot bump returns for an unknown ID.
+    ///
+    /// # The nonce
+    ///
+    /// One draw per **durable** record write, from the same pool
+    /// [`Self::draw_random`] feeds makeCredential from, and the reason for the
+    /// destructuring rather than a `&mut self` closure is
+    /// [`Self::migrate_snapshot_to_region`]'s: the nonce closure has to hold the
+    /// pool while the region store holds the window, and a method call taking
+    /// `&mut self` would claim the whole app and forbid exactly that.
+    fn bump_sign_counter(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        slot: Option<fapico2_platform::keyregion::Slot>,
+        credential_id: &[u8],
+        store: Option<&mut dyn SecureStore>,
+    ) -> Option<u32> {
+        if let (Some(keys), Some(slot)) = (keys, slot) {
+            let Self { keystore, rng_pool, rng_cursor, .. } = self;
+            let mut next_nonce = || {
+                let mut n = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+                take_random(rng_pool, rng_cursor, &mut n);
+                n
+            };
+            let region = crate::device_app::key_region()?;
+            let mut creds = crate::device_keystore::RegionCredentials::new(region, keys);
+            return match creds.bump_credential_counter(
+                &mut keystore.counter_window,
+                slot,
+                &mut next_nonce,
+            ) {
+                // `Reverted` carries the value the window held *before* this
+                // command — SOAK-FINDING-1's discipline, and the region mirror of
+                // `bump_credential_counter_checked`'s revert arm. It is not an
+                // error here for the same reason it is not one there.
+                crate::device_keystore::RegionCounterBump::Batched(next)
+                | crate::device_keystore::RegionCounterBump::Durable(next)
+                | crate::device_keystore::RegionCounterBump::Reverted(next) => Some(next),
+                crate::device_keystore::RegionCounterBump::Unreadable => None,
+            };
+        }
+        self.keystore.bump_credential_counter_checked(credential_id, store)
+    }
+
+    /// Migrate the snapshot's credentials into the key region, once, if needed.
+    ///
+    /// # Why it is a method here and not a free function at the call site
+    ///
+    /// Three things have to be asked in this order and each can answer `no`:
+    /// is there anything to migrate, is there a region, are there keys. The
+    /// first is `self.keystore`; the second is
+    /// [`crate::device_app::key_region`]; the third is
+    /// [`crate::device_app::region_keys`], which needs the `SecureStore` *and*
+    /// the keystore's `device_random`. Gathering them in one place is what keeps
+    /// the three `None`s from becoming three slightly different answers at
+    /// three call sites — the `AGENTS.md` §4 rule about a wire claim and the
+    /// command path agreeing, applied to "did we migrate".
+    ///
+    /// # The nonce
+    ///
+    /// A **fresh TRNG draw per write**, from the same pool
+    /// [`Self::draw_random`] feeds makeCredential from. The store will not
+    /// choose one (`record::seal`'s docs) and neither will this; a closure
+    /// rather than a `&mut Trng` because the applet has no TRNG handle at
+    /// serve time, only a pool.
+    ///
+    /// # Never fatal (S10/S11)
+    ///
+    /// Every failure below is a `MigrationOutcome::Deferred` this method
+    /// discards. There is no `?`, no `unwrap`, no `panic!` and no halt on any
+    /// path: a device that cannot migrate keeps serving from the snapshot,
+    /// which is exactly what it did before this firmware was flashed.
+    /// The `+ '_` on the trait object is load-bearing, not decoration: a bare
+    /// `dyn SecureStore` in an elided position defaults to
+    /// `dyn SecureStore + 'a` with `'a` the *reference's* lifetime, which makes
+    /// the caller reborrow its own `store` binding for that whole lifetime and
+    /// then be unable to move it into a dispatch arm. Decoupling the two is what
+    /// lets `process_ctap2_with_store` pass `store.as_deref_mut()` and still
+    /// hand `store` to `handle_make_credential` on the next line.
+    pub(crate) fn migrate_snapshot_to_region(
+        &mut self,
+        store: Option<&mut (dyn SecureStore + '_)>,
+    ) {
+        // The steady state, and the cheapest possible test of it: an empty
+        // resident array. Checked before the region is even asked for, so a
+        // device that has migrated pays one `len()` per CTAP2 command and
+        // nothing else — and, on the host, never calls the provider at all.
+        if self.keystore.credentials.is_empty() {
+            return;
+        }
+        let Some(store) = store else {
+            // No store, so nowhere to make a retirement durable. Migrating the
+            // records anyway would leave the credentials in *both* places,
+            // which is the half-applied state the gherkin forbids. The bridge
+            // dispatch path is the caller that reaches here; it persists after
+            // the command, so the next command retries.
+            return;
+        };
+        // `region_keys` borrows the keystore immutably and returns an owned
+        // `RegionKeys`, so the borrow ends here and the mutable one below does
+        // not conflict.
+        let Some(keys) = crate::device_app::region_keys(store, &self.keystore) else {
+            // No root — an unkeyed store, which is the host emulation and the
+            // pre-US-915 device shape. This is the gherkin's last clause: a
+            // device that cannot derive its keys **still enumerates**, because
+            // `region_keys_for` answers `None` too and the snapshot — untouched
+            // — stays the store.
+            return;
+        };
+        let Some(region) = crate::device_app::key_region() else {
+            return;
+        };
+        // Disjoint field borrows, so the nonce closure can hold the pool while
+        // the migration holds the keystore. `take_random` is the same primitive
+        // `draw_random` is one line of — destructuring rather than calling it is
+        // what lets the two borrows coexist, and it is why this does not go
+        // through a `&mut self` closure (which would claim the whole app).
+        let Self { keystore, rng_pool, rng_cursor, .. } = self;
+        let mut nonce = || {
+            let mut n = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+            take_random(rng_pool, rng_cursor, &mut n);
+            n
+        };
+        // The outcome is deliberately discarded. Every variant is a state the
+        // device serves correctly from: `AlreadyMigrated` and `Retired` need
+        // no further work, and `Deferred` means the snapshot is intact and is
+        // still the store. Surfacing it as a command error would tell a user
+        // their authenticator is broken over an upgrade detail that costs them
+        // nothing.
+        let _ = crate::device_keystore::migrate_snapshot_to_region(
+            region,
+            &keys,
+            &mut nonce,
+            keystore,
+            Some(store),
+        );
+    }
+
     fn token_allows(&self, perm: u8) -> bool {
         match self.token_permissions {
             0 => perm == PERM_MC || perm == PERM_GA,
@@ -854,6 +1193,7 @@ impl FidoApp {
         out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
         store: Option<&mut dyn SecureStore>,
     ) -> Result<(), Err> {
+        let rkeys = self.region_keys_for(store.as_deref());
         let req = parse_mc(data)?;
         let pin_set = self.keystore.pin_state.pin_hash.is_some();
 
@@ -914,8 +1254,21 @@ impl FidoApp {
         }
 
         // Exclude list.
+        //
+        // US-1554: on the region path each ID costs one on-demand load instead
+        // of a lookup into the resident array. `cred` is **owned** — 720 B of
+        // stack for the length of the loop iteration — which is what lets the
+        // array go: the twelve-entry array was 8,640 B of `.bss` and a ceiling
+        // of twelve, and one credential at a time is 720 B of stack and none.
         for id in &req.exclude {
-            if let Some(cred) = self.keystore.get_credential(id) {
+            let owned;
+            let cred = if rkeys.is_some() {
+                owned = self.region_credential(rkeys.as_ref(), None, id);
+                owned.as_ref()
+            } else {
+                self.keystore.get_credential(id)
+            };
+            if let Some(cred) = cred {
                 let (revoked, protect) = (cred.revoked, cred.cred_protect);
                 if revoked || (protect == 3 && !uv) {
                     continue;
@@ -1014,7 +1367,7 @@ impl FidoApp {
         // failure, so an exhausted pool spun forever and the request never
         // came back. `try_fill_valid` caps the rejection and returns, which
         // is what turns "the card stopped answering" into a status byte.
-        let mut scalar = [0u8; 32];
+        let mut scalar = Zeroizing::new([0u8; 32]);
         // `try_fill_valid_with`, not `try_fill_valid`: the pool draw is not
         // an `RngCore` and cannot report a refusal, so the attempt cap is
         // the only thing bounding this. An exhausted pool serves the same
@@ -1024,11 +1377,11 @@ impl FidoApp {
                 self.draw_random(out);
                 Ok(())
             },
-            &mut scalar,
+            &mut *scalar,
             |b| p256::SecretKey::from_slice(b).is_ok(),
         )
         .map_err(|_| err(Ctap2Response::Other))?;
-        let sk = p256::SecretKey::from_slice(&scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+        let sk = p256::SecretKey::from_slice(&*scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
         let pub_bytes = crypto::public_key_bytes(&sk.public_key());
         let mut x = [0u8; 32];
         let mut y = [0u8; 32];
@@ -1155,7 +1508,7 @@ impl FidoApp {
         let mut cred = DeviceCredential {
             credential_id: cred_id.clone(),
             public_key: cose_key,
-            private_key: scalar,
+            private_key: crate::device_keystore::PrivateScalar::from_bytes(*scalar),
             rp_id_hash,
             rp_id: req.rp_id.clone(),
             user_handle: req.user_handle.clone(),
@@ -1185,15 +1538,46 @@ impl FidoApp {
         // SOAK-FINDING-1: transactional capacity — with the store bound, the
         // registration (counter bump included, per FX-409 the persisted
         // counter covers it) commits only if the resulting snapshot still
+        // SOAK-FINDING-1: transactional capacity — with the store bound, the
+        // registration (counter bump included, per FX-409 the persisted
+        // counter covers it) commits only if the resulting snapshot still
         // persists; on failure everything rolls back and the command answers
         // CTAP2_ERR_KEY_STORE_FULL with zero side effects.
         let counter_before = self.keystore.cred_counter;
         self.keystore.cred_counter = counter_before.wrapping_add(1);
-        let stored = match store {
-            Some(store) => self.keystore.store_credential_checked(cred, store),
-            None => self.keystore.store_credential(cred),
+
+        // US-1563: **the region is the credential store when one is reachable**,
+        // and this is the line that makes the measured boundary reachable at
+        // all. The snapshot path below still runs when there is no region — a
+        // host build, the dispatcher bridge (`store = None`), or a boot that has
+        // not released the region — and that path is bounded by the resident
+        // array at twelve.
+        //
+        // **The nonce is a fresh TRNG draw per write.** `record::seal` refuses
+        // to choose one (a module holding no key has no business picking a GCM
+        // nonce) and the store will not either; `draw_random` is the applet's
+        // bounded pool draw, which can fail and is therefore mapped rather than
+        // assumed. Twelve bytes is a counter's worth of entropy against a
+        // birthday bound nobody will reach in 856 writes.
+        let stored: Result<(), ()> = if rkeys.is_some() {
+            let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+            self.draw_random(&mut nonce);
+            self.with_region(rkeys.as_ref(), |creds| creds.put(&nonce, &cred).map(|_| ()))
+                .map(|r| r.map_err(|_| ()))
+                .unwrap_or(Err(()))
+        } else {
+            match store {
+                Some(store) => self.keystore.store_credential_checked(cred, store),
+                None => self.keystore.store_credential(cred),
+            }
         };
         if stored.is_err() {
+            // The counter bump is reverted with the credential, so a refused
+            // enrolment leaves **nothing** behind — the gherkin's "no partial
+            // credential". On the region path there is no snapshot to half-write
+            // either: `FidoRecordStore::put`'s commit is sector-atomic and its
+            // index write is last, so a failure leaves either the record or
+            // nothing readable as a credential.
             self.keystore.cred_counter = counter_before;
             return Err(err(Ctap2Response::KeyStoreFull));
         }
@@ -1292,10 +1676,19 @@ impl FidoApp {
             }
 
             let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
-            let mut matched: HeaplessVec<HeaplessVec<u8, 64>, DEVICE_MAX_CREDS> = HeaplessVec::new();
+            let mut matched: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
+                HeaplessVec::new();
+            let rkeys = self.region_keys_for(store.as_deref());
             if !req.allow.is_empty() {
                 for id in &req.allow {
-                    if let Some(cred) = self.keystore.get_credential(id) {
+                    let owned;
+                    let cred = if rkeys.is_some() {
+                        owned = self.region_credential(rkeys.as_ref(), Some(&rp_id_hash), id);
+                        owned.as_ref()
+                    } else {
+                        self.keystore.get_credential(id)
+                    };
+                    if let Some(cred) = cred {
                         let (revoked, protect, rp) = (cred.revoked, cred.cred_protect, cred.rp_id_hash);
                         if revoked || (protect == 3 && !uv) || rp != rp_id_hash {
                             continue;
@@ -1307,10 +1700,78 @@ impl FidoApp {
                         break;
                     }
                 }
+            } else if rkeys.is_some() {
+                // US-1554: the resident enumeration, over the **index**.
+                //
+                // This is the RAM win's whole point: the old shape held every
+                // resident credential in a `HeaplessVec<DeviceCredential, 12>`
+                // so that this loop could walk it, and that array cannot be
+                // resized to the derived capacity (856 × 720 B = 616 KB against
+                // 532 KB of RAM). Here the index names the RP's slots — **no
+                // payload key is involved, so no record is decrypted to build
+                // the candidate list** — and each candidate is then opened one
+                // at a time, copied into an owned `DeviceCredential`, and dropped.
+                //
+                // The bound is `MAX_PENDING_CREDENTIAL_IDS`, unchanged and
+                // still deliberate: a site with more resident passkeys than that
+                // is refused `0x27 LIMIT_EXCEEDED` rather than silently served
+                // the first twelve. Raising it is a RAM decision, not a
+                // correctness one — `device_keystore.rs` says so where the
+                // constant lives.
+                let mut window =
+                    fapico2_platform::keyregion::on_demand::CredentialWindow::new();
+                let mut rp_slots: [fapico2_platform::keyregion::Slot;
+                    crate::device_keystore::MAX_ENUMERATED_SLOTS] =
+                    [fapico2_platform::keyregion::Slot::new(0).unwrap_or(
+                        fapico2_platform::keyregion::Slot::new(0).unwrap(),
+                    ); crate::device_keystore::MAX_ENUMERATED_SLOTS];
+                let found = self
+                    .with_region(rkeys.as_ref(), |creds| {
+                        creds.slots_for_rp(&rp_id_hash, &mut rp_slots)
+                    })
+                    .flatten();
+                let found = match found {
+                    Some(n) => n,
+                    // A region that cannot be read is not "no credentials" —
+                    // but every caller of this arm answers `NO_CREDENTIALS`
+                    // anyway, and a device that says "you have no passkeys"
+                    // when it cannot read its own storage is the US-1573 hazard.
+                    // Refusing the assertion is the conservative answer.
+                    None => return Err(err(Ctap2Response::NoCredentials)),
+                };
+                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
+                    HeaplessVec::new();
+                for s in rp_slots.iter().take(found) {
+                    let owned = self.with_region(rkeys.as_ref(), |creds| {
+                        if !matches!(
+                            creds.load_slot(*s, &mut window),
+                            fapico2_platform::keyregion::SlotRead::Present(())
+                        ) {
+                            return None;
+                        }
+                        crate::device_keystore::credential_from_record_body(window.as_slice())
+                    });
+                    let Some(cred) = owned.flatten() else { continue };
+                    if cred.resident
+                        && !cred.revoked
+                        && (uv || cred.cred_protect < 2)
+                        && cred.rp_id_hash == rp_id_hash
+                        && ids.push(cred.credential_id.clone()).is_err()
+                    {
+                        return Err(err(Ctap2Response::LimitExceeded));
+                    }
+                }
+                // Reverse (newest first) — unchanged, and for the same reason:
+                // the index is in slot order and the RP's newest passkey is the
+                // one a browser expects first.
+                while let Some(id) = ids.pop() {
+                    let _ = matched.push(id);
+                }
             } else {
                 // Resident credentials for the RP, newest first; credProtect
                 // >= 2 withheld without UV.
-                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, DEVICE_MAX_CREDS> = HeaplessVec::new();
+                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
+                    HeaplessVec::new();
                 for cred in &self.keystore.credentials {
                     if cred.resident
                         && !cred.revoked
@@ -1345,6 +1806,7 @@ impl FidoApp {
                 self.ga_pending = None;
             }
             self.build_assertion(
+                rkeys.as_ref(),
                 &first,
                 &req.client_data_hash,
                 uv,
@@ -1372,6 +1834,7 @@ impl FidoApp {
     #[allow(clippy::too_many_arguments)]
     fn build_assertion(
         &mut self,
+        rkeys: Option<&crate::device_keystore::RegionKeys>,
         cred_id: &[u8],
         client_data_hash: &[u8; 32],
         uv: bool,
@@ -1387,15 +1850,45 @@ impl FidoApp {
     ) -> Result<(), Err> {
         // Copy the credential fields out first (the hmac-secret derivation
         // needs &mut self for the TRNG pool).
-        let Some(cred) = self.keystore.get_credential(cred_id) else {
-            return Err(err(Ctap2Response::NoCredentials));
+        //
+        // US-1554: **the on-demand read path.** On the region path this is one
+        // sealed record opened, copied into a local `DeviceCredential`, and
+        // dropped — against the old shape, where the credential had to be
+        // resident for the assertion to find it at all. That is why the region
+        // can hold 856: the 856 are in flash and this one is on the stack.
+        //
+        // US-1562: the **slot** comes out of the same load. The signature
+        // counter lives in the record and is addressed by slot, so before this
+        // story the bump below had to find it again — and it did not; it looked
+        // the credential ID up in the *snapshot's* resident array, found
+        // nothing (a region-backed credential is not in it), and answered
+        // `CTAP2_ERR_NO_CREDENTIALS` to every assertion on the very backend the
+        // epic exists to make work. The slot is carried out of the load instead
+        // of looked up again, which is both the fix and one walk of the index
+        // cheaper than the alternative.
+        //
+        // The fields are copied out immediately because `self` is borrowed
+        // mutably a few lines later for the counter bump, and the local is what
+        // ends that borrow.
+        let region_owned = self.region_credential_at(rkeys, None, cred_id);
+        let region_slot = region_owned.as_ref().map(|(_cred, slot)| *slot);
+        let cred = if rkeys.is_some() {
+            match region_owned.as_ref() {
+                Some((c, _slot)) => c,
+                None => return Err(err(Ctap2Response::NoCredentials)),
+            }
+        } else {
+            match self.keystore.get_credential(cred_id) {
+                Some(c) => c,
+                None => return Err(err(Ctap2Response::NoCredentials)),
+            }
         };
         let rp_id_hash = cred.rp_id_hash;
         let cred_blob = if get_cred_blob { Some(cred.cred_blob.clone()) } else { None };
         let lbk = cred.large_blob_key;
         let user_handle = cred.user_handle.clone();
         let resident = cred.resident;
-        let private_key = cred.private_key;
+        let private_key = cred.private_key.copy_out();
 
         // SOAK-FINDING-1 review round 2: transactional counter bump — the
         // snapshot is made durable here or the bump reverts.
@@ -1415,9 +1908,14 @@ impl FidoApp {
         // What is unchanged is the revert: on a persist *failure* the bump
         // rolls back and the reply signs the durable value, so a failing
         // store never latches the durable-before-ack gate.
+        //
+        // US-1562: the bump is over **whichever store holds the credential**
+        // ([`Self::bump_sign_counter`]), not over the snapshot unconditionally.
+        // The snapshot arm is untouched — same function, same batching, same
+        // revert — and every host build still reaches it, because
+        // `region_keys_for` answers `None` there.
         let sign_count = self
-            .keystore
-            .bump_credential_counter_checked(cred_id, store)
+            .bump_sign_counter(rkeys, region_slot, cred_id, store)
             .ok_or(err(Ctap2Response::NoCredentials))?;
 
         let mut hmac_out: HeaplessVec<u8, 80> = HeaplessVec::new();
@@ -1461,7 +1959,7 @@ impl FidoApp {
         }
 
         // Sign authData || clientDataHash with the credential key (DER).
-        let sk = p256::SecretKey::from_slice(&private_key)
+        let sk = p256::SecretKey::from_slice(private_key.expose())
             .map_err(|_| err(Ctap2Response::InvalidCommand))?;
         let mut signed: HeaplessVec<u8, 832> = HeaplessVec::new();
         signed.extend_from_slice(auth_data.as_slice()).ok();
@@ -1513,6 +2011,11 @@ impl FidoApp {
     ) -> usize {
         out.clear();
         out.push(0x00).ok();
+        // US-1554: the same keys the first assertion used. `getNextAssertion`
+        // continues one enumeration, so it opens records from the same region
+        // under the same keys — deriving them again would be the same derivation,
+        // but hoisting it keeps the one-derivation-per-operation rule visible.
+        let rkeys = self.region_keys_for(store.as_deref());
         let r = (|| -> Result<(), Err> {
             let Some(state) = self.ga_pending.as_mut() else {
                 return Err(err(Ctap2Response::NotAllowed));
@@ -1533,7 +2036,7 @@ impl FidoApp {
             if is_last {
                 self.ga_pending = None;
             }
-            self.build_assertion(&id, &cdh, uv, do_up, total, !is_last, None, false, false, false, out, store)
+            self.build_assertion(rkeys.as_ref(), &id, &cdh, uv, do_up, total, !is_last, None, false, false, false, out, store)
         })();
         match r {
             Ok(()) => {}
@@ -2054,6 +2557,35 @@ impl FidoApp {
     // ------------------------------------------------------------------
     pub(crate) fn handle_reset(&mut self, out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>) -> usize {
         out.clear();
+
+        // US-1546: destroy the records on the medium **before** clearing the RAM
+        // state, and answer a refusal rather than an ack.
+        //
+        // The ordering is [`OathApp::cmd_reset`]'s (`apps/oath/src/oath_core.rs`,
+        // `US-1553`): a press is the owner's consent to destroy, so the durable
+        // erasure happens first and only then does the in-RAM state follow.
+        // `reset_from_seed` rotates `device_random` and therefore the payload
+        // key, so erasing afterwards would stage bytes under a key the records
+        // were not written with.
+        //
+        // `None` — no region installed, so the snapshot was this device's store
+        // and the `reset_from_seed` below already cleared it. That is not a
+        // failure and must not be reported as one (S10, "degrade, never halt").
+        if let Some(Err(_)) = self.wipe_region_credentials() {
+            // `0x21 PROCESSING`, which is what the reference answers for a reset
+            // whose storage erase failed (`../pico-fido2/src/fido/cbor_reset.c`:
+            // `if (fido_reset_storage() != PICOKEYS_OK) return CTAP2_ERR_PROCESSING`).
+            //
+            // Refusing is the whole point. Acking would leave a device that
+            // reports an empty credential set over records still on flash, and
+            // `getCredsMetadata`'s `existingResidentCredentialsCount` is
+            // device-rooted and PIN-free (`crypto::derive_index_key_from_root`),
+            // so the index survives the reset intact and enumerable — the owner
+            // would see their pre-reset count come back on the next command.
+            out.push(Ctap2Response::Processing.code()).ok();
+            return out.len();
+        }
+
         // Fresh device random + credential wipe (the hkey is regenerated on
         // the next boot from the store — the snapshot the reset writes is
         // entirely new state).
@@ -2063,27 +2595,37 @@ impl FidoApp {
         // Regenerate the persistent hkey from the pool (TRNG-derived).
         // US-1007: bounded for the same reason as the makeCredential arm —
         // this was a bare rejection loop over a draw that cannot report
-        // failure. `handle_reset` returns a byte count rather than a
-        // `Result`, so a refusal cannot be propagated as a status; it
-        // leaves `hkey` at its current value, which is what the `if let Ok`
-        // below already did for the parse. The residual is real and is
+        // failure. `try_fill_valid_with` has no channel to say *why* it gave
+        // up, so a refusal here leaves `hkey` at its current value, which is
+        // what the `if let Ok` below already did for the parse. Note this is
+        // narrower than it reads: `handle_reset` returns a byte count, but
+        // `out[0]` is the CTAP2 status byte, so a refusal *can* be propagated
+        // and the region-wipe arm above does exactly that. This particular
+        // residual is a failed draw, not an inexpressible outcome.
+        //
+        // The residual is real and is
         // stated rather than hidden: a reset taken while the pool cannot
         // produce does not rotate the `hkey`. That is strictly better than
         // the alternative, which is a request that never returns, and the
         // window is the same one D-9 describes (a generator that has
         // stopped producing).
-        let mut scalar = [0u8; 32];
+        // US-1550: the new persistent key-agreement key's raw scalar, on the
+        // stack, before it becomes `self.hkey`. `p256::SecretKey` clears itself;
+        // this array had no destructor, and the `hkey` it is turned into
+        // outlives the frame by design (it is the device's long-lived ECDH
+        // key), so the intermediate copy is the one that needed clearing.
+        let mut scalar = Zeroizing::new([0u8; 32]);
         if crypto::try_fill_valid_with(
             &mut |out: &mut [u8]| {
                 self.draw_random(out);
                 Ok(())
             },
-            &mut scalar,
+            &mut *scalar,
             |b| p256::SecretKey::from_slice(b).is_ok(),
         )
         .is_ok()
         {
-            if let Ok(sk) = p256::SecretKey::from_slice(&scalar) {
+            if let Ok(sk) = p256::SecretKey::from_slice(&*scalar) {
                 self.hkey = sk;
             }
         }
@@ -2480,10 +3022,21 @@ fn cm_dialect(data: &[u8]) -> CmDialect {
 impl FidoApp {
     // -- credMgmt (0x0A) ---------------------------------------------------
 
-    pub(crate) fn handle_cred_mgmt(&mut self, data: &[u8], out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>) -> usize {
+    /// `store` is US-1555's addition: credential management is where the
+    /// advertised capacity comes from, and on the region path that number is
+    /// counted out of the region's index — which needs the keys, which come from
+    /// the secure store. It is the same `Option<&mut dyn SecureStore>` every
+    /// other persisting handler takes, and `None` degrades to the snapshot, so
+    /// the dispatcher bridge path is unchanged.
+    pub(crate) fn handle_cred_mgmt(
+        &mut self,
+        data: &[u8],
+        out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
+        store: Option<&mut dyn SecureStore>,
+    ) -> usize {
         out.clear();
         out.push(0x00).ok();
-        let r = self.cred_mgmt_inner(data, out);
+        let r = self.cred_mgmt_inner(data, out, store.as_deref());
         match r {
             Ok(()) => {}
             Err(code) => {
@@ -2494,7 +3047,15 @@ impl FidoApp {
         out.len()
     }
 
-    fn cred_mgmt_inner(&mut self, data: &[u8], out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>) -> Result<(), Err> {
+    fn cred_mgmt_inner(
+        &mut self,
+        data: &[u8],
+        out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
+        store: Option<&dyn SecureStore>,
+    ) -> Result<(), Err> {
+        // Derived once, for the whole command: the keys are per-operation
+        // (`crypto.rs`), and one command is one operation.
+        let rkeys = self.region_keys_for(store);
         if data.is_empty() {
             return Err(err(Ctap2Response::MissingParameter));
         }
@@ -2857,8 +3418,35 @@ impl FidoApp {
                 // maxPossibleRemainingResidentCredentialsCount; key 3 (total
                 // capacity) is the PicoForge extension. Both dialects read the
                 // first two, and CTAP2 clients ignore the unknown third.
-                let existing = self.keystore.cred_count();
-                let remaining = self.keystore.max_remaining_creds();
+                //
+                // US-1563: on the region path these come from the region's
+                // index, and **they are the number the measured boundary is
+                // made of** — `docs/capacity.md` reports 856 because this reply
+                // would answer 856, not because a constant says so.
+                //
+                // The two arms are not the same question. `existing` counts
+                // index entries; `remaining` is `FIDO_CAPACITY` less that. A
+                // tombstone left by an uncompacted delete is excluded from the
+                // first and therefore from the second — which is a *claim about
+                // capacity*, so it is the conservative direction: the device
+                // under-promises rather than promising a slot it cannot take.
+                let (existing, remaining) = if rkeys.is_some() {
+                    match self.with_region(rkeys.as_ref(), |creds| {
+                        (creds.used(), creds.remaining())
+                    }) {
+                        Some((Some(e), Some(r))) => (e as usize, r as usize),
+                        // The index could not be read. **Report zero remaining
+                        // rather than zero existing**: claiming a full device we
+                        // have not measured is the wire claim AGENTS.md §4 is
+                        // about, and claiming no credentials we have not looked
+                        // for is the US-1573 memoization. Either way the client
+                        // sees a device that will refuse an enrolment, which is
+                        // the truth.
+                        _ => (self.keystore.cred_count(), 0),
+                    }
+                } else {
+                    (self.keystore.cred_count(), self.keystore.max_remaining_creds())
+                };
                 no_heap::push_map_header(out, 3).ok();
                 no_heap::push_uint(out, 1).ok();
                 no_heap::push_uint(out, existing as u64).ok();
@@ -2870,17 +3458,68 @@ impl FidoApp {
             }
             CM_ENUMERATE_RPS_BEGIN => {
                 // enumerateRpsBegin
-                let mut rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut rps: heapless::Vec<([u8; 32], heapless::Vec<u8, 64>), { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
-                for cred in &self.keystore.credentials {
-                    if !cred.resident || cred.revoked {
-                        continue;
+                let region_backed_here = rkeys.is_some();
+                if region_backed_here {
+                    // US-1555: enumerate **from the index**, which is what makes
+                    // this walk work at 856 rather than at twelve.
+                    //
+                    // The index stores a truncated MAC of the `rp_id_hash` and
+                    // nothing else — no RP name, no RP ID (`index.rs`, "That is
+                    // the entire content"). So the distinct-RP grouping cannot
+                    // be done from the index: every entry is opened, one at a
+                    // time, and its `rp_id_hash` and `rp_id` read out of the
+                    // plaintext. That is why credMgmt is a **PIN-gated**
+                    // enumeration on this path even though the *slots* are
+                    // reachable without the PIN: the index tells you which slots
+                    // exist, not which site each is for.
+                    let mut window =
+                        fapico2_platform::keyregion::on_demand::CredentialWindow::new();
+                    let mut entries = 0u32;
+                    let total_entries = self
+                        .with_region(rkeys.as_ref(), |creds| creds.used())
+                        .flatten()
+                        .unwrap_or(0);
+                    while entries < total_entries {
+                        let slot = match self.with_region(rkeys.as_ref(), |creds| {
+                            creds.nth_entry_slot(entries)
+                        }) {
+                            Some(Some(s)) => s,
+                            _ => break,
+                        };
+                        entries += 1;
+                        let owned = self.with_region(rkeys.as_ref(), |creds| {
+                            if !matches!(
+                                creds.load_slot(slot, &mut window),
+                                fapico2_platform::keyregion::SlotRead::Present(())
+                            ) {
+                                return None;
+                            }
+                            crate::device_keystore::credential_from_record_body(window.as_slice())
+                        });
+                        let Some(cred) = owned.flatten() else { continue };
+                        if !cred.resident || cred.revoked {
+                            continue;
+                        }
+                        if rps.iter().any(|(h, _)| *h == cred.rp_id_hash) {
+                            continue;
+                        }
+                        if rps.push((cred.rp_id_hash, cred.rp_id.clone())).is_err() {
+                            return Err(err(Ctap2Response::LimitExceeded));
+                        }
                     }
-                    if rps.iter().any(|(h, _)| *h == cred.rp_id_hash) {
-                        continue;
-                    }
-                    if rps.push((cred.rp_id_hash, cred.rp_id.clone())).is_err() {
-                        return Err(err(Ctap2Response::LimitExceeded));
+                } else {
+                    for cred in &self.keystore.credentials {
+                        if !cred.resident || cred.revoked {
+                            continue;
+                        }
+                        if rps.iter().any(|(h, _)| *h == cred.rp_id_hash) {
+                            continue;
+                        }
+                        if rps.push((cred.rp_id_hash, cred.rp_id.clone())).is_err() {
+                            return Err(err(Ctap2Response::LimitExceeded));
+                        }
                     }
                 }
                 if rps.is_empty() {
@@ -2976,8 +3615,46 @@ impl FidoApp {
             CM_ENUMERATE_CREDS_BEGIN => {
                 // enumerateCredsBegin
                 let hash = rp_id_hash.ok_or(err(Ctap2Response::MissingParameter))?;
-                let mut ids: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut ids: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
+                if rkeys.is_some() {
+                    // US-1555: the index names this RP's slots — **no record is
+                    // opened to build the list** — and each is then opened once,
+                    // read, and dropped. `MAX_ENUMERATED_SLOTS` (32) bounds the
+                    // slot array; `MAX_PENDING_CREDENTIAL_IDS` (12) bounds what
+                    // one enumeration may *serve*. The two are deliberately
+                    // different numbers answering different questions; see
+                    // `device_keystore::MAX_ENUMERATED_SLOTS`.
+                    let mut window =
+                        fapico2_platform::keyregion::on_demand::CredentialWindow::new();
+                    let mut slots: [fapico2_platform::keyregion::Slot;
+                        crate::device_keystore::MAX_ENUMERATED_SLOTS] =
+                        [fapico2_platform::keyregion::Slot::new(0).unwrap();
+                            crate::device_keystore::MAX_ENUMERATED_SLOTS];
+                    let found = self
+                        .with_region(rkeys.as_ref(), |creds| creds.slots_for_rp(&hash, &mut slots))
+                        .flatten()
+                        .unwrap_or(0);
+                    for slot in slots.iter().take(found) {
+                        let owned = self.with_region(rkeys.as_ref(), |creds| {
+                            if !matches!(
+                                creds.load_slot(*slot, &mut window),
+                                fapico2_platform::keyregion::SlotRead::Present(())
+                            ) {
+                                return None;
+                            }
+                            crate::device_keystore::credential_from_record_body(window.as_slice())
+                        });
+                        let Some(cred) = owned.flatten() else { continue };
+                        if cred.resident
+                            && !cred.revoked
+                            && cred.rp_id_hash == hash
+                            && ids.push(cred.credential_id.clone()).is_err()
+                        {
+                            return Err(err(Ctap2Response::LimitExceeded));
+                        }
+                    }
+                } else {
                 for cred in &self.keystore.credentials {
                     if cred.resident
                         && !cred.revoked
@@ -2987,8 +3664,9 @@ impl FidoApp {
                         return Err(err(Ctap2Response::LimitExceeded));
                     }
                 }
+                }
                 // newest first
-                let mut ordered: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::DEVICE_MAX_CREDS }> =
+                let mut ordered: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }> =
                     heapless::Vec::new();
                 while let Some(id) = ids.pop() {
                     let _ = ordered.push(id);
@@ -2999,7 +3677,7 @@ impl FidoApp {
                 let total = ordered.len();
                 let first = ordered.remove(0);
                 self.cm_cred_state = Some(CmCredState { creds: ordered, total, channel: self.current_channel, dialect: self.cm_dialect });
-                self.cm_cred_response(&first, total, out)
+                self.cm_cred_response(rkeys.as_ref(), &first, total, out)
             }
             CM_ENUMERATE_CREDS_NEXT => {
                 // enumerateCredsGetNext
@@ -3032,13 +3710,42 @@ impl FidoApp {
                 {
                     self.cm_cred_state = None;
                 }
-                self.cm_cred_response(&id, total, out)
+                self.cm_cred_response(rkeys.as_ref(), &id, total, out)
             }
             CM_DELETE_CRED => {
                 // deleteCredential
                 let id = cred_id.ok_or(err(Ctap2Response::MissingParameter))?;
                 if id.is_empty() {
                     return Err(err(Ctap2Response::MissingParameter));
+                }
+                //
+                // US-1556: on the region path a delete is a **tombstone commit**
+                // followed by clearing the index entry — `commit.rs` refuses a
+                // single-slot erase because an erased target is
+                // indistinguishable from a commit that never reached its witness
+                // and `recover` would resurrect the delete as a replay.
+                //
+                // **And it is followed by a compaction of that slot's sector**,
+                // which is the half that makes the freed capacity reachable: a
+                // tombstone is a record, so the allocator will not hand the slot
+                // out again until the sector is rewritten without it. Doing it
+                // here rather than leaving it to the caller is the right place —
+                // the caller is a CTAP client that will never ask, and
+                // `remainingDiscoverableCredentialsCount` would go on promising
+                // capacity the device cannot serve. `AGENTS.md` §4: a wire claim
+                // the device does not honour is the defect.
+                if rkeys.is_some() {
+                    let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+                    self.draw_random(&mut nonce);
+                    return match self.with_region(rkeys.as_ref(), |creds| {
+                        let report = creds.delete(&nonce, id.as_slice()).ok()?;
+                        let sector = fapico2_platform::keyregion::commit::sector_base(report.slot);
+                        creds.compact(sector).ok()?;
+                        Some(())
+                    }) {
+                        Some(Some(())) => Ok(()),
+                        _ => Err(err(Ctap2Response::NoCredentials)),
+                    };
                 }
                 match self.keystore.delete_credential(id.as_slice()) {
                     Ok(()) => Ok(()),
@@ -3049,6 +3756,52 @@ impl FidoApp {
                 // updateUserInformation
                 let id = cred_id.ok_or(err(Ctap2Response::MissingParameter))?;
                 let uid = user_id.ok_or(err(Ctap2Response::MissingParameter))?;
+                //
+                // US-1555: on the region path this is a **read-modify-write of
+                // one record** — load it, check the handle, change the names,
+                // seal it again at the slot's next generation. There is no
+                // in-RAM copy to mutate, which is why the load hands back an
+                // owned `DeviceCredential` rather than a `&mut` into the array
+                // the snapshot path still uses.
+                if rkeys.is_some() {
+                    let rp = rp_id_hash;
+                    let Some((mut cred, slot)) =
+                        self.region_credential_at(rkeys.as_ref(), rp.as_ref(), id.as_slice())
+                    else {
+                        return Err(err(Ctap2Response::NoCredentials));
+                    };
+                    if cred.user_handle != uid && !cred.user_handle.is_empty() {
+                        return Err(err(Ctap2Response::InvalidParameter));
+                    }
+                    if let Some(name) = &user_name {
+                        if !name.is_empty() {
+                            cred.user_name = name.clone();
+                        }
+                    }
+                    if let Some(dn) = &user_dn {
+                        if !dn.is_empty() {
+                            cred.user_display_name = dn.clone();
+                        }
+                    }
+                    // **The slot the lookup already named, at its next
+                    // generation.** An update must go through
+                    // `RegionCredentials::update_credential`, not `put`: `put`
+                    // allocates a second slot for the same credential ID and
+                    // leaves the old record and its index entry live, so the
+                    // passkey would enumerate twice and the capacity would lose
+                    // one slot per rename. `update` re-commits into `slot` and
+                    // rewrites its index entry — the same primitive the counter
+                    // bump uses.
+                    let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+                    self.draw_random(&mut nonce);
+                    return match self
+                        .with_region(rkeys.as_ref(), |creds| {
+                            creds.update_credential(&nonce, slot, &cred)
+                        }) {
+                        Some(Ok(_)) => Ok(()),
+                        _ => Err(err(Ctap2Response::NoCredentials)),
+                    };
+                }
                 {
                     let cred = self
                         .keystore
@@ -3076,11 +3829,26 @@ impl FidoApp {
     }
 
     /// Build the enumerateCreds response body for one credential.
-    fn cm_cred_response(&self, cred_id: &[u8], total: usize, out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>) -> Result<(), Err> {
-        let cred = self
-            .keystore
-            .get_credential(cred_id)
-            .ok_or(err(Ctap2Response::NoCredentials))?;
+    ///
+    /// `rkeys` is US-1555's addition: on the region path the credential this
+    /// response describes is opened from its record rather than found in the
+    /// resident array. `&mut self` follows from that — an on-demand load needs
+    /// the region, and the region is reached through the app.
+    fn cm_cred_response(
+        &mut self,
+        rkeys: Option<&crate::device_keystore::RegionKeys>,
+        cred_id: &[u8],
+        total: usize,
+        out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
+    ) -> Result<(), Err> {
+        let region_owned = self.region_credential(rkeys, None, cred_id);
+        let snapshot = self.keystore.get_credential(cred_id);
+        let cred = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {
+            (true, Some(c), _) => c,
+            (true, None, _) => return Err(err(Ctap2Response::NoCredentials)),
+            (false, _, Some(c)) => c,
+            (false, _, None) => return Err(err(Ctap2Response::NoCredentials)),
+        };
         let mut n = 4usize;
         if cred.cred_protect > 0 { n += 1; }
         if cred.large_blob_key.is_some() { n += 1; }
@@ -4000,6 +4768,9 @@ impl FidoApp {
         out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
         store: Option<&mut dyn SecureStore>,
     ) -> Result<(), U2fStatus> {
+        // US-1554: one derivation for the whole command, as every other handler
+        // does. `None` degrades to the snapshot array.
+        let rkeys = self.region_keys_for(store.as_deref());
         // AUTHENTICATE: client_param(32) || app_param(32) || kh_len(1) || kh
         // REGISTER: client_param(32) || app_param(32) — `data` is apdu_data.
         // US-701: the bound is `< 65` (kh_len lives at data[64]) — the host
@@ -4028,10 +4799,11 @@ impl FidoApp {
 
         if p1 == 0x07 {
             // Check-only: CONDITIONS_NOT_SATISFIED when valid.
-            let legacy_valid = self
-                .keystore
-                .get_credential(key_handle)
+            let legacy_owned = self.region_credential(rkeys.as_ref(), None, key_handle);
+            let legacy_valid = legacy_owned
+                .as_ref()
                 .map(|c| c.rp_id_hash == app_param)
+                .or_else(|| self.keystore.get_credential(key_handle).map(|c| c.rp_id_hash == app_param))
                 .unwrap_or(false);
             if legacy_valid || stateless_valid {
                 return Err(U2fStatus::ConditionsNotSatisfied);
@@ -4078,15 +4850,38 @@ impl FidoApp {
         }
 
         // Legacy (pre-US-714) store-backed handle: per-credential counter.
-        let private_key = {
-            let cred = self.keystore.get_credential(key_handle).ok_or(U2fStatus::WrongData)?;
+        let (private_key, region_slot) = {
+            //
+            // US-1554: U2F's `key_handle` **is** a credential ID, so the same
+            // on-demand load serves it. Stateless handles are unaffected — they
+            // are derived, not stored (`stateless.rs`), which is why this line
+            // is only reached for a resident credential.
+            //
+            // US-1562: the slot comes out of that load rather than from a second
+            // lookup, for the reason `build_assertion` carries the same note: the
+            // bump below is addressed by slot, and CTAP1 is the surface a
+            // pre-US-714 authenticator uses exclusively, so the defect this fixes
+            // would have been *most* visible here.
+            let region_owned = self.region_credential_at(rkeys.as_ref(), None, key_handle);
+            let snapshot = self.keystore.get_credential(key_handle);
+            let (cred, slot) = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {
+                (true, Some((c, slot)), _) => (c, Some(*slot)),
+                (true, None, _) => return Err(U2fStatus::WrongData),
+                (false, _, Some(c)) => (c, None),
+                (false, _, None) => return Err(U2fStatus::WrongData),
+            };
             if cred.rp_id_hash != app_param {
                 return Err(U2fStatus::WrongData);
             }
             if cred.cred_protect == 3 {
                 return Err(U2fStatus::SecurityStatusNotSatisfied);
             }
-            cred.private_key
+            // US-1550: a named, self-clearing copy rather than a `Clone` of the
+            // field. The block's value outlives the `&DeviceCredential` borrow
+            // it is read through — the counter bump below takes `&mut self` —
+            // so it has to own its 32 bytes, and `PrivateScalar` is what owns
+            // them without leaking them into the frame that follows.
+            (cred.private_key.copy_out(), slot)
         };
         // SOAK-FINDING-1 review round 2: transactional counter bump —
         // durable or reverted.
@@ -4102,9 +4897,14 @@ impl FidoApp {
         // restore: a whole window above the durable image, so a power cut
         // skips forward only. See
         // `device_keystore::bump_credential_counter_checked`.
+        //
+        // US-1562: dispatched over the same seam as CTAP2's
+        // ([`Self::bump_sign_counter`]), so a CTAP1-only authenticator — the one
+        // deployment where every assertion takes *this* path — bumps the
+        // credential's record rather than looking for it in an array it is not
+        // in.
         let counter = self
-            .keystore
-            .bump_credential_counter_checked(key_handle, store)
+            .bump_sign_counter(rkeys.as_ref(), region_slot, key_handle, store)
             .ok_or(U2fStatus::WrongData)?;
 
         out.push(0x01).ok(); // user presence
@@ -4114,7 +4914,8 @@ impl FidoApp {
         sign_base.push(0x01).ok();
         sign_base.extend_from_slice(&counter.to_be_bytes()).ok();
         sign_base.extend_from_slice(client_param).ok();
-        let sk = p256::SecretKey::from_slice(&private_key).map_err(|_| U2fStatus::WrongData)?;
+        let sk = p256::SecretKey::from_slice(private_key.expose())
+            .map_err(|_| U2fStatus::WrongData)?;
         let mut sig: HeaplessVec<u8, 72> = HeaplessVec::new();
         crypto::p256_sign_der_into(&sk, sign_base.as_slice(), &mut sig).ok_or(U2fStatus::WrongData)?;
         out.extend_from_slice(sig.as_slice()).ok();
