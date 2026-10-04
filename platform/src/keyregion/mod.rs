@@ -41,7 +41,9 @@
 //! are separate stories, and none of them can change a capacity here without
 //! the compile-time assertions below stopping the build.
 
-use crate::flashmap::{BLOCK_SIZE, KEY_REGION_BYTES};
+extern crate alloc;
+
+use crate::flashmap::{BLOCK_SIZE, KEY_REGION_BYTES, KEY_REGION_OFFSET};
 
 // ---------------------------------------------------------------------------
 // Record sizes (measured, not estimated)
@@ -218,4 +220,206 @@ const _: () = {
 /// capacity above is built from.
 pub const fn region_slots() -> u32 {
     TOTAL_SLOTS
+}
+
+// ---------------------------------------------------------------------------
+// The type chokepoint (US-1574)
+// ---------------------------------------------------------------------------
+
+/// A slot identifier: a **position**, never a byte offset.
+///
+/// The distinction is the whole point of the type. A slot number is what an
+/// applet is allowed to hold; a flash address is what only this module is
+/// allowed to compute. Because `Slot` has no conversion into a `u32` offset
+/// and the write path takes a `Sealed`, the two mistakes that keep appearing in
+/// this tree — putting plaintext under a key-slot identifier, and letting a
+/// caller name an address the layout has moved — do not compile.
+///
+/// RS-Key makes the same argument with the same two newtypes (`sealed.rs`); it
+/// is the one place where being Rust is a structural advantage rather than a
+/// preference.
+///
+/// ```compile_fail
+/// // A slot is a position, not an address: it does not convert into one.
+/// use fapico2_platform::keyregion::Slot;
+/// let s = Slot::new(7).unwrap();
+/// let _address: u32 = s;          // compile_error: no conversion from Slot to u32
+/// ```
+///
+/// ```
+/// // And a slot the region cannot hold does not exist.
+/// use fapico2_platform::keyregion::Slot;
+/// assert!(Slot::new(u16::MAX).is_none());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Slot(u16);
+
+impl Slot {
+    /// The index of this slot, counting from the head of the region.
+    ///
+    /// Named `index` rather than being `Deref`'d to the inner integer so that
+    /// every conversion out of this type is a visible decision.
+    pub const fn index(self) -> u16 {
+        self.0
+    }
+
+    /// Construct a slot from an index, refusing one the region cannot hold.
+    ///
+    /// The bound is [`TOTAL_SLOTS`], so a slot index is checked against the
+    /// region at the point it enters the system rather than at the point it is
+    /// used — which is the difference between a compile-time refusal and a
+    /// read of somebody else's credential.
+    pub const fn new(index: u16) -> Option<Self> {
+        if (index as u32) < TOTAL_SLOTS {
+            Some(Slot(index))
+        } else {
+            None
+        }
+    }
+
+    /// The flash-relative byte offset of this slot.
+    ///
+    /// `pub(crate)` on purpose: address arithmetic is this module's business.
+    /// An applet holding a `Slot` can compare it, order it and store it; it
+    /// cannot turn it into an address without coming here.
+    // US-1573/US-1574 land the type before its first caller: the allocator
+    // (US-1543) and the host region (US-1541) are what turn a `Slot` into an
+    // address. `allow(dead_code)` is here so the shape can be committed and
+    // reviewed on its own — the alternative is a `#[allow]` added and removed
+    // by the same author who wrote the code it hides.
+    #[allow(dead_code)]
+    pub(crate) const fn offset(self) -> u32 {
+        KEY_REGION_OFFSET + self.0 as u32 * FIDO_SLOT_BYTES
+    }
+}
+
+/// A record body that has been sealed under the payload key.
+///
+/// The only constructor is private to this module's sealing path, so the only
+/// way to obtain one is to have encrypted and authenticated the bytes. There
+/// is no `Sealed::new`, no `From<&[u8]>`, and no public field: writing
+/// plaintext into a key slot is a type error, not a review comment.
+///
+/// ```compile_fail
+/// // There is no way to put plaintext under a key-slot identifier.
+/// use fapico2_platform::keyregion::Sealed;
+/// let secret: &[u8] = b"the private key";
+/// let _ = Sealed::from(secret);          // compile_error: no `From<&[u8]>`
+/// ```
+///
+/// ```compile_fail
+/// use fapico2_platform::keyregion::Sealed;
+/// let s: Sealed = Sealed { bytes: vec![0u8; 32] };   // compile_error: private field
+/// ```
+#[derive(Clone)]
+pub struct Sealed(alloc::vec::Vec<u8>);
+
+impl Sealed {
+    /// The sealed bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Take the bytes, for handing to the region's write path.
+    pub fn into_bytes(self) -> alloc::vec::Vec<u8> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl core::fmt::Debug for Sealed {
+    /// Never prints the bytes. A `Debug` that dumps a sealed record is a
+    /// `Debug` that puts key material in a log buffer.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Sealed({} bytes)", self.0.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed fault semantics (US-1573)
+// ---------------------------------------------------------------------------
+
+/// The outcome of a region read, in three states rather than two.
+///
+/// RS-Key's `Storage::last_error` doctrine is the model: a flash fault and an
+/// absent record both look like "nothing there" if the API returns `None` for
+/// both, and the difference matters because the code that *acts* on the answer
+/// writes. A faulted read memoized as "no credentials" makes the next
+/// enrollment build a second identity on top of the owner's — which is why
+/// [`Fault`](Self::Fault) is a state rather than an `Err` that callers are
+/// invited to ignore.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotRead<T> {
+    /// The slot holds a record, and here it is.
+    Present(T),
+    /// The slot is erased or carries a record whose header failed its CRC.
+    ///
+    /// A CRC failure is `Absent`, not `Fault`: a torn or corrupted record is a
+    /// fact about the data, and reading it as absent is what lets one bad
+    /// record fail closed for itself alone (US-1549) instead of taking the
+    /// store with it.
+    Absent,
+    /// The region could not be read — a transport error, not a fact about the
+    /// data. Never memoized as absence.
+    Fault(&'static str),
+}
+
+impl<T> SlotRead<T> {
+    /// The record, if one was actually read.
+    ///
+    /// `Fault` deliberately returns `None`: a caller that ignores it lands on
+    /// the same `None` an absent slot gives, which is the failure US-1573
+    /// exists to prevent. The fix is for callers to match on [`Self::Fault`],
+    /// and the compiler makes that visible by giving them a variant to match.
+    pub fn present(self) -> Option<T> {
+        match self {
+            SlotRead::Present(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether this outcome is a fact about the data or a failure to learn it.
+    pub fn is_fault(&self) -> bool {
+        matches!(self, SlotRead::Fault(_))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The region interface
+// ---------------------------------------------------------------------------
+
+/// The per-record key region.
+///
+/// Implementations: the QSPI-backed device region, and the host file region
+/// US-1541 adds. Every method is sector-granular where the hardware is, because
+/// [`SLOTS_PER_SECTOR`] slots share one erase.
+pub trait KeyRegion {
+    /// Read one slot's raw bytes into `buf`, or report why it could not.
+    ///
+    /// `buf` is [`FIDO_SLOT_BYTES`] long. A slot whose header CRC fails is
+    /// reported as all-`0xFF` (erased), because a record that cannot be
+    /// authenticated is not a record.
+    fn read_slot(&mut self, slot: Slot) -> Result<[u8; FIDO_SLOT_BYTES as usize], &'static str>;
+
+    /// Erase the sector holding `slot`.
+    ///
+    /// This clears [`SLOTS_PER_SECTOR`] slots, which is why the commit unit is
+    /// a sector and not a slot.
+    fn erase_sector(&mut self, slot: Slot) -> Result<(), &'static str>;
+
+    /// Program `len` bytes at `slot`'s offset. `len` must be a whole number of
+    /// flash pages (256 B).
+    fn program(&mut self, slot: Slot, offset: u32, data: &[u8]) -> Result<(), &'static str>;
+
+    /// How many slots this region holds. Constant for a given device, but a
+    /// method rather than a constant so a host region over a short file
+    /// reports its own capacity (US-1541).
+    fn slots(&self) -> u32;
 }
