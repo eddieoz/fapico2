@@ -274,19 +274,12 @@ impl CryptoRng for Rp2350Rng {}
 /// by value (constructed at boot from `p.FLASH`; S-721-2 passes it in).
 pub struct DevFlashStorage {
     flash: DevFlash,
-    /// Flash-relative base this storage window covers. US-1536: this became a
-    /// field because the relocation reads the legacy window at one offset while
-    /// programming the current one at another, through the same flash handle.
-    offset: u32,
 }
 
 impl DevFlashStorage {
     /// The live trussed window, at [`TRUSSED_FS_OFFSET`].
     pub fn new(flash: DevFlash) -> Self {
-        Self {
-            flash,
-            offset: TRUSSED_FS_OFFSET,
-        }
+        Self { flash }
     }
 }
 
@@ -302,14 +295,14 @@ impl Storage for DevFlashStorage {
 
     fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
         self.flash
-            .blocking_read(self.offset + off as u32, buf)
+            .blocking_read(TRUSSED_FS_OFFSET + off as u32, buf)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(buf.len())
     }
 
     fn write(&mut self, off: usize, data: &[u8]) -> littlefs2::io::Result<usize> {
         self.flash
-            .blocking_write(self.offset + off as u32, data)
+            .blocking_write(TRUSSED_FS_OFFSET + off as u32, data)
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(data.len())
     }
@@ -317,11 +310,50 @@ impl Storage for DevFlashStorage {
     fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
         self.flash
             .blocking_erase(
-                self.offset + off as u32,
-                self.offset + (off + len) as u32,
+                TRUSSED_FS_OFFSET + off as u32,
+                TRUSSED_FS_OFFSET + (off + len) as u32,
             )
             .map_err(|_| littlefs2::io::Error::IO)?;
         Ok(len)
+    }
+}
+
+/// littlefs2 `Storage` over the **legacy** trussed window, for the
+/// mountability probe only.
+///
+/// Stack-only and never installed in a static: it exists so the relocation can
+/// ask "is there a filesystem at the old offset?" without a second live `Flash`
+/// handle and without growing [`DevFlashStorage`] by an `offset` field. See
+/// [`DeviceFsStore::boot`] for where it is used and why the cost matters.
+struct LegacyWindow<'a> {
+    flash: &'a mut DevFlash,
+}
+
+impl Storage for LegacyWindow<'_> {
+    const READ_SIZE: usize = READ_SIZE;
+    const WRITE_SIZE: usize = WRITE_SIZE;
+    const BLOCK_SIZE: usize = BLOCK_SIZE;
+    const BLOCK_COUNT: usize = TRUSSED_FS_BLOCKS;
+    const BLOCK_CYCLES: isize = -1;
+
+    type CACHE_SIZE = U256;
+    type LOOKAHEAD_SIZE = U8;
+
+    fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
+        self.flash
+            .blocking_read(crate::flashmap::LEGACY_TRUSSED_FS_OFFSET + off as u32, buf)
+            .map_err(|_| littlefs2::io::Error::IO)?;
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, _off: usize, _data: &[u8]) -> littlefs2::io::Result<usize> {
+        // The legacy window is never written: that is what makes the relocation
+        // idempotent and retryable.
+        Err(littlefs2::io::Error::IO)
+    }
+
+    fn erase(&mut self, _off: usize, _len: usize) -> littlefs2::io::Result<usize> {
+        Err(littlefs2::io::Error::IO)
     }
 }
 
@@ -497,15 +529,19 @@ fn relocate_legacy_window(storage: &mut DevFlashStorage) {
     if Filesystem::is_mountable(&mut *storage) {
         return;
     }
-    // Probe the legacy window by pointing this storage at it for the duration
-    // of the check and restoring the live offset immediately after. A second
-    // `DevFlashStorage` would need a second `Flash` handle, and `Flash` is not
-    // `Copy` — so this is the one arrangement that needs no aliasing.
-    let legacy_offset = crate::flashmap::LEGACY_TRUSSED_FS_OFFSET;
-    let live_offset = storage.offset;
-    storage.offset = legacy_offset;
-    let legacy_mounts = Filesystem::is_mountable(&mut *storage);
-    storage.offset = live_offset;
+    // Probe the legacy window through a short-lived, stack-only handle.
+    //
+    // It borrows the flash rather than owning it, which is what keeps
+    // `DevFlashStorage` down to a single field: an `offset` field would have
+    // cost 8 B of `.bss` on `IFS_STORAGE` (2 -> 8), and this board has 4 B of
+    // unallocated SRAM in total — DARK-BOOT-1 territory, where RAM growth is a
+    // hardware risk and not merely a gate failure. The borrow ends before the
+    // handle is moved into the static, so there is never a second live
+    // `Flash`.
+    let legacy_mounts = {
+        let mut probe = LegacyWindow { flash: &mut storage.flash };
+        Filesystem::is_mountable(&mut probe)
+    };
     if !legacy_mounts {
         defmt::info!("trussed: no legacy window; starting empty at the new offset");
         return;
@@ -513,7 +549,7 @@ fn relocate_legacy_window(storage: &mut DevFlashStorage) {
 
     defmt::info!("trussed: relocating the internal FS to the new offset");
     let window = (TRUSSED_FS_BLOCKS * BLOCK_SIZE) as u32;
-    if let Err(e) = relocate_copy(storage, legacy_offset, window) {
+    if let Err(e) = relocate_copy(storage, window) {
         defmt::error!("trussed: relocation failed ({=u8}); the legacy window is intact", e);
         return;
     }
@@ -533,11 +569,7 @@ fn relocate_legacy_window(storage: &mut DevFlashStorage) {
 /// `Result<(), u8>` rather than `littlefs2::io::Result` because the error is
 /// only logged: the caller decides what an unmountable window means, and it is
 /// the first-boot path.
-fn relocate_copy(
-    storage: &mut DevFlashStorage,
-    legacy_offset: u32,
-    window: u32,
-) -> Result<(), u8> {
+fn relocate_copy(storage: &mut DevFlashStorage, window: u32) -> Result<(), u8> {
     let mut buf = [0u8; RELOCATE_CHUNK];
     for off in (0..window as usize).step_by(BLOCK_SIZE) {
         storage
@@ -552,7 +584,7 @@ fn relocate_copy(
     while copied < window as usize {
         let flash = &mut storage.flash;
         flash
-            .blocking_read(legacy_offset + copied as u32, &mut buf)
+            .blocking_read(crate::flashmap::LEGACY_TRUSSED_FS_OFFSET + copied as u32, &mut buf)
             .map_err(|_| 2u8)?;
         flash
             .blocking_write(TRUSSED_FS_OFFSET + copied as u32, &buf)
