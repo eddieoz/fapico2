@@ -628,7 +628,7 @@ fn a_wrong_width_record_is_refused_on_width_not_on_value() {
 /// seventh left. Dropping a tag from this list without giving it a field is
 /// how one of these stops being refused at all.
 #[test]
-fn the_five_undestined_tags_are_refused_whole() {
+fn the_five_unsupported_tags_are_skipped_and_the_rest_applied() {
     for tag in [0x08u8, 0x0A, 0x0C, 0x0D, 0x0E] {
         let mut h = Harness::populated();
         // A well-formed record of the tag's declared width, next to a good one.
@@ -639,10 +639,21 @@ fn the_five_undestined_tags_are_refused_whole() {
         let mut tlv = vec![0x04, 0x01, 0x0D, tag, value.len() as u8];
         tlv.extend_from_slice(value);
         let (_, sw) = h.drive(&write_apdu(&tlv));
-        assert_eq!(sw, 0x6A86, "tag {tag:#04x} has no field in the record");
-        assert!(
-            h.commits().is_empty(),
-            "tag {tag:#04x}: the good 0x04 record beside it must not be applied either"
+        assert_eq!(
+            sw, 0x9000,
+            "tag {tag:#04x} has no field here, but that must not cost the operator the \
+             records beside it — this is what RS-Key and pico-keys-sdk both do"
+        );
+        assert_eq!(
+            h.commits().len(),
+            1,
+            "tag {tag:#04x}: the good 0x04 record beside it must be applied"
+        );
+        let commit = h.commits()[0].clone();
+        assert_eq!(
+            commit.led_gpio,
+            Some(0x0D),
+            "tag {tag:#04x}: the applied record is the supported one, not the skipped one"
         );
     }
 }
@@ -715,11 +726,22 @@ fn an_unterminated_name_is_refused_and_takes_the_blob_with_it() {
 /// but a raw-APDU writer can still send one, and it is refused like any other
 /// record with nowhere to go.
 #[test]
-fn an_unknown_tag_byte_is_refused() {
+fn an_unknown_tag_byte_is_skipped() {
     let mut h = Harness::populated();
-    let (_, sw) = h.drive(&write_apdu(&[0x7A, 0x01, 0xAB]));
-    assert_eq!(sw, 0x6A86);
-    assert!(h.commits().is_empty());
+    // 0x7A is not a tag this build (or the protocol) defines. RS-Key's parser
+    // steps over it (`_ => {}` in `overlay`) and pico-keys-sdk's does the same
+    // (`default: break;`), so this applet matches them: skipping is what makes
+    // a future client that speaks a newer tag work against an older device.
+    let (_, sw) = h.drive(&write_apdu(&[0x04, 0x01, 0x05, 0x7A, 0x01, 0xAB]));
+    assert_eq!(
+        sw, 0x9000,
+        "an unknown tag is a record this build does not model, not a reason to fail the write"
+    );
+    assert_eq!(
+        h.commits().len(),
+        1,
+        "the supported record before the unknown tag must still be applied"
+    );
 }
 
 /// A blob that ends mid-record is a length problem and nothing else.
@@ -1124,61 +1146,76 @@ fn the_ins_and_cla_constants_are_the_client_bytes() {
     assert_eq!(READ_P2_PHY_CONFIG, 0x01, "the read's P2, ops.rs:295");
 }
 
-/// **The vid/pid change the user asked for is discarded because another tag
-/// in the same blob is one this build refuses.**
+/// **The exact user scenario: setting the vendor preset to YubiKey 5 while the
+/// request also carries a `Curves` record the device does not model.**
 ///
-/// This is the reproduction behind "Failed to apply configuration: Device
-/// Error: Write failed: [6A, 86]" when changing the USB vendor preset to
-/// YubiKey 5 (1050:0407). `cmd_write` collects the whole blob and refuses
-/// **whole** on the first tag with no destination
-/// (`apps/rescue/src/lib.rs`: `PhyTag::Curves | PresenceTimeout | LedDriver |
-/// LedOrder | LedNum => return SW_WRONG_PARAMETERS`), so a vid/pid record
-/// sitting in the same blob is thrown away with it.
+/// This is the reproduction behind "Failed to apply configuration: Device Error:
+/// Write failed: [6A, 86]" when changing the USB vendor preset to
+/// YubiKey 5 (1050:0407). picoforge — which we neither control nor fork —
+/// synthesises a `Curves` (0x0A) record whenever the device reports none
+/// (`view_model.rs`: `Some(0) != None` reads as a change), so **every**
+/// configuration save carried one.
 ///
-/// The status word reads like a P1/P2 complaint and is not: `0x6A86` is this
-/// build's "I do not serve that named target" (the module docs say so), and
-/// picoforge prints the raw SW, so a tag refusal is indistinguishable from a
-/// parameter error at the GUI.
-///
-/// The two writes below differ by exactly one record and differ in outcome,
-/// which is what makes the cause unambiguous.
+/// `cmd_write` used to refuse the whole blob on that record, discarding the
+/// vid/pid beside it. Both references skip it instead: RS-Key's `overlay` ends
+/// in a terminal `_ => {}` and returns `PhyData`, not `Result`, so no tag can
+/// fail; pico-keys-sdk's `phy_unserialize_data` has `default: break;`. This
+/// applet now matches them.
 #[test]
-fn one_refused_tag_discards_an_unrelated_vid_pid_change() {
-    // The write a user intends: YubiKey 5, 1050:0407. `00 04` is VidPid, and
-    // the value is vid:u16 BE then pid:u16 BE — `10 50 04 07`, not ASCII.
+fn a_vendor_preset_change_applies_even_when_the_blob_carries_a_curves_record() {
+    // 1050:0407 — `00 04` is VidPid, and the value is vid:u16 BE then
+    // pid:u16 BE. Binary, not ASCII hex.
     let vid_pid: [u8; 6] = [0x00, 0x04, 0x10, 0x50, 0x04, 0x07];
 
+    // 1. The write the operator means.
     let mut h = Harness::populated();
     let (_, sw) = h.drive(&write_apdu(&vid_pid));
-    assert_eq!(
-        sw, 0x9000,
-        "a vid/pid-only write succeeds. It is the record the user is actually \
-         trying to change, and it never failed on its own — the refusal came \
-         from the extra record in the real request"
-    );
+    assert_eq!(sw, 0x9000, "a vid/pid-only write must succeed");
+    assert_eq!(h.commits().len(), 1, "and it must actually be applied");
 
-    // The same write with a `Curves` (0x0A) record appended — which is what
-    // picoforge emits on every save, because it re-synthesises the curves mask
-    // from widget state rather than from the read (its `Some(0) != None`).
+    // 2. The same write with the `Curves` record picoforge adds to every save.
     let mut blob = vid_pid.to_vec();
     blob.extend_from_slice(&[0x0A, 0x04, 0x00, 0x00, 0x00, 0x00]);
     let mut h2 = Harness::populated();
     let (_, sw) = h2.drive(&write_apdu(&blob));
     assert_eq!(
-        sw, 0x6A86,
-        "the same write carrying a Curves record is refused whole — and the \
-         vid/pid goes with it"
+        sw, 0x9000,
+        "the Curves record must be skipped, not cost the operator the vid/pid"
     );
+    assert_eq!(h2.commits().len(), 1, "the vid/pid is still applied");
 
-    // The point of the test: the refusal is total, not partial. Nothing from the
-    // blob was applied, so the user's vendor preset silently did not change
-    // even though the record it carried was fine.
+    // 3. And the device reports the new identity — the whole point of the
+    //    operation, observed rather than assumed.
     let (data, sw) = h2.read_phy();
     assert_eq!(sw, 0x9000);
     assert!(
-        !data.windows(6).any(|w| w == [0x00, 0x04, 0x10, 0x50, 0x04, 0x07]),
-        "the refused write applied nothing at all — the whole-blob refusal \
-         is what makes this a silent no-op rather than a partial one"
+        data.windows(6).any(|w| w == [0x00, 0x04, 0x10, 0x50, 0x04, 0x07]),
+        "the READ must report 1050:0407 after the write: {data:02x?}"
     );
 }
 
+/// **A blob that omits a field preserves it** — the merge half of the same
+/// contract, and the reason skipping is safe.
+///
+/// RS-Key overlays a partial record onto the stored one; pico-keys-sdk
+/// `memset`s and replaces, which means a vid/pid-only write to a pico-fido
+/// clears its product name, curves and USB interfaces. That is the behaviour
+/// *not* to copy: a client that sends one tag must not silently drop the rest.
+/// The device's `commit` implements the preserve (`firmware/src/boot.rs`: "An
+/// absent field is a *preserve*: this is the merge the Rescue WRITE is defined
+/// to be"), and this pins it from the applet side.
+#[test]
+fn a_blob_that_omits_a_field_preserves_the_stored_one() {
+    let mut h = Harness::populated();
+    // The fixture starts with a product name set. Write vid/pid alone.
+    let (_, sw) = h.drive(&write_apdu(&[0x00, 0x04, 0x10, 0x50, 0x04, 0x07]));
+    assert_eq!(sw, 0x9000);
+
+    let commit = h.commits().last().expect("a commit").clone();
+    assert_eq!(commit.vid_pid, Some(0x1050_0407), "the vid/pid was applied");
+    assert_eq!(
+        commit.product, PhyUpdate::default().product,
+        "a field absent from the blob must stay absent from the update — the \
+         owner's `commit` is what preserves it, and it does so by leaving it None"
+    );
+}

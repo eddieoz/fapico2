@@ -1793,6 +1793,17 @@ fn rescue_bare_cases() -> Vec<Case> {
 /// get past, and `cmd_read` is the only way to see a merged record come back.
 fn rescue_owned_cases() -> Vec<Case> {
     vec![
+        // An unsupported tag beside a supported one. `9000`, and the supported
+        // record applies: both references skip a tag they do not model rather
+        // than refusing the blob (RS-Key `overlay`'s terminal `_ => {}`;
+        // pico-keys-sdk `phy_unserialize_data`'s `default: break;`). Refusing
+        // here is what made every picoforge configuration save fail, because
+        // picoforge synthesises a `0x0A` whenever the device reports none.
+        case(
+            "WRITE an unsupported tag beside a supported one",
+            vec![0x80, 0x1C, 0x01, 0x00, 0x06, 0x04, 0x01, 0x09, 0x0A, 0x01],
+            0x9000,
+        ),
         // A 0x0B record whose mask clears bit 0x01 (USB_ITF_CCID). The applet
         // refuses the whole blob, before any field is applied, because "a
         // 0x0B record replaces the stored mask outright" and a cleared mask
@@ -1818,8 +1829,12 @@ fn rescue_owned_cases() -> Vec<Case> {
         // `UsbManufacturer` until that tag was given a field; the sweep
         // caught the change, which is what it is for — a named case whose
         // status changes is a behaviour change someone has to look at.
+        // `0x6A86` here is **not** the tag being unsupported — that is skipped
+        // (see `rescue_owned_cases`). It is this scenario's missing record
+        // owner: there is nowhere for the write to go. The distinction is the
+        // point of running the case in the bare scenario.
         case(
-            "WRITE an undestined tag",
+            "WRITE with no record owner",
             vec![0x80, 0x1C, 0x01, 0x00, 0x03, 0x0C, 0x01, 0x19],
             0x6A86,
         ),

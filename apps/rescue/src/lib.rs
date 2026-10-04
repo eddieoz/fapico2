@@ -146,20 +146,27 @@
 //! `0x41` path already refuses exactly that group with
 //! `CTAP2_ERR_UNSUPPORTED_OPTION` (`0x2B` — US-1528 corrected this from the
 //! `0x2A` this comment used to quote, which is a code the spec withdrew),
-//! `apps/fido/src/vendor41.rs:1680-1687`), and the threat model §10.3 records
-//! that **accepted-and-ignored is not available**: the client's reader skips a
-//! tag it does not know with a `_ => {}` arm
-//! (`picoforge/src/hal/fido/mod.rs:1001-1003`), so a silently-dropped record
-//! would be reported to the operator as a successful configuration change.
+//! `apps/fido/src/vendor41.rs:1680-1687`).
 //!
-//! **Decision: this applet takes §0.2 Option A — the undestined five are
-//! refused, whole, with `6A86`, and nothing in the blob is applied.** That is
-//! the same rule `0x41` applies and the only answer that does not lie to the
-//! client. The consequence is recorded here because it is a real functional
-//! limit, not an implementation detail: **a Rescue WRITE that carries any of
-//! those five tags fails, including the tags next to it in the same blob.** A
-//! user who types a new product name into the client's Config screen gets an
-//! honest `6A86` rather than a success that changed nothing.
+//! Threat model §10.3 once argued **accepted-and-ignored is not available**:
+//! the client's reader skips a tag it does not know with a `_ => {}` arm
+//! (`picoforge/src/hal/fido/mod.rs:1001-1003`), so a silently-dropped record
+//! would be reported to the operator as a successful configuration change. That
+//! argument is sound in the abstract and **it is not what the references do** —
+//! see the next section. It was answered by refusing the whole blob, which is
+//! strictly worse for the operator: they lost every *supported* change too.
+//!
+//! **Decision: an unsupported tag is SKIPPED, and the records around it are
+//! applied.** This was reversed, and the reason is in "An unsupported tag is
+//! skipped, not refused" below.
+//!
+//! What this applet used to do was refuse the **whole blob** with `6A86` on the
+//! first tag it had no field for. That is not what either reference does — see
+//! the section — and it cost a user every configuration change: picoforge,
+//! which we neither control nor fork, synthesises a `Curves` record whenever the
+//! device reports none, so **every** save carried one and the vid/pid beside it
+//! was discarded. `6A86` reads like a P1/P2 complaint, which is why the real
+//! cause survived so long unexamined.
 //!
 //! **The round-trip stays inside the writable set only because the client
 //! honours it — this applet cannot enforce it.** It used to be asserted here
@@ -171,9 +178,52 @@
 //! reporting only `Write failed: [6A, 86]`, a status word that reads like a
 //! P1/P2 complaint and is not. The contract this applet can offer is the
 //! narrower one `encode_phy`'s docs now state: a tag it omits is a tag it does
-//! not serve, and a client must not invent one. Fixed on the client side; see
-//! `encode_phy` for the full account.
+//! not serve. That is a statement about what a client should send, and it is not
+//! one this applet can enforce — so rather than require clients to obey it, this
+//! applet now tolerates a client that does not. See "An unsupported tag is
+//! skipped, not refused".
 //!
+//! ## An unsupported tag is skipped, not refused
+//!
+//! Both references answer `9000` and apply the records they understand:
+//!
+//! * **RS-Key** — `rsk_phy::merge_save` calls `overlay`, whose terminal arm is
+//!   `_ => {}` and which returns `PhyData`, **not** `Result`
+//!   (`rsk-phy/src/lib.rs:270`). No tag can fail a write. Its own test says so:
+//!   `parse_skips_unknown_tags_and_truncation_is_safe`. Its parser *does*
+//!   refuse an unknown **P1 selector** (`INCORRECT_P1P2`, `rsk-rescue:255-266`),
+//!   so it skips an unknown *tag* while refusing an unknown *command*. This
+//!   applet conflated the two; it no longer does.
+//! * **pico-keys-sdk** — `phy_unserialize_data` ends in `default: break;` with
+//!   one unconditional `PICOKEYS_OK` (`fs/phy.c:170-182`). Byte-identical in
+//!   pico-fido, pico-openpgp and pico-fido2.
+//!
+//! We were the only one of the four that refused, and that is what broke
+//! configuration. Compatibility with released clients is not a nicety here:
+//! picoforge synthesises `Curves` (`0x0A`) whenever a device reports none, and
+//! it is not ours to change.
+//!
+//! ### The merge half, which is the part that must not be copied wrong
+//!
+//! Skipping is only safe because a partial blob **preserves** what it omits.
+//! RS-Key *merges* (`phy.overlay(data)` onto the stored record). pico-keys-sdk
+//! *replaces* — `memset(phy, 0, sizeof(*phy))` before parsing
+//! (`fs/phy.c:91`) — so a vid/pid-only write to a pico-fido clears its product
+//! name, curves and USB interfaces. **Merge, do not copy that.** This applet
+//! already does: `PhyUpdate`'s fields are `Option`, and the owner's `commit`
+//! treats an absent field as a preserve (`firmware/src/boot.rs`: "An absent
+//! field is a *preserve*: this is the merge the Rescue WRITE is defined to be").
+//!
+//! ### What is still refused
+//!
+//! Capability is no longer a reason to fail a write; **malformed input** still
+//! is, and each of these is a property of the bytes rather than of the build:
+//! a bad P1/P2, a length that runs past the end of the blob (`6700`), a record
+//! whose width does not match the codec's table (`6700`), the `0x0B` mask guard
+//! (`6A80`), and a name with no terminator (`6A80`). A `6A86` now means only
+//! "this build has no record owner for a PHY write", which is what it should
+//! have meant all along.
+
 //! The alternative, Option B (add the seven fields to the persisted record),
 //! stays refused. It is a change to the secure-snapshot codec with its own size
 //! budget, and it would *create* two new unauthenticated-writable identity
@@ -957,19 +1007,16 @@ impl RescueApp {
     /// complaint and is not: `0x6A86` is "this build does not serve that named
     /// target" (see the module docs).
     ///
-    /// The contract this read can actually offer is narrower, and is the one the
-    /// client is expected to honour: **a tag this function omits is a tag the
-    /// device does not serve, and a client must not invent one.** Omitting it
-    /// says "unsupported"; it does not say "unchanged, please write it back".
-    /// Synthesising a value for an unreported tag is the client's error, and it
-    /// is fixed on the client side — the refusal here is deliberate (the threat
-    /// model rules out accepted-and-ignored, which would report success for a
-    /// change that never happened).
+    /// What this read actually communicates is narrower than "unchanged": **a
+    /// tag this function omits is a tag the device does not serve.** Omitting
+    /// it says "unsupported"; it does not say "unchanged, please write it back".
     ///
-    /// `product_name` and `manufacturer_name` are filtered on empty, and an
-    /// untouched control preserves its device value (`None`), so those do stay
-    /// `None`. `raw_curves_mask` did not, and that is the regression recorded
-    /// above.
+    /// Clients have not all honoured that — picoforge synthesises a `Curves`
+    /// record when the device reports none — and since a WRITE is refused
+    /// whole, that cost the operator every *supported* change too. This applet
+    /// now skips a tag it does not model instead of failing on it, which is
+    /// what both references do. See the module docs' "An unsupported tag is
+    /// skipped, not refused".
     fn encode_phy(&self, snap: &PhySnapshot, out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         if let Some(v) = snap.vid_pid {
             // `(vid << 16) | pid` is the packed form; the wire is
@@ -1049,10 +1096,10 @@ impl RescueApp {
     ///
     /// The parse is a **single collecting pass**: nothing is applied while
     /// records are examined, and the only mutation in the whole command is the
-    /// owner's [`RescueConfigHandler::commit`] at the end, reached only once
-    /// every record has passed every check. That is what makes the
-    /// whole-blob refusals whole: there is no partial application to roll back
-    /// and no transaction needed to avoid one.
+    /// owner's [`RescueConfigHandler::commit`] at the end. So a *malformed*
+    /// record still refuses the whole blob — there is no partial application to
+    /// roll back — but a record this build merely does not model is skipped and
+    /// the rest proceed. See "An unsupported tag is skipped, not refused".
     fn cmd_write(&mut self, p1: u8, p2: u8, data: &[u8]) -> Sw {
         if p1 != WRITE_P1_PHY_CONFIG || p2 != P2_UNUSED {
             return SW_WRONG_PARAMETERS;
@@ -1066,14 +1113,23 @@ impl RescueApp {
                 // nothing else.
                 Err(_) => return SW_WRONG_LENGTH,
             };
-            // A tag byte the protocol does not define. `PhyTag::from_byte` has
-            // no `_` arm, so a thirteenth tag cannot even be spelled; the
-            // refusal is here for a raw-APDU writer, and it is the same
-            // `6A86` as an undestined tag because both say "there is nowhere
-            // for this record to go in this build".
+            // A tag byte this build does not define. **Skipped, not refused.**
+            //
+            // Both references skip it and answer success: RS-Key's `overlay`
+            // ends in a terminal `_ => {}` and returns `PhyData`, not
+            // `Result`, so no tag can fail (`rsk-phy/src/lib.rs:270`, and its
+            // test `parse_skips_unknown_tags_and_truncation_is_safe`);
+            // pico-keys-sdk's `phy_unserialize_data` has `default: break;`
+            // and a single unconditional `PICOKEYS_OK` (`fs/phy.c:170-182`).
+            //
+            // Refusing here instead is what made this applet the odd one out,
+            // and it is not free: a client whose *other* records are fine gets
+            // `6A86` for all of them. Skipping is safe because the decoder
+            // already took the length from the blob, so an unrecognised record
+            // is stepped over rather than mis-parsed.
             let tag = match PhyTag::from_byte(tag_byte) {
                 Some(t) => t,
-                None => return SW_WRONG_PARAMETERS,
+                None => continue,
             };
             // The width check, from the codec's own table rather than a second
             // list spelled out here. Before the value is read, so a
@@ -1129,15 +1185,28 @@ impl RescueApp {
                     }
                     update.manufacturer = Some(pad_name(value));
                 }
-                // The five tags with no field in the persisted record. Refused
-                // as a group and whole, with the status that says "this
-                // firmware does not support this record". See the module docs
-                // for why accepted-and-ignored is not available.
+                // The five tags with no field in the persisted record.
+                // **Skipped, not refused**, matching both references — see the
+                // module docs' "An unsupported tag is skipped, not refused".
+                //
+                // This arm used to `return SW_WRONG_PARAMETERS`, which refused
+                // the *whole* blob: one unsupported record discarded every other
+                // record beside it. picoforge — which we do not control and must
+                // not fork — synthesises a `Curves` record whenever the device
+                // reports none, so every configuration save it made carried
+                // `0x0A`, and the vid/pid the operator was changing went with
+                // it. The GUI reported `Write failed: [6A, 86]`, a status word
+                // that reads like a P1/P2 complaint and is not.
+                //
+                // Nothing an operator can express is silently lost by skipping:
+                // a client that sets these means to change something this build
+                // does not model, and the alternative — refusing — cost them
+                // every *supported* change too. RS-Key makes the same trade.
                 PhyTag::Curves
                 | PhyTag::PresenceTimeout
                 | PhyTag::LedDriver
                 | PhyTag::LedOrder
-                | PhyTag::LedNum => return SW_WRONG_PARAMETERS,
+                | PhyTag::LedNum => {}
             }
         }
         let Some(h) = &mut self.config else {
