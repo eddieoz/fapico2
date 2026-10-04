@@ -230,14 +230,16 @@ pub const MAX_ERASES_PER_SECTOR_PER_COUNTER_WRITE: u32 =
 
 /// The first slot a FIDO record may occupy.
 ///
-/// The region's head, and not a choice: the allocator's rule is **lowest free
-/// slot** (`slotmap.rs`, "Lowest free slot is a linear scan"), so a reservation
-/// placed at the head would be destroyed by the first enrolment. `index.rs`
-/// makes the same argument for the tail ("Why the tail and not the head"); the
-/// OATH area and the commit scratchpad sit in between for the same reason.
+/// Not the region's head: OATH owns `[0, OATH_CAPACITY)` and the commit
+/// scratchpad the next `SLOTS_PER_SECTOR` slots, both because the allocator's
+/// rule is **lowest free slot** (`slotmap.rs`, "Lowest free slot is a linear
+/// scan") and a reservation placed at the head would be destroyed by the first
+/// enrolment. `index.rs` makes the same argument for the tail ("Why the tail and
+/// not the head"); FIDO's range sits between the scratchpad and the index.
 pub const FIDO_FIRST_SLOT: u32 = super::FIDO_FIRST_SLOT;
 
-/// The exclusive end of FIDO's slot range: slots `[0, FIDO_SLOT_LIMIT)`.
+/// The exclusive end of FIDO's slot range: slots
+/// `[FIDO_FIRST_SLOT, FIDO_SLOT_LIMIT)`.
 ///
 /// **The derived capacity, and the only number that decides how many passkeys
 /// this device holds.** It is [`FIDO_CAPACITY`](super::FIDO_CAPACITY) — **856**
@@ -251,15 +253,15 @@ pub const FIDO_FIRST_SLOT: u32 = super::FIDO_FIRST_SLOT;
 pub const FIDO_SLOT_LIMIT: u32 = super::FIDO_SLOT_LIMIT;
 
 /// The head slot of the commit scratchpad sector: slots
-/// `[FIDO_SLOT_LIMIT, FIDO_SLOT_LIMIT + SLOTS_PER_SECTOR)`.
+/// `[SCRATCHPAD_FIRST_SLOT, SCRATCHPAD_FIRST_SLOT + SLOTS_PER_SECTOR)`.
 ///
-/// Immediately after FIDO's range rather than at either end of the region, so the
-/// boundary the allocator stops at and the boundary the commit stages behind are
+/// Immediately before FIDO's range and after OATH's, so the boundary the
+/// allocator stops at and the boundary the commit stages behind are
 /// **adjacent and both sector-aligned**. `mod.rs` charges the scratchpad to
 /// FIDO's capacity and says nothing else about where it goes; the only
 /// constraints are that it be a whole sector inside the region and not the sector
-/// being written — which this placement cannot be, because FIDO's records stop
-/// one sector short of it.
+/// being written — which this placement cannot be, because OATH's records stop
+/// one sector short of it and FIDO's begin one sector after it.
 pub const SCRATCHPAD_FIRST_SLOT: u32 = super::SCRATCHPAD_FIRST_SLOT;
 
 /// The scratchpad sector's head slot, as the [`Slot`] `commit` wants it.
@@ -282,12 +284,15 @@ pub const fn scratchpad_slot() -> Slot {
 /// name is a scan that crosses into a reservation. The allocator stops here and
 /// [`FidoRecordStore::put`] refuses.
 pub const fn is_fido_slot(slot: Slot) -> bool {
-    // Only the upper bound is tested. `FIDO_FIRST_SLOT` is 0 — the region's
-    // head, which is the whole argument for putting it there — so comparing an
-    // index against it is a tautology, and `clippy::absurd_extreme_comparisons`
-    // is right to say so. The lower bound is stated by the constant and enforced
-    // by [`Slot::new`], which refuses an index the region cannot hold.
-    (slot.index() as u32) < FIDO_SLOT_LIMIT
+    // Both bounds are tested, and `super::is_fido_slot` is the same predicate:
+    // OATH owns the region's head (`[0, OATH_CAPACITY)`) and the scratchpad and
+    // index follow it, so a lower bound of 0 would admit OATH's credentials to
+    // every FIDO write — a tombstone committed over an OATH record would erase
+    // its sector and destroy the credential. This file once stated "the
+    // region's head" as the reason only the upper bound needed testing; that
+    // stopped being true when the partition put OATH there (`mod.rs`), which is
+    // exactly the drift the two-sided form makes representable.
+    (slot.index() as u32) >= FIDO_FIRST_SLOT && (slot.index() as u32) < FIDO_SLOT_LIMIT
 }
 
 const _: () = {
@@ -1703,7 +1708,7 @@ fn clear_index_entries(
         if first.is_none() {
             first = Some(touched);
         }
-        rewrite_index_sector(region, touched, |bytes| {
+        rewrite_index_sector(region, touched, |_offset, bytes| {
             let mut n = 0u32;
             while n < index::ENTRIES_PER_SLOT {
                 let at = index::entry_offset(n) as usize;
@@ -1803,8 +1808,18 @@ pub fn rewrite_index_entry(
         ));
     };
     let bytes = entry.encode();
-    rewrite_index_sector(region, live, |image| {
-        image[at as usize..at as usize + index::INDEX_ENTRY_BYTES].copy_from_slice(&bytes);
+    // The splice lands in **one** cell — the one `find_entry_cell` named. The
+    // edit closure is handed every slot image of the sector, so the offset has
+    // to be guarded: an unguarded splice would write the entry at `at` of all
+    // four slots, which both triplicates the entry (`fido_entries` counts three
+    // credentials that are not there) and, on a dense index, overwrites the
+    // entries of the three credentials whose cells sit at the same offset in the
+    // mate slots — a counter bump corrupting three unrelated passkeys.
+    let live_offset = live.index() as u32 - commit::sector_base(live).index() as u32;
+    rewrite_index_sector(region, live, |offset, image| {
+        if offset == live_offset {
+            image[at as usize..at as usize + index::INDEX_ENTRY_BYTES].copy_from_slice(&bytes);
+        }
     })?;
     Ok(live)
 }
@@ -1825,7 +1840,7 @@ pub fn rewrite_index_entry(
 fn rewrite_index_sector(
     region: &mut dyn KeyRegion,
     live: Slot,
-    mut edit: impl FnMut(&mut SlotImage),
+    mut edit: impl FnMut(u32, &mut SlotImage),
 ) -> Result<(), FidoStoreError> {
     let live_base = commit::sector_base(live);
     let scratch_base = commit::sector_base(scratchpad_slot());
@@ -1836,7 +1851,7 @@ fn rewrite_index_sector(
     while offset < SLOTS_PER_SECTOR {
         let from = slot_in_sector(live_base, offset)?;
         let mut bytes: SlotImage = region.read_slot(from).map_err(FidoStoreError::IndexUnreadable)?;
-        edit(&mut bytes);
+        edit(offset, &mut bytes);
         if !is_erased(&bytes) {
             region
                 .program(slot_in_sector(scratch_base, offset)?, 0, &bytes)
