@@ -158,6 +158,10 @@ pub mod cfs;
 /// (US-1536).
 pub mod flashmap;
 
+/// The per-record key store: geometry and the capacities derived from it
+/// (US-1539, US-1540).
+pub mod keyregion;
+
 /// C-firmware key hierarchy derivation (US-413 S-413-4).
 pub mod ckey;
 
