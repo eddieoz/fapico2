@@ -185,30 +185,35 @@ length. An owner-chosen code *is* persisted; `cmd_set_code` sets `dirty` itself.
 | Both GUIs authenticate and manage OATH | `oath_keyregion.rs::a_device_with_no_access_code_is_usable_on_both_paths` (host); `test_070_oath.py::test_a_credential_survives_a_new_session_without_an_access_code` (raw CCID wire) |
 | Unauthenticated session is still refused | `test_redteam.py::test_oath_unauth_dump_refused`, `::test_oath_unauth_tamper_refused` — 5 passed, 0 failed |
 | The default is what closes it | mutation: removing provisioning → 3 failed; wrong default → 13 of 14 emulator OATH tests fail |
-
-## Why some stories share a commit — a decision, not an omission
+## Why some stories share a commit — owner sign-off
 
 The brief said **commit after finishing each story**, so each of the 43 has its
 own commit. Nine do not: `587ea10` carries four, `301bb31` five, `3038aff` five,
 `7e05582` four, `5113ee9` three, `db8b560` three, `9583c39` two, `9ab862e` two,
-`4f24bc3` three. **This was put to the user and they chose to leave the history
-as it is**; this section records that so the choice is auditable rather than
-looking like an oversight.
+`4f24bc3` three.
 
-The bundles are not arbitrary. They are where the work was genuinely one change:
+**Owner decision, 2026-10-04: this file substitutes for per-story commits.** The
+table at the top is the substitute — for every story it names the commit that
+carries it and the named test that fails if the story is removed, which is the
+property a per-story commit would have provided, and it survives a later
+refactor of the history in a way that commit boundaries do not.
+
+The bundles are not arbitrary, and two of them **cannot** be split at all:
 
 | Commit | Stories | Why one commit |
 |---|---|---|
-| `9ab862e` | US-1542, US-1549 | One file (`record.rs`, 1128 lines). US-1542's BDD specifies "a **sealed** body" — the AEAD is part of the record format US-1542 defines, so a commit split at the boundary would not build. |
-| `9583c39` | US-1573, US-1574 | One file (`mod.rs`). The `SlotRead` three-state enum and the `Slot`/`Sealed` newtypes reference each other. |
-| `4f24bc3` | US-1567, US-1568, US-1576 | Three ADRs, disjoint files — separable, but all three are prose decisions with no code and no test to hang a commit boundary on. |
+| `9ab862e` | US-1542, US-1549 | One file (`record.rs`, 1128 lines). US-1542's BDD specifies "a **sealed** body" — the AEAD is part of the record format US-1542 defines, so a commit split at that boundary would not build. |
+| `9583c39` | US-1573, US-1574 | One file (`mod.rs`, 205 lines). The `SlotRead` three-state enum and the `Slot`/`Sealed` newtypes reference each other. |
 
-The first two are the load-bearing cases: splitting them would produce commits
-that lie about what exists, or that do not compile, and would make `git bisect`
-on this branch stop working. Laya's reading of the same evidence was to keep the
-final tree byte-exact and the history bisectable, which is what this does.
+The remaining seven were **measured**, not assumed splittable. Each has files
+shared between its stories — `3038aff`'s three commit stories share `commit.rs`;
+`301bb31`'s five share a 952-line `device_keystore.rs`; `587ea10`'s US-1541 and
+US-1543 share `key_region_host.rs` — so splitting needs hunk-level surgery on
+those files and the resulting intermediate commits would not compile. That is why
+the alternative offered was a *partial* split (~20 of the 43 stories) rather
+than a complete one: even the file-separable stories sit behind shared
+production files.
 
-**What replaces per-story commits.** This table. For every story it names the
-commit that carries it and the named test that fails if the story is removed —
-which is the property a per-story commit would have provided, and it survives a
-later refactor of the history in a way that commit boundaries do not.
+Full compliance was therefore not available at any cost that left the tree
+verifiable. This records that, rather than leaving a bundled commit looking like
+an oversight.
