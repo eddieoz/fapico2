@@ -105,6 +105,15 @@ any given build enrols 68 OATH credentials is a question about
 and that they tile the partition, which is a different statement from "the
 device holds 68 OATH credentials".
 
+**The reservation is not served on a device build yet.** `OathApp::attach_region`
+has no firmware call site — the region path is implemented and host-tested
+(`apps/oath/tests/oath_keyregion.rs`), but the firmware never attaches a region
+to the OATH applet, so on hardware OATH still runs on the legacy chunked store
+with its measured ceiling of **30**. The 68 slots are flash reserved against
+that wiring, and only geometry keeps FIDO's allocator out of them. Wiring the
+provider (mirroring FIDO's `install_region_provider` call in `main.rs`) is the
+step that turns this row from a reservation into a served capacity.
+
 The earlier version of this table had a row reading **"OATH credentials | 68 |
 as above"**, which quietly converted the reservation into a capacity claim. That
 is the same defect the previous section is about, one row further down: a number

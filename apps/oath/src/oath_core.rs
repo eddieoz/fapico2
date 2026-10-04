@@ -70,7 +70,8 @@
 //!   bound, never a capacity claim.
 //!
 //!   **All of that paragraph describes the legacy path, and US-1553 replaces
-//!   it.** With a key region attached ([`OathApp::attach_region`]) the table is
+//!   it — on the region path, which today exists only where a caller attaches
+//!   a region.** With a key region attached ([`OathApp::attach_region`]) the table is
 //!   no longer a chunked whole snapshot in the 24-entry image shared with
 //!   FIDO: each credential is one record in one slot of the key region
 //!   (`fapico2_platform::keyregion::oath_store`), committed one at a time, so
@@ -81,6 +82,17 @@
 //!   migration) and still **written** for the records that are not credentials
 //!   — the access code and the US-904 OTP-PIN verifier — so `encode_state` is
 //!   not dead code.
+//!
+//!   **Wiring status: the region path is implemented and host-tested
+//!   (`apps/oath/tests/oath_keyregion.rs`), but no firmware call site attaches
+//!   a region yet** — `attach_region`'s only caller is that test. A device
+//!   build therefore serves OATH from the legacy chunked store, and the
+//!   ceiling on hardware is the legacy one, not [`MAX_CREDS`]. Installing the
+//!   provider in `firmware/src/main.rs` after `boot::release_key_region()`
+//!   (mirroring `fapico2_fido::device_app::install_region_provider` and its
+//!   `main.rs` call site) is the step that makes this paragraph's
+//!   substitution true on hardware; until then, `docs/capacity.md`'s OATH row
+//!   is a reservation for that wiring, not a served capacity.
 //!
 //! - US-1553 (secure storage): **credentials are per-record in the key region,
 //!   and the secure store holds no credential table.** The properties are
@@ -100,9 +112,11 @@
 //!     generation"; `oath.seal.gen.v1` is still reserved and written on the
 //!     legacy path only;
 //!   * *the boot path does not touch the region* (S8/S9) — `attach_region` is
-//!     called at first applet use, after `RUNG_USB`, never from `OathApp::boot`
-//!     or `boot_in_place`, and `apps/oath/tests/oath_keyregion.rs` asserts that
-//!     a booted app whose region is mounted never touches the medium;
+//!     to be called at first applet use, after `RUNG_USB`, never from
+//!     `OathApp::boot` or `boot_in_place`, and
+//!     `apps/oath/tests/oath_keyregion.rs` asserts that a booted app whose
+//!     region is mounted never touches the medium. **No firmware call site
+//!     does this yet** — see the wiring-status paragraph above.
 //!   * *an unreadable region degrades* — [`OathApp::attach_region`] returns
 //!     [`RegionStatus::Degraded`] and the applet serves an **empty** credential
 //!     set with a clean status word. Never `fatal_boot`, never a panic: a

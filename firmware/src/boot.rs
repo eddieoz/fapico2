@@ -422,16 +422,16 @@ pub fn release_key_region() {
 /// the reason it is written here rather than left to the applets is that the
 /// reason is invisible at the call site.
 ///
-/// # Why this reads as dead code today
+/// # Who calls this, and which adapter is still missing
 ///
-/// Its callers are the FIDO and OATH adapters (US-1552 / US-1553), which reach
-/// for the region at first applet use — and `apps/` is not this story's file
-/// ownership, so landing them is the next commit. The `#[allow]` is stated here
-/// with its reason rather than deleted-and-re-added by the same author who wrote
-/// the accessor, which is the arrangement `keyregion/mod.rs:413-417` rejects: an
-/// `#[allow]` added and removed by its own author is a comment, not a
-/// constraint.
-#[allow(dead_code)]
+/// The FIDO adapter is wired: `main.rs` installs
+/// `fapico2_fido::device_app::install_region_provider` right after
+/// [`release_key_region`], and its provider forwards here. **The OATH adapter
+/// is not**: `OathApp::attach_region` has no firmware call site, so a device
+/// build serves OATH from the legacy chunked store and the key region's OATH
+/// slots are reserved flash nothing reads (`oath_core.rs`'s wiring-status
+/// paragraph records the same fact from the applet's side). Wiring it is the
+/// step that makes US-1553 true on hardware.
 pub fn key_region() -> Option<&'static mut KeyRegionHandle> {
     if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
