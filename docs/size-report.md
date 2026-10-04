@@ -279,7 +279,8 @@ Command, verbatim: `./build.sh`, then `check_size_report.py`'s own
 `measure_elf()` / `uf2_facts()`. `build.sh`'s own line for this build, unedited:
 
 ```
-firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes
+firmware/fapico2.uf2: 3071 blocks (1 absolute preamble + 3070 ARM_S payload), 1572352 bytes,
+sha256 44cc065a39370d1c1afc7496b76fe13620be04cf63b0828b190ad943ba43151e
 3f46f624cc1431222cdfb22afc95f80562cb9ca70b465d3cca46c30d9c026fde  firmware/fapico2.uf2
 ```
 
@@ -1369,10 +1370,10 @@ separately, because Berkeley folds the `.data` load image into `text`**:
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 765,984 | `0x10000200` | no (flash) |
-| `.rodata` | 18,716 | `0x100bb220` | no (flash) |
+| `.text` | 766,088 | `0x10000200` | no (flash) |
+| `.rodata` | 18,716 | `0x100bb288` | no (flash) |
 | `.data` | 196 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100bfc00` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100bfc80` | non-alloc, not in Berkeley `text` |
 | `.bss` | 420,744 | `0x200000c8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20066c50` | yes |
 | `.defmt` | 32 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -1387,7 +1388,7 @@ the `X` flag) = **817,960**. That identity is stated so a reader can check
 the two tables against each other rather than take the sum on trust.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 817,960 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 818,064 B** · **`.data` = 196 B** · **`.bss` = 421,768 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 421,964 B** (421,968 B address-to-address: `__sheap` `0x20067050` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20067050` → **main stack zone = 110,512 B** of 532,480 B of SRAM.
 
