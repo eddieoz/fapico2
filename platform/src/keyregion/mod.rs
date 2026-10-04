@@ -237,12 +237,19 @@ pub const fn is_fido_slot(slot: Slot) -> bool {
 
 /// Is this slot reserved — the scratchpad or the index?
 ///
-/// **Published but not yet enforced.** `commit.rs` takes the scratchpad as a
-/// caller's argument and cannot refuse a slot from where it sits, and
-/// `fido_store.rs`/`oath_store.rs` both scan their own ranges. A caller that
-/// passes an index slot as the scratchpad erases the index on every commit.
-/// This is the predicate that closes it, and making the allocator and the
-/// commit plan consult it is the follow-through.
+/// A **description**, not a guard. `CommitPlan::validate` refuses any scratchpad
+/// that is not the region's own scratchpad sector, which is a stricter test and
+/// the one that is enforced; this predicate stays for callers that want to ask
+/// the narrower question ("is this slot the region's own to write?"), and it is
+/// what the partition tests assert directly.
+///
+/// Kept separate rather than folded into the commit check because the two
+/// answer different questions. `is_reserved_slot` is about *the region's*
+/// reservations and would answer `true` for a slot a specific applet is free to
+/// use; the commit's question is whether the caller named the staging sector at
+/// all. Note it does **not** cover OATH's range — OATH's slots are reserved to
+/// OATH, which is a partition boundary rather than a region-wide one, and the
+/// cross-tenant guard for those is `is_fido_slot` on the record path.
 pub const fn is_reserved_slot(slot: Slot) -> bool {
     let i = slot.index() as u32;
     (i >= SCRATCHPAD_FIRST_SLOT && i < FIDO_FIRST_SLOT)

@@ -509,6 +509,37 @@ impl CommitPlan {
                         generation 1, so a record claiming 0 is one no allocator issued",
             });
         }
+        // The scratchpad must not be the **index**.
+        //
+        // Every check above is about a plan that cannot work. This one is
+        // about a plan that works *too well*, and that is the dangerous shape:
+        // a scratchpad pointing at the index would not fail — it would succeed,
+        // and erase the index sector on every commit from then on. The commit
+        // returns `Ok`, the credential is written, and the entry naming it is
+        // gone. No error is reported at any point.
+        //
+        // Scoped to the index deliberately. `commit` is a generic primitive
+        // whose scratchpad is a **caller's argument**, and a host region
+        // smaller than the device geometry legitimately chooses its own staging
+        // sector — `key_region_commit.rs` uses a three-sector region and slot 4,
+        // which is not this region's scratchpad at 68. Demanding the region's
+        // own scratchpad would refuse every commit in that fixture and every
+        // region of another size, which is the check being wrong rather than
+        // strict.
+        //
+        // What justifies singling the index out is that it is the one sector no
+        // domain owns: both the FIDO and OATH stores write entries into it, so a
+        // commit staging through it destroys entries belonging to whoever was
+        // not committing. The scratchpad and OATH's range are each owned by a
+        // caller that already names them correctly (`scratchpad_slot()` and
+        // `oath_store::SCRATCHPAD_FIRST_SLOT`), and the cross-tenant guard for a
+        // record slot is `is_fido_slot` on the target side of the same plan.
+        if sector_base_index(self.scratchpad) >= super::index::INDEX_FIRST_SLOT {
+            return Err(CommitError::Plan {
+                reason: "the scratchpad is inside the index: staging through it would erase the \
+                        index on every commit, and the commit would still report success",
+            });
+        }
         Ok(())
     }
 }

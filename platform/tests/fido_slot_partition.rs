@@ -187,3 +187,88 @@ fn the_guard_refuses_only_across_the_partition() {
         .delete(&payload_key(), report.slot, &nonce(2))
         .expect("a FIDO delete inside FIDO's own range succeeds");
 }
+
+// ---------------------------------------------------------------------------
+// The scratchpad guard — the same partition, on the commit path
+// ---------------------------------------------------------------------------
+
+/// **A commit cannot stage through the index.**
+///
+/// `commit::CommitPlan::validate` is the last line of defence for a hazard no
+/// other check sees: a scratchpad pointing into the **index** would not fail —
+/// it would *succeed*, and erase the index sector on every commit from then on.
+/// The commit returns `Ok`, the credential is written, and the entry naming it
+/// is gone. No error is reported at any point.
+///
+/// The index is the one sector no domain owns — both the FIDO and OATH stores
+/// write into it — which is what justifies singling it out. Demanding the
+/// region's *own* scratchpad instead would be stricter and wrong: `commit` takes
+/// the scratchpad as a caller's argument, and `key_region_commit.rs` runs a
+/// three-sector region that legitimately stages through slot 4. The comment on
+/// the guard records that reasoning.
+///
+/// This lives here rather than in `key_region_commit.rs` because that file's
+/// three-sector fixture cannot express the hazard at all: its region ends at
+/// slot 12, and the index starts at 928.
+#[test]
+fn a_commit_refuses_a_reserved_slot_as_its_scratchpad() {
+    use fapico2_platform::keyregion::commit::{self, CommitError, CommitPlan};
+    use fapico2_platform::keyregion::index::INDEX_FIRST_SLOT;
+    use fapico2_platform::keyregion::record::Domain;
+    use fapico2_platform::keyregion::{is_reserved_slot, SCRATCHPAD_FIRST_SLOT};
+
+    let tmp = TempRegion::new("scratchpad-guard");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+
+    // Seed a real index entry, so "the index survived" is a claim and not a
+    // tautology about an empty region.
+    {
+        let mut store = FidoRecordStore::new(&mut region);
+        store
+            .put(&payload_key(), &index_key(), &nonce(1), &rp_hash(), &body(1))
+            .expect("a FIDO enrolment must seed the index");
+    }
+
+    // A sealed body to hand the plan. `validate` refuses before anything is
+    // staged, so its contents do not matter — but the call must be well-formed
+    // enough to reach the guard rather than fail earlier for want of a body.
+    let sealed = {
+        let header =
+            record::RecordHeader::new(record::Domain::Fido, slot(FIDO_FIRST_SLOT), 1);
+        record::seal(
+            &header,
+            payload_key().as_bytes(),
+            &nonce(1),
+            &body(1),
+        )
+        .expect("a 128-byte body seals under the fixture's payload key")
+    };
+
+    for (why, scratch) in [
+        ("the first index slot", slot(INDEX_FIRST_SLOT)),
+        ("a later index slot", slot(INDEX_FIRST_SLOT + 8)),
+    ] {
+        let plan = CommitPlan::new(scratch, slot(FIDO_FIRST_SLOT), Domain::Fido, 1);
+        let outcome = commit::commit(&mut region, plan, &sealed);
+        assert!(
+            matches!(outcome, Err(CommitError::Plan { .. })),
+            "{why} must be refused as a scratchpad, got {outcome:?}",
+        );
+    }
+
+    // The index is intact, and a legitimate commit still works — the guard
+    // refuses reserved slots, not commits.
+    let mut store = FidoRecordStore::new(&mut region);
+    assert!(
+        store.put(&payload_key(), &index_key(), &nonce(2), &rp_hash(), &body(2)).is_ok(),
+        "a FIDO enrolment through the region's own scratchpad must still succeed",
+    );
+    // The exemption in the guard is load-bearing and this is its other half:
+    // the region's own scratchpad **is** reserved, which is exactly why the
+    // check has to exempt it rather than simply refusing every reserved slot.
+    assert!(
+        is_reserved_slot(slot(SCRATCHPAD_FIRST_SLOT)),
+        "the region's own scratchpad is a reserved slot, so the guard must exempt it by name — \
+         a predicate that refused all reserved slots would refuse every commit",
+    );
+}
