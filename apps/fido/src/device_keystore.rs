@@ -3813,6 +3813,37 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
             .map_err(map_store_error)
     }
 
+    /// US-1555: rewrite one credential **in the slot its record occupies**.
+    ///
+    /// The read-modify-write's write half, addressed by slot — the same shape
+    /// [`Self::write_counter`] gives the counter, and the one credMgmt's
+    /// `updateUserInformation` needs. A rename that went through [`Self::put`]
+    /// would allocate a **second** slot for the same credential ID and leave the
+    /// old record and its index entry live: the passkey would enumerate twice,
+    /// the two copies' counters would diverge, and [`FIDO_CAPACITY`] would lose
+    /// one slot per rename.
+    ///
+    /// `slot` is the answer [`Self::load_by_id_at`] (and the applet's
+    /// `region_credential_at`) already computed for this credential in this
+    /// command. A slot holding no record is
+    /// [`RegionCredentialError::NoSuchCredential`]; a tombstone or a body that
+    /// does not decode is [`RegionCredentialError::Malformed`] — which is also
+    /// what keeps an update from resurrecting a deleted credential, because the
+    /// slot the update names must open as a live credential before the new body
+    /// is committed over it.
+    pub fn update_credential(
+        &mut self,
+        nonce: &[u8; record::NONCE_LEN],
+        slot: Slot,
+        cred: &DeviceCredential,
+    ) -> Result<fido_store::PutReport, RegionCredentialError> {
+        let body = credential_record_body(cred).ok_or(RegionCredentialError::Malformed)?;
+        let rp_hash = RpIdHash::from_bytes(cred.rp_id_hash);
+        self.store
+            .update(&self.keys.payload, &self.keys.index, slot, nonce, &rp_hash, body.as_slice())
+            .map_err(map_store_error)
+    }
+
     /// US-1561: bump `slot`'s signature counter, batching the durable write.
     ///
     /// `current` is the counter the applet holds — what

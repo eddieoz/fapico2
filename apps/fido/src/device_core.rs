@@ -3698,7 +3698,8 @@ impl FidoApp {
                 // the snapshot path still uses.
                 if rkeys.is_some() {
                     let rp = rp_id_hash;
-                    let Some(mut cred) = self.region_credential(rkeys.as_ref(), rp.as_ref(), id.as_slice())
+                    let Some((mut cred, slot)) =
+                        self.region_credential_at(rkeys.as_ref(), rp.as_ref(), id.as_slice())
                     else {
                         return Err(err(Ctap2Response::NoCredentials));
                     };
@@ -3715,16 +3716,21 @@ impl FidoApp {
                             cred.user_display_name = dn.clone();
                         }
                     }
-                    // **A second record, not an update of the first.** The region
-                    // has no in-place write: the new body is committed into the
-                    // slot the index already names, at the next generation, and
-                    // the index entry is rewritten to match. The tombstone slot
-                    // the first write used is reclaimed by the next compaction —
-                    // the same shape as the delete, and for the same reason
-                    // (`commit.rs` has no in-place update).
+                    // **The slot the lookup already named, at its next
+                    // generation.** An update must go through
+                    // `RegionCredentials::update_credential`, not `put`: `put`
+                    // allocates a second slot for the same credential ID and
+                    // leaves the old record and its index entry live, so the
+                    // passkey would enumerate twice and the capacity would lose
+                    // one slot per rename. `update` re-commits into `slot` and
+                    // rewrites its index entry — the same primitive the counter
+                    // bump uses.
                     let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
                     self.draw_random(&mut nonce);
-                    return match self.with_region(rkeys.as_ref(), |creds| creds.put(&nonce, &cred)) {
+                    return match self
+                        .with_region(rkeys.as_ref(), |creds| {
+                            creds.update_credential(&nonce, slot, &cred)
+                        }) {
                         Some(Ok(_)) => Ok(()),
                         _ => Err(err(Ctap2Response::NoCredentials)),
                     };
