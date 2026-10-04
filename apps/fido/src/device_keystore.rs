@@ -553,11 +553,11 @@ impl PrivateScalar {
     /// cleared rather than merely marked unusable" would be untestable — and an
     /// untestable security claim is an assertion in a comment.
     pub fn wipe(&mut self) {
-        #[cfg(not(target_arch = "arm"))]
+        #[cfg(all(feature = "host", not(target_arch = "arm")))]
         let was_nonzero = !self.is_zero();
         let bytes: &mut [u8; PRIVATE_KEY_LEN] = &mut self.0;
         bytes.zeroize();
-        #[cfg(not(target_arch = "arm"))]
+        #[cfg(all(feature = "host", not(target_arch = "arm")))]
         testing::record_dropped_scalar(*self.0, was_nonzero);
     }
 
@@ -583,11 +583,11 @@ impl Drop for PrivateScalar {
     /// clear, so that what it reports is evidence of the clear rather than of
     /// the clear having been skipped.
     fn drop(&mut self) {
-        #[cfg(not(target_arch = "arm"))]
+        #[cfg(all(feature = "host", not(target_arch = "arm")))]
         let was_nonzero = !self.is_zero();
         let bytes: &mut [u8; PRIVATE_KEY_LEN] = &mut self.0;
         bytes.zeroize();
-        #[cfg(not(target_arch = "arm"))]
+        #[cfg(all(feature = "host", not(target_arch = "arm")))]
         testing::record_dropped_scalar(*self.0, was_nonzero);
     }
 }
@@ -4531,13 +4531,18 @@ pub fn migrate_snapshot_to_region(
 /// zero keys, so a witness without the flag would be vacuous here more often
 /// than anywhere else in the tree. `fused_key::DropWitness` is the shape to
 /// copy, and `apps/fido/tests/credential_zeroize.rs` copies it.
-#[cfg(not(target_arch = "arm"))]
+// Gated on `host` **as well as** on the target arch. The arch gate alone was
+// not enough: `cargo check -p fapico2-firmware --release --features dbg-log`
+// builds this crate in its `device` (no_std) form on a host target, where
+// `not(target_arch = "arm")` is true and `std::thread_local!` has no `std` to
+// resolve against — so the US-922 release gate saw unrelated build errors
+// instead of the `compile_error!` it asserts.
+#[cfg(all(feature = "host", not(target_arch = "arm")))]
 pub mod testing {
     use core::cell::RefCell;
 
     /// What one dropped [`PrivateScalar`](super::PrivateScalar) held, recorded by
     /// its own `Drop` after its explicit zeroize ran.
-    #[cfg(not(target_arch = "arm"))]
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct DroppedScalar {
         /// Whether the buffer held anything before its zeroize ran.
