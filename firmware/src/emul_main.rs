@@ -136,7 +136,16 @@ static mut EMUL_FACTORY_RESET_HANDLER: EmulFactoryResetHandler = EmulFactoryRese
 /// and a blob from a build with a different field set is length-refused rather
 /// than reinterpreted. Every field is stored at the width `PhySnapshot` types
 /// it at, so nothing is truncated into a different value on the way through.
-const EMUL_RESCUE_PHY_LEN: usize = 9;
+/// The stand-in PHY record: nine fixed bytes, then two name slots of
+/// `1 + MAX_NUL_STRING_LEN` each (a presence byte followed by the padded
+/// name).
+///
+/// The nine are the fields `EmulRescueConfig::commit` has always written; the
+/// two name slots were added with `product`/`manufacturer`, which the device
+/// handler has always stored and this stand-in silently dropped. It is a
+/// private per-test file and nothing depends on its shape.
+const EMUL_RESCUE_PHY_LEN: usize = 9
+    + 2 * (1 + fapico2_platform::phy_tlv::MAX_NUL_STRING_LEN);
 
 struct EmulRescueConfig {
     cell: std::cell::RefCell<PhySnapshot>,
@@ -164,6 +173,17 @@ impl EmulRescueConfig {
                 snap.led_gpio = opt_byte(raw[5]);
                 snap.led_brightness = opt_byte(raw[6]);
                 snap.options = Some(u16::from_be_bytes([raw[7], raw[8]]));
+                let mut names = 9usize;
+                for slot in [&mut snap.product, &mut snap.manufacturer] {
+                    let present = raw[names] != 0;
+                    let width = fapico2_platform::phy_tlv::MAX_NUL_STRING_LEN;
+                    let mut buf = [0u8; fapico2_platform::phy_tlv::MAX_NUL_STRING_LEN];
+                    buf.copy_from_slice(&raw[names + 1..names + 1 + width]);
+                    if present {
+                        *slot = Some(buf);
+                    }
+                    names += 1 + buf.len();
+                }
             }
         }
         Self {
@@ -204,11 +224,43 @@ impl RescueConfigHandler for EmulRescueConfig {
             if update.enabled_usb_itf.is_some() {
                 s.enabled_usb_itf = update.enabled_usb_itf;
             }
+            // US-1553 follow-through: the two identity names are stored by the
+            // **device** handler (`boot.rs` writes `ks.phy.product` /
+            // `.manufacturer`) and `cmd_write` accepts both tags — but this
+            // stand-in dropped them, so on the emulator a product name vanished
+            // on write and the PhyConfig READ never showed one. picoforge sends
+            // `0x09` and `0x0F` on **every** save, so the stand-in was silently
+            // discarding two records the compatibility work depends on.
+            //
+            // Found by `tests/harness/test_rescue_write.py::
+            // test_no_tag_picoforge_can_emit_breaks_the_write`, which reads the
+            // record back after writing all twelve tags.
+            if update.product.is_some() {
+                s.product = update.product;
+            }
+            if update.manufacturer.is_some() {
+                s.manufacturer = update.manufacturer;
+            }
         }
+        // The stand-in's own medium. It is a private `/tmp` file per test, so
+        // extending it costs nothing and buys a restart that actually restores
+        // the names — the record above is not a device format and nothing
+        // depends on its shape.
         let s = *self.cell.borrow();
         let vid_pid = s.vid_pid.unwrap_or(0).to_be_bytes();
         let options = s.options.unwrap_or(0).to_be_bytes();
-        let raw = [
+        let name = |v: Option<[u8; fapico2_platform::phy_tlv::MAX_NUL_STRING_LEN]>| {
+            let mut out = [0u8; 1 + fapico2_platform::phy_tlv::MAX_NUL_STRING_LEN];
+            match v {
+                Some(n) => {
+                    out[0] = 1;
+                    out[1..].copy_from_slice(&n);
+                }
+                None => out[0] = 0,
+            }
+            out
+        };
+        let mut raw = vec![
             s.enabled_usb_itf.unwrap_or(0) as u8,
             vid_pid[0],
             vid_pid[1],
@@ -219,6 +271,8 @@ impl RescueConfigHandler for EmulRescueConfig {
             options[0],
             options[1],
         ];
+        raw.extend_from_slice(&name(s.product));
+        raw.extend_from_slice(&name(s.manufacturer));
         if std::fs::write(&self.path, raw).is_err() {
             // Nothing is acknowledged when the record did not reach the
             // medium: a `9000` here would tell the operator a configuration

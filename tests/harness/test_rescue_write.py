@@ -403,3 +403,73 @@ def test_an_empty_blob_is_a_legal_no_op_merge(tmp_path):
         assert parse_phy(blob)[TAG_LED_BRIGHTNESS] == bytes([42]), (
             "the empty merge must not have disturbed the record"
         )
+
+
+def test_no_tag_picoforge_can_emit_breaks_the_write(tmp_path):
+    """Every tag in the protocol, alone and all together, writes cleanly.
+
+    The reported failure was one tag in one blob. Proving that *one* tag is
+    skipped proves very little about a GUI that can emit **any** combination of
+    twelve, so this enumerates them.
+
+    picoforge's ``write_config`` (``src/hal/rescue/ops.rs``) emits a record for
+    every ``Some`` field in ``AppConfigInput``, and which fields are ``Some``
+    depends on what the operator touched: a vid/pid change alone, a LED driver
+    picked from the dropdown, a touch timeout typed into the field. So the set
+    of tags on the wire varies per save, and the write has to survive all of it.
+
+    Each record below is the tag at its **declared width** with a plausible
+    value, so a failure here is a capability refusal rather than a malformed
+    blob — malformed shapes are covered separately, by
+    :func:`test_malformed_writes_are_refused_on_their_own_terms`.
+    """
+    # tag -> value. Widths from `platform/src/phy_tlv.rs`'s own table.
+    every_tag = {
+        0x00: bytes([0x10, 0x50, 0x04, 0x07]),  # VidPid
+        0x04: bytes([0x0C]),                    # LedGpio
+        0x05: bytes([73]),                       # LedBrightness
+        0x06: bytes([0x00, 0x06]),               # Options
+        0x08: bytes([0x0A]),                     # PresenceTimeout — skipped
+        0x09: b"fapico2\x00",                    # UsbProduct
+        0x0A: bytes([0x00, 0x00, 0x00, 0x00]),  # Curves — skipped
+        0x0B: bytes([USB_ITF_CCID | USB_ITF_HID]),  # EnabledUsbItf
+        0x0C: bytes([0x01]),                     # LedDriver — skipped
+        0x0D: bytes([0x01]),                     # LedOrder — skipped
+        0x0E: bytes([0x04]),                     # LedNum — skipped
+        0x0F: b"Test\x00",                       # UsbManufacturer
+    }
+
+    with RescueEmu("write", tmp_path) as emu:
+        emu.select()
+
+        # Each tag alone.
+        for tag, value in every_tag.items():
+            data, sw = emu.send(write_phy(bytes([tag, len(value)]) + value))
+            assert sw == 0x9000, (
+                f"a write carrying only tag {tag:#04x} must succeed. Got {sw:04X} "
+                f"({data.hex()})"
+            )
+
+        # And all twelve at once — the worst case a save can produce, and the
+        # shape that refused everything before.
+        blob = b"".join(bytes([tag, len(v)]) + v for tag, v in every_tag.items())
+        data, sw = emu.send(write_phy(blob))
+        assert sw == 0x9000, (
+            f"a write carrying every one of the twelve tags must succeed. Got {sw:04X} "
+            f"({data.hex()})"
+        )
+
+        # The supported records landed and the unsupported ones changed nothing.
+        read, sw = emu.send(bytes([0x80, 0x1E, 0x01, 0x01, 0x00]))
+        assert sw == 0x9000
+        records = parse_phy(read)
+        for tag, value in every_tag.items():
+            if tag in TAGS_UNDESTINED:
+                assert tag not in records, (
+                    f"tag {tag:#04x} is skipped, so it must not appear in the READ"
+                )
+            else:
+                assert records.get(tag) == value, (
+                    f"tag {tag:#04x} should have been applied: wrote {value!r}, "
+                    f"read {records.get(tag)!r}"
+                )
