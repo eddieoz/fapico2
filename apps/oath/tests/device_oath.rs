@@ -2722,3 +2722,43 @@ fn the_raw_password_does_not_unlock_the_default_code() {
          password and no real client will ever get in. Got {sw:#04x} / {body:02x?}",
     );
 }
+
+/// **A store slot that is *present but empty* still provisions the default.**
+///
+/// The emulator boots over a store with no `oath.keystore.v1` entry at all, so
+/// it exercises the `NotFound` arm of `boot_in_place`. A **nuked** device is
+/// the other case: the partition has been erased but the entry may still be
+/// *present with zero length*, which takes the `Ok(0)` arm — `load_stream` on an
+/// empty slice, then provision. That second arm had no coverage at all.
+///
+/// Both must end with the same thing: the documented default access key, which
+/// is the only key a client can ever present.
+#[test]
+fn an_empty_but_present_keystore_slot_still_provisions_the_default() {
+    let mut store = HostSecureStore::new();
+    // Present, zero length.
+    store
+        .write(b"oath.keystore.v1", &[])
+        .expect("an empty record can be written");
+
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot over a present-but-empty slot must not fail");
+
+    let sel = select(&mut app);
+    let chal = select_challenge(&sel);
+    let key = picoforge_access_key(DEFAULT_ACCESS_CODE, &emul_device_id());
+    let (_, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &picoforge_validate_data(&key, &chal, &[3u8; 8])),
+    );
+    assert_eq!(
+        sw, 0x9000,
+        "a nuked-device boot must end up holding the client-derived default, whichever \\
+         `boot_in_place` arm it took"
+    );
+}
