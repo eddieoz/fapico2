@@ -394,6 +394,22 @@ const MAX_ACCESS_CODE: usize = 65;
 /// and the OATH section of `AGENTS.md` so no future reader mistakes it for
 /// defence in depth.
 pub const DEFAULT_ACCESS_CODE: &[u8] = b"123456";
+
+/// The derived access key's length: picoforge `ACCESS_KEY_LEN`, `yubikit`'s
+/// `_derive_key`.
+const DEFAULT_ACCESS_KEY_LEN: usize = 16;
+
+/// picoforge `PBKDF2_ITERS` / `yubikit`'s `_derive_key` iteration count.
+const DEFAULT_ACCESS_PBKDF2_ITERS: u32 = 1000;
+
+/// The key-type byte stored alongside the key: `TYPE_TOTP(0x20) | ALG_SHA1(0x01)`
+/// — exactly what `yubikit` sends in `SET_CODE`. `hmac_into` masks with
+/// `ALG_MASK`, so `0x21` selects SHA-1; stored verbatim so the record matches
+/// what a client would have written.
+const DEFAULT_ACCESS_KEY_TYPE: u8 = 0x21;
+
+/// SHA-1's output length — the PBKDF2 block size here (`hLen`).
+const SHA1_LEN: usize = 20;
 const FID_CRED_BASE: u16 = 0xBA00;
 const FID_CRED_MAX: u16 = FID_CRED_BASE + MAX_CREDS as u16 - 1;
 const FID_ACCESS_CODE: u16 = 0xBAFF;
@@ -702,6 +718,56 @@ fn nth_tlv(data: &[u8], tag: u8, nth: usize) -> Option<&[u8]> {
 
 /// HMAC into a fixed buffer; returns the digest length (C
 /// `mbedtls_md_hmac` over `key[2..]` callers pass the secret directly).
+/// `PBKDF2-HMAC-SHA1(password, salt, 1000, 16)` — what picoforge's
+/// `derive_access_key` and `yubikit/oath.py`'s `_derive_key` compute.
+///
+/// Present **only** to derive the one key [`Self::provision_default_access_code`]
+/// needs. In every other flow the host derives it and `SET_CODE` hands over the
+/// result, which is why `apps/oath/Cargo.toml` keeps `pbkdf2` a dev-dependency:
+/// pulling it in as a real one would drag `password-hash`/`sha2`/`alloc` onto
+/// the `no_std` thumbv8m build. So this is PBKDF2 written over the HMAC-SHA1
+/// the applet already has — PBKDF2 *is* a chained HMAC, and the parameters
+/// here are fixed (one output block, since `dkLen 16 ≤ hLen 20`), so the whole
+/// thing is a dozen lines rather than a dependency.
+///
+/// `tests/device_oath.rs::the_default_access_code_is_the_key_the_clients_derive`
+/// checks this against the `pbkdf2` crate, so a divergence from the reference
+/// is a test failure and not a GUI's.
+///
+/// Cost: 1000 HMAC-SHA1 iterations, once, and only when the device has no
+/// access code on file.
+fn pbkdf2_access_key(
+    password: &[u8],
+    device_id: &[u8],
+) -> [u8; DEFAULT_ACCESS_KEY_LEN] {
+    // U1 = HMAC(P, S || INT_BE32(1)); Ui = HMAC(P, U(i-1)); T = XOR of all.
+    // dkLen 16 <= hLen 20, so T is one block and there is no second block.
+    let mut seed = [0u8; DEVICE_ID_LEN + 4];
+    seed[..DEVICE_ID_LEN].copy_from_slice(device_id);
+    seed[DEVICE_ID_LEN..].copy_from_slice(&1u32.to_be_bytes());
+
+    let mut u = [0u8; SHA1_LEN];
+    let mut buf = [0u8; 64];
+    let mut acc = u;
+    hmac_into(ALG_SHA1, password, &seed, &mut buf).expect("SHA-1 HMAC fits its buffer");
+    u.copy_from_slice(&buf[..SHA1_LEN]);
+    acc.copy_from_slice(&u);
+    for _ in 1..DEFAULT_ACCESS_PBKDF2_ITERS {
+        // A separate buffer: `hmac_into` writes `out` while `data` borrows the
+        // previous block, so aliasing them would be a borrow error at best.
+        let mut next = [0u8; SHA1_LEN];
+        hmac_into(ALG_SHA1, password, &u, &mut buf).expect("SHA-1 HMAC fits its buffer");
+        next.copy_from_slice(&buf[..SHA1_LEN]);
+        u = next;
+        for (a, b) in acc.iter_mut().zip(u.iter()) {
+            *a ^= *b;
+        }
+    }
+    let mut out = [0u8; DEFAULT_ACCESS_KEY_LEN];
+    out.copy_from_slice(&acc[..DEFAULT_ACCESS_KEY_LEN]);
+    out
+}
+
 fn hmac_into(alg: u8, key: &[u8], data: &[u8], out: &mut [u8; 64]) -> Option<usize> {
     match alg & ALG_MASK {
         ALG_SHA1 => {
@@ -1024,11 +1090,22 @@ impl OathApp {
         if self.access_code.is_some() {
             return;
         }
+        // **The derived key, never the password.** Both first-party clients
+        // derive it host-side and send the derived bytes — picoforge
+        // `derive_access_key`, `yubikit/oath.py` `_derive_key`, both
+        // `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)` — and
+        // `apps/oath/Cargo.toml` states the contract outright: "the applet
+        // stores a *derived* key, never the password".
+        //
+        // Storing the password here produced a device that advertised the
+        // SELECT challenge (so the GUI reported "needs authentication") and
+        // then refused every VALIDATE with `0x6984`, because the only key any
+        // client will ever send is one this never held. Found on hardware.
+        let key = pbkdf2_access_key(DEFAULT_ACCESS_CODE, &self.device_id);
         let mut arr = [0u8; MAX_ACCESS_CODE];
-        arr[0] = ALG_SHA1;
-        let n = DEFAULT_ACCESS_CODE.len();
-        arr[1..=n].copy_from_slice(DEFAULT_ACCESS_CODE);
-        self.access_code = Some((arr, (n + 1) as u8));
+        arr[0] = DEFAULT_ACCESS_KEY_TYPE;
+        arr[1..=DEFAULT_ACCESS_KEY_LEN].copy_from_slice(&key);
+        self.access_code = Some((arr, (DEFAULT_ACCESS_KEY_LEN + 1) as u8));
     }
 
     fn refresh_session_grant(&mut self) {

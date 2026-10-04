@@ -144,6 +144,16 @@ OATH_AID = bytes.fromhex("A0000005272101")      # oath/src/oath.rs:389
 OATH_DEFAULT_ACCESS_CODE = b"123456"
 
 
+def _oath_device_id(select_body: bytes) -> bytes:
+    i = 0
+    while i + 1 < len(select_body):
+        tag, ln = select_body[i], select_body[i + 1]
+        if tag == 0x71:
+            return select_body[i + 2:i + 2 + ln]
+        i += 2 + ln
+    raise AssertionError(f"OATH SELECT served no 71 device-id: {select_body.hex()}")
+
+
 def _oath_challenge(select_body: bytes) -> bytes:
     i = 0
     while i + 1 < len(select_body):
@@ -155,9 +165,17 @@ def _oath_challenge(select_body: bytes) -> bytes:
 
 
 def authenticate_oath(emu) -> None:
-    """SELECT the OATH applet and VALIDATE with the default access code."""
-    chal = _oath_challenge(emu.select(OATH_AID))
-    mac = hmac.new(OATH_DEFAULT_ACCESS_CODE, chal, hashlib.sha1).digest()
+    """SELECT the OATH applet and VALIDATE with the default access code.
+
+    The device stores `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)` and the
+    salt is the `71` device-id TLV from this same SELECT — the derivation both
+    clients perform before they ever send a proof.
+    """
+    sel = emu.select(OATH_AID)
+    chal = _oath_challenge(sel)
+    device_id = _oath_device_id(sel)
+    key = hashlib.pbkdf2_hmac("sha1", OATH_DEFAULT_ACCESS_CODE, device_id, 1000, 16)
+    mac = hmac.new(key, chal, hashlib.sha1).digest()
     data = bytes([0x74, len(chal)]) + chal + bytes([0x75, len(mac)]) + mac
     _, sw = emu.transmit(bytes([0x00, 0xA3, 0x00, 0x00, len(data)]) + data)
     assert sw == 0x9000, f"OATH VALIDATE failed: SW={sw:04X}"

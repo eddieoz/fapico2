@@ -11,6 +11,7 @@ use fapico2_oath::OathSeal;
 use fapico2_platform::dispatch::{App, MAX_RESPONSE};
 use fapico2_platform::secure_store::{HostSecureStore, SecureStore, SecureStoreError};
 use fapico2_platform::trng::HostTrng;
+use sha1::Sha1;
 
 /// US-130: the emulation stand-in device-id every host test constructs with
 /// (`SHA-256(EMULATION_CHIPID)` truncated to 8). The `OathApp` constructors now
@@ -407,7 +408,13 @@ fn validate_data(challenge: &[u8], response: &[u8]) -> Vec<u8> {
 fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
     let sel = select(app);
     let chal = challenge_of(&sel);
-    let mac = hmac_sha1(fapico2_oath::oath_core::DEFAULT_ACCESS_CODE, &chal);
+    // **Derive, exactly as the clients do.** The access key is
+    // `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)` and the device-id is
+    // the SELECT response's `71` TLV. HMACing with the raw password works
+    // against a device that stores the password and against nothing else — which
+    // is how that bug reached hardware with a fully green suite.
+    let key = default_access_key();
+    let mac = hmac_sha1(&key, &chal);
     let mut data = vec![0x74, 8];
     data.extend_from_slice(&chal);
     data.extend_from_slice(&[0x75, mac.len() as u8]);
@@ -418,6 +425,17 @@ fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
         "VALIDATE with the default access code must grant — this is the flow both clients run"
     );
     body
+}
+
+/// `PBKDF2-HMAC-SHA1(DEFAULT_ACCESS_CODE, EMULATION_CHIPID-derived device-id,
+/// 1000, 16)` — picoforge `derive_access_key` / `yubikit` `_derive_key`.
+fn default_access_key() -> Vec<u8> {
+    pbkdf2::pbkdf2_hmac_array::<Sha1, 16>(
+        fapico2_oath::oath_core::DEFAULT_ACCESS_CODE,
+        &emul_device_id(),
+        1000,
+    )
+    .to_vec()
 }
 
 /// The 8-byte challenge from a SELECT response's `74` TLV.

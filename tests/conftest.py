@@ -694,6 +694,7 @@ def pin_gate_lifted_once(card):
 
 OATH_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
 OATH_DEFAULT_ACCESS_CODE = b"123456"
+OATH_TAG_DEVICE_ID = 0x71
 OATH_TAG_CHALLENGE = 0x74
 OATH_TAG_RESPONSE = 0x75
 OATH_INS_VALIDATE = 0xA3
@@ -726,21 +727,51 @@ def oath_select_challenge(select_body):
     return None
 
 
+def oath_derive_access_key(password, device_id):
+    """`PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)` — the client derivation.
+
+    Byte-identical to picoforge `derive_access_key` and `yubikit/oath.py`
+    `_derive_key`. The device **never** sees the password: it stores this
+    derived key, so HMACing with the raw password validates against nothing a
+    real client sends.
+    """
+    return _hashlib.pbkdf2_hmac("sha1", password, device_id, 1000, 16)
+
+
+def oath_select_device_id(select_body):
+    """The `71` device-id TLV out of a SELECT response — the PBKDF2 salt."""
+    i = 0
+    while i + 1 < len(select_body):
+        tag, ln = select_body[i], select_body[i + 1]
+        if tag == OATH_TAG_DEVICE_ID:
+            return bytes(select_body[i + 2:i + 2 + ln])
+        i += 2 + ln
+    return None
+
+
 def authenticate_oath(ccid_card, code=OATH_DEFAULT_ACCESS_CODE):
     """SELECT + VALIDATE, i.e. the client flow both first-party clients use.
 
     Mirrors ykman/yubikit and picoforge: read the challenge off the SELECT
-    response, answer it with HMAC-SHA1 of the access code (INS 0xA3, `74`
-    challenge + `75` proof), and every credential command is served until the
-    next host-issued SELECT drops the grant again.
+    response, answer it with HMAC-SHA1 of the **derived** access key (INS 0xA3,
+    `74` challenge + `75` proof), and every credential command is served until
+    the next host-issued SELECT drops the grant again.
+
+    The salt is the device-id from the same SELECT response — the `71` TLV the
+    applet documents as "the PBKDF2 salt a host uses for the access key".
     """
     # SELECT picks up the challenge; VALIDATE answers it. Same two steps the
     # clients take, so a test that calls this is exercising a reachable path.
-    chal = oath_select_challenge(select_oath_aid(ccid_card))
+    sel = select_oath_aid(ccid_card)
+    chal = oath_select_challenge(sel)
     assert chal is not None and len(chal) == 8, (
         "OATH SELECT served no VALIDATE challenge: %s" % (chal,)
     )
-    mac = _hmac.new(code, chal, _hashlib.sha1).digest()
+    salt = oath_select_device_id(sel)
+    assert salt is not None and len(salt) == 8, (
+        "OATH SELECT served no 71 device-id TLV: %s" % (sel,)
+    )
+    mac = _hmac.new(oath_derive_access_key(code, salt), chal, _hashlib.sha1).digest()
     data = [OATH_TAG_CHALLENGE, len(chal)] + list(chal) \
         + [OATH_TAG_RESPONSE, len(mac)] + list(mac)
     resp, sw1, sw2 = ccid_card.connection.transmit(

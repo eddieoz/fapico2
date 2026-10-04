@@ -192,6 +192,13 @@ def _set_code_tlv(code=ACCESS_CODE, chal=bytes(range(1, 9))):
 
 
 def _validate_tlv(code, chal):
+    """Proof over the challenge, using the **derived** access key.
+
+    `code` here is the raw password; the device holds
+    `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`, so the proof must be
+    made with that derivation and not with the password. Callers pass the
+    already-derived key (see `_authenticate`).
+    """
     proof = hmac.new(code, chal, hashlib.sha1).digest()[:20]
     return (
         bytes([TAG_CHALLENGE, len(chal)])
@@ -224,10 +231,18 @@ def _authenticate(client, code=DEFAULT_ACCESS_CODE):
     resp = _ccid(client, SELECT_OATH)
     if _sw(resp) != SW_OK:
         raise AssertionError(f"setup: SELECT failed: {resp.hex()}")
-    chal = _tlv(resp[:-2], TAG_CHALLENGE)
+    body = resp[:-2]
+    chal = _tlv(body, TAG_CHALLENGE)
     if chal is None or len(chal) != 8:
         raise AssertionError(f"setup: SELECT served no VALIDATE challenge: {resp.hex()}")
-    validate = _oath_apdu(INS_VALIDATE, data=_validate_tlv(code, chal))
+    # The device stores `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`; the
+    # salt is the `71` device-id TLV from this same SELECT. Deriving is what
+    # makes this the client handshake rather than a guess.
+    device_id = _tlv(body, TAG_NAME)
+    if device_id is None:
+        raise AssertionError(f"setup: SELECT served no 71 device-id TLV: {resp.hex()}")
+    key = hashlib.pbkdf2_hmac("sha1", code, device_id, 1000, 16)
+    validate = _oath_apdu(INS_VALIDATE, data=_validate_tlv(key, chal))
     resp = _ccid(client, validate)
     if _sw(resp) != SW_OK:
         raise AssertionError(f"setup: VALIDATE failed: {resp.hex()}")

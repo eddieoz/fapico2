@@ -584,7 +584,13 @@ def _authenticate_oath(client, code: bytes = OATH_DEFAULT_ACCESS_CODE) -> None:
     i = body.find(bytes([0x74, 8]))
     assert i >= 0, f"OATH SELECT served no 74 challenge: {body.hex()}"
     chal = body[i + 2:i + 10]
-    mac = hmac.new(code, chal, hashlib.sha1).digest()
+    # The device holds `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`; the
+    # salt is the `71` device-id TLV from this SELECT.
+    j = body.find(bytes([0x71, 8]))
+    assert j >= 0, f"OATH SELECT served no 71 device-id: {body.hex()}"
+    device_id = body[j + 2:j + 10]
+    key = hashlib.pbkdf2_hmac("sha1", code, device_id, 1000, 16)
+    mac = hmac.new(key, chal, hashlib.sha1).digest()
     data = bytes([0x74, 8]) + chal + bytes([0x75, len(mac)]) + mac
     _, sw = client.apdu(0x00, 0xA3, 0x00, 0x00, data=data)
     assert sw == 0x9000, f"OATH VALIDATE failed: SW={sw:04x}"

@@ -139,7 +139,13 @@ fn authenticate_with_default(app: &mut OathApp) -> Vec<u8> {
     let chal = tlv_find(&sel, 0x74)
         .expect("an app carrying an access code must advertise a 74 challenge TLV");
     assert_eq!(chal.len(), 8, "the 74 challenge is 8 bytes");
-    let mac = hmac_sha1(DEFAULT_ACCESS_CODE, &chal);
+    // Derive the way the clients do — `PBKDF2-HMAC-SHA1(password, device_id,
+    // 1000, 16)` — not HMAC with the raw password. The password only ever
+    // validates against a device that wrongly stores it.
+    let mac = hmac_sha1(
+        &picoforge_access_key(DEFAULT_ACCESS_CODE, &emul_device_id()),
+        &chal,
+    );
     let mut data = vec![0x74, 8];
     data.extend_from_slice(&chal);
     data.extend_from_slice(&[0x75, mac.len() as u8]);
@@ -2623,4 +2629,96 @@ fn reset_gates_are_the_magic_and_the_touch_and_nothing_else() {
     // can only be read through an authenticated session.
     authenticate_with_default(&mut app);
     assert!(table(&mut app).is_empty(), "the table really was wiped");
+}
+
+// ---------------------------------------------------------------------------
+// The provisioned default access code is the key the CLIENTS derive
+// ---------------------------------------------------------------------------
+
+/// The documented default password.
+const DEFAULT_OATH_PASSWORD: &[u8] = b"123456";
+
+/// **A device with no access code on file must hold the key picoforge and
+/// yubikit will hand it — not the password.**
+///
+/// This is the whole point of US-131 and the reason it is worth pinning at the
+/// provisioning site rather than only at `SET_CODE`. Both first-party clients
+/// derive the access key **host-side** and send the derived bytes:
+///
+/// * picoforge `derive_access_key` — `PBKDF2-HMAC-SHA1(password, device_id,
+///   1000, 16)`;
+/// * `yubikit/oath.py` — `_derive_key(salt, passphrase)`, byte-identical.
+///
+/// `apps/oath/Cargo.toml` states the contract in as many words: *"the applet
+/// stores a **derived** key, never the password"*. So the default code is not
+/// the string `123456`; it is `PBKDF2-HMAC-SHA1("123456", device_id, 1000, 16)`,
+/// and provisioning it with the raw password produces a device that advertises
+/// a challenge and then rejects the only key any client will ever send it.
+///
+/// **Observed on hardware, not hypothesised:** with the password stored raw,
+/// SELECT advertised the `74` challenge — so the GUI reported "needs
+/// authentication" — and every VALIDATE was refused `0x6984`
+/// (`SW_DATA_INVALID`, `cmd_validate`'s proof check).
+#[test]
+fn the_default_access_code_is_the_key_the_clients_derive() {
+    let mut store = HostSecureStore::new();
+    // A store with no OATH record: the not-found boot path, which is what a
+    // freshly-nuked device presents.
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
+
+    let sel = select(&mut app);
+    let challenge = select_challenge(&sel);
+
+    // Exactly what picoforge/yubikit send after the owner types `123456`.
+    let key = picoforge_access_key(DEFAULT_OATH_PASSWORD, &emul_device_id());
+    let (body, sw) = drive(
+        &mut app,
+        &apdu(0xA3, 0, 0, &picoforge_validate_data(&key, &challenge, &[7u8; 8])),
+    );
+    assert_eq!(
+        sw, 0x9000,
+        "VALIDATE with the client-derived key must grant. Got {sw:#04x} / {body:02x?} — the \
+         device is holding something other than `PBKDF2-HMAC-SHA1(password, device_id, 1000, 16)`",
+    );
+}
+
+/// **The raw password must not work** — the negative half, and the assertion
+/// that would have caught this in the first place.
+///
+/// Without it, a device that stored the password would still answer `0x9000`
+/// here and fail only against a real GUI, where the client always derives.
+#[test]
+fn the_raw_password_does_not_unlock_the_default_code() {
+    let mut store = HostSecureStore::new();
+    let mut app = OathApp::boot(
+        &mut HostTrng::new(),
+        &mut store,
+        emul_device_id(),
+        OathSeal::emul(),
+    )
+    .expect("boot");
+    let sel = select(&mut app);
+    let challenge = select_challenge(&sel);
+
+    let (body, sw) = drive(
+        &mut app,
+        &apdu(
+            0xA3,
+            0,
+            0,
+            &picoforge_validate_data(DEFAULT_OATH_PASSWORD, &challenge, &[7u8; 8]),
+        ),
+    );
+    assert_eq!(
+        sw, 0x6984,
+        "the password itself must not validate — the applet stores a derived key, never the \
+         password (apps/oath/Cargo.toml). If this answers 0x9000 the device is storing the \
+         password and no real client will ever get in. Got {sw:#04x} / {body:02x?}",
+    );
 }
