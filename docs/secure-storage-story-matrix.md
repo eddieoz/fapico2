@@ -56,49 +56,55 @@ fully contiguous.
 | US-1576 | TrustZone ADR | `4f24bc3` | `docs/adr/0003-trustzone.md`, indexed in `docs/adr/README.md` | verified (doc) |
 
 **41 verified, 1 partial, 0 unverified.**
-## The partial: US-1572
+## US-1572 — decided: the store key is the story; the OATH seal stays
 
-**Still partial. This was not resolved by the OATH compatibility work, which
-fixed a different problem** — client access and the credential-dump finding, not
-where the seal lives.
+**Owner decision, 2026-10-04: leave the OATH seal as it is.** This is a decision
+with a reason, not an unfinished item, and the reason is a product one that the
+engineering analysis had under-weighted:
+
+> *"leave as-is, because it is compatible with picoforge and yubikey, that
+> decrypt all oath's when entering the key and leave it open for the user to
+> search the otp it wants."*
+
+That is the load-bearing constraint. Both first-party clients **select from a
+decrypted table** — the applet hands over credential names so the user can pick
+the one they want, and only then is a code computed. `OathApp` therefore
+decrypts every credential into RAM at mount (`oath_core.rs:1543`,
+`self.slots[i] = self.cred_from_record(&record)`) and holds it in `Cred.key`, and
+nothing zeroizes that table — there is no `slots.*zeroize` in the file.
+
+So the resident plaintext is not incidental. It is what makes the GUI flow work.
+A decrypt-on-demand design would move the plaintext *inside* the seal's exposure
+window but change the client contract: the applet could no longer answer "which
+credentials do you have?" without first being told which one the user wants,
+and neither client asks in that order.
 
 | Half | State | Evidence |
 |---|---|---|
-| Store key, per-operation fused read | **done** | `platform/tests/fused_key.rs`, 7 tests: `each_use_reads_derives_and_drops`, `a_store_that_cannot_read_its_key_refuses_rather_than_degrading` |
-| OATH seal, per-operation fused read | **not done** | `apps/oath/src/oath_core.rs:940` still holds `seal: OathSeal` in the applet's `static mut` |
+| Store key → per-operation fused read | **delivered** | `platform/tests/fused_key.rs`, 7 tests: `each_use_reads_derives_and_drops`, `a_store_that_cannot_read_its_key_refuses_rather_than_degrading` |
+| OATH seal → per-operation fused read | **out of scope by decision** | `apps/oath/src/oath_core.rs:940` keeps `seal: OathSeal`; retained deliberately |
 
-### Why the conversion is not "the same conversion"
+### What the engineering review said, for the next reader
 
-`FusedKey` fuses **one** `[u8; 32]` per operation, which works for the store key
-because the store has a medium to read it back from — its own encrypted image.
-`OathSeal` has no such medium and is not one value: it is a three-field derived
-struct (`platform/src/ckey.rs:394-402`) — `kenc` and `nonce_key` from two
-different derivations over the same inputs, plus a 16-byte `aad` that is not key
-material at all. Converting it needs a container for a derived *struct*, and
-changes every `self.seal.*` use site in `apps/oath`.
+Both findings stand and are recorded so a future change does not rediscover them
+as surprises:
 
-### Why it is recommended **out of scope** rather than done
+1. **The conversion is not "the same conversion".** `FusedKey` fuses **one**
+   `[u8; 32]` per operation, which works for the store key because the store has
+   a medium to read it back from — its own encrypted image. `OathSeal` has no
+   such medium and is not one value: it is a three-field derived struct
+   (`platform/src/ckey.rs:394-402`) — `kenc` and `nonce_key` from two different
+   derivations, plus a 16-byte `aad` that is not key material at all. It would
+   need a container for a derived *struct*.
+2. **It would not close the exposure it appears to close.** With the plaintext
+   resident by design (above), fusing the seal closes one of two doors to the
+   same material, and would cost a per-operation OTP fuse read on the command
+   path that no test covers.
 
-Because it would not close the exposure it appears to close. `OathApp` decrypts
-**every** credential into RAM at mount (`oath_core.rs:1543`,
-`self.slots[i] = self.cred_from_record(&record)`) into `Cred.key`, and nothing
-zeroizes that table — there is no `slots.*zeroize` in the file.
-
-So the secrets the seal protects are already resident in the clear for exactly
-the same window as the seal. Fusing the seal would close one of two doors to the
-same plaintext, at the cost of a new container type, changes across two crates,
-and a per-operation OTP fuse read on the command path that no test covers.
-
-**What would actually help** is the opposite direction: decrypt one credential
-per operation and zeroize it afterwards — the US-1554 `CredentialWindow` shape
-FIDO already uses. That is a different piece of work in `apps/oath`, and it is
-explicitly **not** what US-1572 asks for.
-
-The exposure that would remain: 16 bytes of seal plus a nonce root, resident for
-one session and cleared on drop (`ckey.rs:390-393`). The store key was the
-larger exposure, and it is the one US-1572 closed. Also recorded in
-`platform/src/fused_key.rs` and in [`capacity.md`](capacity.md) §"Two stories that
-shipped partly".
+**Residual exposure, accepted:** 16 bytes of seal plus a nonce root, and the
+decrypted credential table, resident for one session. Cleared on drop
+(`ckey.rs:390-393`) where the platform supports it. The store key was the
+larger exposure and is the one this story closed.
 
 ## Four BDDs reconciled rather than met as written
 
