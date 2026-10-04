@@ -1376,8 +1376,13 @@ Berkeley summary (`arm-none-eabi-size`, `target/thumbv8m.main-none-eabi/release/
 
 ```
    text	   data	    bss	    dec	    hex	filename
- 809608	      0	 420380	1229988	  12c4a4	fapico2-firmware
+ 818476	      0	 421768	1240244	  12ecb4	target/thumbv8m.main-none-eabi/release/fapico2-firmware
 ```
+
+This block is **outside** the gated delimiters and is therefore the one place a
+reader can be told a stale number: it is hand-copied, so nothing checks it. It
+was found carrying `809608 / 420380`, which was 8,868 B of `text` and 1,388 B
+of `bss` out of date. The gated blocks above are the authoritative figures.
 
 Per-section (`arm-none-eabi-size -A`) — **`.data` and `.bss` listed
 separately, because Berkeley folds the `.data` load image into `text`**:
