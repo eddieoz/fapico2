@@ -130,11 +130,19 @@
 //! nothing observable on the bus.
 //!
 //! Worse, the client **can** write tags this firmware has nowhere to put. Of
-//! the twelve PHY tags, five have a field in the persisted record
-//! (`vendorff::PhyConfig`: `vid_pid`, `led_gpio`, `led_brightness`, `options`,
-//! `enabled_usb_itf`) and **seven do not**: `Curves` (`0x0A`),
-//! `PresenceTimeout` (`0x08`), `UsbProduct` (`0x09`), `LedDriver` (`0x0C`),
-//! `LedOrder` (`0x0D`), `LedNum` (`0x0E`), `UsbManufacturer` (`0x0F`). The
+//! the twelve PHY tags, **seven are handled** and **five are not**. Handled:
+//! the five with a field in the persisted record (`vendorff::PhyConfig`:
+//! `vid_pid`, `led_gpio`, `led_brightness`, `options`, `enabled_usb_itf`) plus
+//! the two identity strings `product` and `manufacturer`, which the device's
+//! config handler stores (`firmware/src/boot.rs`'s `DeviceRescueConfigHandler`
+//! gained those fields — `apps/tests/sw_universe.rs` records the transition).
+//! **Refused**: `Curves` (`0x0A`), `PresenceTimeout` (`0x08`), `LedDriver`
+//! (`0x0C`), `LedOrder` (`0x0D`) and `LedNum` (`0x0E`) — five, which is what
+//! `cmd_write` refuses and what `the_five_undestined_tags_are_refused_whole`
+//! pins. (An earlier revision of this paragraph said *seven* and listed
+//! `UsbProduct` and `UsbManufacturer` among the undestined; that was wrong on
+//! both counts and was what made `SUPPORTED_PHY_TAGS` look like the complete
+//! writable set.) The
 //! `0x41` path already refuses exactly that group with
 //! `CTAP2_ERR_UNSUPPORTED_OPTION` (`0x2B` — US-1528 corrected this from the
 //! `0x2A` this comment used to quote, which is a code the spec withdrew),
@@ -144,17 +152,27 @@
 //! (`picoforge/src/hal/fido/mod.rs:1001-1003`), so a silently-dropped record
 //! would be reported to the operator as a successful configuration change.
 //!
-//! **Decision: this applet takes §0.2 Option A — the undestined seven are
+//! **Decision: this applet takes §0.2 Option A — the undestined five are
 //! refused, whole, with `6A86`, and nothing in the blob is applied.** That is
 //! the same rule `0x41` applies and the only answer that does not lie to the
 //! client. The consequence is recorded here because it is a real functional
 //! limit, not an implementation detail: **a Rescue WRITE that carries any of
-//! those seven tags fails, including the tags next to it in the same blob.** The
-//! normal client path stays inside the writable set, because the client only
-//! round-trips tags the device *reported* on READ — and this applet reports
-//! exactly the five that have a destination (see below). A user who types a new
-//! product name into the client's Config screen gets an honest `6A86` rather
-//! than a success that changed nothing.
+//! those five tags fails, including the tags next to it in the same blob.** A
+//! user who types a new product name into the client's Config screen gets an
+//! honest `6A86` rather than a success that changed nothing.
+//!
+//! **The round-trip stays inside the writable set only because the client
+//! honours it — this applet cannot enforce it.** It used to be asserted here
+//! ("the client only round-trips tags the device *reported* on READ"), and that
+//! is false: picoforge rebuilt `raw_curves_mask` from widget state rather than
+//! from this read, manufacturing a `0x0A` record on **every** Apply Changes,
+//! which this applet then refused whole — silently discarding the vid/pid in
+//! the same blob. One user's vendor preset would not change, with the GUI
+//! reporting only `Write failed: [6A, 86]`, a status word that reads like a
+//! P1/P2 complaint and is not. The contract this applet can offer is the
+//! narrower one `encode_phy`'s docs now state: a tag it omits is a tag it does
+//! not serve, and a client must not invent one. Fixed on the client side; see
+//! `encode_phy` for the full account.
 //!
 //! The alternative, Option B (add the seven fields to the persisted record),
 //! stays refused. It is a change to the secure-snapshot codec with its own size
@@ -784,18 +802,31 @@ pub trait RescueDeviceHandler {
 /// then accept.
 pub const UNCONFIGURED_USB_ITF: u8 = USB_ITF_CCID;
 
-/// The tags this firmware has a field for, ascending — the only records a
-/// Rescue `WRITE` can apply and the only records `READ PhyConfig` emits.
+/// The tags a Rescue `WRITE` can apply, ascending — and the only records
+/// `READ PhyConfig` emits.
 ///
-/// Five of the twelve. The seven that are **not** here are refused whole by
-/// [`RescueApp::cmd_write`] with [`SW_WRONG_PARAMETERS`]; see the module docs'
-/// "What the WRITE can and cannot actually do" and threat model §0.2 / §10.3.
-pub const SUPPORTED_PHY_TAGS: [PhyTag; 5] = [
+/// Seven of the twelve: the five with a field in the persisted record, plus the
+/// two identity strings the device's config handler stores. The **five** that
+/// are not here are refused whole by [`RescueApp::cmd_write`] with
+/// [`SW_WRONG_PARAMETERS`]; see the module docs' "What the WRITE can and cannot
+/// actually do" and threat model §0.2 / §10.3.
+///
+/// Kept in step with `cmd_write`'s match arms deliberately: a reader that took
+/// this as "what the WRITE accepts" while `cmd_write` accepted more would reach
+/// the wrong conclusion about a `6A86` — which is how this list drifted once
+/// already, by omitting the two name tags.
+pub const SUPPORTED_PHY_TAGS: [PhyTag; 7] = [
     PhyTag::VidPid,
     PhyTag::LedGpio,
     PhyTag::LedBrightness,
     PhyTag::Options,
     PhyTag::EnabledUsbItf,
+    // Added with the identity-string fields the device's config handler gained.
+    // Before this, the list claimed to be "the only records a Rescue WRITE can
+    // apply" while omitting two records `cmd_write` accepts — and
+    // `apps/tests/sw_universe.rs` cites it as authority.
+    PhyTag::UsbProduct,
+    PhyTag::UsbManufacturer,
 ];
 
 /// The RS-Key Rescue applet.
@@ -911,13 +942,34 @@ impl RescueApp {
     /// `0x0000` mask as a real configured value.
     ///
     /// A record is emitted only if it has a destination, so the blob the client
-    /// reads back contains **only tags a Rescue `WRITE` will accept**. That is
-    /// deliberate and it is what keeps the normal client round-trip inside the
-    /// writable set: the client builds its write blob from the fields it
-    /// parsed from this read (`ops.rs:470-620`), so a tag this function does not
-    /// emit is a tag the client has no reason to send back
-    /// (`product_name` and `manufacturer_name` are filtered on empty, and
-    /// `led_order` / `led_num` / `raw_curves_mask` stay `None`).
+    /// reads back contains **only tags a Rescue `WRITE` will accept**.
+    ///
+    /// **That halves the round-trip but does not close it, and this paragraph
+    /// used to claim it did.** It previously asserted that "a tag this function
+    /// does not emit is a tag the client has no reason to send back". That is
+    /// false, and it was believed for long enough to cost a user a configuration
+    /// change: picoforge rebuilds `raw_curves_mask` from its **widget state**
+    /// rather than from this read, and compared `Some(0)` against the `None`
+    /// here as a difference — so every Apply Changes manufactured a `0x0A`
+    /// record, which `cmd_write` refuses **whole**, discarding the vid/pid
+    /// sitting in the same blob. The GUI reported
+    /// `Write failed: [6A, 86]`, a status word that reads like a P1/P2
+    /// complaint and is not: `0x6A86` is "this build does not serve that named
+    /// target" (see the module docs).
+    ///
+    /// The contract this read can actually offer is narrower, and is the one the
+    /// client is expected to honour: **a tag this function omits is a tag the
+    /// device does not serve, and a client must not invent one.** Omitting it
+    /// says "unsupported"; it does not say "unchanged, please write it back".
+    /// Synthesising a value for an unreported tag is the client's error, and it
+    /// is fixed on the client side — the refusal here is deliberate (the threat
+    /// model rules out accepted-and-ignored, which would report success for a
+    /// change that never happened).
+    ///
+    /// `product_name` and `manufacturer_name` are filtered on empty, and an
+    /// untouched control preserves its device value (`None`), so those do stay
+    /// `None`. `raw_curves_mask` did not, and that is the regression recorded
+    /// above.
     fn encode_phy(&self, snap: &PhySnapshot, out: &mut HeaplessVec<u8, MAX_RESPONSE>) {
         if let Some(v) = snap.vid_pid {
             // `(vid << 16) | pid` is the packed form; the wire is

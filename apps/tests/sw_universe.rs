@@ -1810,11 +1810,11 @@ fn rescue_owned_cases() -> Vec<Case> {
             vec![0x80, 0x1C, 0x01, 0x00, 0x04, 0x0B, 0x02, 0x00, 0x02],
             0x6700,
         ),
-        // A tag the protocol defines but this firmware has no field for
-        // (`SUPPORTED_PHY_TAGS` is five of the twelve). `0x0F` is
-        // `LedDriver` (`0x0C`), which still has no field in the persisted
-        // record, so it reaches the "this build has no field for it" group
-        // instead of being caught earlier by the width check. It was
+        // A tag the protocol defines but this firmware refuses to apply —
+        // `SUPPORTED_PHY_TAGS` is seven of the twelve and this is not one of
+        // them. `0x0F` is `LedDriver` (`0x0C`), which still has no field in the
+        // persisted record, so it reaches the "this build does not serve it"
+        // group instead of being caught earlier by the width check. It was
         // `UsbManufacturer` until that tag was given a field; the sweep
         // caught the change, which is what it is for — a named case whose
         // status changes is a behaviour change someone has to look at.

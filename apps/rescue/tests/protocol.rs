@@ -1123,3 +1123,62 @@ fn the_ins_and_cla_constants_are_the_client_bytes() {
     assert_eq!(READ_P1_SECURE_BOOT_STATUS, 0x03, "ReadParam::SecureBootStatus, constants.rs:162");
     assert_eq!(READ_P2_PHY_CONFIG, 0x01, "the read's P2, ops.rs:295");
 }
+
+/// **The vid/pid change the user asked for is discarded because another tag
+/// in the same blob is one this build refuses.**
+///
+/// This is the reproduction behind "Failed to apply configuration: Device
+/// Error: Write failed: [6A, 86]" when changing the USB vendor preset to
+/// YubiKey 5 (1050:0407). `cmd_write` collects the whole blob and refuses
+/// **whole** on the first tag with no destination
+/// (`apps/rescue/src/lib.rs`: `PhyTag::Curves | PresenceTimeout | LedDriver |
+/// LedOrder | LedNum => return SW_WRONG_PARAMETERS`), so a vid/pid record
+/// sitting in the same blob is thrown away with it.
+///
+/// The status word reads like a P1/P2 complaint and is not: `0x6A86` is this
+/// build's "I do not serve that named target" (the module docs say so), and
+/// picoforge prints the raw SW, so a tag refusal is indistinguishable from a
+/// parameter error at the GUI.
+///
+/// The two writes below differ by exactly one record and differ in outcome,
+/// which is what makes the cause unambiguous.
+#[test]
+fn one_refused_tag_discards_an_unrelated_vid_pid_change() {
+    // The write a user intends: YubiKey 5, 1050:0407. `00 04` is VidPid, and
+    // the value is vid:u16 BE then pid:u16 BE — `10 50 04 07`, not ASCII.
+    let vid_pid: [u8; 6] = [0x00, 0x04, 0x10, 0x50, 0x04, 0x07];
+
+    let mut h = Harness::populated();
+    let (_, sw) = h.drive(&write_apdu(&vid_pid));
+    assert_eq!(
+        sw, 0x9000,
+        "a vid/pid-only write succeeds. It is the record the user is actually \
+         trying to change, and it never failed on its own — the refusal came \
+         from the extra record in the real request"
+    );
+
+    // The same write with a `Curves` (0x0A) record appended — which is what
+    // picoforge emits on every save, because it re-synthesises the curves mask
+    // from widget state rather than from the read (its `Some(0) != None`).
+    let mut blob = vid_pid.to_vec();
+    blob.extend_from_slice(&[0x0A, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    let mut h2 = Harness::populated();
+    let (_, sw) = h2.drive(&write_apdu(&blob));
+    assert_eq!(
+        sw, 0x6A86,
+        "the same write carrying a Curves record is refused whole — and the \
+         vid/pid goes with it"
+    );
+
+    // The point of the test: the refusal is total, not partial. Nothing from the
+    // blob was applied, so the user's vendor preset silently did not change
+    // even though the record it carried was fine.
+    let (data, sw) = h2.read_phy();
+    assert_eq!(sw, 0x9000);
+    assert!(
+        !data.windows(6).any(|w| w == [0x00, 0x04, 0x10, 0x50, 0x04, 0x07]),
+        "the refused write applied nothing at all — the whole-blob refusal \
+         is what makes this a silent no-op rather than a partial one"
+    );
+}
+
