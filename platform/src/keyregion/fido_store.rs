@@ -421,6 +421,39 @@ fn fido_slot_at(index: u32) -> Result<Slot, FidoStoreError> {
 /// index entry.
 pub const MAX_RP_CREDENTIALS: usize = 16;
 
+/// The tombstone body: **one byte, `0xFF`**.
+///
+/// A delete is a commit whose target is this body, and the whole reason it is a
+/// record rather than an erase is `commit.rs`'s "Why there is no single-slot
+/// delete here": a target programmed `0xFF` is indistinguishable from a commit
+/// that never reached its witness, so `commit::recover` would resurrect the
+/// delete as a replay. A one-byte body is an ordinary record, so the delete is a
+/// normal atomic commit and the generation still advances — which is what keeps
+/// the next credential at this slot from spending a nonce the deleted one used.
+///
+/// **`0xFF` is unambiguous because a credential body cannot be one byte.** The
+/// applet's record body is a CBOR map (`DeviceCredential::encode`,
+/// `apps/fido/src/device_keystore.rs`), and CBOR major type 5 with an
+/// additional-information field of 31 is the *break* stop code, not a map with
+/// 31 entries — `cbor.rs`'s parser rejects it. So no credential body this store
+/// can hold begins with, or equals, this value. The same argument `oath_store.rs`
+/// makes for `TOMBSTONE_NAME_LEN`, over the same "an impossible field value"
+/// shape rather than a magic string.
+///
+/// The applet-side check is `FidoCredential::is_deleted` on the *opened*
+/// plaintext, never on the raw slot bytes: an erased slot reads as all-`0xFF`
+/// too, and treating those two as the same would make "never written" and
+/// "deleted" indistinguishable to a caller counting live credentials.
+pub const TOMBSTONE_BODY: [u8; 1] = [0xFF];
+
+/// Is this opened record body a tombstone?
+///
+/// Takes the **plaintext**, not the raw slot image — see [`TOMBSTONE_BODY`]'s
+/// last paragraph for why the raw image cannot answer this question.
+pub fn is_tombstone(body: &[u8]) -> bool {
+    body == TOMBSTONE_BODY.as_slice()
+}
+
 /// A [`SlotLocator`] over the real index, sealed under the PIN-free index key.
 ///
 /// This is the one `impl` [`on_demand::SlotLocator`] was designed to receive —
@@ -520,6 +553,17 @@ impl<'a> CredentialIdLocator<'a> {
     /// begins with the RP's `rp_id_hash` (CTAP 2.1 §5.8.3), so a caller that
     /// has one should hand it over rather than making the store scan.
     ///
+    /// **The `None` walk is bounded at [`MAX_RP_CREDENTIALS`] and stops there.**
+    /// That is not the same as "every FIDO entry" on a full device, and it is
+    /// stated rather than left implicit: a credential beyond the bound is
+    /// reported `Absent`, so a site with 17 passkeys cannot delete the 17th
+    /// through this path. The bound is a **stack** decision — the candidate array
+    /// is one [`Slot`] each, so 16 costs 32 B — and the alternative, a walk
+    /// proportional to capacity, turns one attacker-chosen credential ID into one
+    /// AEAD per index entry (856 of them). CTAP puts no limit on how many
+    /// passkeys one site may register, so this is a real limit; it is the
+    /// cheaper of the two, and the one whose cost is visible.
+    ///
     /// The payload key is here because this locator is what opens the
     /// candidates: without it the search would have to ask the index for the
     /// credential ID, which `index.rs` deliberately never stores. The cost is
@@ -563,30 +607,65 @@ impl SlotLocator for CredentialIdLocator<'_> {
     ) -> on_demand::Located {
         self.examined = 0;
         let mut candidates: [Slot; MAX_RP_CREDENTIALS] = [first_slot(); MAX_RP_CREDENTIALS];
-        let found = match self.rp_id_hash {
-            Some(ref hash) => index::lookup_all(
+        // **`rp_id_hash: None` is a domain-wide walk, not a lookup with a zero
+        // hash.** This used to call `index::lookup_all` with
+        // `RpIdHash::from_bytes([0u8; 32])`, which is wrong in a way that read
+        // as a working feature: `lookup_all` *verifies* each entry's tag against
+        // the hash it is handed, and no entry's tag is a MAC of an all-zero
+        // `rp_id_hash` — so the branch returned zero candidates for every input
+        // and every by-ID lookup without an RP silently answered "absent". Its
+        // own comment claimed the opposite ("`lookup_all` filters by domain but
+        // not by tag"), which is not what `lookup_all` does: the tag check is the
+        // body of its walk (`index.rs`, `lookup_all`).
+        //
+        // The fix is the one shape that is actually right for an unknown RP:
+        // enumerate the FIDO-domain entries structurally and apply the caller's
+        // probe to each. That is `fido_slots`, and it is the same walk
+        // `fido_entries` counts — one index scan, one 1 KiB image at a time, no
+        // allocation (`index.rs`, "Why the entry is 32 bytes").
+        //
+        // The result is **unauthenticated in its first step**: an entry is a
+        // candidate because it parses and names this domain, not because its tag
+        // verified against anything. That is safe here precisely because every
+        // candidate is then *opened* — `record::read` fails a tag — and the
+        // probe compares the credential ID out of the opened plaintext. A forged
+        // entry therefore buys an attacker one extra AEAD, not a credential.
+        let count = match self.rp_id_hash {
+            Some(ref hash) => match index::lookup_all(
                 self.index_key,
                 region,
                 KeyDomain::Fido,
                 hash,
                 &mut candidates,
-            ),
-            // No `rp_id_hash`: walk every FIDO entry. `index::lookup_all`
-            // filters by domain but not by tag, so a scan uses the domain-only
-            // enumeration and applies the probe to each — the same work, and the
-            // only way to answer without knowing the RP.
-            None => index::lookup_all(
-                self.index_key,
-                region,
-                KeyDomain::Fido,
-                &RpIdHash::from_bytes([0u8; index::RP_ID_HASH_LEN]),
-                &mut candidates,
-            ),
-        };
-        let count = match found {
-            SlotRead::Present(n) => n.min(MAX_RP_CREDENTIALS),
-            SlotRead::Fault(why) => return on_demand::Located::Fault(why),
-            SlotRead::Absent => return on_demand::Located::None,
+            ) {
+                SlotRead::Present(n) => n.min(MAX_RP_CREDENTIALS),
+                SlotRead::Fault(why) => return on_demand::Located::Fault(why),
+                SlotRead::Absent => return on_demand::Located::None,
+            },
+            None => {
+                let mut n = 0usize;
+                let mut ordinal = 0u32;
+                while ordinal < index::index_capacity() && n < MAX_RP_CREDENTIALS {
+                    let Some(slot) = index::entry_slot(ordinal) else {
+                        return on_demand::Located::Fault(index::E_INDEX_SLOT_UNREADABLE);
+                    };
+                    let raw = match region.read_slot(slot) {
+                        Ok(raw) => raw,
+                        Err(why) => return on_demand::Located::Fault(why),
+                    };
+                    let at = index::entry_offset(ordinal) as usize;
+                    if let SlotRead::Present(entry) =
+                        IndexEntry::decode(&raw[at..at + index::INDEX_ENTRY_BYTES])
+                    {
+                        if entry.domain() == KeyDomain::Fido {
+                            candidates[n] = entry.slot();
+                            n += 1;
+                        }
+                    }
+                    ordinal += 1;
+                }
+                n
+            }
         };
         for &slot in candidates.iter().take(count) {
             self.examined += 1;
@@ -652,6 +731,60 @@ pub struct PutReport {
     pub commit: CommitReport,
     /// The index slot the entry was written into.
     pub index_slot: Slot,
+}
+
+/// What one [`FidoRecordStore::delete`] did, so a caller can check the index
+/// half landed rather than trust the return value.
+///
+/// Returned for the same reason [`PutReport`] is: the gherkin's claims here are
+/// about the medium ("the slot is erased", "the credential is gone"), and a
+/// number a caller can assert is worth more than a comment asserting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteReport {
+    /// The slot the tombstone landed in.
+    pub slot: Slot,
+    /// The generation the tombstone carries — one past whatever was there.
+    pub generation: u32,
+    /// What the record commit did to the medium.
+    pub commit: CommitReport,
+    /// The index slot the first cleared entry was in.
+    ///
+    /// `None` when the slot had no entry at all — a record the index never knew
+    /// about, which [`FidoRecordStore::put`]'s fault table names as the orphan
+    /// case. Such a credential was already unfindable, so the delete is still
+    /// correct; the `None` is there so a caller can tell it from "an entry was
+    /// removed".
+    pub index_slot: Option<Slot>,
+}
+
+/// What one [`FidoRecordStore::compact`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// The live sector that was considered, reported even for a no-op so a
+    /// caller can tell "this sector was already full" from "you named a slot
+    /// outside FIDO's range" — which is an error, not a report.
+    pub sector: Slot,
+    /// Slots that are erased in the sector afterwards. **Zero means no erase was
+    /// issued at all**: the sector was already full, and the same discipline
+    /// `commit::recover`'s "nothing staged at all" follows.
+    pub slots_erased: u32,
+    /// Programs into the scratchpad: one per surviving record.
+    pub staged_programs: u32,
+}
+
+impl Default for CompactionReport {
+    /// An empty report. Never constructed by the library — the `Default` exists
+    /// so a caller writing `CompactionReport { sector, ..Default::default() }`
+    /// does not have to remember which half is optional. Named rather than
+    /// derived so the type stays `Copy` and 20 bytes rather than growing an
+    /// `Option<Slot>` the size of which is platform-dependent.
+    fn default() -> Self {
+        CompactionReport {
+            sector: first_slot(),
+            slots_erased: 0,
+            staged_programs: 0,
+        }
+    }
 }
 
 /// The FIDO credential store: one record per credential, nothing resident.
@@ -916,6 +1049,315 @@ impl FidoRecordStore<'_> {
         index::verify(index_key, self.region, KeyDomain::Fido, rp_id_hashes)
     }
 
+/// Every FIDO-domain index entry in the region, in index order.
+    ///
+    /// **Structural, and unauthenticated.** An entry is reported because it
+    /// parses and names `KeyDomain::Fido`; nothing here checks its tag, because
+    /// a tag can only be checked against an `rp_id_hash` the caller holds and
+    /// this signature has none — the same limit `index.rs` states for
+    /// [`inspect_region`](Self::inspect_index), whose `malformed` counter is the
+    /// operational half of the same answer.
+    ///
+    /// The count is what `remainingDiscoverableCredentialsCount` is computed
+    /// from, and that is a deliberate choice over counting *records*: the index
+    /// is what decides whether a credential can be found, so an entry is a
+    /// credential as far as the wire is concerned, and a record with no entry is
+    /// invisible to the user — the direction `FidoRecordStore::put`'s docs call
+    /// the safe one.
+    pub fn fido_entries(&mut self) -> SlotRead<u32> {
+        let mut found = 0u32;
+        let mut ordinal = 0u32;
+        while ordinal < index::index_capacity() {
+            let slot = match index::entry_slot(ordinal) {
+                Some(s) => s,
+                None => return SlotRead::Fault(index::E_INDEX_SLOT_UNREADABLE),
+            };
+            let raw = match self.region.read_slot(slot) {
+                Ok(raw) => raw,
+                Err(why) => return SlotRead::Fault(why),
+            };
+            let at = index::entry_offset(ordinal) as usize;
+            if let SlotRead::Present(entry) =
+                IndexEntry::decode(&raw[at..at + index::INDEX_ENTRY_BYTES])
+            {
+                if entry.domain() == KeyDomain::Fido {
+                    found += 1;
+                }
+            }
+            ordinal += 1;
+        }
+        SlotRead::Present(found)
+    }
+
+    /// How many FIDO credentials this region still has room for.
+    ///
+    /// [`FIDO_CAPACITY`](super::FIDO_CAPACITY) minus the live index entries, and
+    /// the expression the credMgmt `getMetadata` reply answers
+    /// `maxPossibleRemainingResidentCredentialsCount` with. It is a **count**,
+    /// not a promise: a tombstone left by an uncompacted delete still occupies
+    /// its slot, so it is excluded here exactly as it is excluded from the
+    /// allocator's free list — the two numbers come from the same two facts
+    /// (entries for the first, occupancy for the second), which is what keeps a
+    /// wire claim and the command path from disagreeing (AGENTS.md §4).
+    ///
+    /// `None` rather than `0` on a fault: "the index could not be read" is not
+    /// "the device is full", and reporting the latter would refuse enrolments
+    /// with a claim about capacity the device never established.
+    pub fn remaining_capacity(&mut self) -> Option<u32> {
+        match self.fido_entries() {
+            SlotRead::Present(used) => FIDO_CAPACITY.checked_sub(used),
+            SlotRead::Absent | SlotRead::Fault(_) => None,
+        }
+    }
+
+    /// Delete the credential in `slot`: a tombstone commit, then a cleared index
+    /// entry.
+    ///
+    /// # Order, and why a tombstone rather than an erase
+    ///
+    /// The record half first. `commit.rs` has no single-slot delete on purpose
+    /// ("Why there is no single-slot delete here") — an erased target is
+    /// indistinguishable from a commit that never reached its witness, so
+    /// `recover` would resurrect the delete as a replay. [`TOMBSTONE_BODY`] is an
+    /// ordinary record, so the delete is a normal atomic commit, and
+    /// `commit::commit`'s own generation check makes the replay impossible.
+    ///
+    /// The index half second, for the same ordering argument `put` uses: a
+    /// record with no entry is merely *unfindable*, while an entry naming a slot
+    /// whose record is a tombstone is a credential that reads as deleted on
+    /// every path — which is the direction we want if the power fails between
+    /// the two.
+    ///
+    /// `nonce` is the caller's, on the same terms as [`Self::put`]: unique per
+    /// `(key, slot, generation)`, and the generation is one past whatever the
+    /// slot already carried, so a nonce the deleted credential spent cannot be
+    /// spent again here.
+    pub fn delete(
+        &mut self,
+        payload_key: &PayloadKey,
+        slot: Slot,
+        nonce: &[u8; record::NONCE_LEN],
+    ) -> Result<DeleteReport, FidoStoreError> {
+        if !is_fido_slot(slot) {
+            return Err(FidoStoreError::RegionUnreadable(
+                "a delete named a slot outside the FIDO range",
+            ));
+        }
+        self.recover()?;
+        let current = self.record_generation(slot)?;
+        let generation = current
+            .checked_add(1)
+            .ok_or(FidoStoreError::Full)?;
+        let header = RecordHeader::new(Domain::Fido, slot, generation);
+        let sealed = record::seal(&header, payload_key.as_bytes(), nonce, &TOMBSTONE_BODY)
+            .map_err(FidoStoreError::Record)?;
+        let plan = CommitPlan::new(scratchpad_slot(), slot, Domain::Fido, generation);
+        let commit = commit::commit(self.region, plan, &sealed).map_err(FidoStoreError::Commit)?;
+        // The entry is cleared **by slot**, not by `(slot, generation)`: a
+        // caller deleting a credential it found may hold an entry written for
+        // an earlier generation of that slot, and leaving that one behind would
+        // keep the deleted credential findable on every enumeration. Every entry
+        // naming this slot is removed, because every one of them names a record
+        // that is now a tombstone.
+        let index_slot = clear_index_entries(self.region, slot)?;
+        Ok(DeleteReport { slot, generation, commit, index_slot })
+    }
+
+    /// The generation a record in `slot` currently carries; `0` for an empty or
+    /// unreadable slot.
+    ///
+    /// Read through [`record::decode`], so a torn record counts as no record and
+    /// therefore as generation 0 — the direction `commit.rs`'s `read_generation`
+    /// argues for: refusing to write over a corrupt record would leave the owner
+    /// permanently unable to enrol into that slot.
+    pub fn record_generation(&mut self, slot: Slot) -> Result<u32, FidoStoreError> {
+        let raw = self.region.read_slot(slot).map_err(FidoStoreError::RegionUnreadable)?;
+        Ok(match record::decode(slot, &raw) {
+            SlotRead::Present(decoded) => decoded.header().generation(),
+            SlotRead::Absent | SlotRead::Fault(_) => 0,
+        })
+    }
+
+    /// Free the slots of one sector that hold tombstones, leaving its live
+    /// records byte-identical.
+    ///
+    /// # Why a delete is not enough
+    ///
+    /// [`Self::delete`] makes the credential *gone* but leaves its slot occupied:
+    /// `FidoAllocator` reads occupancy out of the record header, and a tombstone
+    /// is a record, so the slot stays off the free list forever. Without this
+    /// operation a device that enrolled and deleted credentials would leak one
+    /// slot per delete until it refused an enrolment at a capacity it still has
+    /// room for — a wire claim about capacity the device does not honour, which
+    /// is the defect AGENTS.md §4 is about.
+    ///
+    /// # Why it takes the payload key
+    ///
+    /// **Because a tombstone is a record, not an erase, so nothing structural
+    /// distinguishes it.** The header of a deleted credential is a perfectly
+    /// good record header, and its slot is as occupied as a live one's. Telling
+    /// them apart means *opening* the body, and only the payload key can.
+    ///
+    /// That is the cost of the tombstone shape, and it is worth naming rather than
+    /// hiding: a compaction is [`SLOTS_PER_SECTOR`] AEAD operations. The
+    /// alternative — a `TOMBSTONE` bit in the record header, readable without a
+    /// key — was refused because the flags byte is part of what
+    /// [`record::RecordHeader`] authenticates into the AAD, so a new bit is a
+    /// format version, and because four AEADs on a path that runs once per delete
+    /// is not a cost worth a format change to avoid. `AGENTS.md` §5: take the
+    /// simpler one.
+    ///
+    /// # Why it is safe where a record commit would not be
+    ///
+    /// This is a **sector rewrite** — stage, erase, copy back — the same three
+    /// phases `write_index_entry` uses, and the same fault window (this file's
+    /// "The index write, and why it is not a `commit`"). It is nevertheless the
+    /// right shape here for a reason that does not apply to a record commit:
+    ///
+    /// * at every point before the erase, **nothing has changed** — the staged
+    ///   set is discarded and the tombstone survives;
+    /// * at every point after it, the staged set is a **complete** replacement
+    ///   for the live sector: every live mate is in it, and the freed slot is
+    ///   erased on both sides, which `commit::recover`'s replacement test scores
+    ///   as "identical" — so a cut is replayed, reproducing the compacted state
+    ///   byte for byte;
+    /// * a tombstone carries nothing that is not already gone (its index entry
+    ///   was cleared first), so **no cut point can lose a credential**.
+    ///
+    /// A record commit has none of that luxury: its target's *previous*
+    /// generation is destroyed by the erase with nothing to restore it, which is
+    /// the entire reason `commit.rs` stages through a scratchpad and refuses a
+    /// single-slot delete.
+    ///
+    /// # A slot that is not a FIDO record is left alone
+    ///
+    /// An erased slot is already free and is left erased. A slot holding another
+    /// domain's record, or one whose body does not open under the payload key, is
+    /// **kept verbatim** — not treated as freeable and not treated as absent. A
+    /// record this build cannot read still occupies its slot (US-1549's fail-closed
+    /// property), and compacting it away would destroy a credential nobody has
+    /// established is deleted.
+    ///
+    /// # Cost
+    ///
+    /// One scratchpad erase, one live erase, [`SLOTS_PER_SECTOR`] AEADs and one
+    /// program per surviving mate — paid **once per delete**, off the boot path
+    /// (S8/S9), and only for the sector the caller names. A sector with nothing to
+    /// free costs four reads and **no erase**, the same discipline
+    /// `commit::recover`'s "nothing staged at all" follows.
+    pub fn compact(
+        &mut self,
+        payload_key: &PayloadKey,
+        sector: Slot,
+    ) -> Result<CompactionReport, FidoStoreError> {
+        self.recover()?;
+        let live_base = commit::sector_base(sector);
+        if !is_fido_slot(live_base)
+            || commit::sector_base_index(scratchpad_slot()) == live_base.index() as u32
+        {
+            return Err(FidoStoreError::RegionUnreadable(
+                "a compaction named a sector that is not inside FIDO's range",
+            ));
+        }
+        let scratch_base = commit::sector_base(scratchpad_slot());
+
+        // Which slots survive, and whether anything is freeable. `keep` is the
+        // decision per slot; `freeable` is "at least one slot changed", which is
+        // the only thing that earns an erase.
+        let mut keep = [true; SLOTS_PER_SECTOR as usize];
+        let mut freeable = false;
+        let mut offset = 0u32;
+        while offset < SLOTS_PER_SECTOR {
+            let live = slot_in_sector(live_base, offset)?;
+            let raw = self.region.read_slot(live).map_err(FidoStoreError::RegionUnreadable)?;
+            match classify_slot(live, &raw, payload_key) {
+                // Already erased: nothing to do, and nothing to copy either.
+                SlotShape::Erased => {
+                    keep[offset as usize] = false;
+                }
+                // A tombstone: this is the slot the compaction exists to free.
+                SlotShape::Tombstone => {
+                    keep[offset as usize] = false;
+                    freeable = true;
+                }
+                // A live record, a foreign one, or one this build cannot open —
+                // all copied verbatim. See the doc's "A slot that is not a FIDO
+                // record is left alone".
+                SlotShape::Keep => {
+                    keep[offset as usize] = true;
+                }
+            }
+            offset += 1;
+        }
+        if !freeable {
+            // Nothing to free. **No erase** — the same discipline `commit`'s
+            // `recover` follows, so a compaction over a full sector costs four
+            // slot reads and no wear.
+            return Ok(CompactionReport {
+                sector: live_base,
+                slots_erased: 0,
+                staged_programs: 0,
+            });
+        }
+
+        // Stage. Every surviving slot is copied verbatim; the freed ones are left
+        // erased in the staged image, which is what makes the copy-back *erase*
+        // them rather than leave stale bytes.
+        self.region
+            .erase_sector(scratch_base)
+            .map_err(FidoStoreError::RegionUnreadable)?;
+        let mut programs = 0u32;
+        offset = 0u32;
+        while offset < SLOTS_PER_SECTOR {
+            if keep[offset as usize] {
+                let live = slot_in_sector(live_base, offset)?;
+                let bytes = self
+                    .region
+                    .read_slot(live)
+                    .map_err(FidoStoreError::RegionUnreadable)?;
+                self.region
+                    .program(slot_in_sector(scratch_base, offset)?, 0, &bytes)
+                    .map_err(FidoStoreError::RegionUnreadable)?;
+                programs += 1;
+            }
+            offset += 1;
+        }
+
+        self.region
+            .erase_sector(live_base)
+            .map_err(FidoStoreError::RegionUnreadable)?;
+
+        let mut erased = 0u32;
+        offset = 0u32;
+        while offset < SLOTS_PER_SECTOR {
+            let staged = slot_in_sector(scratch_base, offset)?;
+            let bytes = self
+                .region
+                .read_slot(staged)
+                .map_err(FidoStoreError::RegionUnreadable)?;
+            if !is_erased(&bytes) {
+                self.region
+                    .program(slot_in_sector(live_base, offset)?, 0, &bytes)
+                    .map_err(FidoStoreError::RegionUnreadable)?;
+            }
+            offset += 1;
+        }
+        // The count is what was **not** kept, not what the staged image happened
+        // to hold: an erased-and-kept slot is impossible (it is not kept), so the
+        // two agree, and deriving it from the decision rather than from the bytes
+        // means a bookkeeping slip cannot under-report what was freed.
+        for k in keep.iter() {
+            if !*k {
+                erased += 1;
+            }
+        }
+        // Best effort, for the reason `commit`'s step 7 is: the live sector is
+        // already correct, and a caller told `Err` would treat a rewrite that
+        // happened as one that did not.
+        let _ = self.region.erase_sector(scratch_base);
+        Ok(CompactionReport { sector: live_base, slots_erased: erased, staged_programs: programs })
+    }
+
     /// Erase every slot and entry this store owns.
     ///
     /// Wraps [`commit::wipe`] so a caller cannot wipe the records and leave the
@@ -1015,6 +1457,211 @@ pub fn write_index_entry(
     //     a write that *happened* as one that did not.
     let _ = region.erase_sector(scratch_base);
     Ok(target)
+}
+
+/// Remove every index entry naming `target`, and report the index slot the first
+/// one was in.
+///
+/// # Why this is a splice rather than a write
+///
+/// **NOR cannot set a bit back from 0 to 1.** An entry cell that has been
+/// programmed can only return to `0xFF` by erasing the sector it lives in — and
+/// an index slot is a whole 1 KiB sector's worth of cells, so "erase one entry"
+/// is "erase the sector and reprogram the other 31". That is the same
+/// read-modify-write [`write_index_entry`] performs, and it inherits exactly its
+/// fault table: a cut between the erase and the copy-back loses up to 31 entries,
+/// which makes up to 31 credentials **unfindable**. Nothing is destroyed — the
+/// records they name are still sealed in their slots, the allocator will not
+/// hand those slots out, and the user re-enrols.
+///
+/// # Why the sector-granular shape is not a defect
+///
+/// A deletion is precisely the operation for which a partially-lost index is
+/// least harmful: the entries most likely to be lost in the same sector are the
+/// ones a delete has just removed. And the atomicity would buy nothing against
+/// the only attacker who cares — one who can cut power between two flash
+/// instructions can also erase the index outright, with no window at all. See
+/// this file's module docs, "The index write, and why it is not a `commit`",
+/// which reaches the same conclusion for [`write_index_entry`].
+///
+/// # Matched by slot, not by `(slot, generation)`
+///
+/// See [`FidoRecordStore::delete`]: a caller may hold an entry written for an
+/// earlier generation of the slot it is deleting, and leaving that one behind
+/// would keep a deleted credential visible to every enumeration.
+fn clear_index_entries(
+    region: &mut dyn KeyRegion,
+    target: Slot,
+) -> Result<Option<Slot>, FidoStoreError> {
+    let want = target.index();
+    let mut first: Option<Slot> = None;
+    // One sector at a time, and as many passes as it takes. A slot's entry
+    // lands in a single index slot in practice — `write_index_entry` always
+    // takes the first erased cell, so entries fill densely and one delete touches
+    // one sector — but "in practice" is not a property a loop should depend on,
+    // and a second pass costs four slot reads when there is nothing to do.
+    let mut pass = 0u32;
+    while pass < INDEX_SLOT_COUNT {
+        pass += 1;
+        let Some(touched) = find_entry_sector(region, want)? else {
+            break;
+        };
+        if first.is_none() {
+            first = Some(touched);
+        }
+        rewrite_index_sector(region, touched, want)?;
+    }
+    Ok(first)
+}
+
+/// The index slot holding an entry that names `want`, if any.
+///
+/// Matches on **slot only**, deliberately: a delete is about the slot, and an
+/// entry left behind for an earlier generation of it would keep the deleted
+/// credential findable. The entry's own tag is not checked — a cell this build
+/// cannot parse is not this store's to interpret, and clearing it would destroy
+/// a record this build does not own.
+fn find_entry_sector(
+    region: &mut dyn KeyRegion,
+    want: u16,
+) -> Result<Option<Slot>, FidoStoreError> {
+    let mut s = 0u32;
+    while s < INDEX_SLOT_COUNT {
+        let slot = index::entry_slot(s * index::ENTRIES_PER_SLOT)
+            .ok_or(FidoStoreError::IndexUnreadable(index::E_INDEX_SLOT_UNREADABLE))?;
+        let raw = region.read_slot(slot).map_err(FidoStoreError::IndexUnreadable)?;
+        if index_slot_holds(&raw, want) {
+            return Ok(Some(slot));
+        }
+        s += 1;
+    }
+    Ok(None)
+}
+
+/// Does any cell of this index slot name `want`?
+fn index_slot_holds(raw: &SlotImage, want: u16) -> bool {
+    let mut n = 0u32;
+    while n < index::ENTRIES_PER_SLOT {
+        let at = index::entry_offset(n) as usize;
+        let cell = &raw[at..at + index::INDEX_ENTRY_BYTES];
+        if !IndexEntry::is_erased(cell) {
+            if let SlotRead::Present(e) = IndexEntry::decode(cell) {
+                if e.slot().index() == want {
+                    return true;
+                }
+            }
+        }
+        n += 1;
+    }
+    false
+}
+
+/// Erase `live`'s sector and reprogram it without any cell naming `want`.
+///
+/// Stage → erase → copy back, one slot image at a time — the same three phases
+/// and the same fault window as `write_index_entry`, for the reason this
+/// function's own docs give. The staged set is a complete replacement for the
+/// live sector at every cut point after the erase (the affected cells are erased
+/// on both sides), so `commit::recover` scores the staged sector as a legitimate
+/// replay rather than abandoning it.
+fn rewrite_index_sector(
+    region: &mut dyn KeyRegion,
+    live: Slot,
+    want: u16,
+) -> Result<(), FidoStoreError> {
+    let live_base = commit::sector_base(live);
+    let scratch_base = commit::sector_base(scratchpad_slot());
+    region
+        .erase_sector(scratch_base)
+        .map_err(FidoStoreError::IndexUnreadable)?;
+    let mut offset = 0u32;
+    while offset < SLOTS_PER_SECTOR {
+        let from = slot_in_sector(live_base, offset)?;
+        let mut bytes: SlotImage = region.read_slot(from).map_err(FidoStoreError::IndexUnreadable)?;
+        let mut n = 0u32;
+        while n < index::ENTRIES_PER_SLOT {
+            let at = index::entry_offset(n) as usize;
+            let cell = &bytes[at..at + index::INDEX_ENTRY_BYTES];
+            if !IndexEntry::is_erased(cell) {
+                if let SlotRead::Present(e) = IndexEntry::decode(cell) {
+                    if e.slot().index() == want {
+                        bytes[at..at + index::INDEX_ENTRY_BYTES].fill(ERASED_CELL_BYTE);
+                    }
+                }
+            }
+            n += 1;
+        }
+        if !is_erased(&bytes) {
+            region
+                .program(slot_in_sector(scratch_base, offset)?, 0, &bytes)
+                .map_err(FidoStoreError::IndexUnreadable)?;
+        }
+        offset += 1;
+    }
+
+    region
+        .erase_sector(live_base)
+        .map_err(FidoStoreError::IndexUnreadable)?;
+
+    offset = 0u32;
+    while offset < SLOTS_PER_SECTOR {
+        let staged = slot_in_sector(scratch_base, offset)?;
+        let bytes = region.read_slot(staged).map_err(FidoStoreError::IndexUnreadable)?;
+        if !is_erased(&bytes) {
+            region
+                .program(slot_in_sector(live_base, offset)?, 0, &bytes)
+                .map_err(FidoStoreError::IndexUnreadable)?;
+        }
+        offset += 1;
+    }
+    let _ = region.erase_sector(scratch_base);
+    Ok(())
+}
+
+/// The byte an erased index cell holds.
+///
+/// Spelled out here rather than imported from `index.rs` or `slotmap.rs`: both
+/// name the same `0xFF` for the same physical reason (an erased NOR cell reads
+/// all-ones, `host.rs:73`, `device_region.rs`'s `nor::ERASED_BYTE`), and this
+/// function writes it into a *cell* rather than a slot, which no existing
+/// constant names. `IndexEntry::is_erased` is the reader that pairs with it.
+const ERASED_CELL_BYTE: u8 = 0xFF;
+
+/// What one slot holds, for the compaction decision.
+enum SlotShape {
+    /// Pristine — nothing was ever written, or a compaction already freed it.
+    Erased,
+    /// A FIDO record whose opened body is [`TOMBSTONE_BODY`].
+    Tombstone,
+    /// Anything else: a live credential, another domain's record, or a record
+    /// this build cannot open.
+    Keep,
+}
+
+/// Classify one slot for compaction.
+///
+/// **The payload key is required**, and that is the whole reason
+/// [`FidoRecordStore::compact`] takes one: a tombstone is an ordinary record
+/// header, so nothing structural separates it from a live credential. A record
+/// that fails to open is [`SlotShape::Keep`] and never [`SlotShape::Erased`] —
+/// a credential this build cannot read still occupies its slot, and compacting
+/// it away would destroy a credential nobody has established is deleted (US-1549's
+/// fail-closed property).
+fn classify_slot(slot: Slot, raw: &SlotImage, payload_key: &PayloadKey) -> SlotShape {
+    if is_erased(raw) {
+        return SlotShape::Erased;
+    }
+    let SlotRead::Present(decoded) = record::decode(slot, raw) else {
+        // A corrupt header is not evidence of a delete, so the slot is kept.
+        return SlotShape::Keep;
+    };
+    if decoded.header().domain() != Domain::Fido {
+        return SlotShape::Keep;
+    }
+    match record::open(decoded.header(), payload_key.as_bytes(), decoded.body()) {
+        SlotRead::Present(pt) if is_tombstone(pt.as_slice()) => SlotShape::Tombstone,
+        _ => SlotShape::Keep,
+    }
 }
 
 /// The first erased cell of the index, as `(slot, byte offset within it)`.

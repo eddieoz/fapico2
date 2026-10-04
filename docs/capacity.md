@@ -43,8 +43,11 @@ The layout and every assertion about it are in
 | record slot | 1 KiB | largest sealed record (836 B) + 16 B header + 128 B margin, rounded up |
 | slots per NOR sector | 4 | 4 KiB erase granularity ÷ 1 KiB slot |
 | total slots | 960 | region ÷ slot |
-| **FIDO resident credentials** | **892** | total slots − OATH's slots |
-| **OATH credentials** | **68** | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the RAM array and nothing else |
+| OATH reservation | 68 | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the RAM array and nothing else |
+| commit scratchpad | 4 | one whole NOR sector, staged through (US-1544) |
+| index reservation | 32 | `index::INDEX_SLOT_COUNT` — one entry per slot in the region, rounded up to whole sectors |
+| **FIDO resident credentials** | **856** | 960 − 68 − 4 − 32 |
+| **OATH credentials** | **68** | as above |
 
 Raising either capacity requires a region that fits it; the compile-time
 assertions in `keyregion/mod.rs` stop the build otherwise. That is the whole
@@ -53,21 +56,56 @@ point — the old failure was a constant no region could contradict.
 **No slot is reserved.** The epic proposed leaving ~500 KB spare; with
 per-record commits there is nothing to spend it on, because the spare existed
 to hold both generations of a double-buffered rewrite, which is exactly the
-cost this design removes. Capacity runs 3.5× the acceptance floor instead, and
+cost this design removes. Capacity runs 3.3× the acceptance floor instead, and
 acceptance criterion 2's "≥500 KB spare" is therefore **not met, deliberately**.
 
-## Still true
+## The 856 is measured, not asserted (US-1563)
 
-- **The compiled-in FIDO attestation key is a public, self-signed development
-  key**; production devices generate per-device keys via TRNG.
-- **U2F credentials are stateless.**
+The table above is a **derivation**. It says the region is 960 slots and the
+four reservations tile it — and the compile-time assertions in
+`keyregion/mod.rs` check that the tiling is exact. What it does *not* say is
+that one enrolment really consumes one slot: a commit could strand a slot, a
+delete could leak one, an index write could fail and orphan a record.
+
+So the number is **run to**:
+[`apps/fido/tests/capacity_boundary.rs`](../apps/fido/tests/capacity_boundary.rs)
+enrols credentials until the first refusal and checks four things:
+
+| claim | check |
+|---|---|
+| the device enrols 856 | each one is written **and read back byte-identically**, with its private key and RP compared |
+| the 857th is refused | `RegionCredentialError::Full` → CTAP2 `0x28` (`KEY_STORE_FULL`) |
+| the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the four terms sum to `TOTAL_SLOTS` |
+| nothing partial is left | exactly 856 slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
+
+**Measured: 856.** Every record in that run is a real `DeviceCredential`
+encoded by the applet's own codec at its maximum field sizes (63-byte RP ID,
+58-byte `user.name`, 43-byte `displayName`, 64-byte `user.id`, 32-byte
+`credBlob`, `largeBlobKey`, `hmac-secret`) — 596 bytes sealed, against the
+836-byte bound the stride was sized from. A boundary measured over filler would
+be a boundary for the filler.
+
+The fixture was not always this. Two defects it caught, both of which are the
+kind a derivation cannot see:
+
+* an RP ID built with `n.to_le_bytes()` produced `0x80` at credential 128, and
+  `push_tstr` — correctly — refused the record. A CBOR `tstr` is a UTF-8 string;
+  a fixture that is not one is not measuring a credential.
+* a compaction pass originally identified freeable slots by asking which were
+  **erased**, which is never true after a delete — a tombstone is a record. It
+  reported "nothing to free" over a sector that was full of them, and the freed
+  slot was never reused.
+
+`capacity_docs_carry_the_measured_number` in the same file reads **this
+document** and fails if `856` is not in it. That is the gate the section below
+says this file does not otherwise have.
 
 ## What this document is not
 
-It has no gate. No script and no workflow reads it, which is the same failure
-mode as the 8,432 B and "~42 credentials" claims that survived as long as they
-did. `check_flash_budget.py` (US-1534) gates the flash map; this file is the
-prose view of the same numbers and can drift from it.
+It has no gate — with one exception, added above: the US-1563 test reads this
+file and fails if the measured figure is absent. Everything else here is the
+prose view of numbers that can drift. `check_flash_budget.py` (US-1534) gates
+the flash map; this file has no equivalent for the other rows.
 
 Related: the keystore capacity layers and the durable-ack latch are recorded in
 [`docs/known-gate-divergences.md`](known-gate-divergences.md) under SF-1

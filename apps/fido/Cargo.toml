@@ -149,3 +149,17 @@ required-features = ["host"]
 [[test]]
 name = "r2_keystore_decode"
 required-features = ["host"]
+
+# US-1563: the measured capacity boundary. Runs the region to its limit and
+# checks the refusal, so the number in `docs/capacity.md` is a measurement and
+# not an assertion. Deliberately **not** `#[ignore]`d — an unrun measurement is
+# an assertion, which is the defect this file exists to close.
+[[test]]
+name = "capacity_boundary"
+required-features = ["host"]
+
+# US-1556: delete, tombstone and compaction on the region, through the applet's
+# own credential codec rather than synthetic blobs.
+[[test]]
+name = "region_delete_compaction"
+required-features = ["host"]

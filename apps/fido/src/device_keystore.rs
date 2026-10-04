@@ -49,7 +49,13 @@ use crate::vendorff::{
     IdentityName, LedConf, PHY_FIELD_ENABLED_USB_ITF, PHY_FIELD_LED_CONF, PHY_FIELD_MANUFACTURER,
     PHY_FIELD_PRODUCT,
 };
-use fapico2_platform::keyregion::FIDO_CAPACITY;
+use fapico2_platform::keyregion::commit::CommitError;
+use fapico2_platform::keyregion::crypto::{IndexKey, PayloadKey};
+use fapico2_platform::keyregion::fido_store::{self, FidoRecordStore};
+use fapico2_platform::keyregion::index::RpIdHash;
+use fapico2_platform::keyregion::on_demand::{self, CredentialWindow, SlotQuery};
+use fapico2_platform::keyregion::record;
+use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead, FIDO_CAPACITY, FIDO_RECORD_MAX};
 use fapico2_platform::secure_store::{chunked, SecureStore, SecureStoreError};
 use heapless::Vec as HeaplessVec;
 
@@ -122,6 +128,29 @@ pub const SNAPSHOT_MAX_CREDS: usize = 12;
 /// (US-1554's follow-through) these lists become a cursor into the key region's
 /// index and this constant goes away with them.
 pub const MAX_PENDING_CREDENTIAL_IDS: usize = 12;
+
+/// How many of one RP's slots a region enumeration will name at once.
+///
+/// The **slot** list, not the credential list: each element is one `Slot` (two
+/// bytes), so 32 costs 64 B of stack — where a `MAX_PENDING_CREDENTIAL_IDS`-sized
+/// *credential* list would cost the same 64 bytes of pointers and then 32 x 720 B
+/// of `DeviceCredential` behind them, one opened at a time.
+///
+/// It is 32 and not 12 for a reason worth stating: the enumeration has two bounds
+/// and this is the one that fires **first**. `MAX_PENDING_CREDENTIAL_IDS` limits
+/// what the device can *serve* in one `getAssertion` (12 assertions, then
+/// `getNextAssertion`); this limits what it can *see*. A site with 20 resident
+/// passkeys must have all 20 enumerable by credential management even though a
+/// single assertion returns at most 12 of them — so the two constants answer
+/// different questions and are deliberately not the same number.
+///
+/// The residual limit is real and is stated rather than hidden: a site with more
+/// than 32 resident passkeys has the tail unreachable by enumeration, and the
+/// device answers `LIMIT_EXCEEDED` rather than truncating. CTAP 2.1 puts no bound
+/// on how many passkeys one relying party may register, so this is a genuine
+/// ceiling — chosen for stack cost, and cheap to raise because it is one constant
+/// and no record format depends on it.
+pub const MAX_ENUMERATED_SLOTS: usize = 32;
 /// US-1011: how many signature-counter bumps may accumulate in RAM before the
 /// whole keystore image is rewritten to the store.
 ///
@@ -2140,6 +2169,707 @@ impl DeviceKeystore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// US-1555 / US-1563 — the per-record region backend (US-1552's applet half)
+// ---------------------------------------------------------------------------
+
+/// Why a region-backed credential operation did not happen.
+///
+/// Three states and no more, for the reason `AGENTS.md` §4 makes load-bearing:
+/// a wire claim the device cannot honour is the defect, so "we could not find
+/// out" ([`Self::Unreachable`](Self::Unreachable)) is never folded into "there is
+/// nothing there". `device_keystore.rs`'s old `Result<(), ()>` could not express
+/// that distinction, and the credMgmt `getMetadata` reply is exactly where it
+/// would be visible to a user as a device claiming a full store it had not
+/// measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionCredentialError {
+    /// **No region, or the region could not be reached.** `boot::key_region()`
+    /// answers `None` before `release_key_region()`, and S8/S9 require the applet
+    /// to cope rather than halt — so this degrades to an empty credential set
+    /// and a clean CTAP error, never a panic and never `fatal_boot`.
+    ///
+    /// `reason` is the transport's own `&'static str`, or a named constant
+    /// below for the "no region installed" case.
+    Unreachable(&'static str),
+    /// Every slot in FIDO's range is occupied, tombstoned or not.
+    Full,
+    /// The credential does not fit the record the slot stride can hold.
+    TooLarge {
+        /// What was offered.
+        len: usize,
+        /// The bound: `FIDO_RECORD_MAX` (836).
+        max: usize,
+    },
+    /// No credential with this ID exists.
+    NoSuchCredential,
+    /// The record would not encode or decode as a credential.
+    ///
+    /// A fact about the data, never about the transport — the same split
+    /// `record::read` draws.
+    Malformed,
+    /// The commit, seal or index write failed.
+    Store(fido_store::FidoStoreError),
+}
+
+/// The `"no region installed"` reason string for [`RegionCredentialError::Unreachable`].
+///
+/// A named constant rather than an inline literal so a log line and a test can
+/// match on it, and so the "the boot path has not released the region" case is
+/// distinguishable from a flash that is genuinely failing — the S10 obligation
+/// to *report* rather than halt.
+pub const E_NO_REGION: &str =
+    "fido: the key region is not reachable (not installed, or not yet released)";
+
+/// The record body one FIDO credential occupies, as a CBOR map.
+///
+/// **The same map the snapshot codec writes**, not a second format. That is the
+/// point of reaching for [`DeviceCredential::encode`] rather than defining a
+/// region-specific layout: `AGENTS.md` §5 names "two formats for one thing" as
+/// the defect class this epic keeps finding (`DEVICE_MAX_CREDS` against the
+/// region; two AAD builders in `record.rs`/`crypto.rs`). One credential has one
+/// encoding, and a record is that encoding sealed.
+///
+/// The `None` key is load-bearing and not merely "the legacy path":
+/// [`DeviceCredential::encode`]'s `key` parameter seals the four sensitive
+/// fields (private key, credBlob, largeBlobKey, hmacSecret) with US-911's
+/// per-field AEAD. Inside a region record that would be **sealing twice** — the
+/// whole body is already one AEAD under the payload key, with an AAD naming the
+/// slot, the generation and the domain. A second inner layer buys no
+/// confidentiality and costs 4 × 28 bytes of every record's 836, which is
+/// capacity taken from the user to protect data the outer layer already protects.
+/// So the region's record body is the *plaintext* form, and the single
+/// confidentiality boundary is `record::seal`.
+///
+/// `FIDO_RECORD_MAX` (836) is `mod.rs`'s measured bound for exactly this shape,
+/// and `assert_credentials_fit_the_record` below fails the build if it stops
+/// being true.
+pub const CREDENTIAL_RECORD_MAX: usize = FIDO_RECORD_MAX as usize;
+
+/// Serialize one credential into a region record body.
+///
+/// `None` on an encode failure or on a body larger than
+/// [`CREDENTIAL_RECORD_MAX`] — refused rather than truncated, for the reason
+/// `mod.rs`'s stride assertion gives: a record written short is a credential
+/// that silently lost a field.
+pub fn credential_record_body(cred: &DeviceCredential) -> Option<HeaplessVec<u8, CREDENTIAL_RECORD_MAX>> {
+    let mut out: HeaplessVec<u8, CREDENTIAL_RECORD_MAX> = HeaplessVec::new();
+    // `None` key: the outer record AEAD is the confidentiality boundary. See
+    // `CREDENTIAL_RECORD_MAX`'s docs.
+    cred.encode(None, &mut out).ok()?;
+    Some(out)
+}
+
+/// The CBOR **map** inside a credential record body, or `None`.
+///
+/// # Why a strip is needed at all
+///
+/// [`DeviceCredential::encode`] writes its map *wrapped in a bstr* — it ends
+/// with `no_heap::push_bstr(out, &body)` — because the host interchange snapshot
+/// stores each credential as one element of an array of byte strings
+/// ([`DeviceKeystore::to_cbor`]). [`DeviceCredential::decode`] correspondingly
+/// expects the **unwrapped** map, and the snapshot decoder hands it the element
+/// its own CBOR parser already unwrapped (`device_keystore.rs:1339`).
+///
+/// A region record has no array around it, so nothing unwraps the bstr for us.
+/// Storing the bstr-wrapped bytes and stripping them on read keeps **one**
+/// encoding — the applet's own — rather than introducing a region-specific
+/// layout that happens to hold the same map under different framing. That is
+/// the `AGENTS.md` §5 argument again: two framings for one record is how a
+/// future field ends up written through one and read through the other.
+///
+/// The strip is strict — a bstr header, then exactly the rest of the buffer.
+/// Truncated or over-long framing is refused rather than clamped, because a body
+/// whose framing does not describe its content is a fact about the data.
+pub fn credential_map_in_body(body: &[u8]) -> Option<&[u8]> {
+    match Parser::new(body).next() {
+        Ok(Item::B(inner)) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Parse one credential out of a region record body.
+///
+/// `None` on anything that is not a well-formed credential map, which is also
+/// how a **tombstone** is recognised — see [`is_deleted_body`].
+///
+/// A record that fails here is a fact about the data and costs itself alone
+/// (US-1549's fail-closed property); it is not turned into "the store is empty",
+/// because that is the memoization US-1573 exists to prevent.
+pub fn credential_from_record_body(body: &[u8]) -> Option<DeviceCredential> {
+    if is_deleted_body(body) {
+        return None;
+    }
+    let map = credential_map_in_body(body)?;
+    // `None` key and `sealed = false`: the plaintext form `encode` wrote. See
+    // `CREDENTIAL_RECORD_MAX`'s docs.
+    DeviceCredential::decode(map, None, false)
+}
+
+/// Is this opened record body a tombstone?
+///
+/// A one-byte `0xFF` body — `fido_store::TOMBSTONE_BODY`, and the reason it is
+/// unambiguous is that file's. Named here so a caller counting live credentials
+/// does not have to reach into the store for one predicate, and so the check is
+/// made on **plaintext**: an erased slot reads as all-`0xFF` too, and treating
+/// "never written" as "deleted" would make the two indistinguishable to a count.
+pub fn is_deleted_body(body: &[u8]) -> bool {
+    fido_store::is_tombstone(body)
+}
+
+/// Recognises a credential ID inside an opened record's plaintext.
+///
+/// The applet's half of [`fido_store::CredentialProbe`]. It is a *second* copy
+/// of the CBOR map's key-1 read, and that is a real cost — so it is stated
+/// rather than hidden: the alternative, having the store carry the applet's
+/// layout, is what `CredentialProbe`'s own docs refuse ("a second parser here
+/// would be a second definition of a record's contents"). One short walk that
+/// stops at key 1 is cheaper than moving the credential codec into the store.
+pub struct CredentialIdProbe<'a> {
+    /// The credential ID to look for.
+    pub credential_id: &'a [u8],
+}
+
+impl fido_store::CredentialProbe for CredentialIdProbe<'_> {
+    fn matches(&self, plaintext: &[u8], credential_id: &[u8]) -> bool {
+        credential_id_in_body(plaintext, credential_id)
+    }
+}
+
+/// Does this credential record body hold `credential_id`?
+///
+/// Reads CBOR key `1` — `DeviceCredential::encode`'s credential-ID field — and
+/// compares it **in full**, because returning `true` here is a claim that the
+/// record *is* that credential and a prefix match would let a 16-byte ID claim
+/// a 64-byte one.
+///
+/// A malformed body is `false` rather than a panic: the body came out of an
+/// AEAD that verified, so it is this build's own encoding or a forgery, and
+/// neither is worth aborting a `getAssertion` over.
+pub fn credential_id_in_body(body: &[u8], credential_id: &[u8]) -> bool {
+    // Unwrap the bstr first — see `credential_map_in_body` for why the record
+    // body carries one. A body that is not bstr-wrapped is not this format, and
+    // answering `false` is what keeps a probe from matching against bytes it
+    // does not understand.
+    let Some(map) = credential_map_in_body(body) else {
+        return false;
+    };
+    let mut p = Parser::new(map);
+    match p.next() {
+        Ok(Item::Map(_)) => {}
+        _ => return false,
+    }
+    loop {
+        if p.remaining() == 0 {
+            return false;
+        }
+        let key = match p.next() {
+            Ok(Item::U(k)) => k,
+            _ => return false,
+        };
+        let item = match p.next() {
+            Ok(item) => item,
+            Err(_) => return false,
+        };
+        if key == 1 {
+            return matches!(item, Item::B(b) if b == credential_id);
+        }
+        // Keys 2..=19 all hold a scalar, a byte string or a **map** (the COSE
+        // key at key 2). `next` already consumed each one, so there is nothing
+        // to skip — and skipping here would advance past the next key and make
+        // the walk read the wrong pair.
+    }
+}
+
+/// The region's two keys, held together because they are always used together.
+///
+/// **Not stored.** A `DeviceKeystore` may hold one of these for the length of one
+/// command and no longer: `crypto.rs` states its keys as "per-operation: derive,
+/// use, drop", and this type does not outlive the operation that made it. A
+/// credential set that is "resident" in flash and re-derived per command is the
+/// property the whole per-record design exists to have.
+pub struct RegionKeys {
+    /// PIN-free, OTP-rooted: *finding* a credential never needs the PIN.
+    pub index: IndexKey,
+    /// PIN-derived: *opening* one does.
+    pub payload: PayloadKey,
+}
+
+/// How the applet derives the region's `pin_secret`.
+///
+/// [`crypto::derive_payload_key`] takes "already-derived material, not a PIN"
+/// and says explicitly that "the applet is the only thing entitled to decide
+/// what that is". This is that decision, and it is **not** the one
+/// `crypto.rs`'s own wording suggests:
+///
+/// ```text
+/// pin_secret = SHA-256("fapico2/fido/keyregion/pin/v1" ‖ device_random)
+/// ```
+///
+/// **Device-rooted, not PIN-gated — deliberately, and at a cost this states.**
+///
+/// The alternative is to mix in the PIN verifier, which `crypto.rs` describes as
+/// the point ("the region is secured by 'something the user's PIN unlocked'").
+/// It was the first implementation here, and it is **wrong for this device**,
+/// for a reason that is about data rather than about cryptography:
+///
+/// > `pin_hash` is `None` on a PIN-less device. A secret derived from it is
+/// > therefore *different* after the user sets a PIN — so **every credential
+/// > enrolled before that moment becomes unreadable**, permanently, and the
+/// > record bodies stay on the part consuming slots.
+///
+/// That is the failure mode `AGENTS.md` §5 names from the other end: "a design
+/// that is maximally secure and stores four keys is not secure, it is broken".
+/// Re-keying the region on `setPIN` would fix it, and is a separate story with
+/// its own transaction (it is a **whole-region rewrite**: every record sealed
+/// under the old key, with a power cut mid-way leaving some credentials under
+/// one key and some under the other). Shipping the PIN-gated derivation without
+/// that transaction would trade a real security property for a data-loss bug,
+/// which is the trade `AGENTS.md` §5 tells you not to make.
+///
+/// **What is given up, named as the brief requires.** An attacker holding the
+/// **OTP row and the chipid** — the same material `store_v3::derive_store_key`
+/// takes — can derive this secret and read every credential record. That is not
+/// a new exposure: the snapshot backend seals its credential fields under
+/// `snapshot_crypt::field_key(store_key)`, and `store_key` **is**
+/// `derive_store_key(OTP ‖ chipid)`. So this is **parity with the backend being
+/// replaced**, not a weakening of it, and the honest summary is that per-record
+/// storage does not change what a full-OTP attacker can read.
+///
+/// The **index key** is the half that does not depend on this: it is
+/// OTP-rooted and PIN-free either way, so a user who has forgotten their PIN can
+/// still be told which slots hold records — which is the property `index.rs`
+/// exists for and the one this derivation does not give up.
+///
+/// **The label** is namespaced like every other HKDF label in the tree
+/// (`crypto.rs`'s label table), so it cannot collide with one of those, and the
+/// device_random it mixes is the TRNG draw the snapshot already persists in its
+/// sealed auth map (key 5) — so it is available on every boot with no new state.
+pub fn region_pin_secret(_pin_state: &DevicePinState, device_random: &[u8; 32]) -> [u8; 32] {
+    const INFO: &[u8] = b"fapico2/fido/keyregion/pin/v1";
+    let mut input: HeaplessVec<u8, 64> = HeaplessVec::new();
+    input.extend_from_slice(INFO).ok();
+    input.extend_from_slice(device_random).ok();
+    let mut out = [0u8; 32];
+    crate::crypto::hkdf_sha256(None, input.as_slice(), INFO, &mut out);
+    out
+}
+
+/// The region-backed credential store: one sealed record per credential.
+///
+/// # Why this exists at all
+///
+/// `DeviceKeystore::credentials` is a resident
+/// `HeaplessVec<DeviceCredential, 12>` — 12 × 720 B = **8,640 bytes of `.bss`**
+/// and a ceiling of twelve, against a derived region capacity of
+/// [`FIDO_CAPACITY`] (**856**). Resizing that array to the capacity is
+/// arithmetically impossible: 856 × 720 = 616 KB against 532 KB of RAM on the
+/// part. This type is the other shape — nothing resident, one credential
+/// decrypted at a time into the caller's [`CredentialWindow`] — and it is what
+/// makes the capacity reachable at all.
+///
+/// # Why it holds no cache
+///
+/// Deliberately stateless, for the reason `fido_store.rs`'s module docs give:
+/// a store with an in-RAM copy of what is on the medium is a store that can
+/// latch dirty state, and SOAK-FINDING-1's `stored` arm is exactly that latch.
+/// There is nothing here to keep in step with the region because there is
+/// nothing here.
+///
+/// # Keys
+///
+/// [`RegionKeys`] is derived per operation and dropped with it. The index key is
+/// OTP-rooted and PIN-free, so credMgmt can *enumerate* a device the owner has
+/// forgotten the PIN for; the payload key is PIN-derived, so opening one is not
+/// possible without it. A caller holding only the index key learns which slots
+/// hold records and nothing about what is in them.
+pub struct RegionCredentials<'a, 'k> {
+    store: FidoRecordStore<'a>,
+    keys: &'k RegionKeys,
+}
+
+impl<'a, 'k> RegionCredentials<'a, 'k> {
+    /// Wrap a region with the keys to seal and open its records.
+    ///
+    /// **Reads nothing.** No discovery scan, no `recover`, no index probe: S8/S9
+    /// forbid the boot path from touching the key region, and a constructor is
+    /// the sort of thing a boot path calls. The first read happens in the first
+    /// operation, which is after `RUNG_USB`.
+    ///
+    /// The keys are **borrowed**, not taken, so one derivation serves a whole
+    /// command — `RegionKeys` is deliberately not `Clone` and not `Copy`
+    /// (`crypto.rs`: "a `Clone` on a key type is the first step of a key that
+    /// ends up in a `static`"), so taking them by value would force a fresh
+    /// derivation per record rather than per operation.
+    pub fn new(region: &'a mut dyn KeyRegion, keys: &'k RegionKeys) -> Self {
+        RegionCredentials { store: FidoRecordStore::new(region), keys }
+    }
+
+    /// How many FIDO credentials this region holds: [`FIDO_CAPACITY`].
+    ///
+    /// A re-export of [`FidoRecordStore::capacity`] so a caller holding this
+    /// type does not have to name the store to ask the one number the credMgmt
+    /// reply is about.
+    pub const fn capacity() -> u32 {
+        FIDO_CAPACITY
+    }
+
+    /// Store one credential: a sealed record, then an index entry for it.
+    ///
+    /// The order is [`FidoRecordStore::put`]'s, and the reason is in its docs:
+    /// a record with no entry is merely *unfindable*, while an entry naming a
+    /// slot with no record reads as a credential that is not one.
+    ///
+    /// `nonce` is this method's caller to supply. The store deliberately does
+    /// not derive one (`record::seal`'s docs: a module holding no key has no
+    /// business choosing a GCM nonce), and the applet has a TRNG pool to draw
+    /// from — a **fresh draw per write**, which is stronger than the
+    /// content-derived nonce `crypto::record_nonce` would give and costs one
+    /// pool draw.
+    pub fn put(
+        &mut self,
+        nonce: &[u8; record::NONCE_LEN],
+        cred: &DeviceCredential,
+    ) -> Result<fido_store::PutReport, RegionCredentialError> {
+        let body = credential_record_body(cred).ok_or(RegionCredentialError::Malformed)?;
+        let rp_hash = RpIdHash::from_bytes(cred.rp_id_hash);
+        self.store
+            .put(&self.keys.payload, &self.keys.index, nonce, &rp_hash, body.as_slice())
+            .map_err(map_store_error)
+    }
+
+    /// Load the credential of `rp_id_hash` whose ID is `credential_id`, into
+    /// `out`.
+    ///
+    /// `rp_id_hash: None` searches **every** FIDO entry. A browser's credential
+    /// ID begins with the RP's `rp_id_hash` (CTAP 2.1 §5.8.3), so a caller that
+    /// has one should pass it — and passing it costs the store one index
+    /// comparison per entry instead of one AEAD per entry.
+    ///
+    /// Costs `candidates + 1` AEAD operations: the index cannot answer a
+    /// by-ID query alone because it stores no credential ID (`fido_store.rs`,
+    /// `CredentialIdLocator`'s docs), so each candidate is opened once to
+    /// identify it and the winner is then loaded. `out` is cleared first and on
+    /// drop ([`CredentialWindow`]), so a failed lookup cannot serve the previous
+    /// operation's credential.
+    pub fn load_by_id(
+        &mut self,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+        out: &mut CredentialWindow,
+    ) -> SlotRead<()> {
+        let hash = rp_id_hash.map(|h| RpIdHash::from_bytes(*h));
+        let probe = CredentialIdProbe { credential_id };
+        drop_hit(self.store.load_by_credential_id(
+            &self.keys.payload,
+            &self.keys.index,
+            hash.as_ref(),
+            credential_id,
+            &probe,
+            out,
+        ))
+        // The window now holds the record's bytes. Whether they are a
+        // *credential* is a second, separate question — a tombstone opens
+        // fine and is not a credential — and it is answered by
+        // `credential_from_record_body` at the call site. Reporting `Present`
+        // here and letting the caller decode is what keeps one fail-closed
+        // composition (`on_demand::load`) from being reassembled at a fourth
+        // call site (`record.rs`'s rule).
+    }
+
+    /// Load one credential of one RP into `out`, addressed by RP alone.
+    ///
+    /// The discovery form — "does this site have anything here?" — which is what
+    /// a resident-credential `getAssertion` asks when the client sends no
+    /// allowList. Answers with the index's choice of one; use
+    /// [`Self::load_by_id`] when the credential ID is known.
+    pub fn load_by_rp(
+        &mut self,
+        rp_id_hash: &[u8; 32],
+        out: &mut CredentialWindow,
+    ) -> SlotRead<()> {
+        let hash = RpIdHash::from_bytes(*rp_id_hash);
+        drop_hit(self.store.load_by_rp(&self.keys.payload, &self.keys.index, &hash, out))
+    }
+
+    /// Delete the credential with ID `credential_id`: a tombstone commit, then
+    /// the index entries naming its slot are cleared.
+    ///
+    /// `None` when no live credential has that ID. The tombstone half is
+    /// `fido_store`'s (`TOMBSTONE_BODY`, and `commit.rs`'s reason for having no
+    /// single-slot delete); the index half matters just as much, because an
+    /// entry left behind is a credential every enumeration still returns.
+    ///
+    /// **The slot stays occupied until [`Self::compact`] runs.** A tombstone is a
+    /// record, so the allocator will not hand it out — the deliberate
+    /// consequence of `commit.rs` refusing an erased target. Callers that care
+    /// about capacity call `compact` after the delete; `remaining_capacity` is
+    /// the number that tells them whether they need to.
+    pub fn delete(
+        &mut self,
+        nonce: &[u8; record::NONCE_LEN],
+        credential_id: &[u8],
+    ) -> Result<fido_store::DeleteReport, RegionCredentialError> {
+        let slot = self.find_slot(credential_id)?;
+        self.store.delete(&self.keys.payload, slot, nonce).map_err(map_store_error)
+    }
+
+    /// Free the slots of `sector` that hold tombstones.
+    ///
+    /// The second half of the delete story, and the half that makes the freed
+    /// capacity reachable: a tombstone is a record, so its slot is off the free
+    /// list until this rewrites the sector without it. See
+    /// [`FidoRecordStore::compact`] for why a sector rewrite is the right shape
+    /// here and why no cut point can lose a credential.
+    pub fn compact(&mut self, sector: Slot) -> Result<fido_store::CompactionReport, RegionCredentialError> {
+        self.store.compact(&self.keys.payload, sector).map_err(map_store_error)
+    }
+
+    /// How many FIDO index entries the region holds.
+    ///
+    /// The count `remainingDiscoverableCredentialsCount` is derived from — see
+    /// [`Self::remaining`] for why the *index* and not the records is the right
+    /// thing to count.
+    pub fn used(&mut self) -> Option<u32> {
+        match self.store.fido_entries() {
+            SlotRead::Present(n) => Some(n),
+            SlotRead::Absent | SlotRead::Fault(_) => None,
+        }
+    }
+
+    /// How many more credentials this region can take, or `None` when the index
+    /// could not be read.
+    ///
+    /// `None` rather than `0` on a fault, and that distinction is the point:
+    /// reporting `0` would refuse an enrolment with a claim about capacity the
+    /// device never established, which is the wire-claim defect `AGENTS.md` §4 is
+    /// about.
+    pub fn remaining(&mut self) -> Option<u32> {
+        self.store.remaining_capacity()
+    }
+
+    /// The slots holding one RP's credentials, appended to `out`.
+    ///
+    /// **Index slots only** — no payload key is in this signature, so there is
+    /// nowhere for one to arrive. This is the enumeration a credMgmt
+    /// `enumerateCredsBegin` walks and the candidate list a `getAssertion`
+    /// builds, and it is what makes credMgmt a *PIN-gated* enumeration: the
+    /// slots come from the index, the credential bodies are opened one at a time
+    /// by the caller.
+    pub fn slots_for_rp(&mut self, rp_id_hash: &[u8; 32], out: &mut [Slot]) -> Option<usize> {
+        let hash = RpIdHash::from_bytes(*rp_id_hash);
+        match self.store.slots_for_rp(&self.keys.index, &hash, out) {
+            SlotRead::Present(n) => Some(n),
+            SlotRead::Absent | SlotRead::Fault(_) => None,
+        }
+    }
+
+    /// The slot of the `n`-th FIDO index entry, in index order.
+    ///
+    /// **A cursor, not a materialised list.** credMgmt's `enumerateRPs` has to
+    /// walk every credential the device holds, and at 856 credentials a
+    /// `Vec<Slot>` of them is 1.7 KB — on a task frame that already carries an
+    /// 836-byte `CredentialWindow`. Walking the index one entry at a time and
+    /// keeping one `Slot` is the same reason `index::walk_present` streams a
+    /// single 1 KiB image (`index.rs`, "Why the entry is 32 bytes").
+    ///
+    /// `None` past the last entry **and** for a region that cannot be read —
+    /// the same `Option`, deliberately, because the caller's loop treats both as
+    /// "stop" and inventing a third state here would only be discarded at the
+    /// call site. A caller that must distinguish them uses
+    /// [`Self::inspect_index`](FidoRecordStore::inspect_index), which is the
+    /// operation that reports a fault.
+    ///
+    /// O(n) per call, so a full walk is O(n²) index reads. That is the honest
+    /// cost of a stateless store: caching the cursor across commands is exactly
+    /// the resident state `fido_store.rs` refuses to keep, and a 32 KiB index
+    /// materialised in RAM is more than six times the boot stack
+    /// (`index.rs`, "Bounded and fixed is a boot-path constraint").
+    pub fn nth_entry_slot(&mut self, n: u32) -> Option<Slot> {
+        let mut seen = 0u32;
+        let mut ordinal = 0u32;
+        while ordinal < fapico2_platform::keyregion::index::index_capacity() {
+            let slot = fapico2_platform::keyregion::index::entry_slot(ordinal)?;
+            let raw = self.store.region().read_slot(slot).ok()?;
+            let at = fapico2_platform::keyregion::index::entry_offset(ordinal) as usize;
+            let cell = &raw[at..at + fapico2_platform::keyregion::index::INDEX_ENTRY_BYTES];
+            if let SlotRead::Present(entry) =
+                fapico2_platform::keyregion::index::IndexEntry::decode(cell)
+            {
+                if entry.domain() == fapico2_platform::keyregion::crypto::KeyDomain::Fido {
+                    if seen == n {
+                        return Some(entry.slot());
+                    }
+                    seen += 1;
+                }
+            }
+            ordinal += 1;
+        }
+        None
+    }
+
+    /// Open the record in `slot` into `out`, without consulting the index.
+    ///
+    /// The enumeration's inner step: credMgmt already knows the slot from the
+    /// index walk, so re-deriving it from a credential ID would cost a second
+    /// index pass for no answer. `Absent` covers the tombstone case the same way
+    /// it covers a corrupt record — one bad record costs itself alone.
+    pub fn load_slot(&mut self, slot: Slot, out: &mut CredentialWindow) -> SlotRead<()> {
+        drop_hit(on_demand::load(
+            self.store.region(),
+            &mut DirectLocator { slot },
+            &self.keys.payload,
+            &SlotQuery::RpIdTag { tag: &[0u8; on_demand::RP_ID_TAG_LEN] },
+            out,
+        ))
+    }
+
+    /// The slot holding the credential with ID `credential_id`.
+    ///
+    /// # Why a locator and not a scan of this module's own
+    ///
+    /// The store already owns "find a credential by its ID": `CredentialIdLocator`
+    /// narrows by RP through the index and then opens candidates, and its docs
+    /// say so. Re-implementing that walk here would be a second definition of
+    /// the same lookup, which is the defect `AGENTS.md` §5 names twice over. So
+    /// this borrows it — and pays `candidates + 1` AEAD operations for it, which
+    /// is the price the store's docs state for a query the index cannot answer
+    /// alone.
+    ///
+    /// # The window is a scratch buffer, not a result
+    ///
+    /// It exists because [`on_demand::load`] needs somewhere to put the record it
+    /// opens, and it is dropped — zeroized by `CredentialWindow::drop` — before
+    /// this returns. The caller gets a **slot number**, not a credential, so a
+    /// delete never needs the plaintext and the private key never sits in a
+    /// buffer across a sector erase.
+    fn find_slot(&mut self, credential_id: &[u8]) -> Result<Slot, RegionCredentialError> {
+        let probe = CredentialIdProbe { credential_id };
+        let mut locator = fido_store::CredentialIdLocator::new(
+            &self.keys.index,
+            &self.keys.payload,
+            None,
+            credential_id,
+            &probe,
+        );
+        let mut window = CredentialWindow::new();
+        let tag = &[0u8; on_demand::RP_ID_TAG_LEN];
+        match on_demand::load(
+            self.store.region(),
+            &mut locator,
+            &self.keys.payload,
+            &SlotQuery::RpIdTag { tag },
+            &mut window,
+        ) {
+            SlotRead::Present(hit) => Ok(hit.slot()),
+            SlotRead::Absent => Err(RegionCredentialError::NoSuchCredential),
+            SlotRead::Fault(why) => Err(RegionCredentialError::Unreachable(why)),
+        }
+    }
+}
+
+/// A [`SlotLocator`] that answers one known slot.
+///
+/// The enumeration's locator: credMgmt already holds the slot from its index
+/// walk, so this exists so `load_slot` goes through
+/// [`on_demand::load`] — the composed fail-closed path, with its `out`-cleared
+/// first guarantee and its one-decryption property — rather than reassembling
+/// `record::decode` plus `record::open` at a fourth call site (`record.rs`'s
+/// standing rule).
+struct DirectLocator {
+    slot: Slot,
+}
+
+impl on_demand::SlotLocator for DirectLocator {
+    fn locate(&mut self, _region: &mut dyn KeyRegion, _want: &SlotQuery<'_>) -> on_demand::Located {
+        on_demand::Located::Found(self.slot)
+    }
+}
+
+/// Discard a [`SlotRead`]'s payload, keeping its three states.
+///
+/// One function rather than three `match`es at the call sites, and the reason
+/// it exists is the one `SlotRead`'s own docs warn about: **a caller that
+/// collapses `Fault` into `Absent` memoizes a transport failure as a decided
+/// fact.** Written once, the collapse is visible in one place instead of three,
+/// and there is no arm here that turns a `Fault` into "no such credential".
+fn drop_hit(outcome: SlotRead<on_demand::OnDemandHit>) -> SlotRead<()> {
+    match outcome {
+        SlotRead::Present(_) => SlotRead::Present(()),
+        SlotRead::Absent => SlotRead::Absent,
+        SlotRead::Fault(why) => SlotRead::Fault(why),
+    }
+}
+
+/// Translate a store error into the applet's three-state vocabulary.
+///
+/// **One mapping, in one place**, because the alternative is each call site
+/// deciding what "the region is full" and "the region is sick" mean, and getting
+/// them differently — which is how `KeyStoreFull` (0x28, a capacity statement)
+/// ends up being returned for a flash that is merely failing.
+fn map_store_error(e: fido_store::FidoStoreError) -> RegionCredentialError {
+    match e {
+        fido_store::FidoStoreError::Full | fido_store::FidoStoreError::IndexFull => {
+            RegionCredentialError::Full
+        }
+        fido_store::FidoStoreError::CredentialTooLarge { len, max } => {
+            RegionCredentialError::TooLarge { len, max }
+        }
+        fido_store::FidoStoreError::RegionUnreadable(why)
+        | fido_store::FidoStoreError::IndexUnreadable(why)
+        | fido_store::FidoStoreError::Commit(CommitError::Flash { reason: why, .. }) => {
+            RegionCredentialError::Unreachable(why)
+        }
+        other => RegionCredentialError::Store(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time assertions
+// ---------------------------------------------------------------------------
+
+const _: () = {
+    // The record the applet writes must be the record the region's stride was
+    // sized from. `FIDO_RECORD_MAX` is measured against *this* encoding
+    // (`mod.rs:52-67`), so a change to `DeviceCredential::encode` that grows a
+    // credential past it has to stop the build here rather than truncate the
+    // longest legitimate credential to fit — the exact failure
+    // `DEVICE_MAX_CREDS = 12` was.
+    assert!(
+        CREDENTIAL_RECORD_MAX == FIDO_RECORD_MAX as usize,
+        "the applet's record bound must be the region's measured FIDO record bound — one \
+         credential, one record, one number"
+    );
+    // `CredentialWindow` is sized for the largest record the store can *write*,
+    // so a credential that encodes to at most that fits the one buffer every
+    // load goes through. If this ever fails, `credential_record_body` is
+    // returning bodies no window can hold and every load fails with an error
+    // indistinguishable from a corrupt record.
+    assert!(
+        CREDENTIAL_RECORD_MAX <= on_demand::ON_DEMAND_WINDOW_BYTES,
+        "the applet's record bound must fit the on-demand window — a credential larger \
+         than the window would fail to load as though it were corrupt"
+    );
+    // A tombstone must be distinguishable from a credential body without a
+    // version byte or a magic string. `DeviceCredential::encode` always emits a
+    // CBOR map header first, and CBOR major type 5 with additional information
+    // 31 is the break stop code, never a map — so a one-byte 0xFF body cannot be
+    // a credential. Stated so a future "shorten the tombstone" edit cannot make
+    // a deleted credential decode as a broken one.
+    assert!(
+        TOMBSTONE_PROOF.len() == 1,
+        "a FIDO tombstone is a one-byte body; anything longer could collide with a \
+         credential map header"
+    );
+};
+
+/// Compile-time witness that `0xFF` cannot begin a credential map.
+///
+/// Never evaluated and never used: its job is to make the sentence above a
+/// checked statement rather than a claim. CBOR major type 5 is the map type and
+/// 0xFF is major type 7 (simple value / float) with additional information 31
+/// (indefinite-length "break"), which `cbor.rs`'s parser rejects outright.
+const TOMBSTONE_PROOF: [u8; 1] = [0xFF];
 
 #[cfg(test)]
 mod us113_tests {

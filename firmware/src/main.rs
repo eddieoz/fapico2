@@ -1136,6 +1136,19 @@ async fn main(spawner: Spawner) -> ! {
     // the region unreadable gets an empty key set and a clean CTAP error (S10),
     // never a halt.
     boot::release_key_region();
+    // US-1552: hand the region to the FIDO applet. **This is the line that makes
+    // the migration take effect on hardware** — without it nothing calls the
+    // region path, LTO proves `REGION_PROVIDER` is never written, and the whole
+    // key-region implementation is linked out of the image.
+    //
+    // A `fn` pointer rather than a closure, because `REGION_PROVIDER` stores the
+    // provider's code address (`device_app.rs::install_region_provider`) and a
+    // capturing closure would not be one. It asks `boot::key_region()` at every
+    // call, which is what makes "before RUNG_USB it answers None" a guarantee
+    // rather than a comment.
+    fapico2_fido::device_app::install_region_provider(|| {
+        boot::key_region().map(|r| r as &'static mut dyn fapico2_platform::keyregion::KeyRegion)
+    });
     // US-929 boot ladder, stage 3 (dbg-log builds only): the USB device is
     // constructed and `usb_task` spawned — configuration completes when the
     // executor first polls `usb_task` (stage 4's record proves that poll
