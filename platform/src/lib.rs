@@ -147,6 +147,18 @@ pub mod secure_store;
 /// argument and the 128-bit length counter.
 pub mod sha512;
 
+/// US-1569: the RP2350 **hardware SHA-256 engine** at `0x400f_8000`, driven
+/// from Rust — the accelerator that all five reference implementations, and
+/// `embassy-rp`, alike ignore. Layered as pure logic (`padding_blocks`,
+/// `digest_from_words`, `hash_into` — target-agnostic, `no_std`, no allocation)
+/// under a `#[cfg(target_arch = "arm")]` register + DMA layer, with a single
+/// [`sha256_accel::BlockSink`] seam between them so the block assembly is
+/// differentially tested against `sha2` without an RP2350 in the loop. The
+/// register layer itself is **not** exercised by any test and its docs say so.
+/// Performance control, not a security control; a failure is always an error,
+/// never a digest.
+pub mod sha256_accel;
+
 /// Secure-partition image format v3 — encrypt-then-MAC (US-915): the AEAD
 /// sealing layer over [`secure_store`]'s logical serialization.
 pub mod store_v3;
