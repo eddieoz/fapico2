@@ -1931,6 +1931,130 @@ fn kdf_do_reboot_survival_and_removal_device_path() {
     });
 }
 
+/// **Acceptance criterion 3: a key GENERATED on the device survives a power
+/// cycle, on the GENERATE path.**
+///
+/// The reboot test above proves the **import** path. `device_boot_order.rs`
+/// — which the epic cites for criterion 3 — proves neither: it replays a
+/// captured C-flash image and reads a **migrated** key. So the generate path had
+/// no evidence at all, and this is it.
+///
+/// The question it asks is the one that was open: `gen.rs` creates the private
+/// key at `Location::Volatile` (`vfs`, RAM, formatted on every boot), while the
+/// public key and the state file are on flash. Does the card still sign after
+/// the RAM filesystem dies?
+///
+/// It does, and not by accident. `State::set_key` ChaChaPoly-wraps the volatile
+/// key with the PW1-derived user key into `signing_key.bin` **on flash** and
+/// then `clear`s the plaintext handle (`state.rs:573-591`); the load path is the
+/// mirror (`state.rs:640-692`). The plaintext therefore exists in RAM only
+/// between GENERATE and the wrap, and again between VERIFY and the signature.
+///
+/// Two boots over one persistent store, a **fresh** RAM filesystem for the
+/// second, and the signature is verified against the public key the first boot
+/// returned — so a card that silently re-keyed, or served a stale public key,
+/// fails here rather than passing on a matching length.
+#[test]
+fn a_generated_key_survives_a_power_cycle_on_the_generate_path() {
+    use fapico2_platform::trusted_backend::{
+        dispatch::OpcardDispatch,
+        host::{HostPlatform, HostStore, leak_buf, mount_fs},
+        runner::with_backend,
+    };
+
+    use k256::ecdsa::signature::hazmat::PrehashVerifier as K256PrehashVerifier;
+
+    const SECP_SIGN: &[u8] = &hex!("132b8104000a");
+
+    let internal = leak_buf(256 * 4096);
+    let store = || {
+        let ram = HostStore::fresh();
+        HostPlatform::with_store(HostStore::new(
+            mount_fs::<256>(internal),
+            ram.efs,
+            ram.vfs,
+        ))
+    };
+
+    // Session A: personalize, then GENERATE the signing key on the device.
+    let public = with_backend(store(), OpcardDispatch::new(), "opcard", |client| {
+        let mut app = OpenPgpApp::new(client);
+        let mut dispatcher = Dispatcher::<1>::new();
+        assert!(dispatcher.register(&mut app));
+        command(&mut dispatcher, 0xa4, 4, 0, OPENPGP_AID, 0x9000);
+        command(&mut dispatcher, 0x24, 0, 0x81, b"123456654321", 0x9000);
+        command(&mut dispatcher, 0x24, 0, 0x83, b"1234567887654321", 0x9000);
+        command(&mut dispatcher, 0x20, 0, 0x83, b"87654321", 0x9000);
+        command(&mut dispatcher, 0xda, 0, 0xc1, SECP_SIGN, 0x9000);
+
+        let gen = command(&mut dispatcher, 0x47, 0x80, 0, &[0xb6, 0], 0x9000);
+        let idx = gen
+            .windows(2)
+            .position(|w| w == [0x86, 0x41])
+            .expect("GENERATE reply must carry an 86 41 public key");
+        assert_eq!(gen[idx + 2], 0x04, "secp256k1 point must be uncompressed");
+        let public = k256::PublicKey::from_sec1_bytes(&gen[idx + 2..idx + 2 + 65])
+            .expect("GENERATE reply must be a valid secp256k1 point");
+
+        // It signs in the same power cycle, so a later failure is the reboot's
+        // doing and not a key that never worked.
+        let digest = Sha256::digest(b"This is a test message.");
+        reselect(&mut dispatcher);
+        command(&mut dispatcher, 0x2a, 0x9e, 0x9a, &digest, 0x6982);
+        command(&mut dispatcher, 0x20, 0, 0x81, b"654321", 0x9000);
+        let signature = command(&mut dispatcher, 0x2a, 0x9e, 0x9a, &digest, 0x9000);
+        assert_eq!(signature.len(), 64, "a raw secp256k1 signature, not a DER one");
+        let verifying = k256::ecdsa::VerifyingKey::from(&public);
+        K256PrehashVerifier::verify_prehash(
+            &verifying,
+            &digest,
+            &k256::ecdsa::Signature::from_slice(&signature).expect("valid secp256k1 signature"),
+        )
+        .expect("a generated key must sign in the power cycle that made it");
+
+        public.to_encoded_point(false).as_bytes().to_vec()
+    });
+
+    // Session B: simulated reboot — fresh app, fresh RAM filesystem, same
+    // persistent store. The key must still sign, with the same key.
+    with_backend(store(), OpcardDispatch::new(), "opcard", |client| {
+        let mut app = OpenPgpApp::new(client);
+        let mut dispatcher = Dispatcher::<1>::new();
+        assert!(dispatcher.register(&mut app));
+        command(&mut dispatcher, 0xa4, 4, 0, OPENPGP_AID, 0x9000);
+        command(&mut dispatcher, 0x20, 0, 0x83, b"87654321", 0x9000);
+
+        // READ PUBLIC KEY must return the key generated before the reboot.
+        let read = command(&mut dispatcher, 0x47, 0x81, 0, &[0xb6, 0], 0x9000);
+        let idx = read
+            .windows(2)
+            .position(|w| w == [0x86, 0x41])
+            .expect("READ PUBLIC KEY reply must carry an 86 41 public key");
+        assert_eq!(
+            &read[idx + 2..idx + 2 + 65],
+            &public[..],
+            "the key after the reboot must be the key before it. A card that re-keyed, or that \
+             served a stale public key, is not what this test is looking for",
+        );
+
+        // …and the private half still signs.
+        let digest = Sha256::digest(b"This is a test message.");
+        reselect(&mut dispatcher);
+        command(&mut dispatcher, 0x2a, 0x9e, 0x9a, &digest, 0x6982);
+        command(&mut dispatcher, 0x20, 0, 0x81, b"654321", 0x9000);
+        let signature = command(&mut dispatcher, 0x2a, 0x9e, 0x9a, &digest, 0x9000);
+        let verifying = k256::ecdsa::VerifyingKey::from(
+            &k256::PublicKey::from_sec1_bytes(&public).expect("valid point"),
+        );
+        K256PrehashVerifier::verify_prehash(
+            &verifying,
+            &digest,
+            &k256::ecdsa::Signature::from_slice(&signature).expect("valid secp256k1 signature"),
+        )
+        .expect("a key GENERATED before the reboot must still sign after it");
+    });
+}
+
 /// US-948, device path (defensive probe): the KDF-DO lives in the
 /// `Location::Internal` file `kdf_do` — this test pins that by deleting
 /// that exact file at the trussed layer and requiring GET DATA F9 to answer
