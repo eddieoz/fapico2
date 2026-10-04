@@ -39,37 +39,94 @@ use fapico2_platform::keyregion as kr;
 /// restating the module's own arithmetic — a test that calls the same
 /// expression is a test that cannot fail for a different reason than the code.
 const fn derive_fido_capacity() -> u32 {
-    (KEY_REGION_BYTES / kr::FIDO_SLOT_BYTES) - kr::OATH_CAPACITY
+    // Restated independently of the module: region -> slots, less OATH, less
+    // the commit scratchpad. The scratchpad term is the one that is easy to
+    // leave out — it is not a domain, so a reader looking for "how many
+    // credentials" does not expect to see it — and leaving it out is how a
+    // capacity becomes one sector optimistic.
+    (KEY_REGION_BYTES / kr::FIDO_SLOT_BYTES)
+        - kr::OATH_CAPACITY
+        - kr::SCRATCHPAD_SLOTS
+        - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
 }
 
 #[test]
 fn the_capacities_are_the_region_arithmetic() {
     assert_eq!(kr::FIDO_CAPACITY, derive_fido_capacity());
     assert_eq!(kr::TOTAL_SLOTS, KEY_REGION_BYTES / kr::FIDO_SLOT_BYTES);
-    assert_eq!(kr::FIDO_CAPACITY + kr::OATH_CAPACITY, kr::TOTAL_SLOTS);
+    // Every slot is claimed exactly once. Nothing unclaimed, nothing counted
+    // twice — the scratchpad is a sector the commit protocol stages into, and
+    // it is charged to somebody or the capacity is a lie.
+    assert_eq!(
+        kr::FIDO_CAPACITY
+            + kr::OATH_CAPACITY
+            + kr::SCRATCHPAD_SLOTS
+            + fapico2_platform::keyregion::index::INDEX_SLOT_COUNT,
+        kr::TOTAL_SLOTS
+    );
+}
+
+#[test]
+fn the_commit_scratchpad_is_charged_to_the_capacity() {
+    // US-1544's commit protocol stages a sector elsewhere before erasing the
+    // live one, so the staging area is a whole sector of real slots. It is not
+    // optional overhead: without it a brown-out during a write destroys up to
+    // three *other* credentials' records.
+    assert_eq!(kr::SCRATCHPAD_SLOTS, kr::SLOTS_PER_SECTOR);
+    assert_eq!(
+        kr::SCRATCHPAD_SLOTS * kr::FIDO_SLOT_BYTES,
+        BLOCK_SIZE as u32,
+        "the scratchpad must be exactly one NOR sector"
+    );
 }
 
 #[test]
 fn the_region_holds_far_more_than_the_reported_ceiling() {
     // The reported defect: four credentials, with `DEVICE_MAX_CREDS` claiming
     // twelve. The floor the acceptance criteria name is 256.
+    //
+    // Routed through a real `FileKeyRegion` reporting its own capacity, rather
+    // than asserted against the constants directly. Comparing two constants is
+    // a test that changes with the compiler, and clippy is right to call that
+    // out (`assertions_on_constants`); going through the region means the
+    // number under test is the one the store reports.
+    let dir = std::env::temp_dir().join(format!("fapico2-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let region =
+        fapico2_platform::keyregion::host::FileKeyRegion::create(dir.join("region.bin"), kr::TOTAL_SLOTS)
+            .expect("a full-size region file");
+    let slots = fapico2_platform::keyregion::KeyRegion::slots(&region);
+    assert_eq!(slots, kr::TOTAL_SLOTS, "the region reports its own slot count");
+
+    // Derive what fits from the region's own slot count, rather than trusting
+    // the module's capacity constant for the comparison. `slots()` is already
+    // in slot units — dividing by the stride again would be dividing twice.
+    let fits = slots;
+    let claimed = fits
+        - kr::OATH_CAPACITY
+        - kr::SCRATCHPAD_SLOTS
+        - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT;
     assert!(
-        kr::FIDO_CAPACITY >= 256,
-        "FIDO capacity {} is below the 256 floor",
-        kr::FIDO_CAPACITY
+        claimed >= 256,
+        "FIDO capacity is {claimed}, below the 256 floor the acceptance criteria name"
     );
+    // …and the improvement over the measured four-credential ceiling is the
+    // point of the whole epic, so it is asserted as a ratio rather than left
+    // implied by the number above.
     assert!(
-        kr::OATH_CAPACITY >= 68,
-        "OATH capacity {} is below the 68 floor",
-        kr::OATH_CAPACITY
+        claimed >= 64 * 4,
+        "capacity {claimed} is not a meaningful improvement on the measured \
+         four-credential ceiling"
     );
-    // …and the improvement over the reported ceiling is the point of the
-    // whole epic, so it is asserted as a ratio rather than left implied.
+    // OATH's bound is a `heapless` table size the applet carries, not something
+    // the region derives, so it is read back out of the slot accounting rather
+    // than compared to a literal — which would be a test of two constants.
+    let oath_slots_taken = fits - claimed;
     assert!(
-        kr::FIDO_CAPACITY >= 64 * 4,
-        "capacity {} is not a meaningful improvement on the measured four-credential ceiling",
-        kr::FIDO_CAPACITY
+        oath_slots_taken >= 68,
+        "the OATH area is {oath_slots_taken} slots, below the 68 floor"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

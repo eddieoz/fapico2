@@ -290,11 +290,8 @@ pub const OFF_CRC: usize = 12;
 /// leaves behind.
 pub const FLAG_SEALED: u8 = 0x01;
 
-/// The AAD domain-separation prefix.
-///
-/// **A wire constant, and the whole of this module's AAD policy.** It is
 // The AAD itself is NOT defined here. `crypto::RecordAad` owns it — the AEAD
-// layer that consumes it — and `RecordHeader::aad()` below is a call into it.
+// layer that consumes it — and [`RecordHeader::aad`] is a call into it.
 //
 // An earlier revision of this file defined the AAD here *and* `crypto.rs`
 // defined it there, and the two disagreed (35 bytes against 11). A body sealed
@@ -304,13 +301,12 @@ pub const FLAG_SEALED: u8 = 0x01;
 // keeps finding: `card.rs:569` against `device_shell.rs:123`, `DEVICE_MAX_CREDS`
 // against the region. One record format, one AAD, one key hierarchy.
 
-
-/// The AAD's exact length: prefix(27) + `0x00` + domain(1) + slot(2) +
-/// generation(4) = **35**.
+/// The AAD's exact length, which is `crypto::AAD_LEN` and not a restatement
+/// of it.
 ///
-/// Fixed rather than heap-built, so the device path holds it in a small local
-/// and so a layout change is a compile error here rather than a decryption
-/// failure in the field.
+/// It was 35 bytes here and 11 there for one commit. Making this an alias is
+/// what stops that recurring: a layout change is then a compile error in one
+/// place rather than a decryption failure in the field.
 pub const AAD_BYTES: usize = crate::keyregion::crypto::AAD_LEN;
 
 /// GCM nonce length — the `Aes256Gcm` standard 12 bytes, the same width

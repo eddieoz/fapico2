@@ -138,14 +138,43 @@ pub const TOTAL_SLOTS: u32 = KEY_REGION_BYTES / FIDO_SLOT_BYTES;
 // Capacities — derived, never asserted
 // ---------------------------------------------------------------------------
 
+/// Slots reserved as the commit scratchpad (US-1544).
+///
+/// The commit protocol stages a sector's new contents somewhere else before
+/// erasing the live sector, because the erase destroys the old generation
+/// immediately and no ordering of programs brings it back. That staging area
+/// is one sector, so it costs [`SLOTS_PER_SECTOR`] slots — 4 of 960, about
+/// 0.4%.
+///
+/// It is charged to FIDO because FIDO is the domain that consumes it; OATH pays
+/// through the same sector when it commits. Charging it is the point: the
+/// alternative is a capacity that is one sector optimistic, which is how
+/// `DEVICE_MAX_CREDS = 12` came to be a number nobody could check.
+pub const SCRATCHPAD_SLOTS: u32 = SLOTS_PER_SECTOR;
+
 /// Resident FIDO credentials the region holds.
 ///
-/// Derived: the region, less OATH's slots, divided by FIDO's stride. The old
-/// `DEVICE_MAX_CREDS = 12` was a number in a file that no region could
-/// contradict; this one is a function of the region and the measured record
-/// size, so raising the region or lowering the record raises it, and lowering
-/// the region lowers it.
-pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS - OATH_CAPACITY;
+/// Derived: the region, less OATH's slots, the commit scratchpad, and the
+/// index. The old `DEVICE_MAX_CREDS = 12` was a number in a file that no
+/// region could contradict; this one is a function of the region, the measured
+/// record size, the commit protocol and the index, so changing any of those
+/// four changes it.
+///
+/// The two non-obvious deductions are the scratchpad and the index, and both
+/// are charged deliberately rather than absorbed:
+///
+/// * **scratchpad** — a commit stages a sector elsewhere before erasing the
+///   live one, so without it a brown-out destroys up to three *other*
+///   credentials' records;
+/// * **index** — every record needs an entry or it cannot be found, so an index
+///   smaller than the capacity makes the last credentials unfindable.
+///
+/// A capacity that does not charge both is a number nobody checked, which is
+/// the shape `DEVICE_MAX_CREDS = 12` had.
+pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS
+    - OATH_CAPACITY
+    - SCRATCHPAD_SLOTS
+    - crate::keyregion::index::INDEX_SLOT_COUNT;
 
 /// Resident OATH credentials the region holds.
 ///
@@ -225,9 +254,17 @@ const _: () = {
         "a capacity of zero is not a capacity"
     );
     assert!(
-        (FIDO_CAPACITY + OATH_CAPACITY) * FIDO_SLOT_BYTES <= KEY_REGION_BYTES,
-        "the two domains' slots overrun the key region"
+        TOTAL_SLOTS
+            == FIDO_CAPACITY
+                + OATH_CAPACITY
+                + SCRATCHPAD_SLOTS
+                + crate::keyregion::index::INDEX_SLOT_COUNT,
+        "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index"
     );
+    // The scratchpad is a whole sector, and a commit stages into it — a
+    // scratchpad that is not sector-aligned is a staging area with no
+    // commit unit.
+
 };
 
 /// The key region's size in slots at the FIDO stride — the denominator every
@@ -430,6 +467,7 @@ pub mod commit;
 pub mod crypto;
 pub mod host;
 pub mod index;
+pub mod on_demand;
 pub mod record;
 pub mod slotmap;
 

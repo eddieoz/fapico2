@@ -157,8 +157,11 @@ const _: () = {
         "the key store must end where the secure partition begins: an overlap is a keystore \
          the firmware can be linked over, and a gap is flash nothing can use"
     );
+    // Stated as an exact-multiple identity rather than `% == 0`: same meaning,
+    // and it is the form that compiles here — CI runs clippy with `-D warnings`
+    // and `manual_is_multiple_of` rejects the `%` form.
     assert!(
-        KEY_REGION_BYTES % BLOCK_SIZE as u32 == 0,
+        KEY_REGION_BYTES == (KEY_REGION_BYTES / BLOCK_SIZE as u32) * BLOCK_SIZE as u32,
         "the key region must be a whole number of NOR sectors; the record stride US-1540 \
          derives divides it, and a remainder would leave a partial sector nobody can erase"
     );
