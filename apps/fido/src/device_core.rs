@@ -901,15 +901,101 @@ impl FidoApp {
         rp_id_hash: Option<&[u8; 32]>,
         credential_id: &[u8],
     ) -> Option<DeviceCredential> {
+        self.region_credential_at(keys, rp_id_hash, credential_id)
+            .map(|(cred, _slot)| cred)
+    }
+
+    /// US-1562: [`Self::region_credential`] **and the slot the record occupies**.
+    ///
+    /// The two answers come from one `on_demand::load`
+    /// ([`RegionCredentials::load_by_id_at`]), which is why this is not
+    /// [`Self::region_credential`] followed by a locator call: the counter bump
+    /// is addressed by slot, and a second walk of the index to learn the slot
+    /// the first walk had already computed would be a second answer to a
+    /// question that can have two (`region_delete_compaction.rs`'s compaction
+    /// half is exactly the case where it would).
+    ///
+    /// `None` for the same three reasons [`Self::region_credential`] answers
+    /// `None` — no keys, no region, and "not there / could not be read" — plus
+    /// the same deliberate collapse of the last two.
+    fn region_credential_at(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+    ) -> Option<(DeviceCredential, fapico2_platform::keyregion::Slot)> {
         let mut window = fapico2_platform::keyregion::on_demand::CredentialWindow::new();
         self.with_region(keys, |creds| {
-            let hit = creds.load_by_id(rp_id_hash, credential_id, &mut window);
-            if !matches!(hit, fapico2_platform::keyregion::SlotRead::Present(())) {
-                return None;
-            }
+            let slot = match creds.load_by_id_at(rp_id_hash, credential_id, &mut window) {
+                fapico2_platform::keyregion::SlotRead::Present(slot) => slot,
+                _ => return None,
+            };
             crate::device_keystore::credential_from_record_body(window.as_slice())
+                .map(|cred| (cred, slot))
         })
         .flatten()
+    }
+
+    /// US-1562: the signature counter an assertion or a U2F authenticate must
+    /// sign, batched over whichever store holds the credential.
+    ///
+    /// **The one place the two backends are told apart**, and it is told apart by
+    /// the same accessor every other region/snapshot decision in this file uses —
+    /// [`Self::region_keys_for`] — rather than by a second predicate. A command
+    /// that decided "am I region-backed?" one way to load the credential and
+    /// another way to bump it would be the twin trap one level down: it passes
+    /// until the two disagree, and the symptom is a signed assertion whose
+    /// `signCount` came from a different store than the key that signed it.
+    ///
+    /// `slot` is `Some` exactly when `keys` is `Some` — the two arrive together
+    /// from [`Self::region_credential_at`], and a mismatch is treated as "not
+    /// region-backed" rather than as a panic, because every caller has a working
+    /// snapshot answer to fall back to.
+    ///
+    /// `None` means the credential could not be read at all, and every caller
+    /// maps it to its own "no such credential" answer — the same refusal the
+    /// snapshot bump returns for an unknown ID.
+    ///
+    /// # The nonce
+    ///
+    /// One draw per **durable** record write, from the same pool
+    /// [`Self::draw_random`] feeds makeCredential from, and the reason for the
+    /// destructuring rather than a `&mut self` closure is
+    /// [`Self::migrate_snapshot_to_region`]'s: the nonce closure has to hold the
+    /// pool while the region store holds the window, and a method call taking
+    /// `&mut self` would claim the whole app and forbid exactly that.
+    fn bump_sign_counter(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        slot: Option<fapico2_platform::keyregion::Slot>,
+        credential_id: &[u8],
+        store: Option<&mut dyn SecureStore>,
+    ) -> Option<u32> {
+        if let (Some(keys), Some(slot)) = (keys, slot) {
+            let Self { keystore, rng_pool, rng_cursor, .. } = self;
+            let mut next_nonce = || {
+                let mut n = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+                take_random(rng_pool, rng_cursor, &mut n);
+                n
+            };
+            let region = crate::device_app::key_region()?;
+            let mut creds = crate::device_keystore::RegionCredentials::new(region, keys);
+            return match creds.bump_credential_counter(
+                &mut keystore.counter_window,
+                slot,
+                &mut next_nonce,
+            ) {
+                // `Reverted` carries the value the window held *before* this
+                // command — SOAK-FINDING-1's discipline, and the region mirror of
+                // `bump_credential_counter_checked`'s revert arm. It is not an
+                // error here for the same reason it is not one there.
+                crate::device_keystore::RegionCounterBump::Batched(next)
+                | crate::device_keystore::RegionCounterBump::Durable(next)
+                | crate::device_keystore::RegionCounterBump::Reverted(next) => Some(next),
+                crate::device_keystore::RegionCounterBump::Unreadable => None,
+            };
+        }
+        self.keystore.bump_credential_counter_checked(credential_id, store)
     }
 
     /// Migrate the snapshot's credentials into the key region, once, if needed.
@@ -1738,13 +1824,24 @@ impl FidoApp {
         // resident for the assertion to find it at all. That is why the region
         // can hold 856: the 856 are in flash and this one is on the stack.
         //
+        // US-1562: the **slot** comes out of the same load. The signature
+        // counter lives in the record and is addressed by slot, so before this
+        // story the bump below had to find it again — and it did not; it looked
+        // the credential ID up in the *snapshot's* resident array, found
+        // nothing (a region-backed credential is not in it), and answered
+        // `CTAP2_ERR_NO_CREDENTIALS` to every assertion on the very backend the
+        // epic exists to make work. The slot is carried out of the load instead
+        // of looked up again, which is both the fix and one walk of the index
+        // cheaper than the alternative.
+        //
         // The fields are copied out immediately because `self` is borrowed
         // mutably a few lines later for the counter bump, and the local is what
         // ends that borrow.
-        let region_owned = self.region_credential(rkeys, None, cred_id);
+        let region_owned = self.region_credential_at(rkeys, None, cred_id);
+        let region_slot = region_owned.as_ref().map(|(_cred, slot)| *slot);
         let cred = if rkeys.is_some() {
             match region_owned.as_ref() {
-                Some(c) => c,
+                Some((c, _slot)) => c,
                 None => return Err(err(Ctap2Response::NoCredentials)),
             }
         } else {
@@ -1778,9 +1875,14 @@ impl FidoApp {
         // What is unchanged is the revert: on a persist *failure* the bump
         // rolls back and the reply signs the durable value, so a failing
         // store never latches the durable-before-ack gate.
+        //
+        // US-1562: the bump is over **whichever store holds the credential**
+        // ([`Self::bump_sign_counter`]), not over the snapshot unconditionally.
+        // The snapshot arm is untouched — same function, same batching, same
+        // revert — and every host build still reaches it, because
+        // `region_keys_for` answers `None` there.
         let sign_count = self
-            .keystore
-            .bump_credential_counter_checked(cred_id, store)
+            .bump_sign_counter(rkeys, region_slot, cred_id, store)
             .ok_or(err(Ctap2Response::NoCredentials))?;
 
         let mut hmac_out: HeaplessVec<u8, 80> = HeaplessVec::new();
@@ -4675,18 +4777,24 @@ impl FidoApp {
         }
 
         // Legacy (pre-US-714) store-backed handle: per-credential counter.
-        let private_key = {
+        let (private_key, region_slot) = {
             //
             // US-1554: U2F's `key_handle` **is** a credential ID, so the same
             // on-demand load serves it. Stateless handles are unaffected — they
             // are derived, not stored (`stateless.rs`), which is why this line
             // is only reached for a resident credential.
-            let region_owned = self.region_credential(rkeys.as_ref(), None, key_handle);
+            //
+            // US-1562: the slot comes out of that load rather than from a second
+            // lookup, for the reason `build_assertion` carries the same note: the
+            // bump below is addressed by slot, and CTAP1 is the surface a
+            // pre-US-714 authenticator uses exclusively, so the defect this fixes
+            // would have been *most* visible here.
+            let region_owned = self.region_credential_at(rkeys.as_ref(), None, key_handle);
             let snapshot = self.keystore.get_credential(key_handle);
-            let cred = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {
-                (true, Some(c), _) => c,
+            let (cred, slot) = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {
+                (true, Some((c, slot)), _) => (c, Some(*slot)),
                 (true, None, _) => return Err(U2fStatus::WrongData),
-                (false, _, Some(c)) => c,
+                (false, _, Some(c)) => (c, None),
                 (false, _, None) => return Err(U2fStatus::WrongData),
             };
             if cred.rp_id_hash != app_param {
@@ -4700,7 +4808,7 @@ impl FidoApp {
             // it is read through — the counter bump below takes `&mut self` —
             // so it has to own its 32 bytes, and `PrivateScalar` is what owns
             // them without leaking them into the frame that follows.
-            cred.private_key.copy_out()
+            (cred.private_key.copy_out(), slot)
         };
         // SOAK-FINDING-1 review round 2: transactional counter bump —
         // durable or reverted.
@@ -4716,9 +4824,14 @@ impl FidoApp {
         // restore: a whole window above the durable image, so a power cut
         // skips forward only. See
         // `device_keystore::bump_credential_counter_checked`.
+        //
+        // US-1562: dispatched over the same seam as CTAP2's
+        // ([`Self::bump_sign_counter`]), so a CTAP1-only authenticator — the one
+        // deployment where every assertion takes *this* path — bumps the
+        // credential's record rather than looking for it in an array it is not
+        // in.
         let counter = self
-            .keystore
-            .bump_credential_counter_checked(key_handle, store)
+            .bump_sign_counter(rkeys.as_ref(), region_slot, key_handle, store)
             .ok_or(U2fStatus::WrongData)?;
 
         out.push(0x01).ok(); // user presence

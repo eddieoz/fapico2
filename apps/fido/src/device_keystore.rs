@@ -1498,6 +1498,25 @@ pub struct DeviceKeystore {
     /// own: a credential created or deleted mid-window persists the counter
     /// along with it, and the window must start again from there.
     pub(crate) counter_unpersisted: u16,
+    /// US-1562: the batched signature-counter window over the **key region**,
+    /// the counterpart of [`Self::counter_unpersisted`].
+    ///
+    /// **On the app rather than on a static beside it**, for the same reason the
+    /// snapshot's half is here: the window is session state that must never
+    /// reach the medium, and a field of the value `boot.rs` parks in
+    /// `FIDO_APP` is the one place that guarantees it. Its cost is
+    /// [`CounterWindow`]'s own size — bounded by the *batch*
+    /// ([`CounterWindow::PENDING_MAX`] entries), never by the store, which is
+    /// the property that lets the region hold [`FIDO_CAPACITY`] credentials
+    /// from a window this small.
+    ///
+    /// **Always constructed restored, for the reason `decode`'s own arm gives.**
+    /// Only one of the two backends is live on a given board
+    /// (`FidoApp::region_keys_for` answers which one, and the command path asks
+    /// it the same question), and the other one's window is simply unused — which
+    /// is what keeps the applet from needing a second field to choose between
+    /// them.
+    pub(crate) counter_window: CounterWindow,
 }
 
 /// Decoded auth-map parts (see [`DeviceKeystore::decode_auth`]).
@@ -1570,6 +1589,12 @@ impl DeviceKeystore {
             // whole window is available: the first assertion after a
             // first-ever boot may be batched like any other.
             counter_unpersisted: 0,
+            // US-1562: restored, not fresh — see `decode`'s arm for why a
+            // keystore that has no snapshot to restore from still starts the
+            // region's window spent. A `DeviceKeystore::fresh()` is the
+            // "no snapshot yet" state, and on a region-backed board that is also
+            // "no way to tell", so the safe answer is the one that costs a skip.
+            counter_window: CounterWindow::restored(),
         })
     }
 
@@ -1777,6 +1802,21 @@ impl DeviceKeystore {
             // past the skip and hand a restored device a value below one the
             // client had already seen.
             counter_unpersisted,
+            // US-1562. **Not derived from `mode`, and the asymmetry is the
+            // point.** The snapshot can tell a restore from a fresh image because
+            // the whole document was in hand at decode; the key region cannot be
+            // touched at all until `RUNG_USB` (S8/S9), so at construction there
+            // is nothing in the applet that distinguishes "a device with eight
+            // hundred signed assertions" from "a device that has never signed
+            // one". Answering `fresh()` on an unreadable question is the
+            // direction that repeats a `signCount` after a power cut, which is
+            // the one outcome a signature counter exists to prevent, so every
+            // session starts restored. A credential enrolled moments earlier pays
+            // for it by signing `COUNTER_PERSIST_INTERVAL + 1` on its first
+            // assertion: over-skipping is legal (FIDO asks that a `signCount`
+            // never *repeat*, never that it advance by one), and the cost is one
+            // spare counter value on a credential that has no history to repeat.
+            counter_window: CounterWindow::restored(),
         })
     }
 
@@ -2364,6 +2404,19 @@ impl DeviceKeystore {
         self.counter_unpersisted = 0;
     }
 
+    /// US-1562: this device's batched signature-counter window over the key
+    /// region.
+    ///
+    /// **Read-only on purpose.** A mutable accessor would let a caller record a
+    /// pending value the store never learned about, and the next bump would then
+    /// sign *above* a value that was never written — which is a counter that
+    /// skips rather than repeats, so it would pass every test here and be wrong
+    /// in the only direction FIDO cares about once the window is spent. Every
+    /// mutation goes through [`RegionCredentials::bump_credential_counter`].
+    pub fn region_counter_window(&self) -> &CounterWindow {
+        &self.counter_window
+    }
+
     pub fn get_credential(&self, id: &[u8]) -> Option<&DeviceCredential> {
         self.credentials.iter().find(|c| c.credential_id.as_slice() == id)
     }
@@ -2938,6 +2991,35 @@ impl CounterWindow {
         self.unpersisted = self.unpersisted.saturating_sub(1);
     }
 
+    /// US-1562: undo one [`Self::record`] — put `slot` back to `counter` and
+    /// give back the budget the bump consumed.
+    ///
+    /// **Only ever called when the durable write that was supposed to carry the
+    /// raised value failed**, so this is the SOAK-FINDING-1 rollback on the
+    /// region path: the reply signs what the window held before the command, so
+    /// a flash that refuses a counter never lets the device sign a value it
+    /// cannot back. The applet-side mirror is
+    /// [`DeviceKeystore::bump_credential_counter_checked`]'s revert arm, and the
+    /// two have to agree — a rollback in one backend and not the other would be
+    /// the same signing discipline with two different answers to "what happens
+    /// when the flash says no".
+    ///
+    /// The entry is **not removed**, only lowered, and that is the whole point:
+    /// the next bump reads [`Self::pending_value`] and raises from there, so a
+    /// lowered entry keeps the counter moving forward. Removing it would hand
+    /// the next bump a *durable* value to raise from — and on a restored
+    /// session that is a value the cut-away session already signed, which is
+    /// the clone-detection repeat the whole restore mechanism exists to prevent.
+    ///
+    /// `unpersisted` falls by one because the budget counts **bumps**
+    /// ([`Self::record`]) and the bump being undone is one of them.
+    pub(crate) fn restore_pending(&mut self, slot: Slot, counter: u32) {
+        if let Some(entry) = self.pending.iter_mut().find(|(s, _)| *s == slot) {
+            entry.1 = counter;
+        }
+        self.unpersisted = self.unpersisted.saturating_sub(1);
+    }
+
     /// Every pending entry is durable: close the window.
     ///
     /// Never called for an empty flush — see [`RegionCredentials::flush_counters`],
@@ -3182,6 +3264,54 @@ pub fn region_pin_secret(_pin_state: &DevicePinState, device_random: &[u8; 32]) 
     out
 }
 
+/// What one region-backed signature-counter bump produced.
+///
+/// US-1562, and the three answers are not one answer with a `bool` bolted on.
+/// `DeviceKeystore::bump_credential_counter_checked` (crate-private) collapses
+/// the same three
+/// into "the counter to sign", because a snapshot persist either rewrites the
+/// whole image or does not — there is no in-between to report. A **per-record**
+/// write has one: a flush writes several records, so the record this assertion
+/// is about may be durable, or may not have been reached before a later record
+/// failed. A caller that only saw `u32` would sign a value it could not tell
+/// from one the flash had just refused.
+///
+/// `Reverted` is the SOAK-FINDING-1 arm: the bump is undone and the reply signs
+/// what the window held before the command, so a sick flash never lets the
+/// device sign a counter it has not committed. `Unreadable` is the only arm a
+/// caller must refuse on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionCounterBump {
+    /// Sign `counter`: the window is still open, so this value is in RAM only.
+    Batched(u32),
+    /// Sign `counter`: the window closed and the record is now in the region, so
+    /// the value survives a power cut without a restore.
+    Durable(u32),
+    /// Sign `counter`: the durable write failed and the bump was rolled back, so
+    /// this is the value the window held **before** this command — on a restored
+    /// session, the granted restore base rather than the raw durable one.
+    Reverted(u32),
+    /// The credential's record could not be read: absent, a tombstone, or a
+    /// flash fault. The caller must refuse the command rather than sign.
+    Unreadable,
+}
+
+/// [`RegionCredentials::raise_counter`]'s three outcomes, before they are
+/// widened into [`RegionCounterBump`].
+///
+/// Separate only so that the *primitive* ([`RegionCredentials::bump_counter`],
+/// which US-1561's caller holds) and the *applet seam*
+/// ([`RegionCredentials::bump_credential_counter`], which US-1562 added) share one
+/// implementation of the rollback rather than two that could disagree.
+enum Raise {
+    /// Recorded in the window, not yet written.
+    Signed(u32),
+    /// Recorded **and** written.
+    Durable(u32),
+    /// The write failed and the window was rolled back to this value.
+    RolledBack(u32),
+}
+
 /// The region-backed credential store: one sealed record per credential.
 ///
 /// # Why this exists at all
@@ -3302,6 +3432,42 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
         // here and letting the caller decode is what keeps one fail-closed
         // composition (`on_demand::load`) from being reassembled at a fourth
         // call site (`record.rs`'s rule).
+    }
+
+    /// US-1562: [`Self::load_by_id`] **and the slot the record occupies**.
+    ///
+    /// The same single `on_demand::load` composition and the same cost — it
+    /// keeps the store's [`on_demand::OnDemandHit`] instead of dropping it — and
+    /// it exists because a signature-counter bump is addressed by slot
+    /// ([`Self::bump_credential_counter`]) while a credential is looked up by
+    /// ID. Asking for the slot separately would be a **second** index walk and a
+    /// second round of AEAD probes to learn a number the first lookup had
+    /// already computed, and the two walks could disagree about a slot that had
+    /// been compacted in between.
+    ///
+    /// **The slot is the answer only for a record that is really a credential.**
+    /// A tombstone opens fine and is not one, so this says `Present` and lets the
+    /// caller decode — the same division of labour [`Self::load_by_id`] keeps.
+    pub fn load_by_id_at(
+        &mut self,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+        out: &mut CredentialWindow,
+    ) -> SlotRead<Slot> {
+        let hash = rp_id_hash.map(|h| RpIdHash::from_bytes(*h));
+        let probe = CredentialIdProbe { credential_id };
+        match self.store.load_by_credential_id(
+            &self.keys.payload,
+            &self.keys.index,
+            hash.as_ref(),
+            credential_id,
+            &probe,
+            out,
+        ) {
+            SlotRead::Present(hit) => SlotRead::Present(hit.slot()),
+            SlotRead::Absent => SlotRead::Absent,
+            SlotRead::Fault(why) => SlotRead::Fault(why),
+        }
     }
 
     /// Load one credential of one RP into `out`, addressed by RP alone.
@@ -3441,6 +3607,15 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
     /// write pattern has since changed shape and whose divisor has been
     /// re-derived (`docs/erase-budget.md` §4c).
     ///
+    /// **US-1562: a durable write that fails is answered, not propagated.** The
+    /// window is rolled back and the value it held *before* this call is
+    /// returned, which is SOAK-FINDING-1's discipline and the mirror of
+    /// `DeviceKeystore::bump_credential_counter_checked`'s revert arm. The
+    /// [`Err`] this can still return is the unreachable "the window could not
+    /// hold the write" case below, which is a defect rather than a medium
+    /// failure. Callers that want to *tell* the two apart use
+    /// [`Self::bump_credential_counter`].
+    ///
     /// `next_nonce` supplies a fresh GCM nonce per durable write. The store does
     /// not derive one (`record::seal`'s docs: a module holding no key has no
     /// business choosing a nonce), and a repeated nonce under one key is
@@ -3453,18 +3628,81 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
         current: u32,
         next_nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
     ) -> Result<u32, RegionCredentialError> {
+        match self.raise_counter(window, slot, current, next_nonce)? {
+            Raise::Signed(next) | Raise::Durable(next) => Ok(next),
+            Raise::RolledBack(previous) => Ok(previous),
+        }
+    }
+
+    /// US-1562: the bump an assertion or a U2F authenticate needs, addressed by
+    /// slot and answering all three outcomes distinctly.
+    ///
+    /// [`Self::bump_counter`] collapses them, which is right for its own
+    /// "return the counter to sign" contract and wrong for a caller that has to
+    /// decide whether to serve the assertion at all. The three are genuinely
+    /// different: `Batched` is a value the device has signed but not written,
+    /// `Durable` is one it can rebuild from the region alone, and `Reverted` is
+    /// one the flash refused. Only `Unreadable` refuses the command, and it is
+    /// the only one — `build_assertion`'s applet-side caller maps it to
+    /// `CTAP2_ERR_NO_CREDENTIALS` exactly as it already did when the bump
+    /// resolved the credential out of the snapshot.
+    ///
+    /// The read that precedes the bump is a genuine three-state question
+    /// ([`Self::counter_value`]'s own docs), so a faulted region is `Unreadable`
+    /// rather than a silently wrong counter.
+    pub fn bump_credential_counter(
+        &mut self,
+        window: &mut CounterWindow,
+        slot: Slot,
+        next_nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
+    ) -> RegionCounterBump {
+        let current = match self.counter_value(window, slot) {
+            Ok(current) => current,
+            Err(_) => return RegionCounterBump::Unreadable,
+        };
+        match self.raise_counter(window, slot, current, next_nonce) {
+            Ok(Raise::Signed(next)) => RegionCounterBump::Batched(next),
+            Ok(Raise::Durable(next)) => RegionCounterBump::Durable(next),
+            // SOAK-FINDING-1: the write failed, the window was rolled back, and
+            // the reply signs what the window held before this command. The
+            // flash error is deliberately not surfaced — `docs` on the snapshot
+            // arm says the same thing, and the two backends disagreeing about
+            // what a sick store means is the failure `AGENTS.md` §5's "one
+            // record format" rule exists to prevent.
+            Ok(Raise::RolledBack(previous)) => RegionCounterBump::Reverted(previous),
+            Err(_) => RegionCounterBump::Unreadable,
+        }
+    }
+
+    /// Raise `slot`'s value in the window, writing the window down when it is
+    /// due, and say which of the three outcomes happened.
+    ///
+    /// The one place the region's batching rules live; [`Self::bump_counter`]
+    /// and [`Self::bump_credential_counter`] are the two shapes callers hold it
+    /// in, so the rollback that SOAK-FINDING-1 requires cannot be implemented
+    /// by one caller and forgotten by the other.
+    fn raise_counter(
+        &mut self,
+        window: &mut CounterWindow,
+        slot: Slot,
+        current: u32,
+        next_nonce: &mut dyn FnMut() -> [u8; record::NONCE_LEN],
+    ) -> Result<Raise, RegionCredentialError> {
         // A full pending list is the only way `record` refuses, and a flush
         // empties it — so flushing *before* the record is what makes the refusal
         // unreachable rather than merely unlikely.
-        if window.pending_full() {
-            self.flush_counters(window, next_nonce)?;
+        //
+        // A flush that fails here is answered the same way a failure below is:
+        // nothing of this command's has been recorded yet, so the reply signs
+        // what the window already held and the next assertion retries.
+        if window.pending_full() && self.flush_counters(window, next_nonce).is_err() {
+            return Ok(Raise::RolledBack(Self::held_value(window, slot, current)));
         }
-        let base = match window.pending_value(slot) {
-            // Already in flight: this session's own raise is the newest value,
-            // and it has already had whatever slack it was owed.
-            Some(p) => p.saturating_add(1),
-            None => window.resume_base(slot, current).saturating_add(1),
-        };
+        // **Read the base after the flush above**, because the flush empties the
+        // pending list and `pending_value` is where an in-flight session's own
+        // newest value lives.
+        let pre = window.pending_value(slot).unwrap_or_else(|| window.resume_base(slot, current));
+        let base = pre.saturating_add(1);
         if !window.record(slot, base) {
             // Unreachable — the list was just emptied or had room. Reported
             // rather than swallowed, because the alternative is signing `base`
@@ -3474,10 +3712,36 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
                 "fido: the counter window could not hold the pending write",
             ));
         }
-        if window.should_flush() {
-            self.flush_counters(window, next_nonce)?;
+        if !window.should_flush() {
+            return Ok(Raise::Signed(base));
         }
-        Ok(base)
+        if self.flush_counters(window, next_nonce).is_err() {
+            // The durable write failed. If this slot's entry is **still** pending
+            // then the flush never reached it, so the region still holds `pre`
+            // and the bump is undone; if it is not pending the flush wrote it
+            // before failing on a later record, so the durable value is `base`
+            // and there is nothing to undo. `flush_counters` drops entries one
+            // at a time on success, so this test is exact rather than a guess.
+            if window.pending_value(slot) == Some(base) {
+                window.restore_pending(slot, pre);
+                return Ok(Raise::RolledBack(pre));
+            }
+            return Ok(Raise::Durable(base));
+        }
+        Ok(Raise::Durable(base))
+    }
+
+    /// What `slot` holds when the window has nothing pending for it: the
+    /// restore-granted value, which is `current` on a session that did not begin
+    /// as a restore and [`CounterWindow::resume_from`] of it on one that did.
+    ///
+    /// A separate accessor because the rollback answer is *not* `current` on a
+    /// restored session: signing the raw durable value there would sign a number
+    /// the cut-away session already signed, which is the clone-detection repeat
+    /// US-1012's grant exists to avoid. The grant is memoised in the window, so
+    /// calling this on the error path spends nothing the next bump needs.
+    fn held_value(window: &mut CounterWindow, slot: Slot, current: u32) -> u32 {
+        window.pending_value(slot).unwrap_or_else(|| window.resume_base(slot, current))
     }
 
     /// US-1561: make every batched counter durable, and report how many records

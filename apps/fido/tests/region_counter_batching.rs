@@ -62,23 +62,19 @@
 
 use std::path::{Path, PathBuf};
 
+mod region_boot;
+
 use fapico2_fido::device_keystore::{
     region_pin_secret, CounterWindow, DeviceCredential, DevicePinState, PrivateScalar,
     RegionCredentials, RegionKeys, COUNTER_PERSIST_INTERVAL,
 };
 use fapico2_platform::keyregion::crypto;
 use fapico2_platform::keyregion::fido_store;
-use fapico2_platform::keyregion::host::FileKeyRegion;
 use fapico2_platform::keyregion::record;
-use fapico2_platform::keyregion::slotmap::SlotImage;
-use fapico2_platform::keyregion::{KeyRegion, Slot, SLOTS_PER_SECTOR, TOTAL_SLOTS};
+use fapico2_platform::keyregion::{Slot, SLOTS_PER_SECTOR};
+use region_boot::CountingRegion;
 
 use heapless::Vec as HeaplessVec;
-
-/// The region's whole geometry — the same number `capacity_boundary.rs` uses,
-/// and for the same reason: the allocator scans `FIDO_SLOT_LIMIT` slots and the
-/// index lives at the tail, so a short file would change what a write touches.
-const REGION_SLOTS: u32 = TOTAL_SLOTS;
 
 /// The window's size, taken from the code rather than repeated. If the constant
 /// moves, this file follows it and the arithmetic in the test names stays true;
@@ -201,88 +197,14 @@ fn rp_hash(n: u32) -> [u8; 32] {
 // The counting region
 // ---------------------------------------------------------------------------
 
-/// A [`KeyRegion`] that logs every erase and program **by sector**.
-///
-/// Per-sector because the whole lifetime argument is a per-sector argument,
-/// and because "one erase and one program" has to be answered as "one erase of
-/// *this* sector" — a counter of calls cannot say which sector paid.
-struct CountingRegion {
-    inner: FileKeyRegion,
-    erase_log: Vec<u32>,
-    program_log: Vec<u32>,
-}
-
-impl CountingRegion {
-    fn create(path: &Path) -> Self {
-        CountingRegion {
-            inner: FileKeyRegion::create(path, REGION_SLOTS)
-                .expect("the temp region file is creatable"),
-            erase_log: Vec::new(),
-            program_log: Vec::new(),
-        }
-    }
-
-    fn open(path: &Path) -> Self {
-        CountingRegion {
-            inner: FileKeyRegion::open(path).expect("the region file is reopenable"),
-            erase_log: Vec::new(),
-            program_log: Vec::new(),
-        }
-    }
-
-    fn reset_log(&mut self) {
-        self.erase_log.clear();
-        self.program_log.clear();
-    }
-
-    fn erases(&self) -> u32 {
-        self.erase_log.iter().sum()
-    }
-
-    fn on(log: &[u32], slot: Slot) -> u32 {
-        log.get(slot.index() as usize / SLOTS_PER_SECTOR as usize).copied().unwrap_or(0)
-    }
-
-    fn erases_on(&self, slot: Slot) -> u32 {
-        Self::on(&self.erase_log, slot)
-    }
-
-    fn programs_on(&self, slot: Slot) -> u32 {
-        Self::on(&self.program_log, slot)
-    }
-
-    fn bump(log: &mut Vec<u32>, slot: Slot) {
-        let at = slot.index() as usize / SLOTS_PER_SECTOR as usize;
-        if at >= log.len() {
-            log.resize(at + 1, 0);
-        }
-        log[at] += 1;
-    }
-}
-
-impl KeyRegion for CountingRegion {
-    fn read_slot(&mut self, slot: Slot) -> Result<SlotImage, &'static str> {
-        self.inner.read_slot(slot)
-    }
-
-    fn erase_sector(&mut self, slot: Slot) -> Result<(), &'static str> {
-        let out = self.inner.erase_sector(slot);
-        // Logged whether or not it succeeded: the wear question is "what did the
-        // protocol attempt", and no interface says whether a refused erase
-        // consumed a cycle.
-        Self::bump(&mut self.erase_log, slot);
-        out
-    }
-
-    fn program(&mut self, slot: Slot, offset: u32, data: &[u8]) -> Result<(), &'static str> {
-        Self::bump(&mut self.program_log, slot);
-        self.inner.program(slot, offset, data)
-    }
-
-    fn slots(&self) -> u32 {
-        self.inner.slots()
-    }
-}
+// `CountingRegion` itself is shared: `region_boot/mod.rs` owns it, because the
+// **same** sector-granular erase log has to be readable from two places — this
+// file, which drives the applet's store API directly, and
+// `region_assertion_counter.rs`, which needs it behind the applet's *provider*
+// because that is the only handle a command-path write goes through. Two
+// copies of "log erases by sector" in a tree that keeps finding the same
+// mechanism written twice is `AGENTS.md` §5's defect class, and the two would
+// agree only until one of them was edited.
 
 // ---------------------------------------------------------------------------
 // Helpers over the applet API

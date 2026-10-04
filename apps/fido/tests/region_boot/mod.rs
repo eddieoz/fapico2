@@ -30,7 +30,7 @@
 
 #![allow(dead_code)] // each of the two test files uses a subset of this
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use fapico2_fido::cbor::no_heap as nh;
@@ -41,7 +41,8 @@ use fapico2_fido::FidoApp;
 use fapico2_platform::fused_key::FusedKey;
 use fapico2_platform::keyregion::host::{Faults, FileKeyRegion};
 use fapico2_platform::keyregion::record;
-use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead, TOTAL_SLOTS};
+use fapico2_platform::keyregion::slotmap::SlotImage;
+use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead, SLOTS_PER_SECTOR, TOTAL_SLOTS};
 use fapico2_platform::secure_store::rp2350::Rp2350SecureStore;
 use fapico2_platform::secure_store::SecureStore;
 use fapico2_platform::trng::HostTrng;
@@ -67,6 +68,14 @@ pub const REGION_SLOTS: u32 = TOTAL_SLOTS;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static REGION: Mutex<Option<Box<FileKeyRegion>>> = Mutex::new(None);
+/// The counting install's region, kept apart from [`REGION`] because the two
+/// providers are different *types* and [`InstalledRegion::with`] hands out a
+/// concrete `&mut FileKeyRegion` for the fault injectors to work through.
+///
+/// **One provider is installed at a time**, whichever [`install`] or
+/// [`install_counting`] ran last, and both `Drop` arms clear both slots — so a
+/// test can never find a live region behind a provider that answers `None`.
+static COUNTING: Mutex<Option<Box<CountingRegion>>> = Mutex::new(None);
 
 /// Serialise the tests in this file against the process-global provider.
 ///
@@ -102,6 +111,18 @@ fn provider() -> Option<&'static mut dyn KeyRegion> {
     Some(unsafe { &mut *ptr })
 }
 
+/// The provider [`install_counting`] publishes — the same
+/// [`provider`], over [`COUNTING`].
+fn counting_provider() -> Option<&'static mut dyn KeyRegion> {
+    let mut guard = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+    let boxed = guard.as_mut()?;
+    let ptr: *mut CountingRegion = &mut **boxed;
+    drop(guard);
+    // SAFETY: identical to [`provider`]'s — the `Box` allocation is stable for
+    // as long as it is installed, and every caller holds [`lock`].
+    Some(unsafe { &mut *ptr })
+}
+
 /// The provider that answers "no region".
 ///
 /// What a host build has, and what a device has before
@@ -122,14 +143,36 @@ pub struct InstalledRegion {
 /// region whose virgin state is `0x00` would accept records a real part cannot
 /// hold.
 pub fn install(tag: &str) -> InstalledRegion {
-    let path = std::env::temp_dir()
-        .join(format!("fapico2-region-boot-{}-{tag}.bin", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    FileKeyRegion::create(&path, REGION_SLOTS).expect("a fresh key region file");
+    let region = InstalledRegion::new_file(tag);
+    FileKeyRegion::create(region.path(), REGION_SLOTS).expect("a fresh key region file");
     *REGION.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(Box::new(FileKeyRegion::open(&path).expect("reopen the region")));
+        Some(Box::new(FileKeyRegion::open(region.path()).expect("reopen the region")));
     device_app::install_region_provider(provider);
-    InstalledRegion { path }
+    region
+}
+
+/// [`install`], with a region that records what the applet's own writes cost.
+///
+/// **The only way to measure the erase profile of a command path**, because the
+/// applet reaches the region exclusively through the provider — a test cannot
+/// wrap the region the applet is holding. The wrapper is transparent apart from
+/// the two logs, so a command that behaves here behaves on the board.
+pub fn install_counting(tag: &str) -> InstalledRegion {
+    let region = InstalledRegion::new_file(tag);
+    FileKeyRegion::create(region.path(), REGION_SLOTS).expect("a fresh key region file");
+    *COUNTING.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Box::new(CountingRegion::open(region.path())));
+    device_app::install_region_provider(counting_provider);
+    region
+}
+
+impl InstalledRegion {
+    fn new_file(tag: &str) -> InstalledRegion {
+        let path = std::env::temp_dir()
+            .join(format!("fapico2-region-boot-{}-{tag}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        InstalledRegion { path }
+    }
 }
 
 impl InstalledRegion {
@@ -146,13 +189,121 @@ impl InstalledRegion {
         let boxed = guard.as_mut().expect("the region is installed");
         f(boxed)
     }
+
+    /// Run `f` over the live counting region.
+    ///
+    /// `None` when the plain [`install`] ran instead — a distinct answer rather
+    /// than a panic, because a caller asking for erase counts and handed zeroes
+    /// would write a test that passes against nothing.
+    pub fn with_counting<R>(&self, f: impl FnOnce(&mut CountingRegion) -> R) -> Option<R> {
+        let mut guard = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        let boxed = guard.as_mut()?;
+        Some(f(boxed))
+    }
 }
 
 impl Drop for InstalledRegion {
     fn drop(&mut self) {
         device_app::install_region_provider(provider_none);
         *REGION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *COUNTING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The region that counts what a write cost
+// ---------------------------------------------------------------------------
+
+/// A [`KeyRegion`] that logs every erase and program **by sector**.
+///
+/// Per-sector because the whole lifetime argument is a per-sector argument
+/// (`docs/erase-budget.md` §4c.3), and because "one erase and one program" has
+/// to be answered as "one erase of *this* sector" — a counter of calls cannot
+/// say which sector paid.
+///
+/// Logged whether or not the call succeeded: the wear question is what the
+/// protocol **attempted**, and no interface says whether a refused erase
+/// consumed a cycle.
+pub struct CountingRegion {
+    inner: FileKeyRegion,
+    erase_log: Vec<u32>,
+    program_log: Vec<u32>,
+}
+
+impl CountingRegion {
+    /// A counting region over a **new** file at `path`.
+    pub fn create(path: &Path) -> Self {
+        CountingRegion::wrap(FileKeyRegion::create(path, REGION_SLOTS).expect("a fresh region file"))
+    }
+
+    /// A counting region over the existing file at `path`.
+    pub fn open(path: &Path) -> Self {
+        CountingRegion::wrap(FileKeyRegion::open(path).expect("the region file is reopenable"))
+    }
+
+    fn wrap(inner: FileKeyRegion) -> Self {
+        CountingRegion { inner, erase_log: Vec::new(), program_log: Vec::new() }
+    }
+
+    /// Forget everything logged so far, so a test can measure one command.
+    pub fn reset_log(&mut self) {
+        self.erase_log.clear();
+        self.program_log.clear();
+    }
+
+    /// Every sector erase since the last [`Self::reset_log`].
+    pub fn erases(&self) -> u32 {
+        self.erase_log.iter().sum()
+    }
+
+    /// Slot programs issued against `slot`'s sector since the last
+    /// [`Self::reset_log`].
+    pub fn programs_on(&self, slot: Slot) -> u32 {
+        Self::on(&self.program_log, slot)
+    }
+
+    /// Sector erases of `slot`'s sector since the last [`Self::reset_log`].
+    pub fn erases_on(&self, slot: Slot) -> u32 {
+        Self::on(&self.erase_log, slot)
+    }
+
+    /// Inject faults into the wrapped region, for the "the flash says no" cases.
+    pub fn inject_faults(&mut self, faults: Faults) {
+        self.inner.inject_faults(faults);
+    }
+
+    fn on(log: &[u32], slot: Slot) -> u32 {
+        log.get(slot.index() as usize / SLOTS_PER_SECTOR as usize).copied().unwrap_or(0)
+    }
+
+    fn bump(log: &mut Vec<u32>, slot: Slot) {
+        let at = slot.index() as usize / SLOTS_PER_SECTOR as usize;
+        if at >= log.len() {
+            log.resize(at + 1, 0);
+        }
+        log[at] += 1;
+    }
+}
+
+impl KeyRegion for CountingRegion {
+    fn read_slot(&mut self, slot: Slot) -> Result<SlotImage, &'static str> {
+        self.inner.read_slot(slot)
+    }
+
+    fn erase_sector(&mut self, slot: Slot) -> Result<(), &'static str> {
+        let out = self.inner.erase_sector(slot);
+        Self::bump(&mut self.erase_log, slot);
+        out
+    }
+
+    fn program(&mut self, slot: Slot, offset: u32, data: &[u8]) -> Result<(), &'static str> {
+        Self::bump(&mut self.program_log, slot);
+        self.inner.program(slot, offset, data)
+    }
+
+    fn slots(&self) -> u32 {
+        self.inner.slots()
     }
 }
 
@@ -423,6 +574,32 @@ impl Device {
         f(&mut self.store)
     }
 
+    /// Run the transport's persist gate — what `firmware/src/tasks.rs::persist_hid`
+    /// runs after every HID transaction, and what the dispatcher's
+    /// `persist_state` runs after every APDU.
+    ///
+    /// **A region-backed device needs this and it is easy to forget.** The
+    /// snapshot is still the home of `device_random`, and `region_pin_secret`
+    /// mixes it into the region's payload key, so a test that never persists
+    /// has a device whose payload key is redrawn at every boot — every record
+    /// unreadable, and a failure that would be read as a region bug. Every test
+    /// here that reboots the app goes through this first, which is what makes the
+    /// reboot a power cut rather than a factory reset.
+    pub fn persist(&mut self) -> bool {
+        self.app.persist_if_dirty(&mut self.store)
+    }
+
+    /// The store, so a test can boot a **second** device over it.
+    ///
+    /// Consuming rather than cloning, for the reason [`Self::with_store`] gives
+    /// about `Rp2350SecureStore` — and it also drops the applet, which is the
+    /// half a power-cut test wants: nothing about the medium survives in the
+    /// old app, because `FidoRecordStore` holds no cache
+    /// (`fido_store.rs`'s module docs).
+    pub fn into_store(mut self) -> Rp2350SecureStore {
+        core::mem::replace(&mut self.store, Rp2350SecureStore::new())
+    }
+
     /// Grant user presence unconditionally.
     ///
     /// The board polls a button (`device_app.rs`'s `presence_grant`), and every
@@ -654,6 +831,25 @@ impl Device {
         nh::push_bstr(&mut req, &self.pin_auth_shared(&pin_enc)).unwrap();
         assert_eq!(self.call(0x06, req.as_slice()).0, 0x00, "setPIN");
 
+        self.mint_token_with_pin(pin);
+    }
+
+    /// Mint a pinUvAuthToken from an **already-set** PIN, with the same
+    /// permissions [`Self::set_pin`] asks for.
+    ///
+    /// **A separate entry point because `setPIN` is refused once a PIN exists**
+    /// (`CTAP2_ERR_PIN_INVALID`), so a test that reboots the device — the whole
+    /// shape of a power-cut story — cannot re-run [`Self::set_pin`] and is left
+    /// with no token, which every `pinUvAuthParam` on the wire then fails
+    /// against. Only the setPIN half is missing; the leg below is the same one
+    /// `set_pin` finishes with.
+    pub fn unlock_with_pin(&mut self, pin: &[u8]) {
+        self.derive_keys();
+        self.mint_token_with_pin(pin);
+    }
+
+    /// `getPinUvAuthTokenUsingPinWithPermissions` with `mc|ga|cm|lbf|acfg`.
+    fn mint_token_with_pin(&mut self, pin: &[u8]) {
         let pin_hash = crypto::pin_hash(pin);
         let pin_hash_enc = self.v1_encrypt(&pin_hash);
         let mut req: HV<u8, 256> = HV::new();
@@ -872,6 +1068,39 @@ pub fn uint_at(cbor: &[u8], key: u64) -> Option<u64> {
             1 => None,
             _ => None,
         };
+    }
+    None
+}
+
+/// The byte string at `key` out of a CTAP2 response map, or `None`.
+///
+/// The counterpart of [`uint_at`], and it exists for the same reason: a
+/// getAssertion reply carries its `authData` — and therefore its `signCount` —
+/// as a **byte string**, and reading that off the wire needs the same
+/// walk-the-bytes discipline rather than a second parser written for one test.
+pub fn bstr_at(cbor: &[u8], key: u64) -> Option<Vec<u8>> {
+    let mut i = 0;
+    let (major, pairs) = cbor_head(cbor, &mut i)?;
+    if major != 5 {
+        return None;
+    }
+    for _ in 0..pairs {
+        let (km, k) = cbor_head(cbor, &mut i)?;
+        if km != 0 {
+            return None;
+        }
+        let value_at = i;
+        cbor_skip(cbor, &mut i)?;
+        if k != key {
+            continue;
+        }
+        let mut j = value_at;
+        let (vm, len) = cbor_head(cbor, &mut j)?;
+        if vm != 2 {
+            return None;
+        }
+        let end = j.checked_add(len as usize)?;
+        return cbor.get(j..end).map(|b| b.to_vec());
     }
     None
 }
