@@ -1780,6 +1780,19 @@ fn rescue_bare_cases() -> Vec<Case> {
         case("CLA 0x00", vec![0x00, 0x1C, 0x01, 0x00, 0x00], 0x6E00),
         case("CLA 0x10", vec![0x10, 0x1C, 0x01, 0x00, 0x00], 0x6E00),
         case("3-byte APDU", vec![0x80, 0x1C], 0x6700),
+        // A `WRITE` with nowhere to go. `0x6A86`, and the status word is about
+        // the **missing owner**, not about the tag: `0x0C` is `LedDriver`,
+        // which this build does not model, and an unmodelled tag is *skipped*
+        // (see `rescue_owned_cases`). So a case run in the owned scenario
+        // answers `9000` on the same bytes — which is precisely why this one
+        // only means anything here. It used to live in the owned list, where
+        // it asserted `6A86` and answered `9000`: the two facts it exists to
+        // separate had been put in the same scenario.
+        case(
+            "WRITE with no record owner",
+            vec![0x80, 0x1C, 0x01, 0x00, 0x03, 0x0C, 0x01, 0x19],
+            0x6A86,
+        ),
     ]
 }
 
@@ -1801,7 +1814,15 @@ fn rescue_owned_cases() -> Vec<Case> {
         // picoforge synthesises a `0x0A` whenever the device reports none.
         case(
             "WRITE an unsupported tag beside a supported one",
-            vec![0x80, 0x1C, 0x01, 0x00, 0x06, 0x04, 0x01, 0x09, 0x0A, 0x01],
+            // `0x04 01 09` = led_gpio 9; `0x0A 04 00 00 00 00` = a `0x0A`
+            // (Curves), which this build does not model. `Curves` declares
+            // width **4** (`phy_tlv.rs:321`), so the record carries four value
+            // bytes and `Lc` is 9. Two earlier spellings of this case were
+            // both wrong in the same direction — `0A 01` and `0A 01 00` — and
+            // each was refused `6700` by the *width* check, so the case was
+            // measuring the width table while claiming to measure tag
+            // tolerance.
+            vec![0x80, 0x1C, 0x01, 0x00, 0x09, 0x04, 0x01, 0x09, 0x0A, 0x04, 0x00, 0x00, 0x00, 0x00],
             0x9000,
         ),
         // A 0x0B record whose mask clears bit 0x01 (USB_ITF_CCID). The applet
@@ -1821,23 +1842,6 @@ fn rescue_owned_cases() -> Vec<Case> {
             vec![0x80, 0x1C, 0x01, 0x00, 0x04, 0x0B, 0x02, 0x00, 0x02],
             0x6700,
         ),
-        // A tag the protocol defines but this firmware refuses to apply —
-        // `SUPPORTED_PHY_TAGS` is seven of the twelve and this is not one of
-        // them. `0x0F` is `LedDriver` (`0x0C`), which still has no field in the
-        // persisted record, so it reaches the "this build does not serve it"
-        // group instead of being caught earlier by the width check. It was
-        // `UsbManufacturer` until that tag was given a field; the sweep
-        // caught the change, which is what it is for — a named case whose
-        // status changes is a behaviour change someone has to look at.
-        // `0x6A86` here is **not** the tag being unsupported — that is skipped
-        // (see `rescue_owned_cases`). It is this scenario's missing record
-        // owner: there is nowhere for the write to go. The distinction is the
-        // point of running the case in the bare scenario.
-        case(
-            "WRITE with no record owner",
-            vec![0x80, 0x1C, 0x01, 0x00, 0x03, 0x0C, 0x01, 0x19],
-            0x6A86,
-        ),
         // A name tag that *is* now writable, carrying a value with no
         // terminator. `6A80`, not `6A86`: the record is one this firmware
         // supports, and the value is one it cannot frame. Pinning both halves
@@ -1854,11 +1858,15 @@ fn rescue_owned_cases() -> Vec<Case> {
             vec![0x80, 0x1C, 0x01, 0x00, 0x03, 0x0A, 0x01, 0x19],
             0x6700,
         ),
-        // A tag the protocol does not define at all.
+        // A tag the protocol does not define at all. `9000`: an
+        // unrecognised tag is **skipped**, exactly as a recognised-but-
+        // unmodelled one is, and what remains of the blob still commits. This
+        // used to claim `6A86` — the behaviour that made this firmware the odd
+        // one out of four and cost every picoforge configuration save.
         case(
             "WRITE an undefined tag",
             vec![0x80, 0x1C, 0x01, 0x00, 0x03, 0x7F, 0x01, 0x19],
-            0x6A86,
+            0x9000,
         ),
         // A declared length that runs past the end of the blob.
         case(

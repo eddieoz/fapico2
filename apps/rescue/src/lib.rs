@@ -385,13 +385,24 @@
 //!
 //! **The risk of registering it**, recorded because it is real and it is the
 //! price of the surface: the device gains a permanent, unauthenticated,
-//! no-rate-limit, no-presence write path to a stored record (threat model R1),
-//! a permanent unauthenticated reboot primitive (R5), and a disclosure of the
-//! full 8-byte OTP chip id where every other surface leaks only
-//! `SHA-256(chipid)[..4]` (R2/R3). All four are **accepted, not fixed** in the
-//! threat model §8, and all four are inert-or-availability today only because
-//! nothing reads the record (threat model §0.1) — a tripwire that fires the day
-//! the USB descriptors become runtime-configurable.
+//! no-rate-limit write path to a stored record (threat model R1), a permanent
+//! unauthenticated reboot primitive (R5), and a disclosure of the full 8-byte
+//! OTP chip id where every other surface leaks only `SHA-256(chipid)[..4]`
+//! (R2/R3). All three are **accepted, not fixed** in the threat model §8.
+//!
+//! **The tripwire in that paragraph has now fired, and US-1536 answered it.**
+//! It said those four were "inert-or-availability today only because nothing
+//! reads the record — a tripwire that fires the day the USB descriptors become
+//! runtime-configurable". They did (`platform/src/usb.rs:425-437` applies a
+//! stored `vid_pid` at enumeration), and the tripwire was not theoretical: a
+//! `WRITE` of a VID/PID no host driver knows leaves the board **enumerable over
+//! USB but invisible to PC/SC**, which retires the rescue channel — the one
+//! surface with no PIN — as a recovery route. So `WRITE` now takes a
+//! user-presence grant (`6985`, as pico-keys-sdk and RS-Key both do), the same
+//! gate `apps/mgmt/src/lib.rs:534-553` applies to `WRITE_CONFIG`. R1 is
+//! narrowed, not closed: it is still unauthenticated and still un-rated, and a
+//! *deliberate* touch can still strand the device. What is gone is the
+//! unattended, one-APDU version.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
@@ -399,6 +410,7 @@ use fapico2_platform::dispatch::{
     App, MAX_RESPONSE, Sw, SW_CLA_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED, SW_OK, SW_WRONG_LENGTH,
 };
 use fapico2_platform::phy_tlv::{self, PhyTag, USB_ITF_CCID};
+use fapico2_platform::presence::PresenceService;
 use heapless::Vec as HeaplessVec;
 
 /// Rescue applet AID (`picoforge/src/hal/rescue/constants.rs:106`).
@@ -506,6 +518,34 @@ pub const SECURE_LOCK: u8 = 0x01;
 ///   would brick this applet".
 const SW_WRONG_PARAMETERS: Sw = 0x6A86;
 const SW_INVALID_DATA: Sw = 0x6A80;
+/// A `WRITE` refused for want of a user-presence grant.
+///
+/// `0x6985` — ISO 7816-4 "conditions of use not satisfied", and the *same*
+/// word pico-keys-sdk returns from `rescue_require_user_presence()`
+/// (`apdu.h:107`: `set_res_sw(0x69, 0x85)`). Matching it exactly is the point:
+/// a client that already knows how to present a touch for the reference needs
+/// no new error handling for this firmware, and the picoforge GUI's
+/// "Applying configuration... Press the device button to confirm."
+/// (`view_model.rs:635-651`) is emitted against that expectation.
+const SW_CONDITIONS_NOT_SATISFIED: Sw = 0x6985;
+
+/// The device user-presence source for the applet's own fallback path.
+///
+/// `None` (the firmware does not inject one) resolves differently per build,
+/// exactly as `apps/mgmt/src/lib.rs:212-221` does: a **device** build denies,
+/// so the fail-closed case is the one that ships, while a **host/emulation**
+/// build auto-acks so the emulator suites — which have no button to press —
+/// keep exercising the write path rather than skipping it.
+fn default_user_present() -> bool {
+    #[cfg(feature = "device")]
+    {
+        false
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        true
+    }
+}
 
 /// The two `REBOOT` modes, as a type.
 ///
@@ -911,6 +951,10 @@ pub struct RescueApp {
     /// The privileged actions. `None` ⇒ `REBOOT` and `SECURE` are refused
     /// `6A86`.
     device: Option<&'static mut dyn RescueDeviceHandler>,
+    /// The user-presence grant path for `WRITE` (US-1536). `None` ⇒ the
+    /// per-command fallback in [`RescueApp::user_present`], which is
+    /// auto-ack on host/emulation and fail-closed on device.
+    presence_grant: Option<fn(u32) -> bool>,
 }
 
 impl Default for RescueApp {
@@ -933,6 +977,7 @@ impl RescueApp {
             secure_boot: SecureBootStatus::default(),
             config: None,
             device: None,
+            presence_grant: None,
         }
     }
 
@@ -966,6 +1011,16 @@ impl RescueApp {
     /// Attach the privileged device actions.
     pub fn with_device_handler(mut self, h: &'static mut dyn RescueDeviceHandler) -> Self {
         self.device = Some(h);
+        self
+    }
+
+    /// US-1536: attach the shared presence runtime's grant path
+    /// (`fapico2_firmware::presence::window_grant` — the same join-or-open
+    /// window the OATH and mgmt applets are given). Takes precedence over the
+    /// fallback, and with it attached the whole grant path *is* the runtime's
+    /// shared service: one pending slot, one button latch, one clock.
+    pub fn with_presence_grant(mut self, g: fn(u32) -> bool) -> Self {
+        self.presence_grant = Some(g);
         self
     }
 
@@ -1092,6 +1147,34 @@ impl RescueApp {
         }
     }
 
+    /// US-1536: the user-presence grant for `WRITE`, routed through the
+    /// platform presence service (bound, timed, single-use) — the same helper
+    /// `apps/mgmt/src/lib.rs:534-553` and the OATH applet use.
+    ///
+    /// With `with_presence_grant` attached this *is* the runtime's shared
+    /// service, so a press with no pending request arms nothing and cannot be
+    /// harvested by a later command. The fallback below is the host/test path:
+    /// a per-command service fed by the injected poll, synchronous within the
+    /// command, with tick 0 standing in for the clock.
+    fn user_present(&mut self, tag: u32) -> bool {
+        if let Some(g) = self.presence_grant {
+            return g(tag);
+        }
+        let mut svc = PresenceService::new();
+        if !svc.begin_request(tag) {
+            return false;
+        }
+        if default_user_present() {
+            // No clock and press→consume is synchronous within this command,
+            // so the window is moot here; tick 0 is the injected stand-in
+            // (`firmware/src/main.rs` wires the real one).
+            svc.observe_press(0);
+        }
+        let grant = svc.request(tag, 0).is_some();
+        svc.end_request(tag);
+        grant
+    }
+
     /// `WRITE` (INS `0x1C`) — merge a PHY TLV blob into the record.
     ///
     /// The parse is a **single collecting pass**: nothing is applied while
@@ -1208,6 +1291,30 @@ impl RescueApp {
                 | PhyTag::LedOrder
                 | PhyTag::LedNum => {}
             }
+        }
+        // US-1536: the presence gate. Placed here, **after** the whole blob has
+        // parsed and **after** the record owner is known to exist, so that a
+        // request this firmware was going to refuse anyway (`6A86`/`6700`)
+        // never spends the operator's touch. Everything above is pure — it
+        // only builds `update` — so declining here leaves the record exactly as
+        // it was.
+        //
+        // Why a button and not the PIN: this applet is the **recovery** path.
+        // A PIN requirement would mean a forgotten PIN also forfeits the
+        // ability to repair the device identity, which is the one thing the
+        // no-PIN surface exists for. Both references draw the line in the same
+        // place — pico-keys-sdk gates `INS_WRITE 0x1C` on
+        // `rescue_require_user_presence()` (`rescue.c:339-350`), RS-Key on
+        // `require_presence()` with the comment "a hostile host must not
+        // rewrite it silently" (`rsk-rescue/src/lib.rs:216-229`). The PIN is
+        // not dropped from the *device*: the FIDO carrier's `CONFIG_WRITE`
+        // still demands an `acfg` `pinUvAuthToken` for the identity tier
+        // (`vendor41.rs:1930-1957`).
+        if self.config.is_none() {
+            return SW_WRONG_PARAMETERS;
+        }
+        if !self.user_present(INS_WRITE as u32) {
+            return SW_CONDITIONS_NOT_SATISFIED;
         }
         let Some(h) = &mut self.config else {
             // No record owner in this build: nowhere for the write to go, and

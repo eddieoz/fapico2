@@ -188,6 +188,21 @@ impl Harness {
         Self::with_log(Log::populated())
     }
 
+    /// US-1536: [`Self::populated`], but with the `WRITE` presence gate
+    /// attached and armed to answer `answer`.
+    ///
+    /// Built through [`Harness::with_log`] rather than by re-deriving the
+    /// wiring, so the fixture under a presence test is the *same* fixture every
+    /// other test drives — the gate is then the only variable.
+    fn populated_with_grant(answer: bool) -> Self {
+        let mut h = Self::populated();
+        let inner = std::mem::replace(&mut h.app, RescueApp::new());
+        // `inner` carries the chip / flash / secure-boot state and both
+        // handler handles; re-attaching the grant is all that changes.
+        h.app = inner.with_presence_grant(grant::armed(answer));
+        h
+    }
+
     fn with_log(log: Log) -> Self {
         let shared = Rc::new(RefCell::new(log));
         // `Box::leak` so the applet can hold the `&'static mut dyn` handle its
@@ -1211,11 +1226,129 @@ fn a_blob_that_omits_a_field_preserves_the_stored_one() {
     let (_, sw) = h.drive(&write_apdu(&[0x00, 0x04, 0x10, 0x50, 0x04, 0x07]));
     assert_eq!(sw, 0x9000);
 
-    let commit = h.commits().last().expect("a commit").clone();
+    let commit = *h.commits().last().expect("a commit");
     assert_eq!(commit.vid_pid, Some(0x1050_0407), "the vid/pid was applied");
     assert_eq!(
         commit.product, PhyUpdate::default().product,
         "a field absent from the blob must stay absent from the update — the \
          owner's `commit` is what preserves it, and it does so by leaving it None"
     );
+}
+
+// ── US-1536: the `WRITE` presence gate ─────────────────────────────────────
+
+/// A grant source that records what it was asked for and answers `yes` or
+/// `no`. `fn(u32) -> bool` cannot close over anything, so the tag lands in a
+/// thread-local — the same shape `apps/fido/tests/selection.rs:72` uses to
+/// give `with_user_presence` two distinguishable sources.
+mod grant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ANSWER: Cell<bool> = const { Cell::new(true) };
+        static TAGS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub fn grant(tag: u32) -> bool {
+        TAGS.with(|t| t.borrow_mut().push(tag));
+        ANSWER.with(|a| a.get())
+    }
+
+    /// Arm the source and return it as a plain `fn` pointer.
+    pub fn armed(answer: bool) -> fn(u32) -> bool {
+        ANSWER.with(|a| a.set(answer));
+        TAGS.with(|t| t.borrow_mut().clear());
+        grant
+    }
+
+    /// Every tag the applet asked about, in order.
+    pub fn tags() -> Vec<u32> {
+        TAGS.with(|t| t.borrow().clone())
+    }
+}
+
+/// A `WRITE` with no grant is `6985` and **changes nothing**.
+///
+/// The status word is the load-bearing part: `6985` is what
+/// pico-keys-sdk's `rescue_require_user_presence()` returns
+/// (`apdu.h:107`), so a client written against the reference recognises it
+/// without new handling. `6A86` would read as "this build cannot store that"
+/// and send an operator looking in entirely the wrong place.
+#[test]
+fn a_write_with_no_presence_grant_is_refused_and_changes_nothing() {
+    let mut h = Harness::populated_with_grant(false);
+
+    let before = h.stored();
+    let (_, sw) = h.drive(&write_apdu(&[0x00, 0x04, 0x10, 0x50, 0x04, 0x07]));
+    assert_eq!(sw, 0x6985, "no touch ⇒ conditions not satisfied");
+    assert!(
+        h.commits().is_empty(),
+        "the owner must never be reached: a declined write is not a partial one"
+    );
+    assert_eq!(h.stored(), before, "the record is untouched");
+}
+
+/// With a grant, the very same APDU succeeds — so `6985` above is the gate and
+/// not a property of the blob.
+#[test]
+fn a_write_with_a_presence_grant_applies_the_whole_blob() {
+    let mut h = Harness::populated_with_grant(true);
+
+    let (_, sw) = h.drive(&write_apdu(&[0x00, 0x04, 0x10, 0x50, 0x04, 0x07]));
+    assert_eq!(sw, 0x9000);
+    assert_eq!(
+        h.commits().last().expect("a commit").vid_pid,
+        Some(0x1050_0407)
+    );
+}
+
+/// The gate declares itself pending under `INS_WRITE`, and asks exactly once.
+///
+/// The tag matters: the platform presence service binds a grant to the tag
+/// that was pending when the press arrived, so a different tag would take a
+/// grant minted for some *other* command — the anti-theft property US-906
+/// exists to provide.
+#[test]
+fn the_gate_pends_under_the_write_tag_and_asks_once() {
+    let mut h = Harness::populated_with_grant(true);
+
+    let _ = h.drive(&write_apdu(&[0x00, 0x04, 0x10, 0x50, 0x04, 0x07]));
+    assert_eq!(grant::tags(), vec![INS_WRITE as u32]);
+}
+
+/// A request this firmware refuses anyway does not spend the operator's touch.
+///
+/// Ordering is the whole point of the test: `P1`/`P2` and the TLV walk both
+/// run *before* the gate, so a malformed blob is answered `6A86`/`6700`
+/// without ever asking for a button. Burning a touch on a request that was
+/// never going to be honoured is the kind of thing that teaches people to
+/// press the button without reading.
+#[test]
+fn a_request_the_build_would_refuse_never_pends_for_presence() {
+    let mut h = Harness::populated_with_grant(true);
+
+    // Wrong P1 — refused `6A86` before the gate.
+    let (_, sw) = h.drive(&[0x80, INS_WRITE, 0x09, 0x00, 0x02, 0x00, 0x04]);
+    assert_eq!(sw, 0x6A86);
+    // A record whose declared length runs past the blob — refused `6700`.
+    let (_, sw) = h.drive(&write_apdu(&[0x00, 0x04, 0x10]));
+    assert_eq!(sw, 0x6700);
+    assert!(
+        grant::tags().is_empty(),
+        "neither refusal should have asked for a touch, got {:?}",
+        grant::tags()
+    );
+}
+
+/// `READ` is not gated. Reading the configuration discloses nothing and
+/// destroys nothing, and gating it would break the *detection* path the GUI
+/// depends on — which is the same PC/SC channel the write uses.
+#[test]
+fn a_read_needs_no_grant() {
+    let mut h = Harness::populated_with_grant(false);
+
+    let (data, sw) = h.read_phy();
+    assert_eq!(sw, 0x9000);
+    assert!(!data.is_empty());
+    assert!(grant::tags().is_empty(), "a read must not pend at all");
 }

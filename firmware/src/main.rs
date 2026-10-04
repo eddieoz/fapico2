@@ -1087,6 +1087,15 @@ async fn main(spawner: Spawner) -> ! {
                 .with_device_handler(unsafe {
                     &mut *core::ptr::addr_of_mut!(boot::RESCUE_DEVICE_HANDLER)
                 })
+                // US-1536: `WRITE PhyConfig` rewrites the USB identity, so it
+                // takes the same join-or-open touch window the OATH and mgmt
+                // applets already use (`window_grant`, not
+                // `request_grant_in_window` — the CCID task owns no window of
+                // its own, so the gate opens one on demand). pico-keys-sdk
+                // gates the same APDU on `rescue_require_user_presence()`;
+                // RS-Key does the same. Without it this applet is an
+                // unauthenticated, unattended rewrite of the device's VID/PID.
+                .with_presence_grant(fapico2_firmware::presence::window_grant)
         },
     );
 
