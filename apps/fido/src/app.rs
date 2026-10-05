@@ -486,6 +486,28 @@ impl<K: Keystore> FidoApp<K> {
     /// The user-presence answer for a presence-gated command. `false` means
     /// "the touch has not landed", i.e. answer `UpRequired` and let the
     /// transport open a consent window.
+    ///
+    /// # `None => true` is deliberate, and it is the mirror of a fail-closed default
+    ///
+    /// This is the **inverse** of the device twin's
+    /// `device_core::default_user_present`, which is `false` under
+    /// `#[cfg(feature = "device")]`. So an unwired source auto-acks here and
+    /// fails closed there.
+    ///
+    /// The asymmetry is load-bearing for this crate and is not to be
+    /// "corrected" here: roughly ten python suites call `device.reset()`
+    /// against the emulator, which builds this twin, and a fail-closed default
+    /// would hang every one of them on a button nobody is going to press.
+    /// `firmware/src/emul_main.rs` installs a presence source on this app, so
+    /// the emulator does exercise the gate — `emul_touch_lands_in_window`, which
+    /// alternates, standing in for a human who is slow to press.
+    ///
+    /// The cost of the arrangement is stated so it is not mistaken for parity:
+    /// **a host-twin build with no presence source is fail-OPEN**, so this
+    /// method cannot certify the device's posture on its own. That is what
+    /// `firmware/src/presence/device_fails_closed.rs` is for — it builds the
+    /// *device* twin under `cfg(feature = "device")` and asserts the refusal
+    /// there. The gate on this twin is only as good as the source attached.
     fn user_present(&mut self) -> bool {
         match self.presence {
             Some(f) => f(),
