@@ -2681,8 +2681,6 @@ impl FidoApp {
         ));
         // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
         // plaintext over the persisted device random (host parity).
-        // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
-        // plaintext over the persisted device random (host parity).
         //
         // US-1609: the IV drawn here is the one the field **advertises** and
         // the one the CBC is run **under**. They used to disagree — the IV was
