@@ -656,10 +656,9 @@ jobs:
           # so it can run here and fail a pull request in seconds; inside the
           # device-build job it would run only after a full release build of
           # the ELF, which is minutes per raise of the budget.
-          for g in \
-            tests/scripts/check_flash_budget.py \
           rc=0
           for g in \
+            tests/scripts/check_flash_budget.py \
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \

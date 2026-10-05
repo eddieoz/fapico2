@@ -64,3 +64,8 @@ fapico2-piv = { path = "piv" }
 # applet's own constants. dev-dependencies never enter the firmware binary.
 hmac = { version = "0.12", default-features = false }
 sha1 = { version = "0.10", default-features = false }
+# The third crate the paragraph above asks for, added when the sweep had to
+# learn to *authenticate* rather than merely assert: a device now ships with a
+# derived access code (`PBKDF2-HMAC-SHA1(DEFAULT_ACCESS_CODE, device_id,
+# 1000, 16)`), so HMACing a literal is no longer how a client gets in.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha1"] }

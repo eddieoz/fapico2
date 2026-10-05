@@ -1,3 +1,18 @@
 [toolchain]
-channel = "stable"
-targets = ["thumbv6m-none-eabi"]
+# Pinned exactly, not "stable". The boot-chain gate (US-956/US-957) measures
+# real frame sizes out of the release ELF, and the clippy job runs with
+# `-D warnings`: both change with the compiler, so a floating channel made
+# them non-reproducible. Run 37299016449 measured a 107264 B worst call chain
+# under 1.99.0 where the same sources measured 91120 B under 1.98.1 — a 9 KB
+# disagreement across the ceiling, with nothing in the tree to explain it.
+#
+# Raise this deliberately, and re-run `python3 tests/scripts/check_boot_chain.py
+# --no-build` plus the workspace clippy on the new version before committing:
+# both gates are toolchain-sensitive by construction.
+channel = "1.99.0"
+
+# thumbv8m.main-none-eabi is the RP2350 (Cortex-M33) target this firmware
+# builds for. The list previously read thumbv6m-none-eabi, which is RP2040 —
+# it never matched anything built here, and only went unnoticed because every
+# CI job ran `rustup target add thumbv8m.main-none-eabi` by hand.
+targets = ["thumbv8m.main-none-eabi"]

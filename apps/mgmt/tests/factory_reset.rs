@@ -25,6 +25,61 @@ fn emul_device_id() -> [u8; DEVICE_ID_LEN] {
     device_id_from_chipid(EMULATION_CHIPID)
 }
 
+/// `PBKDF2-HMAC-SHA1(DEFAULT_ACCESS_CODE, device_id, 1000, 16)` — the key both
+/// first-party clients derive host-side and send on VALIDATE.
+fn oath_default_access_key() -> Vec<u8> {
+    use sha1::Sha1;
+    pbkdf2::pbkdf2_hmac_array::<Sha1, 16>(
+        fapico2_oath::oath_core::DEFAULT_ACCESS_CODE,
+        &emul_device_id(),
+        1000,
+    )
+    .to_vec()
+}
+
+fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    let mut m = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    m.update(data);
+    m.finalize().into_bytes().to_vec()
+}
+
+/// SELECT the OATH applet and return the `74` challenge it advertises.
+///
+/// The challenge only exists *because* the device ships with an access code —
+/// `select_apdu` emits it only when one is present — which is exactly the
+/// signal both clients read to decide they must authenticate.
+///
+/// Routed through a [`Dispatcher`] rather than `OathApp::process` because
+/// SELECT is the *platform's* arm, not the applet's: `OathApp`'s INS table
+/// starts at PUT and has no `0xA2`/`0xA4` SELECT row, so calling the applet
+/// directly answers `0x6982` and teaches nothing about the real path.
+fn oath_default_challenge(oath: &mut fapico2_oath::oath_core::OathApp) -> [u8; 8] {
+    use fapico2_platform::dispatch::Dispatcher;
+    let aid = fapico2_oath::oath_core::OATH_AID;
+    let mut d: Dispatcher<1> = Dispatcher::new();
+    assert!(d.register(oath), "the OATH applet registers into a Dispatcher<1>");
+    let mut sel = vec![0x00, 0xA4, 0x04, 0x00, aid.len() as u8];
+    sel.extend_from_slice(aid);
+    let mut resp = HeaplessVec::<u8, MAX_RESPONSE>::new();
+    d.dispatch(&sel, &mut resp);
+    let n = resp.len();
+    assert_eq!(
+        u16::from_be_bytes([resp[n - 2], resp[n - 1]]),
+        0x9000,
+        "SELECT OATH must answer 9000"
+    );
+    let body = &resp[..n - 2];
+    let at = body
+        .windows(2)
+        .position(|w| w == [0x74, 8])
+        .expect("SELECT must advertise an 8-byte 74 challenge on a device with an access code");
+    let mut chal = [0u8; 8];
+    chal.copy_from_slice(&body[at + 2..at + 10]);
+    chal
+}
+
 fn presence_granted() -> bool {
     PRESENCE_CALLS.fetch_add(1, Ordering::SeqCst);
     true
@@ -38,6 +93,7 @@ fn presence_denied() -> bool {
 // OATH INS codes (oath_core keeps them private; C `oath.c` values).
 const OATH_INS_PUT: u8 = 0x01;
 const OATH_INS_LIST: u8 = 0xA1;
+const OATH_INS_VALIDATE: u8 = 0xA3;
 // OTP durable-state slot (otp.rs keeps it private). US-140 versioned this
 // key `otp.slots.v1` → `otp.slots.v2` when the slot table widened 2 → 4; the
 // v1 record is retired, never read. This constant must track the rename
@@ -145,6 +201,27 @@ fn seed_fixture() -> (&'static mut FixtureReset, ManagementApp) {
     // 0x71 + TAG_KEY 0x73 = [alg 0x31 (SHA256), digits 6, secret..]).
     let mut oath =
         fapico2_oath::oath_core::OathApp::boot(&mut trng, &mut store, emul_device_id(), OathSeal::emul()).unwrap();
+    // Authenticate first. A device ships with an access code
+    // (`provision_default_access_code`), the session grant is derived from its
+    // absence, and so the PUT below answers 0x6982 until a client VALIDATEs —
+    // which is what both first-party clients do, deriving
+    // `PBKDF2-HMAC-SHA1(DEFAULT_ACCESS_CODE, device_id, 1000, 16)`.
+    let chal = oath_default_challenge(&mut oath);
+    let mut vd = vec![0x74, 8];
+    vd.extend_from_slice(&chal);
+    let mac = hmac_sha1(&oath_default_access_key(), &chal);
+    vd.extend_from_slice(&[0x75, mac.len() as u8]);
+    vd.extend_from_slice(&mac);
+    let mut va = vec![0x00, OATH_INS_VALIDATE, 0x00, 0x00, vd.len() as u8];
+    va.extend_from_slice(&vd);
+    let mut vresp = HeaplessVec::<u8, MAX_RESPONSE>::new();
+    oath.process(&va, &mut vresp);
+    let vn = vresp.len();
+    assert_eq!(
+        u16::from_be_bytes([vresp[vn - 2], vresp[vn - 1]]),
+        0x9000,
+        "OATH VALIDATE with the shipped default access code must grant"
+    );
     let mut data = vec![0x71, 5, b'a', b'b', b'c', b'd', b'e', 0x73, 6, 0x31, 6];
     data.extend_from_slice(&[0x11u8; 4]);
     let mut put = vec![0x00, OATH_INS_PUT, 0x00, 0x00, data.len() as u8];

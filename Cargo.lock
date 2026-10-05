@@ -1322,6 +1322,7 @@ dependencies = [
  "fapico2-vendor-led",
  "heapless 0.8.0",
  "hmac 0.12.1",
+ "pbkdf2",
  "sha1",
 ]
 
@@ -1386,6 +1387,9 @@ dependencies = [
  "fapico2-oath",
  "fapico2-platform",
  "heapless 0.8.0",
+ "hmac 0.12.1",
+ "pbkdf2",
+ "sha1",
 ]
 
 [[package]]
