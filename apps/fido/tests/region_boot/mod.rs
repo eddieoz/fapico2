@@ -613,6 +613,24 @@ impl Device {
         self.app.set_presence_grant(grant);
     }
 
+    /// Install an **arbitrary** presence source, replacing whatever
+    /// [`Self::grant_presence_always`] installed.
+    ///
+    /// Needed by the stories whose subject is what happens when a human has
+    /// *not* consented — an unauthorised `authenticatorReset` being the one
+    /// that ships. `grant_presence_always` cannot express "denied", and a test
+    /// that never denies a press would be asserting about a command nobody is
+    /// trying to change.
+    ///
+    /// The grant is called once per presence request and the grant is consumed
+    /// by that request (`device_core::FidoApp::user_present`), so a `fn` that
+    /// records into a global is how a caller counts the calls — the tripwire
+    /// `reset_presence_gate.rs` needs for the "exactly one grant, not two"
+    /// property.
+    pub fn with_presence_grant(&mut self, g: fn(u32) -> bool) {
+        self.app.set_presence_grant(g);
+    }
+
     /// The live `pinUvAuthToken`, once [`Self::set_pin`] has minted one.
     pub fn pin_token(&self) -> Option<[u8; 32]> {
         self.pin_token
