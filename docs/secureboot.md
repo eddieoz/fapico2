@@ -130,6 +130,33 @@ the assessment's exposure and none of the protection.
 
 ---
 
+## Release checklist — verify the debug closure before the first `-release` tag
+
+ADR 0002 defers `CRIT1.DEBUG_DISABLE` / `SECURE_DEBUG_DISABLE` to the first
+`-release` tag, and "deferred" is not "done". Before tagging, against a board
+flashed from the image being released:
+
+```bash
+./scripts/check_release_debug_state.sh --class release    # must exit 0
+```
+
+A release must read `secure boot: 1`, `debug enable: 0`,
+`secure debug enable: 0` — signed boot **on**, both debug paths **off**. The
+script is deliberately not in `run_tests.sh` because it needs hardware; its
+parser and policy are self-tested without any (`--self-test`), and it gates
+**both** directions, so a pre-release image that reads as closed fails too.
+
+This is here because of red-team F2, and because two adjacent things are easy
+to conflate: **signed boot on is not debug access off.** Setting
+`SECURE_BOOT_ENABLE` stops an attacker substituting firmware; it does nothing
+to an attacker who attaches a debugger to *your* firmware, which is a
+different fuse with a different trigger. See
+[`debug-access-risk.md`](debug-access-risk.md) for the full statement of what
+an open debug port exposes, and for why every other control in this repository
+is a delay rather than a barrier while it is open.
+
+---
+
 ## Before you do any of this
 
 **Test on a spare Pico 2.** Walk all five steps, then set that board's fuse.
