@@ -369,3 +369,216 @@ fn reset_ignores_apdu_data() {
     let ks = fapico2_fido::device_keystore::DeviceKeystore::load(&mut fx.store).unwrap();
     assert!(ks.is_none(), "the device-wide wipe still runs");
 }
+
+// ---------------------------------------------------------------------------
+// US-1606 — the tripwire for the double-touch regression
+// ---------------------------------------------------------------------------
+//
+// **These three tests are serialised against each other**, and the lock is not
+// optional. `US1606_CALLS` is process-global and `with_user_presence` takes
+// `fn() -> bool`, so a test cannot capture its own counter — the same constraint
+// `tests/presence_gating.rs` and `region_boot::lock` document. Without the lock
+// the three counters interleave and the counts below read as each other's.
+//
+// This is not hypothetical: the first version of these tests ran unlocked and
+// turned the four pre-existing `seed_fixture` tests red, because they share the
+// binary and therefore the global. A test that breaks its neighbours while
+// claiming to guard them is worse than no test.
+
+/// US-1606's **own** counter, separate from the file's [`PRESENCE_CALLS`].
+///
+/// The obvious move — reusing `PRESENCE_CALLS` — is wrong, and it was wrong in
+/// the first version of this file: the pre-existing tests in this binary use
+/// that global through `presence_granted`/`presence_denied` and do **not**
+/// take this lock, so `cargo test`'s per-file parallelism interleaves the two
+/// sets and a count of 2 appears out of nowhere. The failure looks exactly
+/// like the double-touch regression this story exists to detect, which is the
+/// worst possible place to have a look-alike.
+///
+/// A private counter cannot be perturbed by a neighbour, so the numbers below
+/// mean what they say. The lock is still needed — for the three tests in this
+/// section against **each other**.
+static US1606_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn us1606_granted() -> bool {
+    US1606_CALLS.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+fn us1606_denied() -> bool {
+    US1606_CALLS.fetch_add(1, Ordering::SeqCst);
+    false
+}
+
+/// Serialise this section's tests against each other.
+///
+/// `unwrap_or_else(|e| e.into_inner())` rather than `unwrap()`: a test that
+/// panicked while holding the lock poisons it, and every later test would then
+/// fail on the *poison*, hiding the real failure. Same reason as
+/// `region_boot::lock`.
+fn presence_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A handler that drives the **real** `device_app::FidoApp::factory_reset`, so
+/// the grant count is observable end to end.
+///
+/// US-711's own fixture (`FixtureReset`) wipes the durable slots and stops
+/// there, which is correct for what it tests but cannot see this story: the
+/// question is whether the FIDO app's *in-RAM* reset asks for a second touch,
+/// and only the real app can answer that.
+struct FidoHook {
+    app: &'static mut fapico2_fido::FidoApp,
+    /// How many times the hook was reached at all. Zero would mean the
+    /// management applet refused before calling us — the denied case.
+    fired: usize,
+}
+
+impl FactoryResetHandler for FidoHook {
+    fn factory_reset(&mut self) -> fapico2_platform::dispatch::Sw {
+        self.fired += 1;
+        self.app.factory_reset();
+        fapico2_platform::dispatch::SW_OK
+    }
+}
+
+/// A `ManagementApp` whose reset hook reaches the real device twin, plus the
+/// leaked hook so the test can read `fired` afterwards.
+///
+/// `Box::leak` is [`seed_fixture`]'s discipline, for the same reason: the
+/// `&'static mut dyn FactoryResetHandler` the applet takes has to outlive the
+/// local, and a leaked box is the least surprising way to say so in a test.
+/// The FIDO app is leaked separately because the hook holds a `&'static mut`
+/// of it and `with_user_presence` returns the app **by value**, so there is no
+/// owned value left to move once the hook is built.
+fn mgmt_with_fido_hook(present: fn() -> bool) -> (&'static mut FidoHook, ManagementApp) {
+    let mut store = HostSecureStore::new();
+    let mut trng = fapico2_platform::trng::HostTrng::new();
+
+    // The counter has to be on the **FIDO app** too, not just on the
+    // management applet, or the regression this story guards is invisible: a
+    // gate added inside `handle_reset` would consult the FIDO app's own
+    // source, which nothing else here counts. `with_user_presence` takes
+    // `fn() -> bool` and `us1606_granted` is exactly that, so one global
+    // counts both sides of the boundary.
+    let app = fapico2_fido::FidoApp::boot(&mut trng, &mut store)
+        .expect("boot the device twin")
+        .with_user_presence(present);
+
+    let app: &'static mut fapico2_fido::FidoApp = Box::leak(Box::new(app));
+    let hook = Box::leak(Box::new(FidoHook { app, fired: 0 }));
+    // SAFETY: the leaked hook backs both handles — the test's own `&mut` and
+    // the applet's `&mut dyn` — the same single-fixture discipline
+    // `seed_fixture` states. The test never uses the two at once: the read of
+    // `fired` happens after the `ManagementApp` has been dropped.
+    let handler = unsafe { &mut *(hook as *mut FidoHook as *mut dyn FactoryResetHandler) };
+    let app = ManagementApp::new()
+        .with_user_presence(present)
+        .with_factory_reset(handler);
+    (hook, app)
+}
+
+/// **The management factory reset consumes exactly ONE presence grant, across
+/// both applets.**
+///
+/// This story encodes the epic's constraint 1, and its whole purpose is to
+/// fail if anyone later "helpfully" moves the presence gate out of the CTAP2
+/// command boundary and into the shared `handle_reset` primitive.
+///
+/// ## Why the count and not the outcome
+///
+/// Asserting only that the reset succeeded would pass against **both** the
+/// correct code and the double-gated version — a double-gated reset still
+/// succeeds, it just makes the owner press the button twice. The regression is
+/// invisible in the status word and visible only in how many grants were
+/// consumed, so **the count is the assertion**.
+///
+/// ## What the 1 is, and why that is not luck
+///
+/// Exactly one: the management applet's own `cmd_reset` → `user_present`
+/// (`INS_RESET`, tag 0x1E). The FIDO half contributes **zero** — US-1602
+/// pointed `factory_reset` at `handle_reset` directly, bypassing the gate the
+/// CTAP2 command boundary carries. Both sides read the same counter, so if that
+/// indirection is ever removed this reads 2 and the double touch is back.
+#[test]
+fn the_management_factory_reset_consumes_exactly_one_presence_grant() {
+    let _g = presence_lock();
+    US1606_CALLS.store(0, Ordering::SeqCst);
+    let (hook, mut app) = mgmt_with_fido_hook(us1606_granted);
+
+    let (_, sw) = drive(&mut app, &reset_apdu());
+    assert_eq!(sw, 0x9000, "the management factory reset must still succeed");
+    drop(app);
+
+    let calls = US1606_CALLS.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 1,
+        "the management factory reset consumed {calls} presence grant(s), not 1 — counted \
+         across BOTH applets, which share this counter. The management applet gates once \
+         (cmd_reset → user_present(INS_RESET), tag 0x1E) and the FIDO half must not gate again: \
+         presence is press→consume and one-shot, and the two tags differ (0x1E vs \
+         0x8000_0001), so a second gate is a second window and a second touch for one reset. \
+         Move the gate, never add to it.",
+    );
+    assert_eq!(hook.fired, 1, "the hook must have run exactly once");
+}
+
+/// **The counter is attached to the FIDO app's gate too — proved, not assumed.**
+///
+/// A tripwire that cannot fail is worse than none, because it reads as
+/// coverage. This drives the path where the FIDO gate **does** apply (the
+/// CTAP2 command boundary) and shows the same counter move, which is what
+/// makes the `1` above mean "the FIDO half contributed zero" rather than "the
+/// FIDO half is not wired to anything".
+#[test]
+fn the_counter_sees_the_fido_gate_on_the_ctap2_command_boundary() {
+    let _g = presence_lock();
+    let mut store = HostSecureStore::new();
+    let mut trng = fapico2_platform::trng::HostTrng::new();
+    let mut app = fapico2_fido::FidoApp::boot(&mut trng, &mut store)
+        .expect("boot the device twin")
+        .with_user_presence(us1606_granted);
+
+    US1606_CALLS.store(0, Ordering::SeqCst);
+    let mut out = heapless::Vec::<u8, { fapico2_fido::CTAP2_MAX_MSG }>::new();
+    let n = app.process_ctap2(0x07, &[], [1, 2, 3, 4], &mut out);
+
+    // The host build auto-acks (`default_user_present`), so the gate grants
+    // and the reset succeeds — which is exactly why the assertion is on the
+    // counter rather than on the status byte. The gate *ran*; that is the claim.
+    assert_eq!(out[..n][0], 0x00, "the host build auto-acks a presence gate");
+    assert_eq!(
+        US1606_CALLS.load(Ordering::SeqCst),
+        1,
+        "the CTAP2 command boundary's gate must consult the shared counter. If this reads 0, \
+         the management test above is counting only the management side and its '1' says \
+         nothing about the FIDO half — which is the whole question.",
+    );
+}
+
+/// **A denied management reset never reaches the FIDO half, and costs one
+/// refused grant.**
+///
+/// The other half of constraint 1. `reset_denied_without_user_presence` covers
+/// the durable slots; this covers the *in-RAM* app the hook would have reset —
+/// which on hardware is the state that would otherwise survive to the next
+/// power cycle.
+#[test]
+fn a_denied_management_reset_never_reaches_the_fido_half() {
+    let _g = presence_lock();
+    US1606_CALLS.store(0, Ordering::SeqCst);
+    let (hook, mut app) = mgmt_with_fido_hook(us1606_denied);
+
+    let (_, sw) = drive(&mut app, &reset_apdu());
+    assert_eq!(sw, 0x6985, "RESET without a press must be refused");
+    drop(app);
+
+    assert_eq!(hook.fired, 0, "the hook must not run on a denied reset");
+    assert_eq!(
+        US1606_CALLS.load(Ordering::SeqCst),
+        1,
+        "a denied management reset consumes exactly one grant — its own, refused. A second \
+         would mean the denial is being paid for twice.",
+    );
+}
