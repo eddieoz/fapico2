@@ -153,6 +153,7 @@ jobs:
       # runs the pinned one, so the target the next step adds would land on a
       # toolchain nothing uses.
       - name: Set up Rust (pinned by rust-toolchain.toml)
+        working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
       - name: Add RP2350 target + ARM ELF linker
         run: |
