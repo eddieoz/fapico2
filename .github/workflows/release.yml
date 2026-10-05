@@ -147,8 +147,13 @@ jobs:
       # SHA-pinning it would freeze the action code while leaving the
       # ref -> toolchain mapping mutable — in the one job that holds
       # `id-token: write`. Removing the dependency removes the question.
-      - name: Set up Rust (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      #
+      # No channel argument, for the same reason as ci.yml: naming `stable`
+      # installs *that* toolchain while `cargo` honours rust-toolchain.toml and
+      # runs the pinned one, so the target the next step adds would land on a
+      # toolchain nothing uses.
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi

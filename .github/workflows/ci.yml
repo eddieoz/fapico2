@@ -127,8 +127,17 @@ jobs:
       # `protected: false`), so SHA-pinning it would freeze the action code
       # while leaving the ref -> toolchain mapping mutable. Removing the
       # dependency removes the question.
-      - name: Set up Rust (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      #
+      # `--profile minimal` plus the components named in rust-toolchain.toml,
+      # and **no channel argument**: `rustup toolchain install` with an explicit
+      # `stable` installs *that* toolchain, while `cargo` then honours
+      # rust-toolchain.toml and runs the pinned one — so the components land on a
+      # toolchain nothing uses. That is not hypothetical: with the channel
+      # pinned to 1.99.0, the clippy job died with "'cargo-clippy' is not
+      # installed for the toolchain '1.99.0'" (run 37308500832) while passing
+      # locally, because clippy had been installed on `stable` instead.
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: Workspace host unit tests
         working-directory: fapico2
         run: cargo test --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware
@@ -199,9 +208,14 @@ jobs:
         with:
           persist-credentials: false
           path: fapico2
-      - name: Set up Rust (stable + clippy)
+      # No channel argument, for the reason on the first job's setup step:
+      # naming `stable` installs components on a toolchain that
+      # rust-toolchain.toml then does not select. `clippy` is named here rather
+      # than left to the toolchain file so the component is visible at the step
+      # that needs it.
+      - name: Set up Rust (pinned + clippy)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup toolchain install --profile minimal --component clippy --no-self-update
       - name: clippy (workspace, host target, all targets)
         working-directory: fapico2
         run: cargo clippy --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware --all-targets -- -D warnings
@@ -224,9 +238,14 @@ jobs:
         with:
           persist-credentials: false
           path: fapico2
-      - name: Set up Rust (stable + clippy)
+      # No channel argument, for the reason on the first job's setup step:
+      # naming `stable` installs components on a toolchain that
+      # rust-toolchain.toml then does not select. `clippy` is named here rather
+      # than left to the toolchain file so the component is visible at the step
+      # that needs it.
+      - name: Set up Rust (pinned + clippy)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup toolchain install --profile minimal --component clippy --no-self-update
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi
@@ -433,8 +452,8 @@ jobs:
         with:
           persist-credentials: false
           path: fapico2
-      - name: Set up Rust (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: "Gate: FA advertises exactly what the dispatch serves, in both configurations"
         working-directory: fapico2
         run: |
@@ -656,10 +675,9 @@ jobs:
           # so it can run here and fail a pull request in seconds; inside the
           # device-build job it would run only after a full release build of
           # the ELF, which is minutes per raise of the budget.
-          for g in \
-            tests/scripts/check_flash_budget.py \
           rc=0
           for g in \
+            tests/scripts/check_flash_budget.py \
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \
@@ -711,8 +729,8 @@ jobs:
         with:
           persist-credentials: false
           path: fapico2
-      - name: Set up Rust (stable)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: cargo-deny — the resolved third-party graph
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
@@ -858,8 +876,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpcsclite-dev
-      - name: Set up Rust (stable; host target for the emulator)
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Set up Rust (pinned; host target for the emulator)
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: Install Python test dependencies
         run: |
           python -m venv .test-venv
