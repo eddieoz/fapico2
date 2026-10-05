@@ -234,6 +234,72 @@ This is a `pcscd` gate, so it binds any PC/SC application, not just one client;
 the reader-ordering hazard that remains after allowlisting is a client bug, not
 an identity one — see the README's *PicoForge compatibility* section.
 
+### The VID/PID is writable at runtime, and a value libccid does not know is a silent lockout
+
+The paragraph above is about the **build-time** default. The VID/PID is also
+**runtime state**: Rescue `WRITE PhyConfig` (tag `0x00`, APDU `80 1C 01 00 …`)
+and the FIDO carrier's `0x41 CONFIG_WRITE` (sub-command `0x0C`) both write it,
+and `platform/src/usb.rs:425-437` applies a stored value at USB enumeration in
+preference to the build-time constant.
+
+That makes the pair a **one-way door**. Choose a `(VID, PID)` that libccid's
+table does not contain and the board stays enumerable over USB while producing
+**no CCID reader at all**. Consequences, in order of how badly they mislead:
+
+* **No PC/SC reader**, so the Rescue applet is unreachable — and it is the only
+  surface with **no PIN**, so the device has just lost its recovery route.
+* **PicoForge does not report an error.** Its Rescue leg is PC/SC-only with no
+  fallback (`io.rs:27-40` folds the failure into `log::warn!`), so the badge
+  degrades to a yellow **"Online - FIDO"** while every FIDO feature keeps
+  working. Passkeys, credentials and accounts are all fine; the one broken thing
+  is the invisible one.
+* **A reflash does not undo it.** `FAPICO2_FOREIGN_IMAGE_WIPE` defaults to the
+  secure store *surviving* a reflash, and `usb.rs` prefers the stored record, so
+  reflashing the same image re-enumerates at the same wrong ids.
+
+This is reachable through PicoForge's own Configuration screen, which offers
+several presets. On a stock Ubuntu host (libccid 1.5.5) `2E8A` is paired with
+`0x10FF` only, so of that vendor's four presets — `2E8A:10FD`, `2E8A:10FE`,
+`2E8A:10FF`, `2E8A:0003` — **only `2E8A:10FF` enumerates**. Choosing
+`2E8A:10FE` writes cleanly, persists, and strands the device.
+
+**Check before choosing:**
+
+```bash
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py --list-known
+```
+
+It prints the pairs the local driver can actually bind, read from the plist
+rather than hardcoded, so the advice does not go stale with the driver version.
+
+**Diagnosing a stranded device.** `scripts/fix_usb_identity.py` reads the stored
+record over the FIDO carrier — `0x41 CONFIG_READ` (`0x0D`) is ungated, so this
+needs no PIN — and warns when the stored pair is unbindable:
+
+```bash
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py
+```
+
+**Repairing one** does need the PIN, because `CONFIG_WRITE`'s identity tier
+requires a `pinUvAuthToken` carrying `PERM_ACFG`, obtainable only via
+`clientPin` sub-command `0x09` (a legacy `getPinToken` token carries no
+permissions and is refused):
+
+```bash
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py --set FA20:0002
+# then unplug and replug — the change applies at the next enumeration
+```
+
+**Why a touch is required to get into this state** (US-1536). Rescue `WRITE`
+takes a user-presence grant and answers `0x6985` without one, matching
+pico-keys-sdk's `rescue_require_user_presence()` and RS-Key's
+`require_presence()` byte for byte. It is a button and **not** a PIN because
+this applet is the recovery path: a PIN requirement would mean a forgotten PIN
+also forfeits the ability to repair the identity. The gate runs *after* the TLV
+walk, so a request this firmware would refuse anyway never spends the touch.
+Threat-model R1 is narrowed, not closed — a *deliberate* touch can still pick an
+unbindable pair, which is why the pair is worth checking first.
+
 ## Changing a default, checklist
 
 1. Change the constant in `platform/src/identity.rs`, not a caller.

@@ -202,6 +202,58 @@ part that makes their design the simpler one rather than merely a different one.
 
 ---
 
+## A yellow "Online - FIDO" in PicoForge is usually the USB identity, not a bug in the applet
+
+Read this before blaming the Rescue applet, and before blaming `pcscd`. Both
+were wrong answers on the board this was written for.
+
+PicoForge's badge is one comparison: `status.method == DeviceMethod::Fido`
+(`sidebar.rs:317-327`). `method` becomes `Rescue` **only** if
+`rescue::read_device_details()` returns `Ok`, and that path is **PC/SC-only,
+with no fallback**. Every failure in it is folded into a `log::warn!`
+(`io.rs:35-40`), so the reason never reaches the user — the badge just goes
+yellow while every FIDO feature keeps working. Four things produce it, and they
+look identical from the UI:
+
+1. **The stored VID/PID is not in libccid's table.** No CCID reader, so no
+   rescue leg. This is the one that actually occurred, and it is **ours**: the
+   Rescue `WRITE` of the VID/PID applies at enumeration (`usb.rs:425-437`),
+   overrides the build-time default, and **survives a reflash**. On a stock
+   Ubuntu host `2E8A` is paired only with `0x10FF`, so of the four `2E8A:*`
+   presets PicoForge offers, only `2E8A:10FF` binds. `docs/identity.md` has the
+   mechanism; `scripts/fix_usb_identity.py` diagnoses (`--list-known`,
+   default) and repairs (`--set FA20:0002`) it, the latter over the FIDO carrier
+   because PC/SC is exactly what is gone.
+2. **`pcscd` churn.** The packaged unit runs `--auto-exit`, so the daemon exits
+   the moment the last client disconnects — and PicoForge opens a *fresh*
+   connection per operation (`rescue/mod.rs:18-33` opens one per call), so it
+   loses the race against the gaps between its own calls. A drop-in at
+   `/etc/systemd/system/pcscd.service.d/` with `ExecStart=` cleared and
+   `ExecStart=/usr/sbin/pcscd --foreground` removes it.
+3. **A `6A82` SELECT failure** — the reader-ordering hazard in the README's
+   *PicoForge compatibility* section, where another PC/SC reader is enumerated
+   first and every APDU goes to the wrong card.
+4. **A genuine applet fault** — `RESCUE PC/SC discovery error: Device Error:
+   Rescue Applet not found` or `Rescue read_device_details failed`. Across the
+   board this was investigated on, the Rescue SELECT succeeded **215** times
+   and "Rescue Applet not found" appeared exactly **once**.
+
+**Discriminate from the log, not from the badge.** The three lines are ordered
+and mutually exclusive — read whichever fired:
+
+```
+~/.var/app/in.suyogtandel.picoforge/data/picoforge/logs/picoforge.log
+  "No Rescue PC/SC device found"          -> the reader is gone   (case 1 or 2)
+  "Rescue PC/SC discovery error: ..."     -> SELECT refused / PCSC (case 3 or 4)
+  "Rescue read_device_details failed: ..."-> our applet answered non-9000 (case 4)
+```
+
+And note that **passkeys working while the badge is yellow proves nothing**:
+FIDO runs over CTAPHID/`usbhid` and never touches `pcscd`. That was the
+reason case 1 survived as long as it did.
+
+---
+
 ## Layout
 
 ```

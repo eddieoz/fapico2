@@ -61,6 +61,27 @@ the override procedure, the one-way-door warning, and
 `FAPICO2_FOREIGN_IMAGE_WIPE` (default: the secure store **survives** a reflash)
 are all in [`docs/identity.md`](docs/identity.md).
 
+### The VID/PID is also runtime-writable — and a pair libccid does not know is a silent lockout
+
+Rescue `WRITE PhyConfig` and PicoForge's FIDO `CONFIG_WRITE` both rewrite the
+USB identity, and a stored value wins over the build-time default at
+enumeration. **Only pick a pair your host's CCID driver knows.** Pick one it
+does not, and the board stays enumerable over USB while producing *no PC/SC
+reader at all*: the Rescue applet — the only surface with no PIN — becomes
+unreachable, a reflash does not undo it, and PicoForge shows a yellow
+**"Online - FIDO"** rather than an error, because every FIDO feature still
+works.
+
+```bash
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py --list-known  # what will bind
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py             # read + diagnose
+../pico-fido2/.test-venv/bin/python scripts/fix_usb_identity.py --set FA20:0002
+```
+
+The repair asks for your PIN and takes effect after you replug the board.
+Details and the underlying mechanism are in
+[`docs/identity.md`](docs/identity.md#the-vidpid-is-writable-at-runtime-and-a-value-libccid-does-not-know-is-a-silent-lockout).
+
 ## PicoForge compatibility
 
 PicoForge's PC/SC client takes the **first** reader `list_readers()` returns — never iterating, filtering by name, or falling back to a second (`picoforge/src/hal/transport/pcsc.rs:37-43`, identically `ccid.rs:38-42`). Where another PC/SC reader is enumerated first, every SELECT — Rescue, vendor LED, Management — goes to the **wrong card**, answers `6A82`, and the client returns `Err("Rescue Applet not found...")` rather than `None` (`pcsc.rs:66-71`): the token is healthy and the client simply talked to a different card. `write_led_config` opens a **fresh PC/SC connection per LED slot** (`picoforge/src/hal/io.rs:199-205`), so the same misordering yields a **silently half-written LED profile with every call reporting success**.
