@@ -107,13 +107,17 @@ impl<T: opcard::Client> OpenPgpApp<T> {
     /// trussed internal filesystem — the 1 MiB QSPI-flash window on device
     /// (load-bearing for S-721-4 persistence) — not the RAM volatile store.
     /// US-934: the AID serial is provisioned here (see
-    /// [`Self::provision_serial`]); the manufacturer stays the reserved
-    /// test value `00 00` (OQ-1 — gpg's "test card" display stays truthful
-    /// until the FSFE registration lands). Everything else stays
-    /// `Options::default()` (the AID, historical bytes, and button
-    /// availability match the PIV/OpenPGP identity this token advertises;
-    /// opcard is run unmodified apart from the US-912 / US-914 review
-    /// patches) — the serial flows only through `Options`.
+    /// [`Self::provision_serial`]); the manufacturer is the unmanaged range
+    /// `FF FE` (OQ-1), which the spec assigns to cards that generate their own
+    /// serial. `00 00` is the spec's *test card* value and both gpg and
+    /// PGPOpony render it as the literal string "test card" — a claim a
+    /// production token should not make. When an FSFE-registered ID lands it
+    /// replaces this; the value is a self-description, so changing it is safe.
+    /// Everything else stays `Options::default()` (the AID, historical bytes,
+    /// and button availability match the PIV/OpenPGP identity this token
+    /// advertises; opcard is run unmodified apart from the US-912 / US-914
+    /// review patches) — the serial and manufacturer flow only through
+    /// `Options`.
     // US-939: `#[inline(never)]` -- `State::default()` materializes a ~6 KiB
     // temporary; keep it in this function's own frame, out of the Embassy
     // async-main frame.
@@ -121,6 +125,11 @@ impl<T: opcard::Client> OpenPgpApp<T> {
     pub fn new(mut client: T) -> Self {
         let mut options = opcard::Options::default();
         options.storage = trussed_core::types::Location::Internal;
+        // OQ-1: spec §4.2.1 manufacturer. `FF00`–`FFFE` is the range reserved
+        // for cards with a self-generated serial, which is this one — the
+        // value both `../pico-fido2` and `../RS-Key` claim. Deliberately not
+        // `00 00`, which means "test card" to gpg and PGPOpony alike.
+        options.manufacturer = [0xFF, 0xFE];
         options.serial = Self::provision_serial(&mut client);
         Self {
             card: opcard::Card::new(client, options),

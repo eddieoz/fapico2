@@ -30,6 +30,16 @@ gnupg/Kleopatra ask for a serial that is gone. Delete the stale shadowed stubs
 (back them up first); the live card's keys are unaffected — details in
 [`docs/token2-hardware-validation.md`](token2-hardware-validation.md).
 
+The **manufacturer** (AID bytes 8–9) is a different field and is fixed at
+`FF FE` — the spec's range for cards that generate their own serial, matching
+`../pico-fido2` and `../RS-Key`. It is deliberately *not* `00 00`, which the spec
+reserves for test cards and which gpg **and** PGPOpony both render as the literal
+string "test card". gpg prints the two halves on separate lines (`Manufacturer`
+/ `Serial number`) but joins them in key listings, so an older board shows up as
+`card-no: 0000 …` there. Unlike the serial, this field is not persisted and does
+not change on reset — it is re-derived every boot. Full analysis:
+[`openpgp-kleopatra-pgpony-investigation.md`](openpgp-kleopatra-pgpony-investigation.md).
+
 ## OpenPGP algorithms — as shipped (hardware-verified)
 
 `GET DATA FA` advertises **27 records, 9 each in C1/C2/C3**: RSA-2048/3072/4096,

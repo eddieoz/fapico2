@@ -1266,8 +1266,9 @@ fn factory_wipe_reinitializes_card_in_ram() {
 //
 // GET DATA `4F` composes the AID from `opcard::Options` (vendor/opcard
 // `card.rs::aid`): RID+PIX+version, manufacturer (2 B), serial (4 B),
-// RFU `00 00`. This token keeps the reserved test manufacturer `00 00`
-// (OQ-1) and provisions a random, persisted serial (OQ-5) at first boot;
+// RFU `00 00`. This token claims the unmanaged manufacturer `FF FE` (OQ-1)
+// — the spec's range for cards that generate their own serial — and
+// provisions a random, persisted serial (OQ-5) at first boot;
 // the serial lives in a trussed `Location::Internal` file next to the
 // opcard state, so a plain reboot never changes it (the US-912 gate-flag
 // durability discipline).
@@ -1310,9 +1311,12 @@ fn aid_template_conformance() {
     let aid = boot_and_read_aid(internal);
     // RID D2 76, 00 01 24 01, version 03 04 (spec §4.2.1 layout intact).
     assert_eq!(&aid[..8], &[0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04]);
-    // Manufacturer keeps the reserved test value 00 00 (OQ-1)…
-    assert_eq!(&aid[8..10], &[0x00, 0x00], "manufacturer is the test value");
-    // …and the AID ends with the two RFU bytes.
+    // Manufacturer is `FF FE`, the unmanaged range the spec assigns to cards
+    // with a self-generated serial. `00 00` is the spec's *test card* value,
+    // and gpg/PGPOpony both render it as the literal string "test card" — a
+    // wrong claim on a production token.
+    assert_eq!(&aid[8..10], &[0xFF, 0xFE], "manufacturer is the unmanaged range");
+    // The AID ends with the two RFU bytes.
     assert_eq!(&aid[14..16], &[0x00, 0x00]);
 }
 
