@@ -160,7 +160,8 @@ fn test_get_info_encode_cbor() {
             assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x06))); // pinUvAuthProtocols
             assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x09))); // transports
             assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x0A))); // algorithms
-            assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x15))); // vendorPrototypeConfigCommands
+            // 0x15 is deliberately absent — see "getInfo must not contain a CBOR
+            // integer wider than 32 bits" below.
             assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x1E))); // encCredStoreState
             assert!(map.iter().any(|(k, _)| *k == cbor::Value::U(0x1F))); // authenticatorConfigCommands
         }
@@ -387,27 +388,47 @@ fn firmware_version_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
-// US-122 (EPIC PICOForge-COMPAT): getInfo key 0x15
-// vendorPrototypeConfigCommands must list the ids PicoForge can actually edit
+// getInfo must not contain a CBOR integer wider than 32 bits — which is why
+// key 0x15 (vendorPrototypeConfigCommands) is no longer advertised
 // ---------------------------------------------------------------------------
 //
-// PicoForge dispatches 0x15 (falling back to 0x13) into its shared
-// extension-list parser (`picoforge/src/hal/fido/mod.rs:335`, falling back at
-// :320-322), which reads the value as an array of 64-bit integers
-// (`picoforge/src/hal/fido/mod.rs:384-423`) and maps each through
-// `VendorConfigCommand::from_u64` (`picoforge/src/hal/fido/constants.rs:487-521`);
-// anything it does not know renders as `0x%016X`. The list therefore has to
-// contain the ids the firmware *answers* for the `0xFF` framing, and nothing
-// that is not a 64-bit id.
+// US-122 made this suite pin the *opposite*: that 0x15 lists the six 64-bit
+// ids PicoForge can edit. That was correct about PicoForge and wrong about
+// everyone else, and the cost landed on Yubico's own clients.
 //
-// This asserts set membership, not key presence: `test_get_info_encode_cbor`
-// above only checks that key 0x15 exists at all.
+// The six ids are 64-bit, so `no_heap::push_uint` emits each one canonically
+// as head `0x1B` + 8 bytes — a CBOR unsigned integer with additional-info 27.
+// `yubikit`'s `Cbor.loadInt` stops at additional-info 26 and throws
+// `IllegalArgumentException("Unable to load integer")` for 27, from inside
+// `Ctap2Session`'s constructor. The whole getInfo response is then unreadable
+// and Yubico Authenticator's Passkeys screen never loads. Measured on
+// hardware: the failure is at byte offset 381 of a 519-byte payload, the
+// first element of the 0x15 array, and allowing additional-info 27 lets the
+// remaining 20 keys decode with no trailing bytes — so this one array was the
+// entire difference between a working and a broken authenticator.
+//
+// Why removal is safe, and why not the alternative:
+//
+//   * The ids are 64-bit because *PicoForge* says so. `VendorConfigCommand::from_u64`
+//     (`picoforge/src/hal/fido/constants.rs:487-521`) hardcodes these exact
+//     values and sends them on write, so narrowing them is not ours to do.
+//   * Advertising them was never load-bearing. Both twins dispatch
+//     `authenticatorConfig` 0xFF on the id in key `0x01` of the *request*
+//     (`app.rs::cfg_vendor_prototype`, `device_core.rs` via
+//     `PhyCommand::decode`) and never read getInfo.
+//   * PicoForge's write path uses a compile-time enum
+//     (`picoforge/src/hal/fido/ops.rs:154`), never the discovered list, so no
+//     setting becomes uneditable. Only an info-dump string goes empty.
+//   * A real YubiKey 5 omits 0x15 entirely (`docs/webauthn-discovery-ab.md`).
+//
+// `python-fido2` reads 64-bit integers without complaint, which is why this
+// never showed up on the Linux desktop and why the emulation suite was green.
 
 /// The ids the client gives the four US-113 physical-config commands. Pinned
 /// as literals so the test can fail if `vendorff::SUPPORTED_IDS` is changed
 /// without the client changing with it (the same reasoning as the AAGUID
 /// test above: a comparison against the very constant the list was built from
-/// could never fail).
+/// could never fail). Served, not advertised — see the section header.
 const US113_IDS: [(&str, u64); 4] = [
     ("PhysicalVidPid", 0x6fcb19b0cbe3acfa),
     ("PhysicalLedGpio", 0x7b392a394de9f948),
@@ -416,59 +437,28 @@ const US113_IDS: [(&str, u64); 4] = [
 ];
 
 /// Credential-metadata ids handled by the same `0xFF` match arm
-/// (`app.rs::cfg_vendor_prototype`) and pinned by
+/// (`app.rs::cfg_vendor_prototype`) and driven end-to-end by
 /// `tests/pico-fido/test_043_credential_metadata.py`.
 const CRED_MGMT_IDS: [(&str, u64); 2] = [
     ("CONFIG_CREDENTIAL_EXPIRE", 0x0004E532E1FEB2FD),
     ("CONFIG_CREDENTIAL_REVOKE", 0x0005961ECBA040F9),
 ];
 
-/// Pull key 0x15 out of a decoded getInfo CBOR map.
-fn vendor_prototype_ids(
-    map: &[(fapico2_fido::cbor::Value, fapico2_fido::cbor::Value)],
-) -> Vec<u64> {
-    let (_, v) = map
-        .iter()
-        .find(|(k, _)| *k == fapico2_fido::cbor::Value::U(0x15))
-        .expect("getInfo must carry key 0x15 (vendorPrototypeConfigCommands)");
-    let fapico2_fido::cbor::Value::A(items) = v else {
-        panic!("getInfo key 0x15 must be an array, got {v:?}");
-    };
-    items
-        .iter()
-        .map(|i| match i {
-            fapico2_fido::cbor::Value::U(n) => *n,
-            other => panic!("getInfo key 0x15 entries must be unsigned ints, got {other:?}"),
-        })
-        .collect()
-}
-
-/// 0x15 as the host twin's `to_cbor()` emits it.
-fn ids_from_host_encoder() -> Vec<u64> {
+/// Raw getInfo bytes from the host twin's `to_cbor()`.
+fn bytes_from_host_encoder() -> Vec<u8> {
     use fapico2_fido::cbor;
     use fapico2_fido::ctap2::Ctap2Info;
 
-    let encoded = cbor::encode(&Ctap2Info::default().to_cbor());
-    let (decoded, consumed) = cbor::decode(&encoded).expect("host getInfo must be valid CBOR");
-    assert_eq!(
-        consumed,
-        encoded.len(),
-        "host getInfo must be one CBOR item"
-    );
-    let cbor::Value::M(map) = decoded else {
-        panic!("host getInfo must be a CBOR map");
-    };
-    vendor_prototype_ids(&map)
+    cbor::encode(&Ctap2Info::default().to_cbor())
 }
 
-/// 0x15 as the no-heap `write_cbor_into()` emits it — what the no_std device
-/// build serves. NOT the emulation binary: that runs the *host* `FidoApp`
-/// (`firmware/src/emul_main.rs` -> `process_ctap2` -> `app.rs` `get_info` ->
-/// `to_cbor`), i.e. `ids_from_host_encoder` above; `write_cbor_into` is
-/// reached only through `device_app.rs` -> `device_core.rs`
-/// `handle_get_info` on real hardware.
-fn ids_from_device_encoder() -> Vec<u64> {
-    use fapico2_fido::cbor;
+/// Raw getInfo bytes from the no-heap `write_cbor_into()` — what the no_std
+/// device build serves. NOT the emulation binary: that runs the *host*
+/// `FidoApp` (`firmware/src/emul_main.rs` -> `process_ctap2` -> `app.rs`
+/// `get_info` -> `to_cbor`), i.e. `bytes_from_host_encoder` above;
+/// `write_cbor_into` is reached only through `device_app.rs` ->
+/// `device_core.rs` `handle_get_info` on real hardware.
+fn bytes_from_device_encoder() -> Vec<u8> {
     use fapico2_fido::ctap2::Ctap2Info;
     use heapless::Vec as HeaplessVec;
 
@@ -476,88 +466,117 @@ fn ids_from_device_encoder() -> Vec<u64> {
     Ctap2Info::default()
         .write_cbor_into(&mut out)
         .expect("no-heap getInfo encoding must fit its buffer");
-    let (decoded, _) = cbor::decode(&out).expect("device getInfo must be valid CBOR");
-    let cbor::Value::M(map) = decoded else {
-        panic!("device getInfo must be a CBOR map");
-    };
-    vendor_prototype_ids(&map)
+    out.to_vec()
 }
 
+/// Every `(label, bytes)` pair: both encoders, because they are separate code
+/// and only one of them ships.
+fn both_encoders() -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("host", bytes_from_host_encoder()),
+        ("device", bytes_from_device_encoder()),
+    ]
+}
+
+/// Recursively assert every integer in `p` fits in 32 bits.
+///
+/// On canonical CBOR an integer needs additional-info 27 (a `0x1B` head) iff
+/// its value exceeds `0xFFFF_FFFF`, so the value check *is* the head-width
+/// check — and it says what we mean rather than which byte spells it.
+fn assert_ints_fit_in_32_bits(p: &mut fapico2_fido::cbor::no_heap::Parser<'_>, path: &str) {
+    use fapico2_fido::cbor::no_heap::Item;
+
+    let item = p.next().unwrap_or_else(|e| panic!("{path}: decode error {e:?}"));
+    match item {
+        Item::U(v) => assert!(
+            v <= u32::MAX as u64,
+            "{path}: unsigned integer {v} (0x{v:X}) needs a 64-bit CBOR head \
+             (0x1B); yubikit's loadInt rejects additional-info 27 with \
+             \"Unable to load integer\" and cannot parse the rest of getInfo"
+        ),
+        Item::N(v) => assert!(
+            v >= -(u32::MAX as i64),
+            "{path}: negative integer {v} needs a 64-bit CBOR head (0x3B), \
+             which yubikit cannot parse"
+        ),
+        Item::Array(n) => {
+            for _ in 0..n {
+                assert_ints_fit_in_32_bits(p, path);
+            }
+        }
+        Item::Map(n) => {
+            for _ in 0..n {
+                assert_ints_fit_in_32_bits(p, path); // key
+                assert_ints_fit_in_32_bits(p, path); // value
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The gate. Every integer anywhere in getInfo, on both encoder paths, must be
+/// readable by the 32-bit-only decoder every Yubico client ships.
 #[test]
-fn getinfo_0x15_lists_physical_ids() {
-    for (label, ids) in [
-        ("host", ids_from_host_encoder()),
-        ("device", ids_from_device_encoder()),
-    ] {
-        // The four US-113 ids. This loop was genuinely RED before US-122: the
-        // list held `0xFF` and the two credential-metadata ids only, so all
-        // four of these were absent and PicoForge rendered nothing it could
-        // edit.
-        for (name, id) in US113_IDS {
-            assert!(
-                ids.contains(&id),
-                "US-122: {label} getInfo 0x15 must advertise {name} (0x{id:016X}); \
-                 got {ids:016X?}"
-            );
-        }
+fn getinfo_holds_no_integer_wider_than_32_bits() {
+    use fapico2_fido::cbor::no_heap::Parser;
 
-        // The two credential-metadata ids stay advertised: they are real
-        // commands in the same `0xFF` match arm, and
-        // tests/pico-fido/test_043_credential_metadata.py asserts both.
-        for (name, id) in CRED_MGMT_IDS {
-            assert!(
-                ids.contains(&id),
-                "US-122: {label} getInfo 0x15 must advertise {name} (0x{id:016X}); \
-                 got {ids:016X?}"
-            );
-        }
+    for (label, bytes) in both_encoders() {
+        let mut p = Parser::new(&bytes);
+        assert_ints_fit_in_32_bits(&mut p, label);
+        assert_eq!(p.remaining(), 0, "{label}: trailing bytes after the getInfo item");
+    }
+}
 
-        // 0xFF is NOT a vendor id. It is the legacy framing's *sub-command
-        // byte* — already advertised under key 0x1F
-        // (authenticatorConfigCommands) — and belongs in neither this list nor
-        // a 64-bit id space. Listing it made PicoForge print
-        // 0x00000000000000FF.
-        assert!(
-            !ids.contains(&0xFF),
-            "US-122: {label} getInfo 0x15 must not advertise 0xFF — it is the \
-             vendorPrototype sub-command byte (advertised under 0x1F), not a \
-             64-bit vendor id; got {ids:016X?}"
-        );
+/// The six 64-bit ids are still what the `0xFF` dispatch arm answers for — they
+/// are simply no longer advertised, because advertising them is what made
+/// getInfo unreadable.
+///
+/// Asserting the *constants* rather than a getInfo list is the point: the
+/// handler (`app.rs::cfg_vendor_prototype`, `device_core.rs` ->
+/// `PhyCommand::decode`) matches on these values in the incoming request, so
+/// pinning them here pins the commands. `tests/pico-fido/test_043_credential_metadata.py`
+/// then drives two of them end-to-end over the emulator.
+#[test]
+fn vendor_ids_are_served_but_not_advertised() {
+    let served: Vec<u64> = fapico2_fido::vendorff::SUPPORTED_IDS
+        .iter()
+        .map(|(_, id)| *id)
+        .chain([
+            fapico2_fido::ctap2::CONFIG_CREDENTIAL_EXPIRE,
+            fapico2_fido::ctap2::CONFIG_CREDENTIAL_REVOKE,
+        ])
+        .collect();
 
-        // No duplicates: a repeated id means the list was assembled from two
-        // sources that were not reconciled.
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        let unique = {
-            let mut u = sorted.clone();
-            u.dedup();
-            u
-        };
+    for ((name, id), pinned) in US113_IDS.iter().chain(CRED_MGMT_IDS.iter()).zip(&served) {
         assert_eq!(
-            sorted, unique,
-            "US-122: {label} getInfo 0x15 must not contain duplicate ids"
-        );
-
-        // The exact set, as a set. Four US-113 + two credential-metadata.
-        assert_eq!(
-            ids.len(),
-            6,
-            "US-122: {label} getInfo 0x15 must list exactly the 6 supported \
-             64-bit vendor ids; got {} ({ids:016X?})",
-            ids.len()
+            id, pinned,
+            "the served vendor id for {name} drifted from the value pinned for PicoForge"
         );
     }
 
-    // The two twins share one `Ctap2Info::default()`, so the 0x15 *value* is
-    // identical by construction; only the surrounding key order differs
-    // (device emits 0x15, 0x19, 0x1B; host emits 0x15, 0x1B, 0x19 — a
-    // pre-existing divergence, out of scope here). Assert the value only,
-    // never the whole map.
-    assert_eq!(
-        ids_from_host_encoder(),
-        ids_from_device_encoder(),
-        "US-122: the host and device getInfo encoders must agree on 0x15"
-    );
+    // All six exceed 32 bits — the whole reason the advertisement had to go.
+    for id in &served {
+        assert!(
+            *id > u32::MAX as u64,
+            "0x{id:016X} now fits in 32 bits; if it is still correct to omit \
+             key 0x15, say why here rather than leaving the old reason standing"
+        );
+    }
+
+    // And neither encoder advertises it any more.
+    for (label, bytes) in both_encoders() {
+        let (decoded, consumed) =
+            fapico2_fido::cbor::decode(&bytes).expect("getInfo must be valid CBOR");
+        assert_eq!(consumed, bytes.len(), "{label}: getInfo must be one CBOR item");
+        let fapico2_fido::cbor::Value::M(map) = decoded else {
+            panic!("{label}: getInfo must be a CBOR map");
+        };
+        assert!(
+            !map.iter().any(|(k, _)| *k == fapico2_fido::cbor::Value::U(0x15)),
+            "{label}: getInfo must not carry key 0x15 — its value is an array \
+             of 64-bit ids, which no Yubico client can decode"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

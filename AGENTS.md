@@ -200,6 +200,77 @@ ship per-record flash storage with an OTP- or device-rooted key — but it is no
 a shortcut past measuring. They also each hold 256 credentials, which is the
 part that makes their design the simpler one rather than merely a different one.
 
+### 6. getInfo must contain no CBOR integer wider than 32 bits.
+
+This is not a style rule. It is the whole getInfo response.
+
+`yubikit` — the library behind **Yubico Authenticator on Android and on the
+desktop** — decodes CBOR integers with `Cbor.loadInt`, which handles
+additional-info `0..26` and throws
+`IllegalArgumentException("Unable to load integer")` at `27`. Additional-info
+`27` is a **64-bit** unsigned integer, head `0x1B`.
+
+So a single 64-bit value anywhere in getInfo does not degrade one field — it
+aborts `Ctap2Session`'s constructor, the response is never handed to the
+application, and **every** Passkeys/FIDO screen fails to load. Measured on
+hardware: a 519-byte getInfo whose key `0x15` (`vendorPrototypeConfigCommands`)
+held six 64-bit ids died at byte offset 381; allowing additional-info 27 decoded
+the other 20 keys with no trailing bytes.
+
+`python-fido2` reads 64-bit integers without complaint. **That is why this is
+invisible from the Linux side** — `ykman fido info`, the whole emulator suite,
+and the repo's own tests all pass while every Yubico client is broken. Do not
+treat "python-fido2 is happy" as evidence that a getInfo field is shippable.
+
+**Consequences you will otherwise re-derive the hard way:**
+
+* **Key `0x15` is deliberately not emitted.** The six vendor-prototype ids are
+  64-bit because *PicoForge* says so — `VendorConfigCommand::from_u64`
+  (`../picoforge/src/hal/fido/constants.rs:487-521`) hardcodes those exact
+  values and sends them on write, so they are not ours to narrow. Advertising
+  them was never load-bearing: both twins dispatch `authenticatorConfig` `0xFF`
+  on the id in key `0x01` of the **request** (`app.rs::cfg_vendor_prototype`,
+  `vendorff::PhyCommand::decode`) and neither reads getInfo, and PicoForge's
+  write path uses a compile-time enum (`ops.rs:154`) rather than the discovered
+  list. A real YubiKey 5 omits `0x15` too.
+* **The gate is stated in the client's terms**, not as "key 0x15 must be absent",
+  so it catches a 64-bit field appearing anywhere:
+  `getinfo_holds_no_integer_wider_than_32_bits` in `apps/fido/tests/getinfo.rs`,
+  over **both** encoder paths (`to_cbor` and the no-heap `write_cbor_into` — the
+  two are separate code and only one ships).
+* A CBOR integer needs a `0x1B` head **iff** its value exceeds `0xFFFF_FFFF`, so
+  the test asserts on the decoded value. That is also why `0x0E`
+  (`firmwareVersion`) must stay `u32` and stay below `0x1_0000`.
+
+### 7. AID matching is a prefix match, in the C SDK's direction.
+
+Yubico's **Java** `yubikit` selects OATH with an **eight**-byte AID —
+`a0 00 00 05 27 21 01 01` (`core/smartcard/AppId.java`, `AppId.OATH`, on both
+`main` and the 2.8.0 generation) — while this firmware and
+`../pico-fido2/pico-keys-sdk/src/oath.c` both register the seven-byte
+`a0 00 00 05 27 21 01`. Exact comparison returns `6A82` from `OathSession`'s
+constructor and every OATH screen dies, with Management (whose AID happens to
+be eight bytes here) answering fine moments earlier — an asymmetry in the log
+that points straight at the length.
+
+**The asymmetry is between Yubico's own two clients.** `ykman`'s *Python*
+`yubikit` sends the seven-byte form (`AID.OATH = a0000005272101`), so the Linux
+desktop, `ykman fido info` and every test in this repository never saw it. Do
+not read "ykman works" as evidence that an AID length is fine — `ykman` is not
+the client that failed.
+
+`Dispatcher::find_app` therefore mirrors `main.c:85`: **the registered AID is a
+prefix of the request**. The direction matters. RS-Key uses the inverse
+(`applet.rs:378`, `app.aid().starts_with(apdu.data)`), which admits truncated
+AIDs down to one byte; adopting it would let `00 A4 04 00 01 A0` reach OATH.
+`a_shorter_candidate_does_not_select_the_applet` pins the direction.
+
+Prefix matching is unambiguous only while no registered AID is a prefix of
+another, which is why `register` rejects **overlap** rather than mere equality
+(as `app_exists`, `main.c:56`, does) and why
+`no_device_aid_is_a_prefix_of_another` pins the registered set in
+`apps/tests/registry.rs`.
+
 ---
 
 ## A yellow "Online - FIDO" in PicoForge is usually the USB identity, not a bug in the applet

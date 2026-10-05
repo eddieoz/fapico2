@@ -124,19 +124,57 @@ impl<'a, const N: usize> Dispatcher<'a, N> {
         }
     }
 
-    /// Register an app. The app's AID must be unique.
+    /// Register an app. The app's AID must not overlap an existing one.
     pub fn register(&mut self, app: &'a mut dyn App) -> bool {
         for existing in &self.apps {
-            if existing.aid() == app.aid() {
+            if Self::aids_overlap(existing.aid(), app.aid()) {
                 return false;
             }
         }
         self.apps.push(app).is_ok()
     }
 
-    /// Check if `aid` is a registered AID.
+    /// Do two AIDs overlap — i.e. is either a byte-prefix of the other?
+    ///
+    /// Equality is the degenerate case, so this also covers the plain
+    /// duplicate check. It has to be an *overlap* check rather than an
+    /// equality check because [`Dispatcher::find_app`] resolves by prefix: an
+    /// overlapping pair would be ambiguous, with the first registered winning
+    /// by position and the other becoming unreachable. The C SDK refuses to
+    /// register one for the same reason (`app_exists`, `main.c:56`).
+    fn aids_overlap(a: &[u8], b: &[u8]) -> bool {
+        let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        longer.starts_with(shorter)
+    }
+
+    /// Check if `aid` resolves to a registered app.
+    ///
+    /// A registered AID matches when it is a **prefix** of the requested one,
+    /// which is what the C SDK does (`main.c:85`):
+    ///
+    /// ```c
+    /// if (aid.len >= apps[a].aid[0]
+    ///     && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0]))
+    /// ```
+    ///
+    /// Exact equality is not equivalent, and the difference was visible to
+    /// every first-party client rather than only to us. Yubico's `yubikit`
+    /// selects OATH as the **8**-byte `A0 00 00 05 27 21 01 01`, while both
+    /// this firmware and `pico-keys-sdk` register the 7-byte
+    /// `A0 00 00 05 27 21 01`. Under equality the Java client got
+    /// `ApduException: 0x6a82` from `OathSession`'s constructor on a device
+    /// whose Management applet answered moments earlier — Management's AID
+    /// happens to be 8 bytes, so exact matching found it and missed OATH.
+    ///
+    /// The direction matters. A *shorter* request must not match: that is
+    /// RS-Key's rule (`applet.rs:378`, `app.aid().starts_with(apdu.data)`),
+    /// and adopting it would let `00 A4 04 00 01 A0` reach OATH. The C rule
+    /// admits only refinements of a registered AID.
     fn find_app(&self, aid: &[u8]) -> Option<usize> {
-        self.apps.iter().position(|app: &&mut dyn App| app.aid() == aid)
+        self.apps.iter().position(|app: &&mut dyn App| {
+            let registered = app.aid();
+            aid.len() >= registered.len() && aid[..registered.len()] == *registered
+        })
     }
 
     /// Process a raw APDU.
@@ -540,5 +578,120 @@ mod tests {
         d.dispatch(&[0x00, 0x20, 0x00, 0x00, 0x00], &mut resp);
         d.dispatch(&[0x00, 0x27, 0x00, 0x86, 0x00], &mut resp);
         assert_eq!(resp.as_slice(), &SW_OK.to_be_bytes());
+    }
+
+    // -------------------------------------------------------------------------
+    // AID length: the C SDK matches by prefix, not by equality.
+    // -------------------------------------------------------------------------
+
+    /// The AID this firmware registers for OATH — 7 bytes, as
+    /// `pico-keys-sdk/src/oath.c:123` does.
+    const AID_OATH_7: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01];
+
+    /// What Yubico's Java stack actually sends. `yubikit`'s
+/// `AppId.OATH` is 8 bytes — the same 7 plus a trailing `0x01` — on both
+/// `main` and the 2.8.0 generation (see `core/smartcard/AppId.java`).
+///
+/// The asymmetry is exact, and it is why this was a desktop-and-Android
+/// failure rather than a general one: `ykman`'s Python `yubikit` sends the
+/// **7**-byte form (`core/smartcard/__init__.py`, `AID.OATH =
+/// a0000005272101`), and so does every test in this repository. Yubico
+/// Authenticator on Android selects the 8-byte one and got `6A82` —
+/// `ApplicationNotAvailableException`, every OATH screen dead, on a device
+/// whose Management applet read fine one line earlier. Management's AID
+/// happens to be 8 bytes here, so exact matching found it and missed OATH.
+const AID_OATH_8: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01, 0x01];
+
+    /// The C rule (`main.c:85`): a registered AID matches when it is a
+    /// **prefix** of the requested one.
+    ///
+    ///     if (aid.len >= apps[a].aid[0]
+    ///         && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0]))
+    ///
+    /// Exact matching is what broke the Java client, and it is a divergence
+    /// from the C reference this dispatcher documents itself as mirroring.
+    #[test]
+    fn registered_aid_matches_as_a_prefix_of_the_request() {
+        // Yubikit's 8-byte SELECT lands on the 7-byte registration.
+        {
+            let mut oath = StubApp::new(AID_OATH_7);
+            let mut d: Dispatcher<4> = Dispatcher::new();
+            d.register(&mut oath);
+            select(&mut d, AID_OATH_8);
+            assert_eq!(d.current_idx, Some(0));
+        }
+
+        // The exact AID still selects, of course.
+        {
+            let mut oath = StubApp::new(AID_OATH_7);
+            let mut d: Dispatcher<4> = Dispatcher::new();
+            d.register(&mut oath);
+            select(&mut d, AID_OATH_7);
+            assert_eq!(d.current_idx, Some(0));
+        }
+    }
+
+    /// The other direction must **not** match. RS-Key accepts any candidate
+    /// that is a prefix of a registered AID, down to one byte; adopting that
+    /// would let `00 A4 04 00 01 A0` select OATH. The C SDK does the reverse,
+    /// and so do we: a *short* candidate is not enough.
+    #[test]
+    fn a_shorter_candidate_does_not_select_the_applet() {
+        let mut oath = StubApp::new(AID_OATH_7);
+        let mut d: Dispatcher<4> = Dispatcher::new();
+        d.register(&mut oath);
+
+        for shorter in [
+            &AID_OATH_7[..6],
+            &AID_OATH_7[..1],
+            &AID_OATH_7[..0],
+        ] {
+            let mut apdu: Vec<u8, 32> = Vec::new();
+            apdu.extend_from_slice(&[0x00, 0xA4, 0x04, 0x00]).unwrap();
+            apdu.push(shorter.len() as u8).unwrap();
+            apdu.extend_from_slice(shorter).unwrap();
+            let mut resp = Vec::new();
+            d.dispatch(&apdu, &mut resp);
+            assert_eq!(
+                resp.as_slice(),
+                &SW_FILE_NOT_FOUND.to_be_bytes(),
+                "a {}-byte candidate must not select a {}-byte registration ({shorter:02x?})",
+                shorter.len(),
+                AID_OATH_7.len(),
+            );
+        }
+        assert_eq!(d.current_idx, None);
+    }
+
+    /// Under prefix matching an overlapping pair is ambiguous — the first
+    /// registered wins by position and the other becomes unreachable. The C
+    /// SDK refuses to register one (`app_exists`, `main.c:56`), and so must we,
+    /// or a future "widen OATH to 8 bytes" would silently shadow the 7-byte applet.
+    #[test]
+    fn register_rejects_a_prefix_overlapping_aid() {
+        {
+            let mut seven = StubApp::new(AID_OATH_7);
+            let mut eight = StubApp::new(AID_OATH_8);
+            let mut d: Dispatcher<4> = Dispatcher::new();
+            assert!(d.register(&mut seven));
+            assert!(
+                !d.register(&mut eight),
+                "an 8-byte AID overlapping a registered 7-byte one must be refused"
+            );
+        }
+
+        {
+            // Overlap is symmetric.
+            let mut eight = StubApp::new(AID_OATH_8);
+            let mut seven = StubApp::new(AID_OATH_7);
+            // Exact duplicates are still refused — the behaviour that was
+            // already there, and the one `register_ccid_apps` relies on to
+            // fail loudly rather than half-wire the card.
+            let mut twin = StubApp::new(AID_OATH_7);
+            let mut d: Dispatcher<4> = Dispatcher::new();
+            assert!(d.register(&mut eight));
+            assert!(!d.register(&mut seven), "overlap must be rejected either way round");
+            assert!(!d.register(&mut twin));
+        }
     }
 }

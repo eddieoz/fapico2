@@ -3,6 +3,7 @@
 import pytest
 from fido2.ctap import CtapError
 from fido2.ctap2 import Config, CredentialManagement
+from fido2.ctap2.base import Ctap2
 from fido2.ctap2.pin import ClientPin, PinProtocolV2
 
 
@@ -31,10 +32,29 @@ def _credential_management(device):
     return CredentialManagement(ctap, PinProtocolV2(), token)
 
 
-def test_get_info_advertises_credential_metadata_commands(info):
-    commands = info[0x15]
-    assert CONFIG_CREDENTIAL_EXPIRE in commands
-    assert CONFIG_CREDENTIAL_REVOKE in commands
+def test_get_info_does_not_advertise_credential_metadata_commands(device):
+    """getInfo must not carry key 0x15 (vendorPrototypeConfigCommands).
+
+    These ids are 64-bit, so advertising them means emitting a CBOR head
+    ``0x1B`` (additional-info 27). Yubico's ``yubikit`` decoder stops at
+    additional-info 26 and raises ``IllegalArgumentException("Unable to load
+    integer")`` from ``Ctap2Session``'s constructor, which loses the entire
+    getInfo response — every Yubico client then fails to load its Passkeys
+    screen. ``python-fido2`` reads 64-bit integers fine, which is exactly why
+    this was invisible from the Linux side.
+
+    Omitting the advertisement costs nothing: the commands below are dispatched
+    on the id carried in the *request*, never from getInfo.
+    """
+    # The raw CBOR map, not the `info` fixture. `fido2.ctap2.Info` is a
+    # dataclass that materialises every documented key with a default, so
+    # `0x15 in info` is True whether or not the device sent it — asking it
+    # whether a key is absent can never fail.
+    raw = device.client()._backend.ctap2.send_cbor(Ctap2.CMD.GET_INFO)
+    assert 0x15 not in raw, (
+        "getInfo must not carry key 0x15: its value is an array of 64-bit "
+        "ids, which no Yubico client can decode"
+    )
 
 
 def test_revoke_requires_a_credential_slot(device):

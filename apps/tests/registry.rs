@@ -86,6 +86,64 @@ fn ccid_aid_set_is_the_six_device_apps() {
     }
 }
 
+/// No device AID may be a byte-prefix of another.
+///
+/// This is the precondition that makes `Dispatcher::find_app`'s prefix matching
+/// unambiguous, so it is worth pinning alongside the set itself. An overlap
+/// would not be a test failure at registration — `register` refuses it — but a
+/// *new* AID introduced later could be accepted into an emulator or a
+/// hand-built dispatcher, and then one applet would quietly shadow the other
+/// for every client that sends the longer form.
+///
+/// The current set clears it comfortably: Management, OATH and OTP all begin
+/// `A0 00 00 05 27` and diverge at byte 5 (`0x47` / `0x21` / `0x20`); Rescue
+/// diverges from the rest at byte 1 (`0x58`); OpenPGP and vendor LED differ
+/// in their first byte outright.
+#[test]
+fn no_device_aid_is_a_prefix_of_another() {
+    for (i, a) in CCID_AIDS.iter().enumerate() {
+        for b in &CCID_AIDS[i + 1..] {
+            let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+            assert!(
+                !longer.starts_with(shorter),
+                "device AIDs must not overlap, or prefix matching resolves \
+                 ambiguously: {a:02x?} vs {b:02x?}"
+            );
+        }
+    }
+}
+
+/// Yubico's clients select OATH by an AID one byte **longer** than the one
+/// registered here, and the dispatcher must still route it to OATH.
+///
+/// `yubikit`'s `AppId.OATH` is `A0 00 00 05 27 21 01 01` (8 bytes); this
+/// firmware and `pico-keys-sdk/src/oath.c:123` both register the 7-byte
+/// `A0 00 00 05 27 21 01`. That is fine only because AID matching is
+/// prefix-based, as in the C SDK (`main.c:85`). Before it was, Yubico
+/// Authenticator on Android failed every OATH screen with
+/// `ApplicationNotAvailableException` / `0x6a82` while Management — whose AID
+/// is 8 bytes here, so exact matching happened to find it — worked fine.
+#[test]
+fn yubiko_length_aid_reaches_the_applet() {
+    use fapico2_platform::dispatch::SW_FILE_NOT_FOUND;
+
+    let mut oath = OathApp::new();
+    let mut d: Dispatcher<1> = Dispatcher::new();
+    assert!(d.register(&mut oath));
+
+    let mut apdu: heapless::Vec<u8, 16> = heapless::Vec::new();
+    apdu.extend_from_slice(&[0x00, 0xA4, 0x04, 0x00, 0x08]).unwrap();
+    apdu.extend_from_slice(&[0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01, 0x01]).unwrap();
+
+    let mut resp = heapless::Vec::new();
+    d.dispatch(&apdu, &mut resp);
+    assert_ne!(
+        resp.as_slice(),
+        &SW_FILE_NOT_FOUND.to_be_bytes(),
+        "yubikit's 8-byte OATH AID must select the 7-byte registration"
+    );
+}
+
 /// The vendor LED AID is the one the PicoForge client SELECTs
 /// (`picoforge/src/hal/rescue/constants.rs:484`). A typo here is silent: the
 /// client's SELECT would answer `6A82` and the LED screen would be

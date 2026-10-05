@@ -12,9 +12,9 @@ use heapless::Vec as HeaplessVec;
 /// expiration. Params: `{0x02: <4-byte timestamp>}`.
 ///
 /// Lives in this module so the id has exactly one spelling in the crate: the
-/// handler (`crate::app::FidoApp::cfg_vendor_prototype`) and the key-`0x15`
-/// list in [`Ctap2Info::default`] that tells the host it exists cannot drift
-/// apart.
+/// handler (`crate::app::FidoApp::cfg_vendor_prototype`) and the device path
+/// (`crate::vendorff::PhyCommand::decode`) cannot drift apart. It is
+/// deliberately *not* advertised in getInfo — see the `Ctap2Info` field list.
 pub const CONFIG_CREDENTIAL_EXPIRE: u64 = 0x0004E532E1FEB2FD;
 /// `vendorPrototype` sub-command `0xFF` — credential revocation. Params for
 /// slot-based: `{0x03: <slot_index>}`; id-based: `{0x02: <credential_id>}`.
@@ -234,16 +234,41 @@ pub struct Ctap2Info {
     pub force_pin_change: bool,
     pub pin_complexity_policy: Option<bool>,
     pub authenticator_config_commands: HeaplessVec<u8, 8>,
-    /// Vendor prototype config commands (key 0x15): the 64-bit ids this
-    /// firmware answers for `authenticatorConfig` sub-command `0xFF`
-    /// (`vendorPrototype`) — the four [`crate::vendorff::SUPPORTED_IDS`]
-    /// physical-config ids plus the two credential-metadata ids declared
-    /// above.
-    ///
-    /// It is *not* a list of `authenticatorConfig` sub-command bytes (that
-    /// is key `0x1F`) and it is *not* the RS-Key `0x41` id space (those are
-    /// one byte, disjoint by construction — see `crate::vendorff`).
-    pub vendor_prototype_config_commands: HeaplessVec<u64, 8>,
+    // getInfo key 0x15 (`vendorPrototypeConfigCommands`) is deliberately NOT
+    // emitted, and this is where the field that used to carry it lived. The
+    // reasoning, because it is a trade and not an oversight:
+    //
+    //   * The four [`crate::vendorff::SUPPORTED_IDS`] physical-config ids and
+    //     the two credential-metadata ids above are **64-bit**, because
+    //     PicoForge's `VendorConfigCommand::from_u64`
+    //     (`picoforge/src/hal/fido/constants.rs:487-521`) hardcodes these exact
+    //     values and sends them on write. Narrowing them is not ours to do.
+    //   * A 64-bit CBOR unsigned integer is head `0x1B` — major type 0,
+    //     additional-info 27 — and `yubikit`'s `Cbor.loadInt` handles
+    //     additional-info 0..26 only, throwing
+    //     `IllegalArgumentException("Unable to load integer")` at 27. That
+    //     exception escapes `Ctap2Session`'s constructor, so **every** Yubico
+    //     client that reads getInfo — Yubico Authenticator on Android and on
+    //     the desktop — loses its whole Passkeys screen over this one array.
+    //     `python-fido2` reads 64-bit integers fine, which is why the Linux
+    //     desktop and this crate's own emulator suite stayed green and the
+    //     defect was invisible until it was measured on a real client.
+    //   * Advertising the ids was never load-bearing. Both twins dispatch
+    //     `authenticatorConfig` `0xFF` on the id carried in key `0x01` of the
+    //     *request* — `FidoApp::cfg_vendor_prototype` and `PhyCommand::decode`
+    //     — and neither reads getInfo. PicoForge's write path likewise uses a
+    //     compile-time enum (`picoforge/src/hal/fido/ops.rs:154`), so no
+    //     setting becomes uneditable; only an info-dump string goes empty.
+    //   * A real YubiKey 5 omits key 0x15 entirely
+    //     (`docs/webauthn-discovery-ab.md`, captured from a YubiKey 5).
+    //
+    // The gate that keeps this true is `getinfo_holds_no_integer_wider_than_32_bits`
+    // in `apps/fido/tests/getinfo.rs`; it is stated in terms of the client's
+    // limit rather than this omission, so a future 64-bit field anywhere in
+    // getInfo is caught the same way.
+    //
+    // For the same reason, **nothing else in getInfo may carry an integer
+    // wider than 32 bits.**
     /// Encrypted credential store state (key 0x1E): 16-byte random IV
     /// prepended to a 16-byte ciphertext block.
     pub enc_cred_store_state: HeaplessVec<u8, 64>,
@@ -293,8 +318,11 @@ impl Ctap2Info {
     /// 0x05 maxMsgSize, 0x06 pinUvAuthProtocols, 0x07 maxCredsInList,
     /// 0x08 maxCredIdLen, 0x09 transports, 0x0A algorithms, 0x0B maxLargeBlob,
     /// 0x0D minPINLength, 0x0E firmwareVersion, 0x0F maxCredBlobLength,
-    /// 0x10 maxRPIDs, 0x15 vendorPrototypeConfigCommands, 0x19 encIdentifier,
+    /// 0x10 maxRPIDs, 0x19 encIdentifier,
     /// 0x1D maxPINLength, 0x1E encCredStoreState, 0x1F authenticatorConfigCommands.
+    ///
+    /// Key 0x15 (`vendorPrototypeConfigCommands`) is absent by design; see the
+    /// `Ctap2Info` field list.
     ///
     /// Note the map is written in ascending-key order, which is also the
     /// canonical CBOR order for these single-byte keys.
@@ -302,7 +330,7 @@ impl Ctap2Info {
         &self,
         out: &mut HeaplessVec<u8, N>,
     ) -> Result<(), CborError> {
-        let mut pairs = 20usize;
+        let mut pairs = 19usize;
         if self.max_large_blob.is_some() {
             pairs += 1;
         }
@@ -376,11 +404,10 @@ impl Ctap2Info {
         no_heap::push_uint(out, self.max_cred_blob_length as u64)?;
         no_heap::push_uint(out, 0x10)?;
         no_heap::push_uint(out, self.max_rpids_min_pin as u64)?;
-        no_heap::push_uint(out, 0x15)?;
-        no_heap::push_array_header(out, self.vendor_prototype_config_commands.len())?;
-        for c in &self.vendor_prototype_config_commands {
-            no_heap::push_uint(out, *c)?;
-        }
+        // Key 0x15 (`vendorPrototypeConfigCommands`) is intentionally skipped —
+        // see the `Ctap2Info` field list for why an array of 64-bit ids cannot
+        // be advertised without making getInfo unreadable to every Yubico
+        // client.
         // Encrypted device identifier (key 0x19) — ascending canonical order
         no_heap::push_uint(out, 0x19)?;
         no_heap::push_bstr(out, &self.enc_identifier)?;
@@ -472,15 +499,9 @@ impl Ctap2Info {
         m.push((Value::U(0x0E), Value::U(self.firmware_version as u64)));
         m.push((Value::U(0x0F), Value::U(self.max_cred_blob_length as u64)));
         m.push((Value::U(0x10), Value::U(self.max_rpids_min_pin as u64)));
-        m.push((
-            Value::U(0x15),
-            Value::A(
-                self.vendor_prototype_config_commands
-                    .iter()
-                    .map(|c| Value::U(*c))
-                    .collect(),
-            ),
-        ));
+        // Key 0x15 is intentionally absent here too — see the `Ctap2Info` field
+        // list. The host and device encoders must agree on the key set, and
+        // `getinfo_holds_no_integer_wider_than_32_bits` checks both.
         if let Some(pcp) = self.pin_complexity_policy {
             m.push((Value::U(0x1B), Value::Bool(pcp)));
         }
@@ -829,35 +850,14 @@ impl Default for Ctap2Info {
         for c in [0x01u8, 0x02, 0x03, 0xFF] {
             authenticator_config_commands.push(c).ok();
         }
-        // Compile-time: the advertised set can never overflow the 8-slot
-        // vector, so the `push(..).ok()` calls below can never truncate.
-        const _: () = assert!(crate::vendorff::SUPPORTED_IDS.len() + 2 <= 8);
+        // The `0xFF` vendor-prototype ids are *not* assembled here any more —
+        // they are no longer advertised in getInfo, because a 64-bit id needs a
+        // 64-bit CBOR head and `yubikit` cannot decode one. They remain
+        // reachable: `FidoApp::cfg_vendor_prototype` and `PhyCommand::decode`
+        // match `crate::vendorff::SUPPORTED_IDS` plus `CONFIG_CREDENTIAL_*`
+        // against the id in the incoming request, and nothing about that path
+        // consults this struct. See the `Ctap2Info` field list.
 
-        let mut vendor_prototype_config_commands: HeaplessVec<u64, 8> = HeaplessVec::new();
-        // Every 64-bit id this firmware answers for the `0xFF` framing, and
-        // nothing else. The four physical-config ids are taken from
-        // `vendorff::SUPPORTED_IDS` rather than re-typed so the advertised
-        // set cannot drift from the set the handler dispatches on
-        // (`app.rs::cfg_vendor_prototype`).
-        //
-        // `0xFF` itself is deliberately absent: it is the *framing's*
-        // sub-command byte (advertised under key `0x1F`), not a vendor id.
-        // The `0x41` one-byte ids are absent for the same reason —
-        // `vendorff` documents the two id spaces as disjoint.
-        //
-        // `push(..).ok()` would be the silent-truncation hazard here, so the
-        // capacity is checked at compile time instead of at boot: on `no_std`
-        // there is no unwinder, so a `default()` panic is a hard reset. A
-        // fifth `SUPPORTED_IDS` entry is a build break, not a bricked token.
-        for (_, id) in crate::vendorff::SUPPORTED_IDS {
-            vendor_prototype_config_commands.push(*id).ok();
-        }
-        vendor_prototype_config_commands
-            .push(CONFIG_CREDENTIAL_EXPIRE)
-            .ok();
-        vendor_prototype_config_commands
-            .push(CONFIG_CREDENTIAL_REVOKE)
-            .ok();
         let mut enc_cred_store_state: HeaplessVec<u8, 64> = HeaplessVec::new();
         enc_cred_store_state.extend_from_slice(&[0u8; 32]).ok();
         let mut enc_identifier: HeaplessVec<u8, 64> = HeaplessVec::new();
@@ -886,7 +886,6 @@ impl Default for Ctap2Info {
             force_pin_change: false,
             pin_complexity_policy: None,
             authenticator_config_commands,
-            vendor_prototype_config_commands,
             enc_cred_store_state,
             enc_identifier,
         }

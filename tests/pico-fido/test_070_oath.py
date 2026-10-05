@@ -20,8 +20,10 @@
 import pytest
 from utils import *
 from conftest import (
+    OATH_AID,
     authenticate_oath,
     oath_select_challenge,
+    oath_select_device_id,
     select_oath_aid,
 )
 import hmac, hashlib
@@ -657,3 +659,49 @@ def test_a_credential_survives_a_new_session_across_the_client_handshake(oath_se
     # 6. And the table is genuinely empty afterwards — the session stayed
     #    usable throughout, so this is the applet's state, not a refusal.
     assert len(list_apdu(reset_oath)) == 0
+
+
+def test_select_with_yubikos_eight_byte_oath_aid(ccid_card):
+    """Yubico's Java AID is one byte longer than ours, and must still select OATH.
+
+    `yubikit`'s `AppId.OATH` (Java, `core/smartcard/AppId.java`) is
+    `a0 00 00 05 27 21 01 01` — 8 bytes — while this firmware and
+    `pico-keys-sdk/src/oath.c` both register the 7-byte
+    `a0 00 00 05 27 21 01`. Under exact AID matching the Java client got
+    `ApduException: 0x6a82` from `OathSession`'s constructor — every OATH
+    screen dead in Yubico Authenticator on Android — while Management, whose
+    AID happens to be 8 bytes here, answered moments earlier.
+
+    `ykman`'s Python `yubikit` sends the 7-byte form, which is why this suite
+    and the whole Linux desktop path never saw the bug. The asymmetry is
+    *between Yubico's own two clients*, not between ours and theirs.
+
+    Matching is prefix-based in the C SDK's direction: the *registered* AID is
+    a prefix of the request.
+    """
+    yubikit_aid = OATH_AID + [0x01]
+    resp, sw1, sw2 = ccid_card.connection.transmit(
+        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, len(yubikit_aid)] + yubikit_aid + [0x00, 0x00]
+    )
+    assert [sw1, sw2] == [0x90, 0x00], (
+        "an 8-byte OATH AID must select the 7-byte registration, got %02X%02X" % (sw1, sw2)
+    )
+
+    # The applet really answered, rather than the SELECT being a no-op: the
+    # device-id TLV is the PBKDF2 salt, and only a live OATH session has one.
+    assert oath_select_device_id(resp), (
+        "SELECT must return the 71 device-id TLV, got %02X..." % (resp[0] if resp else 0)
+    )
+
+    # The other direction must not match. Adopting RS-Key's rule instead would
+    # let a truncated AID reach an applet; this pins that it does not.
+    short = OATH_AID[:6]
+    _, sw1, sw2 = ccid_card.connection.transmit(
+        [0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, len(short)] + short + [0x00, 0x00]
+    )
+    assert [sw1, sw2] == [0x6A, 0x82], (
+        "a truncated AID must not select an applet, got %02X%02X" % (sw1, sw2)
+    )
+
+    # Leave the session as the rest of the suite expects it.
+    select_oath_aid(ccid_card)

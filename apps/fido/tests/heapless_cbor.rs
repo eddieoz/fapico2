@@ -18,7 +18,11 @@ fn cbor_roundtrip_heapless_no_alloc() {
         .expect("getInfo map fits the fixed buffer");
 
     let mut p = Parser::new(buf.as_slice());
-    assert!(matches!(p.next(), Ok(Item::Map(21))), "getInfo is map(21)");
+    // 20 pairs = the 19 unconditional keys plus maxLargeBlob (0x0B). This was
+    // 21 until key 0x15 (`vendorPrototypeConfigCommands`) was dropped: its value
+    // is an array of 64-bit ids, which needs a `0x1B` CBOR head that `yubikit`
+    // cannot decode — see AGENTS.md section 6.
+    assert!(matches!(p.next(), Ok(Item::Map(20))), "getInfo is map(20)");
     // versions (key 1): array of tstr, contains FIDO_2_0.
     assert_eq!(p.next().unwrap(), Item::U(0x01));
     let Item::Array(n_versions) = p.next().unwrap() else {
