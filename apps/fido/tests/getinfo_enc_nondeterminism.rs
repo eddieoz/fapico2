@@ -171,10 +171,18 @@ fn get_info_host(app: &mut HostApp) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// US-1600 — the baseline. This passes today, and that is the finding.
+// US-1600 — the baseline, as it stood before US-1609. These passed against
+// the defective tree, which was US-1600's acceptance criterion.
+//
+// **They are `#[ignore]`d now, and that is the record of the flip.** US-1609
+// changed exactly the behaviour they characterise, so they would now fail —
+// and a test that fails after its own fix is a test that gets deleted, which
+// is the one way a measurement can be lost. Kept and ignored, they say what
+// the board did on 2026-10-05; `cargo test -- --ignored` reproduces it.
 // ---------------------------------------------------------------------------
 
-/// **The device's `encCredStoreState` ciphertext is byte-identical across calls.**
+/// **Before US-1609: the device's `encCredStoreState` ciphertext was
+/// byte-identical across calls.**
 ///
 /// Red-team F3. Two consecutive getInfo calls with nothing in between: the IV
 /// half differs (so the existing pytest assertion passes) and the ciphertext
@@ -185,6 +193,9 @@ fn get_info_host(app: &mut HostApp) -> Vec<u8> {
 /// the point, not an accident of the fixture. It is what identifies
 /// `device_core.rs`'s `pin_cbc_encrypt_zero_iv` as the single line to change.
 #[test]
+#[ignore = "US-1600 baseline. Characterises the device twin's zero-IV defect; US-1609 binds the \
+             ciphertext to the advertised IV and this now fails by design. Kept as the \
+             measured before-state."]
 fn getinfo_currently_publishes_a_constant_ciphertext_on_the_device() {
     let _lock = lock();
     let mut app = device();
@@ -219,6 +230,9 @@ fn getinfo_currently_publishes_a_constant_ciphertext_on_the_device() {
 /// enrolled anything. An attacker can therefore learn "this key has not been
 /// factory-reset" from a field that does not depend on any activity at all.
 #[test]
+#[ignore = "US-1600 baseline. `encIdentifier` had no counter in its plaintext at all, so its \
+             ciphertext was constant for a whole boot; US-1609 binds it to its IV too. Kept as \
+             the measured before-state."]
 fn getinfo_currently_publishes_a_constant_identifier_ciphertext() {
     let _lock = lock();
     let mut app = device();
@@ -235,7 +249,7 @@ fn getinfo_currently_publishes_a_constant_identifier_ciphertext() {
     );
 }
 
-/// **The host twin does not have the defect, and that names the fix.**
+/// **The host twin did not have the defect, and that named the fix.**
 ///
 /// `app.rs`'s `get_info` encrypts with the advertised IV, so its ciphertext
 /// already varies per call. The defect is therefore **device-only**, and the
@@ -272,9 +286,6 @@ fn the_host_twin_already_encrypts_with_the_advertised_iv() {
 /// passing, so this pair cannot both be satisfied by "make the field
 /// constant".
 #[test]
-#[ignore = "RED — US-1608. Fails today on the ciphertext half only, because `device_core.rs` \
-             advertises a random IV and encrypts under an all-zero one. Ignored only so that \
-             every commit in this epic lands green; US-1609 un-ignores it with the fix in place."]
 fn the_encrypted_state_ciphertext_must_not_repeat_across_calls() {
     let _lock = lock();
     let mut app = device();

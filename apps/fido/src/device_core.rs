@@ -2681,6 +2681,44 @@ impl FidoApp {
         ));
         // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
         // plaintext over the persisted device random (host parity).
+        // Encrypted state fields (IV(16) || AES-CBC ct(16)), deterministic
+        // plaintext over the persisted device random (host parity).
+        //
+        // US-1609: the IV drawn here is the one the field **advertises** and
+        // the one the CBC is run **under**. They used to disagree — the IV was
+        // drawn, published, and then discarded in favour of an all-zero one
+        // (`pin_cbc_encrypt_zero_iv`) — and that disagreement is what made the
+        // field an oracle.
+        //
+        // Red-team F3: the plaintext is an HMAC over the credential counter, so
+        // a ciphertext that repeats across two unauthenticated getInfo calls is
+        // a machine-checkable assertion that *nothing happened to the counter
+        // between them*. Polling until the ciphertext changes tells an attacker
+        // who has neither the PIN nor a touch that an assertion occurred, and
+        // when it stopped occurring. Measured: the IV varied every call and the
+        // ciphertext was byte-identical every call.
+        //
+        // Binding the ciphertext to the IV that was going to be randomised
+        // anyway kills the oracle for free, and repairs the internal
+        // incoherence at the same time: the advertised IV is now the IV
+        // actually used, so the field is at least self-consistent.
+        //
+        // **No client can regress.** The client decrypts with the *advertised*
+        // IV (`fido2/ctap2/base.py:125,135` — `iv = encrypted[:16]`, then
+        // `Cipher(AES(HKDF(pin_token)), modes.CBC(iv))`), so before this change
+        // the two halves disagreed and no conforming client had ever recovered
+        // this plaintext. The key derivation is untouched: the client derives
+        // from `HKDF(pin_token)`, which an *unauthenticated* getInfo cannot
+        // obtain, so there was never a key that made both the spec and this
+        // firmware agree. Making the field spec-correct is a different and
+        // larger story, deliberately not started here.
+        //
+        // The IV's behaviour is unchanged and stays pinned:
+        // `tests/pico-fido/test_000_getinfo.py:45` asserts the whole field
+        // differs between calls, and it is now satisfied by both halves rather
+        // than the IV alone. `tests/getinfo_enc_nondeterminism.rs` asserts the
+        // two halves separately, and in opposite directions, so that a fix
+        // making the field constant cannot pass one and retire the other.
         let mut iv = [0u8; 16];
         self.draw_random(&mut iv);
         let mut key = [0u8; 32];
@@ -2694,7 +2732,7 @@ impl FidoApp {
         enc_state.extend_from_slice(&iv).ok();
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&state_pt[..16]);
-        crypto::pin_cbc_encrypt_zero_iv(&key, &mut buf).ok();
+        crypto::aes256_cbc_encrypt_into(&key, &iv, &mut buf).ok();
         enc_state.extend_from_slice(&buf).ok();
         info.enc_cred_store_state = enc_state;
 
@@ -2706,7 +2744,12 @@ impl FidoApp {
         enc_id.extend_from_slice(&iv2).ok();
         let mut buf2 = [0u8; 16];
         buf2.copy_from_slice(&id_pt[..16]);
-        crypto::pin_cbc_encrypt_zero_iv(&key, &mut buf2).ok();
+        // Same reasoning for `encIdentifier`, and its plaintext is the stronger
+        // half of the finding: it is an HMAC over `device_random` alone, with no
+        // counter in it, so its ciphertext was constant for the whole life of a
+        // boot on a device that had never enrolled anything. The oracle needed
+        // no assertion activity at all, only patience.
+        crypto::aes256_cbc_encrypt_into(&key, &iv2, &mut buf2).ok();
         enc_id.extend_from_slice(&buf2).ok();
         info.enc_identifier = enc_id;
 
