@@ -11,6 +11,20 @@
 # both gates are toolchain-sensitive by construction.
 channel = "1.99.0"
 
+# clippy travels with the toolchain, not with the step that happens to install
+# it. GitHub's runner images ship rustup with `profile = minimal`, which does
+# not include clippy — and the `--component clippy` on ci.yml's setup steps is
+# spent on the wrong toolchain, because those steps run in the workspace root
+# (the checkout uses `path: fapico2`, so rust-toolchain.toml is one level down
+# and rustup never sees it). `cargo clippy` then auto-installs this toolchain
+# from the file and finds no clippy: run 37348521905 died with "'cargo-clippy'
+# is not installed for the toolchain '1.99.0'" at 12s, while the identical
+# command passed locally. Naming the component here is the only place that is
+# both read by cargo's auto-install and impossible to point at the wrong
+# toolchain. Reproduced and verified by uninstalling 1.99.0 under
+# `rustup set profile minimal` and letting `cargo clippy` re-derive it.
+components = ["clippy"]
+
 # thumbv8m.main-none-eabi is the RP2350 (Cortex-M33) target this firmware
 # builds for. The list previously read thumbv6m-none-eabi, which is RP2040 —
 # it never matched anything built here, and only went unnoticed because every

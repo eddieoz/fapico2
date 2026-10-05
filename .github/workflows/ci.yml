@@ -137,6 +137,7 @@ jobs:
       # installed for the toolchain '1.99.0'" (run 37308500832) while passing
       # locally, because clippy had been installed on `stable` instead.
       - name: Set up Rust (pinned by rust-toolchain.toml)
+        working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
       - name: Workspace host unit tests
         working-directory: fapico2
@@ -214,6 +215,7 @@ jobs:
       # than left to the toolchain file so the component is visible at the step
       # that needs it.
       - name: Set up Rust (pinned + clippy)
+        working-directory: fapico2
         run: |
           rustup toolchain install --profile minimal --component clippy --no-self-update
       - name: clippy (workspace, host target, all targets)
@@ -244,6 +246,7 @@ jobs:
       # than left to the toolchain file so the component is visible at the step
       # that needs it.
       - name: Set up Rust (pinned + clippy)
+        working-directory: fapico2
         run: |
           rustup toolchain install --profile minimal --component clippy --no-self-update
       - name: Add RP2350 target + ARM ELF linker
@@ -453,6 +456,7 @@ jobs:
           persist-credentials: false
           path: fapico2
       - name: Set up Rust (pinned by rust-toolchain.toml)
+        working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
       - name: "Gate: FA advertises exactly what the dispatch serves, in both configurations"
         working-directory: fapico2
@@ -730,6 +734,7 @@ jobs:
           persist-credentials: false
           path: fapico2
       - name: Set up Rust (pinned by rust-toolchain.toml)
+        working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
       - name: cargo-deny — the resolved third-party graph
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
@@ -877,6 +882,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpcsclite-dev
       - name: Set up Rust (pinned; host target for the emulator)
+        working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
       - name: Install Python test dependencies
         run: |
