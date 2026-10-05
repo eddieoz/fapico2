@@ -381,6 +381,20 @@ are the boundary where the `DEBUG_DISABLE` closure will apply. The repository ca
 yet** — `git tag -l` returns empty as of 2026-10-04 — so the convention binds from the first
 one, and no tag is created by ADR 0002.
 
+**Commit messages carry no AI trailers.** Do not add `Co-Authored-By`, a
+`Generated with …` line, or any other AI-attribution footer — whatever the
+model behind the harness calls itself. ZCode is Claude Code under a different
+name, and the co-author habit came across with the code: it was written
+unprompted on 2026-09-26, with no instruction anywhere in the harness, the
+`commit` skill, or the repo's history to produce it.
+
+97 commits between 2026-09-26 and 2026-10-05 do carry
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. That is
+the artifact, not the convention. Reading `git log` and matching what is
+already there is how it spread — copying a trailer out of history is the same
+mistake as copying a bug out of a function you were asked to delete. The only
+author and committer this repository uses is `eddieoz <eddieoz@pm.me>`.
+
 ```bash
 ./build.sh                     # release UF2 for RP2350 -> firmware/fapico2.uf2
 cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
