@@ -81,7 +81,13 @@ def find_device():
     try:
         from fido2.hid import CtapHidDevice
     except ImportError:
-        die("python-fido2 is not importable by this interpreter")
+        die(
+            "python-fido2 is not importable by this interpreter. Use the repo's\n"
+            "         test venv, e.g.\n"
+            "           ../pico-fido2/.test-venv/bin/python "
+            "scripts/fix_usb_identity.py ...\n"
+            "         or set PICO_FIDO2_VENV (see AGENTS.md, 'The pytest interpreter')."
+        )
 
     for dev in CtapHidDevice.list_devices():
         name = dev.product_name or ""
