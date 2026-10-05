@@ -15,6 +15,14 @@ heapless = "0.8"
 [dev-dependencies]
 fapico2-fido = { path = "../fido" }
 fapico2-oath = { path = "../oath" }
+# The reset fixture seeds an OATH credential through the applet's own PUT, and
+# a device now ships with a derived access code, so that PUT must be
+# authenticated first — with the same PBKDF2 key both clients derive. Without
+# it the seeding PUT answers 0x6982 and four reset tests fail on the assertion
+# that the credential was stored.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha1"] }
+sha1 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
 
 [features]
 default = ["host", "otp"]

@@ -892,15 +892,40 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 const OATH_KEY_TLV: [u8; 24] = [0x73, 22, 0x21, 0x06, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
     0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a];
 
-/// SET_CODE with a *valid* HMAC-SHA1 access code, then the two refusals the
-/// resulting unvalidated session produces.
+/// SELECT, VALIDATE with the shipped default access code, then SET_CODE with a
+/// *valid* HMAC-SHA1 access code — and the refusals the resulting unvalidated
+/// session produces.
 ///
-/// US-901 is the load-bearing fact here: a completely virgin applet is
-/// *validated*, so on a fresh applet a PUT succeeds and `0x6982` cannot be
-/// reached at all. Setting any durable state flips the next session to
-/// unvalidated, which is what turns the session-gated half of the OATH table
-/// (`0x6982`, `0x6700`, `0x6984`, `0x6A80`, `0x6A84`) on.
-fn oath_establish() -> Vec<Case> {
+/// **The VALIDATE is load-bearing, and it is there because the applet changed.**
+/// A device no longer boots holding no access code: `provision_default_access_code`
+/// (`oath_core.rs:1089`) runs on every boot path, so `validated` starts *false*
+/// and every session-gated command answers `0x6982` until a client
+/// authenticates. This helper used to open with a bare SET_CODE on the premise
+/// that "a completely virgin applet is *validated*" — true while virginity was
+/// the rule, false now, and the sweep answered `0x6982` to all 123 cases.
+///
+/// The applet is right and the old expectation was wrong: both first-party
+/// clients decide whether to authenticate from the SELECT response's `74`
+/// challenge, which this applet emits **only when an access code exists**, so a
+/// device that shipped without one was unreachable by construction. What is
+/// asserted below is still the same thing it always was — the session-gated
+/// half of the table (`0x6982`, `0x6700`, `0x6984`, `0x6A80`, `0x6A84`) —
+/// reached by *granting* first rather than by inheriting a grant.
+fn oath_establish(d: &mut Driver<'_>) -> Vec<Case> {
+    // The challenge comes off the wire, so this is not a static list.
+    let (body, sw) = d.exchange(&select_aid(fapico2_oath::oath_core::OATH_AID));
+    assert_eq!(sw, Some(0x9000), "SELECT for the grant must answer 9000");
+    let chal = oath_challenge(&body);
+    // **Derive, exactly as the clients do** — picoforge `derive_access_key`,
+    // ykman `_derive_key`. HMACing the raw password works against a device
+    // that stores the password and against nothing else.
+    let mac = hmac_sha1(&oath_default_access_key(), &chal);
+    let mut vd = vec![0x74, chal.len() as u8];
+    vd.extend_from_slice(&chal);
+    vd.extend_from_slice(&[0x75, mac.len() as u8]);
+    vd.extend_from_slice(&mac);
+    let mut v = tlv("VALIDATE with the default access code", 0xA3, 0x00, 0x00, &vd, 0x9000);
+
     let chal = [9u8, 8, 7, 6, 5, 4, 3, 2];
     let mac = hmac_sha1(OATH_SECRET, &chal);
     let mut data = vec![0x73, 1 + OATH_SECRET.len() as u8, 0x21];
@@ -910,7 +935,7 @@ fn oath_establish() -> Vec<Case> {
     data.extend_from_slice(&[0x75, mac.len() as u8]);
     data.extend_from_slice(&mac);
 
-    let mut v = tlv("SET_CODE", 0x03, 0x00, 0x00, &data, 0x9000);
+    v.extend(tlv("SET_CODE", 0x03, 0x00, 0x00, &data, 0x9000));
     v.extend(tlv(
         "PUT before VALIDATE",
         0x01,
@@ -923,6 +948,19 @@ fn oath_establish() -> Vec<Case> {
     v.extend(tlv("CALCULATE before VALIDATE", 0xA2, 0x00, 0x00, &[], 0x6982));
     v.extend(tlv("SET_CODE again", 0x03, 0x00, 0x00, &data, 0x6982));
     v
+}
+
+/// `PBKDF2-HMAC-SHA1(DEFAULT_ACCESS_CODE, device_id, 1000, 16)` — the key both
+/// first-party clients derive host-side and send on VALIDATE.
+fn oath_default_access_key() -> Vec<u8> {
+    use fapico2_oath::oath_core::{device_id_from_chipid, DEFAULT_ACCESS_CODE, EMULATION_CHIPID};
+    use sha1::Sha1;
+    pbkdf2::pbkdf2_hmac_array::<Sha1, 16>(
+        DEFAULT_ACCESS_CODE,
+        &device_id_from_chipid(EMULATION_CHIPID),
+        1000,
+    )
+    .to_vec()
 }
 
 /// The 20-byte TOTP secret TLV, transcribed from `apps/oath/tests/
@@ -1121,7 +1159,8 @@ fn oath_chunked_calc_all() -> Vec<Case> {
 /// the wire. A static list would have to hard-code a challenge, and a
 /// hard-coded challenge is exactly the bug this row exists to catch.
 fn oath_grant(d: &mut Driver<'_>) -> Vec<Case> {
-    d.run(&oath_establish());
+    let establish = oath_establish(d);
+    d.run(&establish);
     let (body, sw) = d.exchange(&select_aid(fapico2_oath::oath_core::OATH_AID));
     assert_eq!(sw, Some(0x9000), "the re-SELECT must answer 9000");
     let chal = oath_challenge(&body);
@@ -1142,18 +1181,26 @@ fn reachability_oath() {
     let aid = fapico2_oath::oath_core::OATH_AID;
     let mut report = Report::default();
 
-    // Scenario 1 — a completely virgin applet. US-901 makes its session
-    // *validated*, so a PUT succeeds here and the `0x6982` half of the table
-    // is unreachable from this state. Sweeping it anyway is the point: it is
-    // the state the device is in on first boot, and the closed-world layer
-    // must see whatever it answers.
+    // Scenario 1 — a completely virgin applet, i.e. the state the device is in
+    // on first boot. This used to be granted: US-901 made virginity imply a
+    // validated session, so a PUT succeeded here and `0x6982` was unreachable
+    // from this state. It no longer is. `provision_default_access_code` gives
+    // every boot an access code, the grant is derived from the *absence* of a
+    // secret, and so a factory-fresh applet answers `0x6982` until a client
+    // VALIDATEs. Asserting that here is the point: this is the first thing a
+    // real device does, and the closed-world layer must see whatever it
+    // answers. Scenarios 2 and 3 reach the granted half.
     {
         let mut trng = HostTrng::new();
         let mut store = HostSecureStore::new();
         let mut app =
             OathApp::boot(&mut trng, &mut store, did, OathSeal::emul()).expect("OATH boots from a fresh store");
         let mut d = Driver::new(&mut app, aid);
-        d.run(&[case("PUT on a virgin applet", ext(0x01, 0x00, 0x00, &oath_cred_tlv(b"ab")), 0x9000)]);
+        d.run(&[case(
+            "PUT on a virgin applet",
+            ext(0x01, 0x00, 0x00, &oath_cred_tlv(b"ab")),
+            0x6982,
+        )]);
         d.cross(&OATH_SPACE);
         report.absorb(d.into_report());
     }
