@@ -493,6 +493,36 @@ impl<K: Keystore> FidoApp<K> {
         }
     }
 
+    /// US-1603: the host twin's counterpart to `device_app::FidoApp::factory_reset`
+    /// — the management applet's FIDO half, reached **without** the CTAP2
+    /// presence gate.
+    ///
+    /// This exists because US-1603 put a presence gate on the `0x07` command
+    /// arm above, and `firmware/src/emul_main.rs`'s `ctap2_factory_reset`
+    /// reaches the reset through that arm. Without this method the emulator's
+    /// management factory reset would acquire a **second** presence grant that
+    /// nobody is going to give it, and would fail in a way that looks like a
+    /// broken applet rather than a broken gate: the emulator's
+    /// `emul_touch_lands_in_window` **alternates** (US-711's documented
+    /// double-poll stand-in), so the answer would alternate between granted and
+    /// refused rather than failing consistently.
+    ///
+    /// The refusal is not a bare hang either, which is what makes this worth
+    /// being explicit about: the management applet gates first
+    /// (`cmd_reset` → `user_present(INS_RESET)`), and presence is press→consume
+    /// and one-shot, so by the time this runs the owner's touch has already been
+    /// spent. Asking again is not "belt and braces" — it is a second demand for
+    /// a grant that cannot exist.
+    ///
+    /// So the twin mirrors the device's structure exactly: the command path
+    /// gates, the management hook does not. `emul_main` calls this instead of
+    /// `process_ctap2(0x07, …)`.
+    pub fn factory_reset(&mut self) {
+        self.keystore.reset().map_err(|_| FidoError::Internal).ok();
+        self.pin_token = None;
+        self.ga_state = None;
+    }
+
     /// Clear volatile session state (called on new HID client connection
     /// to simulate a power-cycle / USB reconnect).
     pub fn clear_session_state(&mut self) {
@@ -695,10 +725,21 @@ impl<K: Keystore> FidoApp<K> {
             0x06 => self.client_pin(data),
             0x01 => self.make_credential(data),
             0x02 => self.get_assertion(data),
+            // US-1603: the same gate the device twin carries, on the same
+            // command. `AGENTS.md` §1 is the reason this is not optional: a
+            // fix applied to one twin only passes every host test and
+            // changes nothing on hardware.
+            //
+            // The local idiom is mirrored rather than the signature
+            // harmonised — this twin's `user_present()` takes no tag
+            // (`app.rs`'s own definition), and unifying it with
+            // `device_core`'s is a separate change, deliberately not made
+            // here.
             0x07 => {
-                self.keystore.reset().map_err(|_| FidoError::Internal).ok();
-                self.pin_token = None;
-                self.ga_state = None;
+                if !self.user_present() {
+                    return vec![Ctap2Response::UpRequired.code()];
+                }
+                self.factory_reset();
                 vec![Ctap2Response::Ok.code()]
             }
             0x08 => self.get_next_assertion(),

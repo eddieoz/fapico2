@@ -804,14 +804,23 @@ struct EmulFido<'a, K: fapico2_fido::keystore::Keystore> {
 impl<'a, K: fapico2_fido::keystore::Keystore> EmulFido<'a, K> {
     /// CTAP2 authenticatorReset (`0x07`) — the same primitive
     /// `DeviceFido::sync_generations` drives on the board, reached through the
-    /// host twin's command path because that twin exposes no `factory_reset`.
+    /// host twin's **management hook** rather than its command path.
+    ///
+    /// US-1603: this used to go through `process_ctap2(0x07, …)`, which is
+    /// where the new presence gate lives. Going through the gated arm would ask
+    /// the emulator for a second grant — and `emul_touch_lands_in_window`
+    /// alternates by design (the documented double-poll stand-in), so the
+    /// factory wipe would fail on alternate runs rather than consistently,
+    /// which is the hardest shape of bug to notice.
+    ///
+    /// It is also simply wrong to ask twice: the management applet gated this
+    /// operation first (`cmd_reset` → `user_present(INS_RESET)`), and presence
+    /// is press→consume and one-shot, so the owner's touch is already spent.
+    /// `app.rs::FidoApp::factory_reset` is the twin of
+    /// `device_app::FidoApp::factory_reset`, and both twins now have the same
+    /// shape: command path gated, management hook not.
     fn ctap2_factory_reset(&mut self) {
-        let resp = self.app.process_ctap2(0x07, &[], [0, 0, 0, 1]);
-        debug_assert_eq!(
-            resp.as_slice(),
-            [0x00],
-            "FIDO reset must not fail during factory wipe"
-        );
+        self.app.factory_reset();
     }
 
     /// The CCID half of the serve loop needs the same secure store the HID half

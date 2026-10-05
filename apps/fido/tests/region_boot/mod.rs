@@ -39,10 +39,21 @@ use fapico2_fido::crypto;
 use fapico2_fido::device_app;
 use fapico2_fido::FidoApp;
 use fapico2_platform::fused_key::FusedKey;
-use fapico2_platform::keyregion::host::{Faults, FileKeyRegion};
+use fapico2_platform::keyregion::host::Faults;
 use fapico2_platform::keyregion::record;
 use fapico2_platform::keyregion::slotmap::SlotImage;
-use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead, SLOTS_PER_SECTOR, TOTAL_SLOTS};
+use fapico2_platform::keyregion::{KeyRegion, SlotRead};
+
+// Re-exported rather than privately imported: the flash-level assertions
+// below (`all_erased`) and the stories that check whether a *refused*
+// destructive command left records on the medium all need the same names, and
+// a third private copy in a third test file is exactly the duplication this
+// module was written to end.
+pub use fapico2_platform::keyregion::host::FileKeyRegion;
+pub use fapico2_platform::keyregion::slotmap::is_erased;
+pub use fapico2_platform::keyregion::{
+    FIDO_CAPACITY, FIDO_FIRST_SLOT, FIDO_SLOT_LIMIT, Slot, SLOTS_PER_SECTOR, TOTAL_SLOTS,
+};
 use fapico2_platform::secure_store::rp2350::Rp2350SecureStore;
 use fapico2_platform::secure_store::SecureStore;
 use fapico2_platform::trng::HostTrng;
@@ -526,6 +537,43 @@ pub fn cold_otp_store() -> Rp2350SecureStore {
     let mut store = Rp2350SecureStore::new();
     store.set_fused_store_key(FusedKey::new("test/cold-otp", || None));
     store
+}
+
+// ---------------------------------------------------------------------------
+// Flash-level assertions
+// ---------------------------------------------------------------------------
+
+/// Where the index reservation starts, in slots.
+///
+/// `index.rs` publishes `INDEX_FIRST_SLOT`; this restates it so a caller reads
+/// the range as `[FIDO_FIRST_SLOT, index_start)` rather than doing arithmetic
+/// on a total it has to know the meaning of. `reset_wipes_region.rs` carries the
+/// same constant for the same reason.
+pub const INDEX_FIRST_SLOT: u32 = TOTAL_SLOTS - 32;
+
+/// Is every slot in `[first, limit)` pristine erased flash?
+///
+/// **A read that faults counts as not-erased**, deliberately: every caller
+/// asserts on this function's answer, and reporting `false` keeps a sick region
+/// from being counted as a clean wipe. The mirror image is
+/// `reset_wipes_region.rs`'s own `all_erased`, which exists there because that
+/// file is the one that needed it first — this copy is shared so a third test
+/// does not add a third.
+pub fn all_erased(region: &mut FileKeyRegion, first: u32, limit: u32) -> bool {
+    let mut i = first;
+    while i < limit {
+        let slot = Slot::new(i as u16).expect("every index here is inside the region");
+        match region.read_slot(slot) {
+            Ok(bytes) => {
+                if !is_erased(&bytes) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+        i += 1;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

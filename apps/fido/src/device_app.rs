@@ -633,9 +633,43 @@ impl FidoApp {
     /// a later mutating command persists the FRESH snapshot and can never
     /// re-persist the pre-reset one the durable wipe deleted (C
     /// `cbor_reset` → `init_fido()` parity).
+    ///
+    /// # US-1602: this calls the primitive directly, NOT `process_ctap2(0x07, …)`
+    ///
+    /// This method used to route through the CTAP2 command path, which is
+    /// now gated on user presence. That was a bug waiting to happen, and the
+    /// reason is structural: **the management applet already gates this
+    /// operation** — `apps/mgmt/src/lib.rs`'s `cmd_reset` calls
+    /// `self.user_present(INS_RESET as u32)` and refuses with
+    /// `SW_CONDITIONS_NOT_SATISFIED` before the hook below is ever invoked.
+    ///
+    /// Presence is **press→consume and one-shot** (US-921: `begin_request` →
+    /// poll → `observe_press` → `request` → `end_request`, all within the one
+    /// command), and the two gates would use **different tags** — the
+    /// management one is the small integer `INS_RESET` (0x1E), the FIDO one
+    /// would be `presence_tag_from_channel(BRIDGE_CHANNEL)` =
+    /// `0x8000_0001` (the HID space, US-921 P0-1). Two tags means two
+    /// windows means **two touches** for one reset, which is the exact
+    /// regression this epic's constraint 1 exists to forbid.
+    ///
+    /// It would also fail *silently and permanently* on hardware rather than
+    /// merely asking twice. `DeviceFido::sync_generations` updates `reset_gen`
+    /// **before** calling this, so a refusal here is never retried: the FIDO
+    /// app would keep its pre-reset in-RAM state while the durable store it
+    /// came from has already been deleted, and the divergence would survive
+    /// until the next power cycle. A reset that reports success to the owner
+    /// and leaves the app stale is the same failure mode as an ungated reset,
+    /// wearing the other hat.
+    ///
+    /// So the discriminator between the two paths is **the entry point, not
+    /// the command byte** — which is the only place it can live. The CTAP2
+    /// command boundary (`process_ctap2_with_store`'s `0x07` arm) gates
+    /// because an unauthenticated host frame reaches it with no grant
+    /// anywhere; this hook does not, because mgmt's own gate ran first and
+    /// already refused if there was no press.
     pub fn factory_reset(&mut self) {
         let mut out = heapless::Vec::<u8, { crate::CTAP2_MAX_MSG }>::new();
-        self.process_ctap2(0x07, &[], BRIDGE_CHANNEL, &mut out);
+        self.handle_reset(&mut out);
     }
 
     /// The persistent P-256 key-agreement key. Exposed for the SecureStore
@@ -765,7 +799,42 @@ impl FidoApp {
             0x01 => self.handle_make_credential(data, out, store),
             0x02 => self.handle_get_assertion(data, out, store),
             0x06 => self.handle_client_pin(data, out),
-            0x07 => self.handle_reset(out),
+            // US-1602: `authenticatorReset` is the one CTAP2 command whose
+            // damage is total and irreversible, and it is the only one this
+            // firmware would answer without a touch (red-team F1, CRITICAL:
+            // one frame, empty CBOR body, no `pinUvAuthToken`, answered
+            // `0x00` in 498 ms on the live board, destroying every credential
+            // and the PIN).
+            //
+            // The gate is here — the **CTAP2 command boundary** — and not in
+            // `handle_reset`, for the reason [`Self::factory_reset`] states
+            // in full: the management applet already gates the factory reset
+            // (`apps/mgmt`: `cmd_reset` → `user_present(INS_RESET)`), and a
+            // second gate inside the shared primitive would make one reset
+            // demand two touches. `handle_reset`'s signature and semantics
+            // are therefore byte-identical to before.
+            //
+            // The ordering is the other half of the story and is not
+            // negotiable (this epic's constraint 4): consent is obtained
+            // **before** `handle_reset` runs, so a refusal leaves the
+            // credential set and the PIN exactly as they were. A refusal
+            // *after* the durable erase would be a lie about state that is
+            // already gone.
+            //
+            // `presence_tag_from_channel` is the established idiom
+            // (`device_core.rs`'s selection/MC/GA arms) and the tag is never
+            // a raw CID: the HID and CCID presence-tag spaces must stay
+            // disjoint (US-921 P0-1), or a CCID command could consume a press
+            // that consented to a FIDO touch.
+            0x07 => {
+                if self.user_present(crate::device_app::presence_tag_from_channel(channel)) {
+                    self.handle_reset(out)
+                } else {
+                    out.clear();
+                    out.push(crate::ctap2::Ctap2Response::UpRequired.code()).ok();
+                    out.len()
+                }
+            }
             0x08 => self.handle_get_next_assertion(out, store),
             0x0A => self.handle_cred_mgmt(data, out, store),
             // US-1514: authenticatorSelection. This arm is what made the
