@@ -810,9 +810,33 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         // only one contending for the same tag is (US-1510's rule below). A
         // platform that probes every connected authenticator concurrently
         // must not have one probe cancel another's.
+        //
+        // US-1605 adds authenticatorReset (0x07) here, and it is the same
+        // structural argument as `0x0B` and for the same reason: the arm
+        // answers `UpRequired` until a touch lands (US-1602, red-team F1), so
+        // without this leg that status leaves as a bare error frame and the
+        // command dead-ends — a user whose platform does not re-send after a
+        // refusal cannot reset the device at all, which is not the same as
+        // being protected from resetting it.
+        //
+        // **Also deliberately not in `up_request`**, which is the stricter set
+        // (a command there is refused outright while *any* window is open, on
+        // any channel — US-1510). A reset contending for a different tag must
+        // open its own window rather than be refused, for the same
+        // concurrent-probe reason as selection above: `up_request` exists
+        // because two MakeCredentials contend for the *same* human's
+        // attention, and a reset on an idle authenticator contends with
+        // nothing.
+        //
+        // And per US-1506, `0x07` gets the **park() keepalive** — a `0x01`
+        // PROCESSING when the window really opens, then `0x02` on later passes
+        // — not the unconditional pre-command `0x02` that was deliberately
+        // removed. A keepalive is a claim about a human's attention, and this
+        // firmware no longer makes that claim before it is true.
         let presence_windowed = up_request
             || ctap_cmd == fapico2_fido::vendor41::CMD
             || ctap_cmd == 0x06
+            || ctap_cmd == 0x07
             || ctap_cmd == 0x0B;
         // US-921 review (P0-1): the tag is domain-separated into the HID
         // space (bit 31 set) — a raw CID would eventually equal a CCID
@@ -1467,6 +1491,32 @@ pub(crate) mod tests {
                         out.clear();
                         out.extend_from_slice(&[0xAA, ctap_cmd]).ok();
                         2
+                    } else {
+                        out.clear();
+                        out.extend_from_slice(&[fapico2_fido::ctap2::Ctap2Response::UpRequired.code()])
+                            .ok();
+                        self.window_open = true;
+                        1
+                    }
+                }
+                // US-1604/1605: authenticatorReset, which the app now gates
+                // (US-1602). Modelled with the **same shape** as the MC/GA arm
+                // above — `UpRequired` until the grant lands — because the
+                // whole point of the transport leg is that an `UpRequired`
+                // answer is what opens the consent window, and a double that
+                // answered `0x00` here would let these tests pass against a
+                // transport that does nothing at all.
+                //
+                // The distinct marker `[0xAB]` on the accepted path is what
+                // separates "the app ran the reset" from "the command was
+                // parked": the catch-all below emits a bare `[0x07]`, so
+                // without it a dispatched reset and a refused one look alike.
+                0x07 => {
+                    self.up_calls.push(ctap_cmd);
+                    if self.grant.load(Ordering::SeqCst) {
+                        out.clear();
+                        out.extend_from_slice(&[0xAB]).ok();
+                        1
                     } else {
                         out.clear();
                         out.extend_from_slice(&[fapico2_fido::ctap2::Ctap2Response::UpRequired.code()])
@@ -2272,6 +2322,169 @@ pub(crate) mod tests {
             io.sent().iter().any(|s| s.payload == vec![0xAA, 0x01]),
             "the parked command must still be answered when its window closes"
         );
+    }
+
+    /// US-1604/1605: an `authenticatorReset` **parks and prompts** instead of
+    /// destroying the device outright.
+    ///
+    /// The app-side gate (US-1602) is half the fix and the transport leg is
+    /// the other half, and they ship together or neither. Without this leg the
+    /// app's `UpRequired` goes out as a bare error frame: the host is told
+    /// "a human is required" and nothing else happens — no prompt, no window,
+    /// no retry. A user whose platform does not re-send the command after a
+    /// refusal is left holding a device they cannot reset, which is not the
+    /// same as a device they are protected from resetting.
+    ///
+    /// So this asserts the *whole* windowed shape, in order, and the order is
+    /// the claim:
+    ///
+    /// 1. the command is **parked** (`PendingUp` occupied) rather than
+    ///    answered — the app was asked and refused, which is what makes the
+    ///    window open at all;
+    /// 2. a `0x01` PROCESSING keepalive goes out when the window opens (the
+    ///    `park()` keepalive US-1506 put there, not the unconditional
+    ///    pre-command one that was deliberately removed);
+    /// 3. no `[0xAB]` has gone out yet — the marker the `FakeApp` arm emits
+    ///    only when the reset is *accepted*, so its absence is the proof that
+    ///    the destructive primitive has not run;
+    /// 4. once the press lands, `[0xAB]` goes out and the slot empties.
+    #[test]
+    fn us1604_a_windowed_reset_parks_prompts_and_answers_after_the_press() {
+        let _g = serve_test_guard();
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let chan = [0x00, 0x00, 0x00, 0x07];
+        let injector = script(
+            &bus,
+            // Empty CBOR body after the opcode — the frame the red team sent.
+            &[(StdDuration::from_millis(0), cbor(chan, &[0x07]))],
+        );
+        let grant = Arc::new(AtomicBool::new(false));
+
+        let mut ctap_out: HeaplessVec<u8, CTAP2_MAX_MSG> = HeaplessVec::new();
+        let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
+        let mut io = Script::new(bus.clone());
+        let mut app = FakeApp::new(grant.clone());
+        let mut slot = PendingUp::new();
+
+        block_on(
+            "US-1604: a reset with no press",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(900)),
+        );
+        injector.join().unwrap();
+
+        // (1) parked, not answered. `assert_the_window_is_live_and_unblocked`
+        // also checks the blackout counter, so a window that opened but wedged
+        // the serve loop fails here rather than passing quietly.
+        assert_the_window_is_live_and_unblocked(&srv, &slot);
+
+        // (3) the destructive path has NOT run. This is the assertion that
+        // would catch a gate placed after the erase rather than before it.
+        assert!(
+            !io.sent().iter().any(|s| s.payload == vec![0xAB]),
+            "the reset was ANSWERED with no press. The app gate refused, but the transport \
+             dispatched it immediately instead of parking — so 0x07 is still absent from \
+             `presence_windowed` and the refusal went out as a dead-end error frame."
+        );
+
+        // (2) the window is announced: a PROCESSING keepalive, which is the
+        // park() keepalive and not the removed pre-command one.
+        assert!(
+            io.sent().iter().any(|s| {
+                s.channel == chan
+                    && s.cmd == CTAP_HID_KEEPALIVE
+                    && s.payload == vec![CTAPHID_KEEPALIVE_PROCESSING]
+            }),
+            "a parked reset must emit a 0x01 PROCESSING keepalive the moment the window \
+             opens, or the host has no way to know it is being asked for a touch"
+        );
+
+        // The app was reached, and every dispatch of it **refused**. The count is
+        // deliberately not 1: US-1509's design re-drives a parked command on
+        // every serve pass, so "dispatched once" would be asserting the
+        // opposite of the intended behaviour. What must hold is that no
+        // dispatch was ever *accepted* — which the `[0xAB]` check above
+        // already covers — and that the command is the same one each time,
+        // i.e. the slot is re-driving rather than queueing a second one.
+        assert!(
+            !app.up_calls.is_empty() && app.up_calls.iter().all(|c| *c == 0x07),
+            "the parked slot must re-drive the SAME reset, not queue another: saw {:?}",
+            app.up_calls,
+        );
+
+        // (4) the press lands; the window closes and the reset is answered.
+        grant.store(true, Ordering::SeqCst);
+        block_on(
+            "US-1604: release the consent window",
+            drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(500)),
+        );
+
+        assert!(
+            !slot.is_occupied(),
+            "the consent window must be released once the press landed, or the slot leaks \
+             into the next command"
+        );
+        assert!(
+            io.sent().iter().any(|s| s.channel == chan && s.payload == vec![0xAB]),
+            "after the press the reset must be answered — a window that opens and never \
+             completes is not a consent prompt, it is a hang"
+        );
+    }
+
+    /// US-1605: `0x07` is in `presence_windowed`, and the refactors below it
+    /// stay out.
+    ///
+    /// Pinned against the **source**, at the same seam the existing transport
+    /// tests use (`the_bound_covers_the_windowed_commands_and_names_the_rest`,
+    /// and `tests/selection.rs`'s `transport_predicate_covers_selection`), so
+    /// this file and that one cannot drift without one of them going red.
+    ///
+    /// Read as source rather than as behaviour because the behaviour test above
+    /// cannot distinguish "0x07 is in the predicate" from "something else
+    /// happened to park this command". The membership is the claim.
+    #[test]
+    fn us1605_the_transport_predicate_covers_reset_and_excludes_the_rest() {
+        let _g = serve_test_guard();
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hid_serve.rs"))
+            .expect("hid_serve.rs must be readable from the test's own crate");
+        let start = src
+            .find("let up_request =")
+            .expect("the dispatch must bind `up_request`");
+        let end = src[start..]
+            .find("if presence_windowed && slot.is_occupied()")
+            .map(|i| start + i)
+            .expect("the predicates must precede the refusal arm");
+        let preds = &src[start..end];
+
+        assert!(
+            preds.contains("ctap_cmd == 0x07"),
+            "0x07 answers UpRequired until a touch lands (US-1602), so it must be in \
+             `presence_windowed` — otherwise that status leaves as a bare error frame and no \
+             window ever opens: {preds}",
+        );
+
+        // `up_request` is a *stricter* set: a command in it is refused outright
+        // while any consent window is open, on any channel (US-1510). Reset is
+        // not in it, deliberately — a reset contending for a *different* tag
+        // must open its own window rather than be refused, or a platform
+        // probing several authenticators could starve one.
+        let up_slice = &preds[..preds.find("let presence_windowed =").unwrap_or(preds.len())];
+        assert!(
+            !up_slice.contains("ctap_cmd == 0x07"),
+            "0x07 must NOT be in `up_request`: that set is refused outright while any window \
+             is open, on any channel. US-1506 removed the unconditional pre-command keepalive \
+             for the same reason — a claim about a human's attention must not be made \
+             unconditionally: {up_slice}",
+        );
+
+        // Untouched by this epic, and the reason the slice is checked at all.
+        for uncovered in ["0x0C", "0x0D"] {
+            assert!(
+                !preds.contains(&format!("ctap_cmd == {uncovered}")),
+                "largeBlobs/config ({uncovered}) must NOT be presence_windowed — \
+                 SERVE_BOUND_MS's scope paragraph names them as commands the bound does not \
+                 cover, and this story is not the one that changes that",
+            );
+        }
     }
 
     /// US-1510's bound, at the dispatch seam: a request above
