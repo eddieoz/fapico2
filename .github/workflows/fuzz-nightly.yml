@@ -155,16 +155,23 @@ jobs:
           # A single-target dispatch narrows the matrix to that one target.
           FUZZ_TARGET: ${{ inputs.target || matrix.target }}
           FUZZ_MAX_TOTAL_TIME: ${{ inputs.max_total_time || '900' }}
+          # A 900s run at ~27k exec/s accumulates ASan quarantine and allocator
+          # fragmentation up to ~2 GB of RSS while the target's own live heap
+          # stays under 30 MB (runs 37193264117: 2021 MB green, 37274652054:
+          # 2051 MB OOM against libFuzzer's default 2048 MB limit). Capping the
+          # quarantine removes the creep; the explicit rss limit keeps a real
+          # OOM detected, just at a threshold the runner can actually host.
+          ASAN_OPTIONS: quarantine_size_mb=64
         run: |
           set -uo pipefail
           echo "target=$FUZZ_TARGET  budget=${FUZZ_MAX_TOTAL_TIME}s"
-          cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_MAX_TOTAL_TIME"
+          cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_MAX_TOTAL_TIME" -rss_limit_mb=4096
           rc=$?
           # The reproducer directory is reported explicitly, because a
           # non-zero exit alone does not say WHICH invariant failed. A clean
           # run that simply stopped making progress exits 0 and leaves this
           # directory absent, so the two cases stay distinguishable in the log.
-          if [ -d "fuzz/crashes/$FUZZ_TARGET" ] && [ -n "$(ls -A "fuzz/craces/$FUZZ_TARGET" 2>/dev/null)" ]; then
+          if [ -d "fuzz/crashes/$FUZZ_TARGET" ] && [ -n "$(ls -A "fuzz/crashes/$FUZZ_TARGET" 2>/dev/null)" ]; then
             echo "::error::$FUZZ_TARGET produced a crash reproducer (see the fuzz-crashes artifact)"
             ls -la "fuzz/crashes/$FUZZ_TARGET"
           else

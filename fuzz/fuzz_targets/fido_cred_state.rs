@@ -42,7 +42,9 @@
 
 use std::vec::Vec;
 
-use fapico2_fido::device_keystore::{DeviceCredential, DeviceCoseKey, DeviceKeystore};
+use fapico2_fido::device_keystore::{
+    DeviceCredential, DeviceCoseKey, DeviceKeystore, PrivateScalar,
+};
 use fapico2_fido::vendor41::SoftLock;
 use fapico2_fido::vendor_state::{with_keystore_ops, VendorSession};
 use fapico2_platform::secure_store::{
@@ -115,7 +117,7 @@ fn credential(id_len: usize, blob_len: usize, salt: u8) -> DeviceCredential {
     let mut cred = DeviceCredential {
         credential_id: HVec::new(),
         public_key: DeviceCoseKey::es256([salt; 32], [salt.wrapping_add(1); 32]),
-        private_key: [salt; 32],
+        private_key: PrivateScalar::from_bytes([salt; 32]),
         rp_id_hash: [salt; 32],
         rp_id: HVec::new(),
         user_handle: HVec::new(),
