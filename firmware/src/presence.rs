@@ -905,3 +905,13 @@ pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests;
+
+/// US-1607: the **device** build's fail-closed default, proved in a host test
+/// binary. Kept separate from [`tests`] because that module is about the latch
+/// and the runtime, while this one is about what `default_user_present()`
+/// resolves to under `cfg(feature = "device")` — a question only the firmware
+/// crate's dual `device`+`host` test build can answer, and one that must not be
+/// answered by a test that silently lost the feature.
+#[cfg(test)]
+#[path = "presence/device_fails_closed.rs"]
+mod device_fails_closed;
