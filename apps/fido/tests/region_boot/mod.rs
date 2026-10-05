@@ -49,8 +49,18 @@ use fapico2_platform::keyregion::{KeyRegion, SlotRead};
 // destructive command left records on the medium all need the same names, and
 // a third private copy in a third test file is exactly the duplication this
 // module was written to end.
+//
+// `unused_imports` is allowed on the block for the same reason `dead_code` is
+// allowed at the top of this file: **each integration test compiles this module
+// separately** and each uses a subset of it. A re-export that three binaries
+// use and a fourth does not is an unused import in that fourth, and clippy
+// runs with `-D warnings`. Making each consumer import what it needs from
+// somewhere else would just move the duplication this module exists to remove.
+#[allow(unused_imports)]
 pub use fapico2_platform::keyregion::host::FileKeyRegion;
+#[allow(unused_imports)]
 pub use fapico2_platform::keyregion::slotmap::is_erased;
+#[allow(unused_imports)]
 pub use fapico2_platform::keyregion::{
     FIDO_CAPACITY, FIDO_FIRST_SLOT, FIDO_SLOT_LIMIT, Slot, SLOTS_PER_SECTOR, TOTAL_SLOTS,
 };
