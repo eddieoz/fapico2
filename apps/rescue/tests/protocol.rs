@@ -664,7 +664,7 @@ fn the_five_unsupported_tags_are_skipped_and_the_rest_applied() {
             1,
             "tag {tag:#04x}: the good 0x04 record beside it must be applied"
         );
-        let commit = h.commits()[0].clone();
+        let commit = h.commits()[0];
         assert_eq!(
             commit.led_gpio,
             Some(0x0D),
