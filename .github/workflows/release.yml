@@ -100,7 +100,7 @@ on:
         type: boolean
   push:
     tags:
-      - 'v*'
+      - 'fapico2-release-*'
 
 # WHY THERE IS NO RELEASE-ON-MERGE
 # ------------------------------------------------------------------------
