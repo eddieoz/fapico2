@@ -38,7 +38,7 @@ string "test card". gpg prints the two halves on separate lines (`Manufacturer`
 / `Serial number`) but joins them in key listings, so an older board shows up as
 `card-no: 0000 …` there. Unlike the serial, this field is not persisted and does
 not change on reset — it is re-derived every boot. Full analysis:
-[`openpgp-kleopatra-pgpony-investigation.md`](openpgp-kleopatra-pgpony-investigation.md).
+[`openpgp-kleopatra-pgpony-investigation.md`](archive/openpgp-kleopatra-pgpony-investigation.md).
 
 ## OpenPGP algorithms — as shipped (hardware-verified)
 

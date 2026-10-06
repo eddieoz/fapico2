@@ -711,10 +711,10 @@ durable — this document is not a substitute for it.**
 Not restated here. Read them for the measurements; read this file for what the
 plan got wrong.
 
-- [`webauthn-discovery-baseline.md`](webauthn-discovery-baseline.md) — first
+- [`webauthn-discovery-baseline.md`](../webauthn-discovery-baseline.md) — first
   hardware baseline (US-1501). Parts (a)(b)(c) machine-measured; part (d) is
   human-gated.
-- [`webauthn-discovery-ab.md`](webauthn-discovery-ab.md) — the two-board wire
+- [`webauthn-discovery-ab.md`](../webauthn-discovery-ab.md) — the two-board wire
   comparison, Rust board vs the `pico-fido2` C reference (US-1521). Source of C3
   and C9.
 - [`webauthn-browser-failure-class-us1520.md`](webauthn-browser-failure-class-us1520.md)
@@ -722,7 +722,7 @@ plan got wrong.
 - [`webauthn-acceptance-us1518.md`](webauthn-acceptance-us1518.md) — the
   acceptance harness results (US-1518). Machine cases and the human/machine
   split.
-- [`size-report.md`](size-report.md) — the flash/RAM budget (US-1519).
+- [`size-report.md`](../size-report.md) — the flash/RAM budget (US-1519).
 
 **A caution about the first one.** `docs/webauthn-discovery-baseline.md` carried
 a column of integer option ids (`clientPin 0x06`, `pinUvAuthToken 0xC`, `uv

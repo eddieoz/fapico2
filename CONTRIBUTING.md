@@ -1,7 +1,8 @@
 # Contributing
 
-Thanks for looking at fapico2. This is firmware for a hardware credential, so
-the bar for a change is "it works **and** the gate is green", not "it builds".
+Thanks for looking at fapico2 — the F**king Authenticator. This is firmware for
+a hardware credential, so the bar for a change is "it works **and** the gate is
+green", not "it builds".
 
 ## Before you start
 

@@ -81,10 +81,11 @@ region; idempotent — a second boot changes nothing).
   only) — no device-side unwrap exists.
 
 Full byte formats, key-derivation formulas, and per-class verdicts with C
-source evidence: [us413-migration-feasibility.md](tasks/us413-migration-feasibility.md).
-On-hardware proof with real C data: [us413-hardware-e2e.md](tasks/us413-hardware-e2e.md)
+source evidence: [us413-migration-feasibility.md](migration-feasibility.md).
+On-hardware proof with real C data: `us413-hardware-e2e.md`
 (cutover executed 2026-09-11 — C release flashed, real data created, Rust
-migration image flashed, cutover assertions recorded verbatim).
+migration image flashed, cutover assertions recorded verbatim; the evidence
+file lives in the untracked working-plans directory and is not in git).
 
 ## Hardware acceptance
 
