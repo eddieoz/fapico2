@@ -376,7 +376,7 @@ assigned ID replaces `FFFE`.
 The change is confined to AID bytes 8–9, so it is **not** a one-way door: the
 value is re-derived on every boot, and the persisted serial is untouched. No
 factory wipe, no key loss, no host-side stub cleanup (contrast the serial-change
-hazard in [`client-compatibility.md`](client-compatibility.md)).
+hazard in [`client-compatibility.md`](../client-compatibility.md)).
 
 **Issue 2 — not firmware.** In PGPony, open the keyring and pair the hardware
 key with its public key via "Pair with Hardware Key". If the key appears in the
