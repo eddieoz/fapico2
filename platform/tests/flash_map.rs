@@ -67,34 +67,53 @@ fn the_flash_budget_cannot_reach_any_data_region() {
 
 #[test]
 fn the_former_layout_would_have_failed() {
-    // The regression, stated as arithmetic rather than as a story. 1536 KiB is
-    // 0x180_000; the old window started at 0x102_000. This test cannot fail
-    // unless someone changes the old offset constant to stop documenting the
-    // bug, which is the point of pinning it.
-    assert_eq!(
-        budget_end(),
-        0x180_000,
-        "the ratchet moved; the regression this test names needs its arithmetic rewritten"
-    );
+    // The regression, stated as arithmetic rather than as a story. The budget
+    // was 1,536 KiB (0x180_000) when the old window started at 0x102_000, so
+    // the two overlapped by 504 KiB. The budget is pinned here as a literal:
+    // it is a ratchet and moves deliberately (1,621 KiB since 2026-10-06), and
+    // what this test names is the geometry that was broken, not whatever the
+    // current value happens to be.
+    let former_budget_end = 0x180_000;
     assert!(
-        budget_end() > flashmap::LEGACY_TRUSSED_FS_OFFSET,
-        "the legacy window used to start at {:#x}, INSIDE the budget. If this now fails, the \
-         legacy offset no longer describes the geometry that was broken, and this test is \
-         naming a bug that no longer exists in the form it describes",
+        former_budget_end > flashmap::LEGACY_TRUSSED_FS_OFFSET,
+        "the legacy window used to start at {:#x}, INSIDE the former budget. If this now \
+         fails, the legacy offset no longer describes the geometry that was broken, and this \
+         test is naming a bug that no longer exists in the form it describes",
         flashmap::LEGACY_TRUSSED_FS_OFFSET
     );
+    // The current budget still covers the old broken offset — which is safe
+    // only because the window itself moved above the growth boundary. If the
+    // budget ever drops below the legacy offset, the regression this test
+    // names can no longer be restated against today's numbers.
+    assert!(budget_end() > flashmap::LEGACY_TRUSSED_FS_OFFSET);
 }
 
 #[test]
 fn the_trussed_window_sits_in_the_headroom_not_the_firmware_budget() {
-    // The margin is the whole point: 512 KiB of headroom between the budget
-    // and the first data byte. If this ever collapses to zero, the layout has
-    // been re-derived and the ratchet is back to one bump away from a wipe.
+    // The invariant: the budget ends BELOW the window, and only a deliberate
+    // ratchet raise consumes the gap — flashmap.rs's compile-time assert keeps
+    // the budget at or below `FIRMWARE_GROWTH_END`, which is where the window
+    // starts, so the gap reaches zero only by moving the window itself (a
+    // layout change that relocates a provisioned unit's keys). The gap was
+    // 512 KiB when the ratchet stood at 1,536 KiB; 438 KiB at the 2026-10-06
+    // raise to 1,621 KiB. It is asserted positive rather than pinned to a
+    // number the next deliberate raise would break.
     let margin = flashmap::TRUSSED_FS_OFFSET - budget_end();
-    assert_eq!(
-        margin, 0x80_000,
-        "the gap between the flash budget and the trussed window is {margin:#x}, not 512 KiB"
+    assert!(
+        margin > 0,
+        "the CI flash budget ends at {:#x}, at or past the trussed window at {:#x}: the \
+         ratchet has consumed the gap to the growth boundary. Raising \
+         FIRMWARE_FLASH_BUDGET_KIB further requires moving the data regions in \
+         platform/src/flashmap.rs deliberately — an already-provisioned unit's keys are in \
+         the region being moved",
+        budget_end(),
+        flashmap::TRUSSED_FS_OFFSET
     );
+    // The restatement of flashmap.rs's compile-time assert: the window starts
+    // exactly at the growth boundary, so "budget <= growth end" and "budget
+    // ends below the window" are the same sentence.
+    assert_eq!(flashmap::TRUSSED_FS_OFFSET, flashmap::FIRMWARE_GROWTH_END);
+    assert!(budget_end() <= flashmap::FIRMWARE_GROWTH_END);
 }
 
 #[test]

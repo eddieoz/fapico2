@@ -6,8 +6,8 @@
 //! magic number written twice.
 //!
 //! ```text
-//! 0x000_000 .. 0x180_000   firmware image                  1,536 KiB — the CI ratchet
-//! 0x180_000 .. 0x200_000   firmware growth headroom          512 KiB — unreferenced, on purpose
+//! 0x000_000 .. 0x195_400   firmware image                  1,621 KiB — the CI ratchet
+//! 0x195_400 .. 0x200_000   firmware growth headroom        ~438 KiB — unreferenced, on purpose
 //! 0x200_000 .. 0x300_000   trussed window                   1,024 KiB
 //!                         ├ 0x200_000 .. 0x2C0_000   ifs     768 KiB — OpenPGP + PIV
 //!                         └ 0x2C0_000 .. 0x300_000   efs     256 KiB — Location::External
@@ -83,7 +83,9 @@ use crate::cflash;
 pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1621 * 1024;
 
 /// The end of the region the firmware may grow into without a layout change:
-/// 512 KiB of unreferenced headroom above the budget.
+/// ~438 KiB of unreferenced headroom above the 2026-10-06 budget (512 KiB
+/// when the ratchet stood at 1,536 KiB; it shrinks with every deliberate
+/// raise, and reaching it stops the ratchet — see the budget's doc).
 pub const FIRMWARE_GROWTH_END: u32 = 0x20_0000;
 
 /// NOR erase granularity (RP2350 QSPI flash).
