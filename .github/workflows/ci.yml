@@ -86,7 +86,18 @@ env:
   # The slack this leaves is 512 B (1536 KiB = 1,572,864 B against a measured
   # 1,572,352 B) — the smallest whole-KiB value that fits, which is what this
   # ratchet is for. Measured and recorded at the top of docs/size-report.md.
-  FIRMWARE_FLASH_BUDGET_KIB: 1536
+  #
+  # 2026-10-06 raised this from 1536 to 1621. The ratchet had already been
+  # exceeded — the US-15xx epics grew the shipping image to 3,247 blocks
+  # (1,662,464 B) — but every CI run between 2026-10-05 and this fix died at
+  # the boot-chain gate two steps earlier, so the ratchet never got to say
+  # so. The rustc 1.99.0 boot-chain fix (docs/size-report.md, 2026-10-06
+  # entry) regenerated the image at 3,242 blocks = 1,659,904 B = **1,621 KiB
+  # exactly**: zero headroom again, per this ratchet's own philosophy — the
+  # next 512 B anywhere trips it. `text` fell 1,204 B in the same change, so
+  # the raise carries drift the tree already had, not new growth from the
+  # fix. Measured and recorded at the top of docs/size-report.md.
+  FIRMWARE_FLASH_BUDGET_KIB: 1621
 
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
@@ -395,18 +406,16 @@ jobs:
           # US-1043, second half: the flash-budget RATCHET on the shipping
           # image. RS-Key's FIRMWARE_FLASH_BUDGET_KIB pattern — a ceiling that
           # is meant to be raised deliberately, with a reason, and never by
-          # accident. **The headroom is ZERO blocks.** The boot-phase LED work
-          # (`firmware/src/bootphase.rs`, `boot_led.rs`) added +228 B of text,
-          # which consumed the last 512-byte block: the shipping image is 3,072
-          # blocks / 1,572,864 B against a 1,572,864 B ceiling, and
-          # `SHIPPING -gt BUDGET_BYTES` is false only because they are equal.
-          # The figures and the reason are in the header above (ci.yml:84-90)
-          # and at the top of docs/size-report.md. So the NEXT 512 B anywhere in
-          # the firmware trips this, for a reason unrelated to whatever change
-          # caused it — which is the point: a red that names the fix beats a
-          # ratchet with headroom nobody reads. The 3.5 MiB text ceiling above
-          # is the absolute backstop; this is the ratchet that says "you have
-          # been told".
+          # accident. **The headroom is ZERO blocks.** The shipping image is
+          # 3,242 blocks / 1,659,904 B against a 1,621 KiB (1,659,904 B)
+          # ceiling, and `SHIPPING -gt BUDGET_BYTES` is false only because
+          # they are equal. The figures and the reason are in the header
+          # above and at the top of docs/size-report.md. So the NEXT 512 B
+          # anywhere in the firmware trips this, for a reason unrelated to
+          # whatever change caused it — which is the point: a red that names
+          # the fix beats a ratchet with headroom nobody reads. The 3.5 MiB
+          # text ceiling above is the absolute backstop; this is the ratchet
+          # that says "you have been told".
           BUDGET_KIB=${FIRMWARE_FLASH_BUDGET_KIB:?FIRMWARE_FLASH_BUDGET_KIB is not set}
           BUDGET_BYTES=$(( BUDGET_KIB * 1024 ))
           SHIPPING=$(stat -c %s /tmp/fapico2-a.uf2)

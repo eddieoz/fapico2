@@ -68,31 +68,155 @@ impl Command {
             return Err(Status::ConditionsOfUseNotSatisfied);
         }
         match self {
-            Self::Select => select(ctx, lifecycle),
-            Self::GetData(mode, tag) => data::get_data(ctx, *mode, *tag),
-            Self::GetNextData(tag) => data::get_next_data(ctx, *tag),
-            Self::PutData(mode, tag) => data::put_data(ctx, *mode, *tag),
-            Self::Verify(mode, password) => verify(ctx.load_state()?, *mode, *password),
-            Self::ChangeReferenceData(password) => {
-                change_reference_data(ctx.load_state()?, *password)
-            }
-            Self::ComputeDigitalSignature => pso::sign(ctx.load_state()?),
-            Self::InternalAuthenticate => pso::internal_authenticate(ctx.load_state()?),
-            Self::Decipher => pso::decipher(ctx.load_state()?),
-            Self::Encipher => pso::encipher(ctx.load_state()?),
-            Self::GenerateAsymmetricKeyPair(mode) => gen_keypair(ctx.load_state()?, *mode),
-            Self::TerminateDf => terminate_df(ctx),
-            Self::ActivateFile => activate_file(ctx),
-            Self::SelectData(occurrence) => select_data(ctx, *occurrence),
-            Self::GetChallenge(length) => get_challenge(ctx, *length),
-            Self::ResetRetryCounter(mode) => reset_retry_conter(ctx.load_state()?, *mode),
-            Self::ManageSecurityEnvironment(mode) => manage_security_environment(ctx, *mode),
+            Self::Select => exec_select(ctx, lifecycle),
+            Self::GetData(mode, tag) => exec_get_data(ctx, *mode, *tag),
+            Self::GetNextData(tag) => exec_get_next_data(ctx, *tag),
+            Self::PutData(mode, tag) => exec_put_data(ctx, *mode, *tag),
+            Self::Verify(mode, password) => exec_verify(ctx, *mode, *password),
+            Self::ChangeReferenceData(password) => exec_change_reference_data(ctx, *password),
+            Self::ComputeDigitalSignature => exec_sign(ctx),
+            Self::InternalAuthenticate => exec_internal_authenticate(ctx),
+            Self::Decipher => exec_decipher(ctx),
+            Self::Encipher => exec_encipher(ctx),
+            Self::GenerateAsymmetricKeyPair(mode) => exec_gen_keypair(ctx, *mode),
+            Self::TerminateDf => exec_terminate_df(ctx),
+            Self::ActivateFile => exec_activate_file(ctx),
+            Self::SelectData(occurrence) => exec_select_data(ctx, *occurrence),
+            Self::GetChallenge(length) => exec_get_challenge(ctx, *length),
+            Self::ResetRetryCounter(mode) => exec_reset_retry_counter(ctx, *mode),
+            Self::ManageSecurityEnvironment(mode) => exec_manage_security_environment(ctx, *mode),
             _ => {
                 error!("Command not yet implemented: {:x?}", self);
                 Err(Status::FunctionNotSupported)
             }
         }
     }
+}
+
+// Each dispatch arm lives in its own `#[inline(never)]` wrapper. The arms are
+// mutually exclusive at runtime, but rustc 1.99.0 stopped stack-coloring the
+// per-arm scratch (the state-load and serde buffers the client-call glue
+// materializes) into one region, so an arm-merged `exec` frame carried the
+// UNION of every arm's buffers on the main stack — measured at 24,112 B where
+// 1.98.1 overlapped the same sources into 13,264 B, and `check_boot_chain.py`
+// (US-957) failed at 107,264 B against its 98,304 B ceiling. Giving each arm
+// its own frame makes the peak the deepest single arm again.
+#[inline(never)]
+fn exec_select<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    lifecycle: LifeCycle,
+) -> Result<(), Status> {
+    select(ctx, lifecycle)
+}
+
+#[inline(never)]
+fn exec_get_data<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    mode: GetDataMode,
+    tag: Tag,
+) -> Result<(), Status> {
+    data::get_data(ctx, mode, tag)
+}
+
+#[inline(never)]
+fn exec_get_next_data<T: crate::card::Client>(ctx: Context<'_, T>, tag: Tag) -> Result<(), Status> {
+    data::get_next_data(ctx, tag)
+}
+
+#[inline(never)]
+fn exec_put_data<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    mode: PutDataMode,
+    tag: Tag,
+) -> Result<(), Status> {
+    data::put_data(ctx, mode, tag)
+}
+
+#[inline(never)]
+fn exec_verify<T: crate::card::Client>(
+    mut ctx: Context<'_, T>,
+    mode: VerifyMode,
+    password: PasswordMode,
+) -> Result<(), Status> {
+    verify(ctx.load_state()?, mode, password)
+}
+
+#[inline(never)]
+fn exec_change_reference_data<T: crate::card::Client>(
+    mut ctx: Context<'_, T>,
+    password: Password,
+) -> Result<(), Status> {
+    change_reference_data(ctx.load_state()?, password)
+}
+
+#[inline(never)]
+fn exec_sign<T: crate::card::Client>(mut ctx: Context<'_, T>) -> Result<(), Status> {
+    pso::sign(ctx.load_state()?)
+}
+
+#[inline(never)]
+fn exec_internal_authenticate<T: crate::card::Client>(mut ctx: Context<'_, T>) -> Result<(), Status> {
+    pso::internal_authenticate(ctx.load_state()?)
+}
+
+#[inline(never)]
+fn exec_decipher<T: crate::card::Client>(mut ctx: Context<'_, T>) -> Result<(), Status> {
+    pso::decipher(ctx.load_state()?)
+}
+
+#[inline(never)]
+fn exec_encipher<T: crate::card::Client>(mut ctx: Context<'_, T>) -> Result<(), Status> {
+    pso::encipher(ctx.load_state()?)
+}
+
+#[inline(never)]
+fn exec_gen_keypair<T: crate::card::Client>(
+    mut ctx: Context<'_, T>,
+    mode: GenerateAsymmetricKeyPairMode,
+) -> Result<(), Status> {
+    gen_keypair(ctx.load_state()?, mode)
+}
+
+#[inline(never)]
+fn exec_terminate_df<T: crate::card::Client>(ctx: Context<'_, T>) -> Result<(), Status> {
+    terminate_df(ctx)
+}
+
+#[inline(never)]
+fn exec_activate_file<T: crate::card::Client>(ctx: Context<'_, T>) -> Result<(), Status> {
+    activate_file(ctx)
+}
+
+#[inline(never)]
+fn exec_select_data<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    occurrence: Occurrence,
+) -> Result<(), Status> {
+    select_data(ctx, occurrence)
+}
+
+#[inline(never)]
+fn exec_get_challenge<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    length: usize,
+) -> Result<(), Status> {
+    get_challenge(ctx, length)
+}
+
+#[inline(never)]
+fn exec_reset_retry_counter<T: crate::card::Client>(
+    mut ctx: Context<'_, T>,
+    mode: ResetRetryCounterMode,
+) -> Result<(), Status> {
+    reset_retry_conter(ctx.load_state()?, mode)
+}
+
+#[inline(never)]
+fn exec_manage_security_environment<T: crate::card::Client>(
+    ctx: Context<'_, T>,
+    mode: ManageSecurityEnvironmentMode,
+) -> Result<(), Status> {
+    manage_security_environment(ctx, mode)
 }
 
 impl TryFrom<iso7816::command::CommandView<'_>> for Command {

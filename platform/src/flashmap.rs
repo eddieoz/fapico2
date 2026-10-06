@@ -36,7 +36,7 @@
 //!
 //! The trussed window used to sit at `0x102_000`, **inside** the region the CI
 //! flash-budget ratchet is free to grow into. The ratchet allows a firmware
-//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,536 KiB) and the window began
+//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,621 KiB) and the window began
 //! at 1,032 KiB, so the geometry was wrong by 504 KiB before this epic touched
 //! it: a firmware image the gate *accepted* could link over the front of the
 //! trussed filesystem, and every OpenPGP and PIV key past that offset would go
@@ -68,13 +68,19 @@ use crate::board;
 use crate::cflash;
 
 /// The firmware flash budget in bytes — the ratchet `ci.yml` enforces against
-/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,536 KiB).
+/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,621 KiB).
+///
+/// Raised 1536 → 1621 on 2026-10-06 (docs/size-report.md, that date's entry):
+/// the shipping image had already grown past 1,536 KiB across the US-15xx
+/// epics while the boot-chain gate hid the ratchet's red; this entry's image
+/// is 3,242 blocks = 1,659,904 B = 1,621 KiB exactly — zero headroom,
+/// deliberately, so the next 512 B trips it.
 ///
 /// This is the number that used to be 504 KiB *above* the trussed window's
 /// start. It is the only place it is written down in Rust; `ci.yml` carries the
 /// same value in KiB because a workflow file cannot import a Rust constant, and
 /// `tests/scripts/check_flash_budget.py` fails the build if the two disagree.
-pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1536 * 1024;
+pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1621 * 1024;
 
 /// The end of the region the firmware may grow into without a layout change:
 /// 512 KiB of unreferenced headroom above the budget.
