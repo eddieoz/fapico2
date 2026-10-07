@@ -1,0 +1,14 @@
+[book]
+title = "fapico2"
+description = "The F**king Authenticator — Your passkeys, PGP keys and 2FA tokens on hardware you own"
+authors = ["eddieoz"]
+language = "en"
+multilingual = false
+src = "."
+
+[build]
+build-dir = "build"
+
+[output.html]
+additional-css = ["theme/css/custom.css"]
+additional-js = ["theme/js/custom.js"]

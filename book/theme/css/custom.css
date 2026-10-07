@@ -1,0 +1,112 @@
+/* Custom styles for fapico2 website */
+
+/* Landing page hero */
+#index .landing-hero {
+    text-align: center;
+    padding: 3rem 1rem;
+    border-bottom: 1px solid var(--table-header-bg);
+    margin-bottom: 2rem;
+}
+
+#index .landing-hero h1 {
+    font-size: 2.5rem;
+    margin-bottom: 0.5rem;
+}
+
+#index .landing-hero .tagline {
+    font-size: 1.25rem;
+    color: var(--fg-muted);
+    margin-bottom: 1.5rem;
+}
+
+#index .landing-hero .cta {
+    display: inline-block;
+    padding: 0.75rem 1.5rem;
+    background-color: var(--links);
+    color: #fff;
+    border-radius: 4px;
+    text-decoration: none;
+    font-weight: 600;
+    margin: 0.5rem;
+}
+
+#index .landing-hero .cta:hover {
+    opacity: 0.9;
+}
+
+/* Feature grid */
+#features .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1.5rem;
+    margin: 2rem 0;
+}
+
+#features .feature-card {
+    border: 1px solid var(--table-header-bg);
+    border-radius: 8px;
+    padding: 1.5rem;
+    text-align: center;
+}
+
+#features .feature-card h3 {
+    margin-top: 0;
+}
+
+/* Security callout */
+#security .security-callout {
+    border-left: 4px solid var(--quote-border);
+    padding: 1rem 1.5rem;
+    margin: 1.5rem 0;
+    background-color: var(--quote-bg);
+}
+
+/* Table improvements */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+th, td {
+    padding: 0.75rem;
+    text-align: left;
+    border-bottom: 1px solid var(--table-header-bg);
+}
+
+th {
+    background-color: var(--table-header-bg);
+    font-weight: 600;
+}
+
+tr:hover {
+    background-color: var(--table-row-alternate-bg);
+}
+
+/* Code blocks */
+pre {
+    background-color: var(--code-bg);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+}
+
+code {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.9em;
+}
+
+/* Links */
+a {
+    color: var(--links);
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+/* Muted text */
+.fg-muted {
+    color: var(--fg-muted);
+}
