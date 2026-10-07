@@ -41,15 +41,18 @@
 #      bytes
 #        -> check_artefact_agreement.py (US-1064), which is the only place
 #           the three are compared.
-#   4. the SET of assets belongs to ONE tag
+#   4. the SET of artefacts belongs to ONE tag
 #        -> the release manifest. The attestation covers one subject, so on
-#           its own it leaves a gap: several assets with nothing saying they
-#           go together or that they came from this tag. The manifest names
-#           the tag, the commit and every asset's digest. It is currently
-#           UNSIGNED — cosign is deferred, see below — so it carries
-#           integrity, not authenticity. What makes it trustworthy is that
-#           the tag it names is GPG-signed: check the tag, read the
-#           manifest, and every asset is pinned to that one version.
+#           its own it leaves a gap: several artefacts with nothing saying
+#           they go together or that they came from this tag. The manifest
+#           names the tag, the commit and every artefact's digest. It is
+#           published as a WORKFLOW artefact, not a Release asset — the
+#           Release carries the image only (see "Create the GitHub Release")
+#           — and it is currently UNSIGNED (cosign is deferred, see below),
+#           so it carries integrity, not authenticity. What makes it
+#           trustworthy is that the tag it names is GPG-signed: check the
+#           tag, read the manifest, and every artefact is pinned to that one
+#           version.
 #
 # Signing
 # ------------------------------------------------------------------------
@@ -354,8 +357,8 @@ jobs:
       # belong together or belong to v1.0.0 rather than some other tag.
       #
       # The manifest is the join. It names the tag and the commit, and the
-      # sha256 and byte length of every published asset, so a verifier can
-      # confirm the set belongs to that one tag.
+      # sha256 and byte length of every artefact this run produces, so a
+      # verifier can confirm the set belongs to that one tag.
       #
       # It is NOT signed, because cosign is deferred (see above). What it
       # carries is integrity, not authenticity: it says what this run
@@ -365,7 +368,7 @@ jobs:
       # The assertions inside keep it honest. Without them the manifest is
       # just a file that says whatever it was built to say: it re-reads the
       # UF2 and cross-checks it against the digest stamped in the SBOM, and
-      # refuses to write a manifest that omits any published asset.
+      # refuses to write a manifest that omits any artefact the run produced.
       - name: Build the release manifest
         if: ${{ inputs.dry_run != true }}
         working-directory: fapico2
@@ -405,7 +408,7 @@ jobs:
               p = dist / name
               if not p.is_file():
                   sys.exit(f"refusing: {p} is missing; the manifest must "
-                           f"describe every published asset")
+                           f"describe every artefact this run produced")
               files[name] = {"sha256": digest(p), "bytes": p.stat().st_size}
 
           manifest = {
@@ -452,14 +455,40 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          # ONE asset: the image. GitHub adds the "Source code" archives
+          # itself, and that pair — image + sources — is the whole desired
+          # set, the same set fapico2-release-alpha-v0.1.0 carries. The SBOM,
+          # the provenance attestation and the manifest are still built and
+          # still travel with this run (the "Publish the release artefacts"
+          # step below), but they are *workflow* artefacts, not release
+          # assets: nobody flashes an SBOM, and a downloader who wants one
+          # reads it from the attestation store or supply-chain/sbom.cdx.json.
+          # Attaching all four was the defect this step used to have.
+          #
+          # Notes are per-tag: docs/release-notes-<tag minus the prefix>.md.
+          # The step used to hardcode docs/release-notes-v1.0.0.md, which put
+          # the v1.0.0 body — its digest, its identity, "the first published
+          # release" — on every future release. When no per-tag file exists,
+          # GitHub writes the notes from the merge history instead.
+          NOTES="docs/release-notes-${RELEASE_TAG#fapico2-release-}.md"
+          if [ -f "$NOTES" ]; then
+            NOTES_ARG=(--notes-file "$NOTES")
+          else
+            echo "no $NOTES; letting GitHub generate the notes from the merge history"
+            NOTES_ARG=(--generate-notes)
+          fi
+          # An alpha/beta tag is a pre-release, as fapico2-release-alpha-v0.1.0
+          # is. A plain `gh release create` would publish it as a full release.
+          case "$RELEASE_TAG" in
+            *alpha*|*beta*) PRE_ARG=(--prerelease) ;;
+            *) PRE_ARG=() ;;
+          esac
           gh release create "$RELEASE_TAG" \
             --verify-tag \
             --title "fapico2 $RELEASE_TAG" \
-            --notes-file docs/release-notes-v1.0.0.md \
-            dist/fapico2.uf2 \
-            dist/sbom.cdx.json \
-            dist/provenance.json \
-            dist/release-manifest.json
+            "${NOTES_ARG[@]}" \
+            "${PRE_ARG[@]}" \
+            dist/fapico2.uf2
           echo "published: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
 
       - name: Publish the release artefacts
