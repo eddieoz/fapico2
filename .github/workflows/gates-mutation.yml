@@ -89,6 +89,16 @@ jobs:
       - name: Warm the build (and fail fast on a broken tree)
         working-directory: fapico2
         run: cargo build --release --target thumbv8m.main-none-eabi
+      # `check_supply_chain.py` shells out to `cargo vet`, and the harness
+      # requires every gate's BASELINE run to be green: a gate that is already
+      # red on an unmodified copy proves nothing about its break, and the
+      # harness reports that as a failure rather than absorbing it. The first
+      # CI run of this workflow failed exactly there — `check_supply_chain.py`
+      # BASELINE-RED in 0.2 s because the tool was not installed. Installed
+      # from source with `--locked`, the way ci.yml's supply-chain job does it,
+      # so this workflow still names no action it does not need.
+      - name: Install cargo-vet (the one gate that shells out to an external tool)
+        run: cargo install cargo-vet --locked
       - name: "Mutation harness — every gate run twice, once with a nominated defect"
         working-directory: fapico2
         run: python3 tests/scripts/test_gates.py
