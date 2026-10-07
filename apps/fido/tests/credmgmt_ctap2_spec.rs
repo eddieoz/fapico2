@@ -719,6 +719,73 @@ mod device_twin {
         assert!(saw_rpid, "rpID must be at key 2 (spec)");
         assert!(saw_total, "totalRps must be at key 7 (spec)");
     }
+
+    /// **US-1624 — red gate for the inverted CTAP2 numbering.** In the CTAP2
+    /// flat layout (`key 2` = `pinUvAuthProtocol`, an integer → the
+    /// `CmDialect::Ctap2` classification), sub-command `0x01` is
+    /// `getCredsMetadata` (§6.8.2, and python-fido2 / PicoForge / libfido2 all
+    /// agree). This firmware answers `enumerateRPsBegin` today, because the
+    /// canonical `CM_*` constants are inverted.
+    ///
+    /// `#[ignore]`d with the wrong behaviour recorded; US-1625 fixes the
+    /// mapping and flips this green.
+    #[ignore = "US-1624 red gate: CTAP2-layout sub-command 0x01 is answered \
+                enumerateRPsBegin today (key 1 is a map, totalRPs at 7). \
+                US-1625 swaps CM_GET_METADATA/CM_ENUMERATE_RPS_BEGIN."]
+    #[test]
+    fn us1624_ctap2_flat_0x01_is_getcredsmetadata() {
+        let mut dev = Dev::boot();
+        dev.make_resident("ssh:example.com");
+        dev.set_pin(b"1234");
+        let token = dev.pin_token(b"1234", 0x04);
+
+        // CTAP2 flat layout: key 2 = protocol (integer), key 3 = MAC.
+        let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x01]);
+        let mut req: HV<u8, 64> = HV::new();
+        nh::push_map_header(&mut req, 3).unwrap();
+        nh::push_uint(&mut req, 1).unwrap();
+        nh::push_uint(&mut req, 0x01).unwrap();
+        nh::push_uint(&mut req, 2).unwrap();
+        nh::push_uint(&mut req, 1).unwrap();
+        nh::push_uint(&mut req, 3).unwrap();
+        nh::push_bstr(&mut req, &mac).unwrap();
+
+        let resp = dev.call(0x0A, req.as_slice());
+        assert_eq!(resp[0], 0x00, "CTAP2 0x01 must succeed");
+        let mut p = Parser::new(&resp[1..]);
+        let Item::Map(n) = p.next().unwrap() else {
+            panic!("map")
+        };
+        let mut key1_is_count = false;
+        for _ in 0..n {
+            let k = match p.next().unwrap() {
+                Item::U(u) => u,
+                other => panic!("key {:?}", other),
+            };
+            if k == 1 {
+                // getCredsMetadata: existingResidentCredentialsCount, an
+                // integer. enumerateRPsBegin puts the `rp` *map* here, whose
+                // pairs must be consumed or they read as outer keys.
+                match p.next().unwrap() {
+                    Item::U(_) => key1_is_count = true,
+                    Item::Map(nr) => {
+                        for _ in 0..nr {
+                            p.next().unwrap();
+                            p.next().unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                p.skip().unwrap();
+            }
+        }
+        assert!(
+            key1_is_count,
+            "CTAP2 0x01 must be getCredsMetadata (key 1 = integer count), \
+             not enumerateRPsBegin (key 1 = rp map, totalRPs at 7)"
+        );
+    }
 }
 
 /// The "Next" sub-commands cannot be classified from their own bytes.
@@ -843,4 +910,30 @@ fn picoforge_rps_next_is_answered_in_picoforge_shape() {
         "PicoForge reads rp at 0x03 and rpIdHash at 0x04 on GetNext too"
     );
     assert!(!has_key(&m, 1), "must not be answered in CTAP2's numbering");
+}
+
+/// **US-1624 — the same red gate on the host twin.** A CTAP2 flat-layout
+/// `getCredsMetadata` (key 2 = protocol integer, key 3 = MAC) must be answered
+/// with the integer counts at keys 1/2, not with an RP map. Both twins carry
+/// the same inverted constants today.
+#[ignore = "US-1624 red gate: host CTAP2-layout 0x01 is enumerateRPsBegin \
+            today. US-1625 fixes both twins."]
+#[test]
+fn us1624_host_ctap2_flat_0x01_is_getcredsmetadata() {
+    let (mut app, client) = setup();
+    make_resident(&mut app, &client, "example.com");
+    let token = client.get_token(&mut app, 0x09, Some(0x04), None).unwrap();
+
+    let req = cbor::encode(&Value::M(vec![
+        (Value::U(0x01), Value::U(0x01)),
+        (Value::U(0x02), Value::U(2)),
+        (Value::U(0x03), Value::B(pin_uv_auth(&token, &[0x01]))),
+    ]));
+    let resp = app.process_ctap2(0x0A, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "host CTAP2 0x01 must succeed");
+    let m = map_of(&resp);
+    assert!(
+        matches!(m.iter().find(|(k, _)| *k == Value::U(1)), Some((_, Value::U(_)))),
+        "CTAP2 0x01 must be getCredsMetadata (key 1 = integer count)"
+    );
 }
