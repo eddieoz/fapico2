@@ -11,6 +11,29 @@ the README's *PicoForge compatibility* section, where a gate
 (`tests/scripts/check_picoforge_compat_docs.py`) pins it; this file carries
 the items that gate does not cover.)
 
+## OpenSSH `ssh-keygen -K`: libfido2 1.14.0 sends credMgmt on `0x41`
+
+libfido2 1.14.0's `credman_tx` transmits **every** credential-management
+operation under the hard-coded command byte `CTAP_CBOR_CRED_MGMT_PRE` (`0x41`)
+— there is no `0x0A` fallback in that release. This firmware serves `0x0A` for
+PicoForge and python-fido2 and, since US-1618, also routes `0x41` to the
+credential manager when the request's `pinUvAuthParam` verifies in the
+credMgmt **preview** scope (`subCommand ‖ params`), which is what libfido2
+signs. The RS-Key vendor channel keeps `0x41` for its own (vendor-scope)
+requests, so the two coexist.
+
+Consequence for the user: `ssh-keygen -K` on a board running firmware before
+US-1618 fails with *"Unable to load resident keys: invalid format"* — the
+vendor channel answered `0x14` and OpenSSH mapped it to
+`SSH_ERR_INVALID_FORMAT` (not a PIN error; see
+[`docs/known-gate-divergences.md`](known-gate-divergences.md)'s US-121
+addendum). On a **wiped** board the same string appears from a correct device:
+`read_rks` gets `0x2E NO_CREDENTIALS` from `enumerateRPsBegin` and libfido2
+1.14.0 treats it as a hard failure — there is no empty-success form for a
+Begin. **Newer libfido2 that honours the `credMgmt` getInfo option sends
+`0x0A`**, which this firmware has always served, so the `0x41` path is only
+reached by 1.14.x-era clients (Ubuntu's OpenSSH links it).
+
 ## OpenPGP factory reset: the client's retry loop is shorter than this card's counter
 
 Ten wrong VERIFYs of `00000000` then `00 E6 00 00` + `00 44 00 00`, breaking on
