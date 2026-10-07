@@ -3262,7 +3262,7 @@ fn verify_mac_scope<'a>(
 /// names the vendor scope instead. The vendor scope signs a disjoint message,
 /// so a `true` here means the request cannot be a vendor request.
 pub fn preview_authenticates(data: &[u8], token: Option<&[u8; 32]>) -> bool {
-    matches!(verify_mac_scope(data, token, MacScope::Preview), Ok(_))
+    verify_mac_scope(data, token, MacScope::Preview).is_ok()
 }
 
 /// US-1617 — the raw wire sub-command byte (CBOR key 1) of a `0x41` request,
