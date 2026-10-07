@@ -483,9 +483,12 @@ jobs:
             *alpha*|*beta*) PRE_ARG=(--prerelease) ;;
             *) PRE_ARG=() ;;
           esac
+          # The title is the tag itself. `--title "fapico2 $RELEASE_TAG"`
+          # double-prefixed it ("fapico2 fapico2-release-…"), which is not
+          # what fapico2-release-alpha-v0.1.0 shows.
           gh release create "$RELEASE_TAG" \
             --verify-tag \
-            --title "fapico2 $RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             "${NOTES_ARG[@]}" \
             "${PRE_ARG[@]}" \
             dist/fapico2.uf2
