@@ -135,7 +135,9 @@ fn stale_record_under_the_same_rp_does_not_fault_the_lookup() {
     // authenticates (real index key) but whose payload key is wrong — the
     // board's orphan shape.
     let poison_keys = device.with_store(|store| {
-        let ks = fapico2_fido::device_keystore::DeviceKeystore::load(store)
+        // The load itself is the assertion — the snapshot must be readable and
+        // present before the payload key is poisoned; the value is not used.
+        let _ks = fapico2_fido::device_keystore::DeviceKeystore::load(store)
             .expect("readable")
             .expect("snapshot present");
         let root = store.store_key().expect("store key");
