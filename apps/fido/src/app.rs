@@ -3031,13 +3031,14 @@ impl<K: Keystore> FidoApp<K> {
         let rp_map = cbor::Value::M(vec![
             (cbor::Value::T("id".to_string()), cbor::Value::T(rp.0.clone())),
         ]);
-        // CTAP2 §12.1.6 numbers these rp(1) ‖ rpID(2) ‖ totalRPs(7);
-        // PicoForge numbers the same three things 3/4/5. The sets collide, so
-        // each sender gets its own shape — a client that cannot find keys
-        // 1/2/7 has nothing to render, which is what left the Slots and
-        // Passkeys screens spinning forever.
+        // CTAP 2.1 §6.8.2 final numbers these rp(1) ‖ rpIDHash(2) ‖
+        // totalRPs(3); PicoForge numbers the same three things 3/4/5. The sets
+        // collide, so each sender gets its own shape. US-1626 corrects the
+        // CTAP2 `totalRPs` key from 7 (a chimera — preview puts it at 5, final
+        // at 3) to 3. No live client reaches the Ctap2 branch: python-fido2,
+        // PicoForge and libfido2 all classify as PicoForge and read 3/4/5.
         let (k_rp, k_id, k_total) = match self.cm_dialect {
-            CmDialect::Ctap2 => (0x01u64, 0x02, 0x07),
+            CmDialect::Ctap2 => (0x01u64, 0x02, 0x03),
             CmDialect::PicoForge => (0x03, 0x04, 0x05),
         };
         let mut map: Vec<(cbor::Value, cbor::Value)> = vec![

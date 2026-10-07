@@ -3632,10 +3632,12 @@ impl FidoApp {
                 let rp_str =
                     core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?;
                 match self.cm_dialect {
-                    // CTAP2 §12.1.6: rp(1) ‖ rpID(2) ‖ totalRPs(7). A client
-                    // that cannot find keys 1/2/7 has nothing to render,
-                    // which is what left the Slots and Passkeys screens
-                    // spinning forever.
+                    // CTAP 2.1 §6.8.2 final: rp(1) ‖ rpIDHash(2) ‖ totalRPs(3).
+                    // US-1626 corrects `totalRPs` from 7 (a chimera — the
+                    // preview draft puts it at 5, the final spec at 3; nothing
+                    // puts it at 7) to the final value. No live client reaches
+                    // this branch: python-fido2, PicoForge and libfido2 all
+                    // classify as PicoForge and read 3/4/5.
                     CmDialect::Ctap2 => {
                         no_heap::push_map_header(out, 3).ok();
                         no_heap::push_uint(out, 1).ok();
@@ -3644,7 +3646,7 @@ impl FidoApp {
                         no_heap::push_tstr(out, rp_str).ok();
                         no_heap::push_uint(out, 2).ok();
                         no_heap::push_bstr(out, &hash).ok();
-                        no_heap::push_uint(out, 7).ok();
+                        no_heap::push_uint(out, 3).ok();
                         no_heap::push_uint(out, total as u64).ok();
                     }
                     // PicoForge: rp(3) ‖ rpIdHash(4) ‖ totalRps(5), byte for

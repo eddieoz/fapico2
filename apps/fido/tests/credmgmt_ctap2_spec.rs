@@ -205,8 +205,8 @@ fn ctap2_subcommand_0x01_reports_metadata_and_0x02_enumerates() {
     let begin = app.process_ctap2(0x0A, &cm_req_ctap2(CTAP2_ENUMERATE_RPS_BEGIN, &token, &[]), [1, 2, 3, 4]);
     let begin = map_of(&begin);
     assert!(
-        has_key(&begin, 0x07),
-        "enumerateRPsBegin must report totalRps at key 0x07 (got keys {:?})",
+        has_key(&begin, 0x03),
+        "enumerateRPsBegin must report totalRps at key 0x03 (CTAP 2.1 §6.8.2 final; got keys {:?})",
         begin.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
     );
 
@@ -220,8 +220,8 @@ fn ctap2_subcommand_0x01_reports_metadata_and_0x02_enumerates() {
 }
 
 /// The RP listing must arrive under the keys a spec client reads: `rp` (1),
-/// `rpID` (2) and `totalRPs` (7). A client that finds none of them has
-/// nothing to draw, which is the hang.
+/// `rpIDHash` (2) and `totalRPs` (3) — CTAP 2.1 §6.8.2 final. A client that
+/// finds none of them has nothing to draw, which is the hang.
 #[test]
 fn ctap2_enumerate_rps_uses_spec_response_keys() {
     let (mut app, client) = setup();
@@ -246,16 +246,17 @@ fn ctap2_enumerate_rps_uses_spec_response_keys() {
         "rpID (key 0x02) must be the 32-byte SHA-256 of the RP id"
     );
     assert_eq!(
-        uint_at(&m, 0x07),
+        uint_at(&m, 0x03),
         Some(1),
-        "totalRps (key 0x07) must be 1 for a single resident credential"
+        "totalRPs (key 0x03) must be 1 for a single resident credential"
     );
 
-    // PicoForge's keys must NOT leak into a spec reply — they collide with
-    // spec meanings (0x03 is rpName, 0x04 is userID, 0x05 credentialID).
+    // PicoForge's keys must NOT leak into a spec reply. Key 0x03 collides
+    // (PicoForge rp, spec totalRPs) and is the spec totalRPs here; the
+    // PicoForge-only keys 0x04 (rpIDHash) and 0x05 (totalRps) must be absent.
     assert!(
-        !has_key(&m, 0x03) && !has_key(&m, 0x05),
-        "a CTAP2 reply must not carry PicoForge's 0x03/0x05 keys"
+        !has_key(&m, 0x04) && !has_key(&m, 0x05),
+        "a CTAP2 reply must not carry PicoForge's 0x04/0x05 keys"
     );
 }
 
@@ -344,7 +345,10 @@ fn dialect_discriminator_is_the_type_of_key_0x02() {
         has_key(&m, 0x03) && has_key(&m, 0x04) && has_key(&m, 0x05),
         "PicoForge must still be answered with its own 3/4/5 keys"
     );
-    assert!(!has_key(&m, 0x07), "PicoForge must not receive the spec's totalRps key");
+    assert!(
+        !has_key(&m, 0x01) && !has_key(&m, 0x02),
+        "PicoForge must not receive the spec's 0x01 (rp) / 0x02 (rpIDHash) keys"
+    );
 }
 
 /// `getPinUvAuthTokenUsingUvWithPermissions` (clientPIN sub-command `0x06`)
@@ -709,7 +713,7 @@ mod device_twin {
                         saw_rpid = true;
                     }
                 }
-                7 => {
+                3 => {
                     saw_total = matches!(p.next().unwrap(), Item::U(_));
                 }
                 _ => {
@@ -719,7 +723,7 @@ mod device_twin {
         }
         assert!(saw_rp, "rp must be at key 1 (spec), not PicoForge's key 3");
         assert!(saw_rpid, "rpID must be at key 2 (spec)");
-        assert!(saw_total, "totalRps must be at key 7 (spec)");
+        assert!(saw_total, "totalRPs must be at key 3 (CTAP 2.1 §6.8.2 final)");
     }
 
     /// **US-1624 — the gate, green since US-1625.** In the CTAP2 flat layout
