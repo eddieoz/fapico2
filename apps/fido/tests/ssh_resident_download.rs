@@ -579,3 +579,60 @@ fn us1619_host_and_device_agree_on_0x41_preview_routing() {
     let h = happ.process_ctap2(0x41, &common::make_cm_request(0x02, &htok), [1, 2, 3, 4]);
     assert_eq!(d, h, "enumerateRPsBegin body must be byte-equal across twins");
 }
+
+/// **US-1621 — empty-store semantics.** A wiped board answers preview
+/// `enumerateRPsBegin` with `0x2E NO_CREDENTIALS`, not with an empty map.
+/// There is no "empty success" representation for a Begin that must return
+/// the first RP, so this byte is what libfido2's `read_rks` sees; the epic's
+/// US-1621 records what libfido2 1.14.0 does with it.
+#[test]
+fn us1621_empty_store_is_no_credentials_not_a_map() {
+    let mut dev = Dev::boot();
+    dev.set_pin(b"1234");
+    let token = dev.pin_token(b"1234", 0x04);
+
+    let resp = dev.call(0x41, &preview_mac_req(&token, 0x02));
+    assert_eq!(
+        resp[0], 0x2E,
+        "an empty store must answer NO_CREDENTIALS (0x2E), not a map"
+    );
+    assert_eq!(resp.len(), 1, "0x2E carries no body");
+
+    // The metadata call is the one place an empty store answers *success*.
+    let meta = dev.call(0x41, &preview_mac_req(&token, 0x01));
+    assert_eq!(meta[0], 0x00);
+    assert!(
+        matches!(value_at(&meta, 1), Some(Item::U(0))),
+        "zero existing credentials"
+    );
+}
+
+/// **US-1623 — the `0x0A` clients are unchanged, and the two command bytes
+/// agree.** A python-fido2/PicoForge preview request (the same bytes
+/// `CredentialManagement._call` sends under `0x0A`) is answered identically
+/// when driven on `0x0A` and on `0x41`. That pins both halves: the routing
+/// change touches only `0x41`, and `0x41` reaches the same credential manager
+/// the `0x0A` clients already use.
+#[test]
+fn us1623_same_request_bytes_on_0x0a_and_0x41_are_identical() {
+    let mut dev = Dev::boot();
+    dev.make_resident_for("ssh:example.com", b"alice");
+    dev.set_pin(b"1234");
+    let token = dev.pin_token(b"1234", 0x04);
+
+    for sub in [0x01u8, 0x02, 0x04] {
+        let req = if sub == 0x04 {
+            preview_creds_begin(&token, &crypto::sha256(b"ssh:example.com"))
+        } else {
+            preview_mac_req(&token, sub)
+        };
+        let on_0a = dev.call(0x0A, &req);
+        let on_41 = dev.call(0x41, &req);
+        assert_eq!(
+            on_0a, on_41,
+            "sub-command {:#04x}: 0x0A and 0x41 must answer identically",
+            sub
+        );
+        assert_eq!(on_0a[0], 0x00, "sub-command {:#04x} must succeed", sub);
+    }
+}
