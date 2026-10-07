@@ -38,6 +38,8 @@ use fapico2_platform::secure_store::HostSecureStore;
 use fapico2_platform::trng::HostTrng;
 use heapless::Vec as HV;
 
+mod common;
+
 fn grant_always(_tag: u32) -> bool {
     true
 }
@@ -484,4 +486,96 @@ fn us1618_vendor_mse_on_0x41_is_untouched() {
         "vendor MSE answers a COSE key map at key 1, not credMgmt counts"
     );
     assert_eq!(resp[0], 0x00, "vendor MSE must succeed; got {:#04x}", resp[0]);
+}
+
+// ---------------------------------------------------------------------------
+// US-1619 — host twin parity for the `0x41` route
+// ---------------------------------------------------------------------------
+
+use fapico2_fido::app::FidoApp as HostApp;
+use fapico2_fido::cbor::{self as heap, Value};
+use fapico2_fido::keystore::MemoryKeystore;
+
+/// Enrol one resident credential on the **host** twin. The host twin's
+/// provisioning path is the opposite order to the device twin's: its PIN is
+/// set first (`common::setup`), so makeCredential carries a pinUvAuthParam.
+fn host_make_resident(app: &mut HostApp<MemoryKeystore>, client: &common::PinClient, rp: &str, user: &[u8]) {
+    let token = client.get_token(app, 0x09, Some(0x01), None).unwrap();
+    let hash = crypto::sha256(rp.as_bytes());
+    let req = heap::encode(&Value::M(vec![
+        (Value::U(0x01), Value::B(hash.to_vec())),
+        (
+            Value::U(0x02),
+            Value::M(vec![
+                (Value::T("id".to_string()), Value::T(rp.to_string())),
+                (Value::T("name".to_string()), Value::T("RP".to_string())),
+            ]),
+        ),
+        (
+            Value::U(0x03),
+            Value::M(vec![
+                (Value::T("id".to_string()), Value::B(user.to_vec())),
+                (Value::T("name".to_string()), Value::T("U".to_string())),
+            ]),
+        ),
+        (
+            Value::U(0x04),
+            Value::A(vec![Value::M(vec![
+                (Value::T("type".to_string()), Value::T("public-key".to_string())),
+                (Value::T("alg".to_string()), Value::N(-7)),
+            ])]),
+        ),
+        (Value::U(0x07), Value::M(vec![(Value::T("rk".to_string()), Value::Bool(true))])),
+        (
+            Value::U(0x08),
+            Value::B(crypto::pin_uv_auth_param(2, &token.try_into().unwrap(), &hash)),
+        ),
+        (Value::U(0x09), Value::U(2)),
+    ]));
+    let resp = app.process_ctap2(0x01, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "host makeCredential must succeed");
+}
+
+/// **US-1619.** The same `0x41` preview requests, driven against the host
+/// twin (`app.rs`'s arm) and the device twin, must produce byte-equal bodies.
+/// The MAC *protocol* differs by construction (host `common::PinClient` is
+/// protocol 2, the device `Dev` is protocol 1) — the response does not depend
+/// on it, so equality here pins routing and response shape, and the shared
+/// `cred_mgmt_preview_route` pins the MAC scope for both.
+///
+/// Credential IDs are random per twin, so only the RP enumeration — whose
+/// bytes are a function of the RP alone — is compared byte-for-byte; metadata
+/// is compared by key set and existing count (the capacity number differs by
+/// construction, per `twin_parity.rs`).
+#[test]
+fn us1619_host_and_device_agree_on_0x41_preview_routing() {
+    let mut dev = Dev::boot();
+    dev.make_resident_for("ssh:example.com", b"alice");
+    dev.set_pin(b"1234");
+    let dtok = dev.pin_token(b"1234", 0x04);
+
+    let (mut happ, client) = common::setup();
+    host_make_resident(&mut happ, &client, "ssh:example.com", b"alice");
+    let htok = client.get_token(&mut happ, 0x09, Some(0x04), None).unwrap();
+
+    // getCredsMetadata — key set and existing count. The absolute capacity
+    // differs by construction (device: FIDO_CAPACITY; host: MemoryKeystore's
+    // configured maximum), so it is deliberately not compared.
+    let d = dev.call(0x41, &preview_mac_req(&dtok, 0x01));
+    let h = happ.process_ctap2(0x41, &common::make_cm_request(0x01, &htok), [1, 2, 3, 4]);
+    assert_eq!(top_keys(&d), top_keys(&h), "metadata key set across twins");
+    assert_eq!(
+        top_keys(&d),
+        vec![1, 2, 3],
+        "metadata answered in the preview keys, not vendor41's shape"
+    );
+    assert!(
+        matches!(value_at(&d, 1), Some(Item::U(1))) && matches!(value_at(&h, 1), Some(Item::U(1))),
+        "one existing credential on both twins"
+    );
+
+    // enumerateRPsBegin — a function of the RP alone, so byte-equal.
+    let d = dev.call(0x41, &preview_mac_req(&dtok, 0x02));
+    let h = happ.process_ctap2(0x41, &common::make_cm_request(0x02, &htok), [1, 2, 3, 4]);
+    assert_eq!(d, h, "enumerateRPsBegin body must be byte-equal across twins");
 }
