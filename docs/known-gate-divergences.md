@@ -2608,6 +2608,26 @@ those two sub-commands — treat it as a conformance and future-proofing
 debt, not a live risk, and land the spec form (with a client migration) if
 and when a `0x01`/`0x02` ever starts honouring a parameter.
 
+**Addendum (EPIC `FIDO-SSH-RESIDENT-KEYS`, US-1615):** the standing
+instruction stands, and this addendum is the exhibit for *why OpenSSH
+showed "invalid format" rather than a PIN error*. libfido2 1.14.0's
+`credman_tx` transmits **every** credential-management operation under the
+hard-coded command byte `CTAP_CBOR_CRED_MGMT_PRE` (`0x41`) — there is no
+`0x0A` fallback in that release. fapico2 routes `0x41` to the RS-Key vendor
+channel (`vendor41::CMD`), so `ssh-keygen -K`'s first credMgmt call is
+parsed as RS-Key `Mse`, not as `getCredsMetadata`. The request grammars are
+the same CBOR shape (`{1: subCommand, 2: params?, 3: pinUvAuthProtocol, 4:
+pinUvAuthParam}`), so no syntactic discriminator exists. With the request's
+absence of key-2 params, `vendor_backup::mse` answers
+`Ctap2Response::MissingParameter` (`0x14`) — **measured** on the device twin
+(`apps/fido/tests/ssh_resident_download.rs`, US-1615, `#[ignore]`d until
+US-1618 routes it). `0x14` is outside `sk_usbhid.c:723`'s
+`0x33/0x34/0x36` PIN_REQUIRED class, so OpenSSH maps it to
+`SSH_SK_ERR_GENERAL` → `SSH_ERR_INVALID_FORMAT` → *"invalid format"*. The
+`0x0A` path that PicoForge and python-fido2 use is unaffected, and the
+preview-scope MAC (`subCommand ‖ params`, no prefix) is exactly what the
+standing instruction requires.
+
 ## D-7 — the PIV pytest suite is red for unimplemented features (2026-09-27)
 
 **`17 failed, 13 passed`** on `tests/piv/`, measured against the Phase G–J
