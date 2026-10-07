@@ -738,7 +738,14 @@ impl<K: Keystore> FidoApp<K> {
         self.current_channel = channel;
         // CTAP2.1 §6.9: any non-credMgmt command invalidates a pending
         // credMgmt enumeration (enumerateRps/ enumerateCreds begin..next).
-        if command != 0x0A {
+        //
+        // US-1617/US-1618: `0x41` is not exempt for being credMgmt — it is
+        // exempt because the arm below may route a preview-scope request into
+        // `cred_mgmt`, and the pending enumeration a `Next` continues must
+        // survive to that point. The device twin never invalidates per
+        // command (its `reset_session` clears on a new HID client instead),
+        // so this is the host mirroring the device, not a new rule.
+        if command != 0x0A && command != crate::vendor41::CMD {
             self.cm_rp_state = None;
             self.cm_cred_state = None;
         }
@@ -803,6 +810,26 @@ impl<K: Keystore> FidoApp<K> {
             // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
             // is the check that the device twin agrees.
             crate::vendor41::CMD => {
+                // US-1617/US-1618 (EPIC FIDO-SSH-RESIDENT-KEYS): the command
+                // byte is dual-homed — libfido2 1.14.0's `credman_tx` sends
+                // every credential-management operation on `0x41`, with the
+                // same request shape the vendor channel parses. Route a
+                // preview-scope request to the credential manager; the device
+                // twin makes the identical call. `cred_mgmt_preview_route`
+                // holds the decision so the two twins cannot drift.
+                let token32: Option<&[u8; 32]> = self
+                    .pin_token
+                    .as_ref()
+                    .and_then(|t| t.get(..32))
+                    .and_then(|s| <&[u8; 32]>::try_from(s).ok());
+                if crate::device_core::cred_mgmt_preview_route(
+                    data,
+                    token32,
+                    matches!(self.cm_rp_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                    matches!(self.cm_cred_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                ) {
+                    return self.cred_mgmt(data);
+                }
                 // US-114: the `0x41` response is `status || CBOR`, so this
                 // arm has somewhere to put a body.
                 //

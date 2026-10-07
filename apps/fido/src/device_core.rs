@@ -3060,6 +3060,52 @@ fn cm_dialect(data: &[u8]) -> CmDialect {
     CmDialect::Ctap2
 }
 
+/// US-1617 — the `0x41` discriminator: should this request be answered by the
+/// credential manager (whose responses come out in the PicoForge/preview
+/// keys libfido2 parses) or by the RS-Key vendor channel?
+///
+/// libfido2 1.14.0's `credman_tx` transmits **every** credential-management
+/// operation under the hard-coded command byte `CTAP_CBOR_CRED_MGMT_PRE`
+/// (`0x41`) — no `0x0A` fallback exists in that release — and its request map
+/// is the same CBOR shape the RS-Key vendor channel defines
+/// (`{1: subCommand, 2: params?, 3: pinUvAuthProtocol, 4: pinUvAuthParam}`).
+/// The sub-command numbers overlap too. So the payload's first byte cannot
+/// discriminate; the two **MAC scopes** can, because they sign disjoint
+/// messages (at most one verifies), and the unauthenticated `Next` pair is
+/// resolved by the enumeration state already pending on this channel.
+///
+/// The three branches, in order:
+///
+/// 1. **Authenticated preview request** — the MAC verifies under the preview
+///    scope (`subCommand ‖ cbor(params)`, no `0xFF×32` prefix). Route to
+///    credMgmt. A vendor request cannot land here.
+/// 2. **A MAC-bearing request that did not verify in preview scope** belongs
+///    to vendor41, which verifies the vendor scope (`0xFF×32 ‖ 0x41 ‖ …`) or
+///    refuses. Checked before the latch so a genuine vendor sub-command is
+///    never captured by a pending preview enumeration.
+/// 3. **No MAC** — the `enumerate…GetNext` pair (`{1: 0x03}` / `{1: 0x05}`,
+///    identical in both protocols) continues whatever enumeration is pending
+///    on this channel. The pending state *is* the latch. A cold request with
+///    no pending enumeration keeps today's vendor41 answer.
+pub(crate) fn cred_mgmt_preview_route(
+    data: &[u8],
+    token: Option<&[u8; 32]>,
+    rp_next_on_channel: bool,
+    cred_next_on_channel: bool,
+) -> bool {
+    if token.is_some() && crate::vendor41::preview_authenticates(data, token) {
+        return true;
+    }
+    if crate::vendor41::has_pin_uv_auth_param(data) {
+        return false;
+    }
+    match crate::vendor41::subcommand_byte(data) {
+        Some(0x03) => rp_next_on_channel,
+        Some(0x05) => cred_next_on_channel,
+        _ => false,
+    }
+}
+
 impl FidoApp {
     // -- credMgmt (0x0A) ---------------------------------------------------
 

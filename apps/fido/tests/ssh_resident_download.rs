@@ -24,9 +24,9 @@
 //!
 //! # Story map
 //!
-//! * US-1615 — the red gate: libfido2's metadata request on `0x41` must be
-//!   answered with preview-shape metadata (keys 1/2). Ignored until US-1618
-//!   routes it, with the captured pre-fix reply byte in the attribute.
+//! * US-1615 — the gate: libfido2's metadata request on `0x41` must be
+//!   answered with preview-shape metadata (keys 1/2). Was `#[ignore]`d with
+//!   the captured pre-fix byte (`0x14`) until US-1618 routed it.
 //! * US-1618 — the full libfido2 `read_rks` walk on `0x41`, and vendor41
 //!   surviving on the same command byte.
 
@@ -231,18 +231,56 @@ impl Dev {
         assert_eq!(token.len(), 32, "the PIN token must be 32 bytes");
         token
     }
+
+    /// Create one discoverable credential for `rp` with user handle `user`.
+    /// Run **before** `set_pin`: on a PIN-less device makeCredential needs no
+    /// token and no UV (makeCredUvNotRqd), which is the same provisioning the
+    /// spec twin uses.
+    fn make_resident_for(&mut self, rp: &str, user: &[u8]) {
+        let hash = crypto::sha256(rp.as_bytes());
+        let mut req: HV<u8, 512> = HV::new();
+        nh::push_map_header(&mut req, 5).unwrap();
+        nh::push_uint(&mut req, 1).unwrap();
+        nh::push_bstr(&mut req, &hash).unwrap();
+        nh::push_uint(&mut req, 2).unwrap();
+        nh::push_map_header(&mut req, 2).unwrap();
+        nh::push_tstr(&mut req, "id").unwrap();
+        nh::push_tstr(&mut req, rp).unwrap();
+        nh::push_tstr(&mut req, "name").unwrap();
+        nh::push_tstr(&mut req, "RP").unwrap();
+        nh::push_uint(&mut req, 3).unwrap();
+        nh::push_map_header(&mut req, 2).unwrap();
+        nh::push_tstr(&mut req, "id").unwrap();
+        nh::push_bstr(&mut req, user).unwrap();
+        nh::push_tstr(&mut req, "name").unwrap();
+        nh::push_tstr(&mut req, "U").unwrap();
+        nh::push_uint(&mut req, 4).unwrap();
+        nh::push_array_header(&mut req, 1).unwrap();
+        nh::push_map_header(&mut req, 2).unwrap();
+        nh::push_tstr(&mut req, "type").unwrap();
+        nh::push_tstr(&mut req, "public-key").unwrap();
+        nh::push_tstr(&mut req, "alg").unwrap();
+        nh::push_neg(&mut req, -7).unwrap();
+        nh::push_uint(&mut req, 7).unwrap();
+        nh::push_map_header(&mut req, 1).unwrap();
+        nh::push_tstr(&mut req, "rk").unwrap();
+        nh::push_bool(&mut req, true).unwrap();
+        let resp = self.call(0x01, req.as_slice());
+        assert_eq!(resp[0], 0x00, "makeCredential must succeed on the device twin");
+    }
 }
 
-/// libfido2 1.14.0's `getCredsMetadata` request as `credman_tx` puts it on
-/// the wire: `{1: 0x01, 3: 1, 4: mac}` — sub-command `0x01`, protocol 1, and
-/// a MAC over the **bare sub-command byte** (preview scope: no `0xFF×32`
-/// prefix, no params to append). The MAC key is the protocol-1 PIN token.
-fn libfido2_metadata_request(token: &[u8]) -> Vec<u8> {
-    let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x01]);
+/// libfido2 1.14.0's request shapes, as `credman_tx` puts them on the wire.
+///
+/// All three authenticated builders use the **preview** MAC scope: the
+/// message is `subCommand ‖ cbor(params)` with no `0xFF×32` prefix, and the
+/// key is the protocol-1 PIN token. `{1: sub, 2: params?, 3: 1, 4: mac}`.
+fn preview_mac_req(token: &[u8], sub: u8) -> Vec<u8> {
+    let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[sub]);
     let mut req: HV<u8, 64> = HV::new();
     nh::push_map_header(&mut req, 3).unwrap();
     nh::push_uint(&mut req, 1).unwrap();
-    nh::push_uint(&mut req, 0x01).unwrap();
+    nh::push_uint(&mut req, sub as u64).unwrap();
     nh::push_uint(&mut req, 3).unwrap();
     nh::push_uint(&mut req, 1).unwrap();
     nh::push_uint(&mut req, 4).unwrap();
@@ -250,62 +288,200 @@ fn libfido2_metadata_request(token: &[u8]) -> Vec<u8> {
     req.as_slice().to_vec()
 }
 
-/// **US-1615 — the red gate.** libfido2 1.14's `getCredsMetadata` under CTAP2
-/// command `0x41` must be answered by the credential manager with a
-/// preview-shape metadata map (keys 1 = existing, 2 = remaining counts), not
-/// by the RS-Key vendor channel.
+/// The unauthenticated `enumerate…GetNext` pair: `{1: sub}` and nothing else.
+fn preview_bare(sub: u8) -> Vec<u8> {
+    let mut req: HV<u8, 8> = HV::new();
+    nh::push_map_header(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, sub as u64).unwrap();
+    req.as_slice().to_vec()
+}
+
+/// libfido2's `enumerateCredentialsBegin`: `{1: 0x04, 2: {1: rpIdHash}, 3: 1,
+/// 4: mac}`, with the MAC over `0x04 ‖ cbor({1: rpIdHash})`.
+fn preview_creds_begin(token: &[u8], hash: &[u8; 32]) -> Vec<u8> {
+    let mut params: HV<u8, 40> = HV::new();
+    nh::push_map_header(&mut params, 1).unwrap();
+    nh::push_uint(&mut params, 1).unwrap();
+    nh::push_bstr(&mut params, hash).unwrap();
+    let mut msg: HV<u8, 48> = HV::new();
+    msg.push(0x04).unwrap();
+    msg.extend_from_slice(params.as_slice()).unwrap();
+    let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), msg.as_slice());
+    let mut req: HV<u8, 128> = HV::new();
+    nh::push_map_header(&mut req, 4).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 0x04).unwrap();
+    nh::push_uint(&mut req, 2).unwrap();
+    req.extend_from_slice(params.as_slice()).unwrap();
+    nh::push_uint(&mut req, 3).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 4).unwrap();
+    nh::push_bstr(&mut req, &mac).unwrap();
+    req.as_slice().to_vec()
+}
+
+/// A genuine RS-Key vendor request: MSE (`0x01`) with a COSE host point in
+/// key 2, no MAC (MSE is ungated). The params value is `{1: {COSE}}` — the
+/// COSE key hangs off label 1.
+fn vendor_mse_request() -> Vec<u8> {
+    let (x, y) = client_coords();
+    let mut cose: HV<u8, 80> = HV::new();
+    push_client_cose(&mut cose, &x, &y);
+    let mut req: HV<u8, 96> = HV::new();
+    nh::push_map_header(&mut req, 2).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 0x01).unwrap();
+    nh::push_uint(&mut req, 2).unwrap();
+    nh::push_map_header(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    req.extend_from_slice(cose.as_slice()).unwrap();
+    req.as_slice().to_vec()
+}
+
+/// The top-level keys of a successful (`0x00`) response body. Nested
+/// containers are skipped whole, so inner map keys never masquerade as outer
+/// ones.
+fn top_keys(resp: &[u8]) -> Vec<u64> {
+    assert_eq!(resp[0], 0x00, "expected OK; got status {:#04x}", resp[0]);
+    let mut p = Parser::new(&resp[1..]);
+    let Item::Map(n) = p.next().unwrap() else {
+        panic!("response body must be a map")
+    };
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let k = match p.next().unwrap() {
+            Item::U(u) => u,
+            other => panic!("key {:?}", other),
+        };
+        out.push(k);
+        p.skip().unwrap();
+    }
+    out
+}
+
+/// The value of top-level `key`, if present. Only the value is returned; the
+/// borrow is of `resp` itself, so callers keep `resp` alive (bind the call).
+fn value_at<'a>(resp: &'a [u8], want: u64) -> Option<Item<'a>> {
+    let mut p = Parser::new(&resp[1..]);
+    let Item::Map(n) = p.next().ok()? else {
+        return None;
+    };
+    for _ in 0..n {
+        let k = match p.next().ok()? {
+            Item::U(u) => u,
+            _ => return None,
+        };
+        if k == want {
+            return p.next().ok();
+        }
+        p.skip().ok()?;
+    }
+    None
+}
+
+fn has_key(keys: &[u64], key: u64) -> bool {
+    keys.contains(&key)
+}
+
+/// **US-1615 — the gate, now green (US-1618 flipped it).** libfido2 1.14's
+/// `getCredsMetadata` under CTAP2 command `0x41` must be answered by the
+/// credential manager with a preview-shape metadata map (keys 1 = existing,
+/// 2 = remaining counts), not by the RS-Key vendor channel.
 ///
-/// # Captured pre-fix behaviour (US-1615, first run of this test)
-///
-/// The reply byte is **`0x14`** (`Ctap2Response::MissingParameter`): the
-/// request is parsed as RS-Key `Mse` (`0x01`) — libfido2's request carries no
-/// key-2 params, so `vendor_backup::mse` refuses before any MAC is even
-/// consulted. `0x14` is outside the `0x33/0x34/0x36` PIN_REQUIRED class in
-/// `sk_usbhid.c`'s `fidoerr_to_skerr`, so OpenSSH reports
-/// `SSH_ERR_INVALID_FORMAT` — the reported *"invalid format"*. Consistent
-/// with the epic's §1.2 ladder, so the root-cause analysis stands.
-#[ignore = "US-1615 red gate: 0x41 is answered 0x14 by vendor41's Mse arm. \
-            Flips green when US-1618 routes preview requests to handle_cred_mgmt."]
+/// Captured pre-fix behaviour: `0x14` (`MissingParameter`), returned by
+/// `vendor_backup::mse` because libfido2's request carries no key-2 params —
+/// outside the `0x33/0x34/0x36` PIN_REQUIRED class, so OpenSSH reported
+/// `SSH_ERR_INVALID_FORMAT` (*"invalid format"*). See the epic's §1.2.
 #[test]
 fn us1615_libfido2_metadata_on_0x41_reaches_the_credential_manager() {
     let mut dev = Dev::boot();
     dev.set_pin(b"1234");
     let token = dev.pin_token(b"1234", 0x04); // PERM_CM
 
-    let req = libfido2_metadata_request(&token);
-    let resp = dev.call(0x41, &req);
-    assert_eq!(
-        resp[0], 0x00,
-        "getCredsMetadata on 0x41 must succeed; captured reply byte {:#04x}",
-        resp[0]
+    let resp = dev.call(0x41, &preview_mac_req(&token, 0x01));
+    let keys = top_keys(&resp);
+    assert!(
+        matches!(value_at(&resp, 1), Some(Item::U(_))),
+        "existingResidentCredentialsCount at key 1"
     );
-    // Preview-shape metadata: keys 1 (existing) and 2 (remaining) — the only
-    // keys libfido2 1.14.0's `credman_parse_metadata` reads.
-    let mut p = Parser::new(&resp[1..]);
-    let Item::Map(n) = p.next().unwrap() else {
-        panic!("metadata body must be a map")
-    };
-    let mut saw_existing = false;
-    let mut saw_remaining = false;
-    for _ in 0..n {
-        let k = match p.next().unwrap() {
-            Item::U(u) => u,
-            other => panic!("key {:?}", other),
-        };
-        match k {
-            1 => {
-                assert!(matches!(p.next().unwrap(), Item::U(_)));
-                saw_existing = true;
-            }
-            2 => {
-                assert!(matches!(p.next().unwrap(), Item::U(_)));
-                saw_remaining = true;
-            }
-            _ => {
-                p.next().unwrap();
-            }
-        }
-    }
-    assert!(saw_existing, "existingResidentCredentialsCount at key 1");
-    assert!(saw_remaining, "maxPossibleRemainingResidentCredentialsCount at key 2");
+    assert!(
+        matches!(value_at(&resp, 2), Some(Item::U(_))),
+        "maxPossibleRemainingResidentCredentialsCount at key 2"
+    );
+    assert!(has_key(&keys, 1) && has_key(&keys, 2));
+}
+
+/// **US-1618 — the full libfido2 1.14 `read_rks` walk on `0x41`.** Every
+/// request libfido2 makes while walking `fido_credman_get_dev_metadata` →
+/// `fido_credman_get_dev_rp` → `fido_credman_get_dev_rk` must be answered by
+/// the credential manager in the preview response keys, including the
+/// unauthenticated `Next` pair, which is routed by the pending enumeration.
+#[test]
+fn us1618_libfido2_read_rks_walk_on_0x41() {
+    let mut dev = Dev::boot();
+    dev.make_resident_for("ssh:example.com", b"alice");
+    dev.make_resident_for("ssh:example.com", b"bob");
+    dev.set_pin(b"1234");
+    let token = dev.pin_token(b"1234", 0x04);
+    let hash = crypto::sha256(b"ssh:example.com");
+
+    // getCredsMetadata — keys 1/2.
+    let meta = dev.call(0x41, &preview_mac_req(&token, 0x01));
+    let keys = top_keys(&meta);
+    assert!(has_key(&keys, 1) && has_key(&keys, 2), "metadata keys 1/2");
+
+    // enumerateRPsBegin — rp(3), rpIDHash(4), totalRPs(5).
+    let begin = dev.call(0x41, &preview_mac_req(&token, 0x02));
+    let keys = top_keys(&begin);
+    assert!(has_key(&keys, 3), "rp map at key 3");
+    assert!(
+        matches!(value_at(&begin, 4), Some(Item::B(b)) if b == hash.as_slice()),
+        "rpIDHash at key 4 must equal the RP hash"
+    );
+    assert!(
+        matches!(value_at(&begin, 5), Some(Item::U(1))),
+        "totalRPs at key 5 must be 1"
+    );
+
+    // enumerateRPsGetNext — single RP, so the Begin consumed it and the Next
+    // is answered NO_CREDENTIALS/NotAllowed by the manager, not by vendor41.
+    let resp = dev.call(0x41, &preview_bare(0x03));
+    assert_eq!(resp[0], 0x30, "a Next past the last RP is NotAllowed");
+
+    // enumerateCredentialsBegin — user(6), credentialID(7), publicKey(8),
+    // totalCredentials(9).
+    let cb = dev.call(0x41, &preview_creds_begin(&token, &hash));
+    let keys = top_keys(&cb);
+    assert!(has_key(&keys, 6), "user map at key 6");
+    assert!(has_key(&keys, 7), "credentialID map at key 7");
+    assert!(has_key(&keys, 8), "publicKey at key 8");
+    assert!(
+        matches!(value_at(&cb, 9), Some(Item::U(2))),
+        "totalCredentials at key 9 must be 2"
+    );
+
+    // enumerateCredentialsGetNextCredential — {1: 0x05}, routed by the pending
+    // credential enumeration on this channel.
+    let cn = dev.call(0x41, &preview_bare(0x05));
+    let keys = top_keys(&cn);
+    assert!(has_key(&keys, 6) && has_key(&keys, 7), "next credential keys 6/7");
+}
+
+/// **US-1618, vendor-survival scenario.** A genuine RS-Key request on `0x41`
+/// — MSE with a COSE point and no MAC — is still served by vendor41, whose
+/// response is a COSE key at key 1 (a map), never a credMgmt metadata map
+/// (integer keys 1/2).
+#[test]
+fn us1618_vendor_mse_on_0x41_is_untouched() {
+    let mut dev = Dev::boot();
+    dev.set_pin(b"1234");
+    let _ = dev.pin_token(b"1234", 0x04);
+
+    let resp = dev.call(0x41, &vendor_mse_request());
+    assert!(
+        matches!(value_at(&resp, 1), Some(Item::Map(_))),
+        "vendor MSE answers a COSE key map at key 1, not credMgmt counts"
+    );
+    assert_eq!(resp[0], 0x00, "vendor MSE must succeed; got {:#04x}", resp[0]);
 }
