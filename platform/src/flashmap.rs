@@ -6,8 +6,8 @@
 //! magic number written twice.
 //!
 //! ```text
-//! 0x000_000 .. 0x195_400   firmware image                  1,621 KiB — the CI ratchet
-//! 0x195_400 .. 0x200_000   firmware growth headroom        ~438 KiB — unreferenced, on purpose
+//! 0x000_000 .. 0x1A0_000   firmware image                  1,664 KiB — the CI ratchet
+//! 0x1A0_000 .. 0x200_000   firmware growth headroom         384 KiB — unreferenced, on purpose
 //! 0x200_000 .. 0x300_000   trussed window                   1,024 KiB
 //!                         ├ 0x200_000 .. 0x2C0_000   ifs     768 KiB — OpenPGP + PIV
 //!                         └ 0x2C0_000 .. 0x300_000   efs     256 KiB — Location::External
@@ -36,7 +36,7 @@
 //!
 //! The trussed window used to sit at `0x102_000`, **inside** the region the CI
 //! flash-budget ratchet is free to grow into. The ratchet allows a firmware
-//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,621 KiB) and the window began
+//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,664 KiB) and the window began
 //! at 1,032 KiB, so the geometry was wrong by 504 KiB before this epic touched
 //! it: a firmware image the gate *accepted* could link over the front of the
 //! trussed filesystem, and every OpenPGP and PIV key past that offset would go
@@ -57,9 +57,11 @@
 //! # The budget is a ratchet, not a ceiling
 //!
 //! [`FIRMWARE_FLASH_BUDGET_BYTES`] is the value CI refuses to exceed, and it is
-//! deliberately allowed to be below [`FIRMWARE_GROWTH_END`]: 512 KiB of
-//! headroom is what makes raising it a deliberate act with a recorded reason
-//! rather than an accident. Raising the budget is safe **up to the growth
+//! deliberately allowed to be below [`FIRMWARE_GROWTH_END`]: the gap (384 KiB
+//! after the 2026-10-07 raise) is what makes raising it a deliberate act with a
+//! recorded reason rather than an accident. A *zero*-headroom ratchet was tried
+//! first and rejected: it turned every 512 B of ordinary growth into a red that
+//! named a number instead of a decision. Raising the budget is safe **up to the growth
 //! boundary**. Past it, this module stops compiling — which is the correct
 //! outcome, because past it the firmware would be growing into a filesystem
 //! full of someone's keys.
@@ -68,19 +70,25 @@ use crate::board;
 use crate::cflash;
 
 /// The firmware flash budget in bytes — the ratchet `ci.yml` enforces against
-/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,621 KiB).
+/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,664 KiB).
 ///
 /// Raised 1536 → 1621 on 2026-10-06 (docs/size-report.md, that date's entry):
 /// the shipping image had already grown past 1,536 KiB across the US-15xx
-/// epics while the boot-chain gate hid the ratchet's red; this entry's image
-/// is 3,242 blocks = 1,659,904 B = 1,621 KiB exactly — zero headroom,
-/// deliberately, so the next 512 B trips it.
+/// epics while the boot-chain gate hid the ratchet's red. Raised again
+/// 1621 → 1664 on 2026-10-07, which is the first raise that is *not* chasing
+/// drift: the image is 3,242 blocks = 1,659,904 B, and the 44,032 B above it is
+/// deliberate headroom — roughly eight features at the measured per-feature
+/// growth, so the ratchet fires on notable growth instead of on every 512-byte
+/// block. The reason is recorded beside the number in `ci.yml`; raise it with
+/// `python3 tests/scripts/raise_flash_budget.py <KiB> --reason "..."`, which
+/// moves every copy (including the `board_def.rs` mirror this module cannot
+/// reach) in one step.
 ///
 /// This is the number that used to be 504 KiB *above* the trussed window's
 /// start. It is the only place it is written down in Rust; `ci.yml` carries the
 /// same value in KiB because a workflow file cannot import a Rust constant, and
 /// `tests/scripts/check_flash_budget.py` fails the build if the two disagree.
-pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1621 * 1024;
+pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1664 * 1024;
 
 /// The end of the region the firmware may grow into without a layout change:
 /// ~438 KiB of unreferenced headroom above the 2026-10-06 budget (512 KiB

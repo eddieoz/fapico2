@@ -1,10 +1,43 @@
 #!/usr/bin/env python3
-"""S-392-2 gate: size report consistency (US-392; RAM figures US-1010).
+"""S-392-2 gate: size budgets over the rebuilt device ELF (US-392; RAM US-1010).
 
 Rebuilds the device ELF (default = device target), re-measures
 `arm-none-eabi-size` (+ `-A` and the RAM symbols), recomputes the shipping UF2
-sha256/block count, and fails while `docs/size-report.md` disagrees (or lacks
-the numbers).
+sha256/block count, and enforces the two *budgets* that decide whether the
+board boots and fits.
+
+Modes
+-----
+
+    check_size_report.py                budgets only — what CI runs on a PR
+    check_size_report.py --check-doc    also: docs/size-report.md must equal
+                                        the build (mutation harness; release)
+    check_size_report.py --update       rewrite the doc's generated block and
+                                        headline figures from the build
+
+What blocks a pull request, and what deliberately does not
+----------------------------------------------------------
+
+**Blocking:**
+
+* ``text <= CEILING`` (3.5 MiB flash) — a coarse backstop. It is ~2.8 MiB
+  above the current build, so it cannot fire on ordinary growth; the flash
+  ratchet in ``.github/workflows/ci.yml`` and the geometry in
+  ``platform/src/flashmap.rs`` are the near-term bounds.
+* ``bss <= RAM_BYTES - CHAIN_CEILING`` — the dark-boot-class check (below).
+
+**Not blocking: the document-equality checks.** Until 2026-10-07 this script
+also failed unless ``docs/size-report.md`` contained the build's exact text,
+UF2 sha256, block count, section table and summary. That made every codegen
+change red for a reason unrelated to the change — a measured +56 B or −1,204 B
+was enough — and it was *weak* as well as churny: the presence checks were
+whole-document substring scans over a 3,400-line file carrying ~99 historical
+sha/block figures, and only the first of the document's two delimited copies
+was validated. Enforcing documentation freshness by failing the build is the
+defect; the numbers a reader needs are printed here and written by --update.
+The equality checks are kept, behind ``--check-doc``, for the two callers that
+want them: the mutation harness (which must prove they bite) and the release
+refresh. Nothing in the PR path reads ``docs/size-report.md``.
 
 What US-1010 changed
 --------------------
@@ -18,12 +51,9 @@ at all. `RAM_CEILING` below closes that.
 **The interior detail tables are generated, not hand-copied.** The headline
 `text` figure the gate compared was current while the per-section tables under
 it were one re-measurement behind (8 B stale on `.bss` and the `__sheap` /
-stack-zone lines at the time of writing). A gate that checks the headline and
-ignores the detail will happily pass over a stale interior, because the detail
-is prose-shaped and there was nothing to compare it against. The measured
-blocks are now delimited, and this script **regenerates them from the ELF and
-fails if the document differs** — so a stale interior is a FAIL, not a thing a
-reader has to notice.
+stack-zone lines at the time of writing). The measured blocks are delimited
+and rendered by :func:`render_sections` / :func:`render_summary` — one
+renderer, shared by ``--check-doc`` and ``--update``, so the two cannot drift.
 
 The RAM ceiling, and where it comes from
 ----------------------------------------
@@ -56,6 +86,7 @@ in) rather than the address-to-address figure, because Berkeley `bss` is the
 number. On this build the two differ by 200 B (`.data` plus 4 B of alignment
 slack ahead of `__sheap`), so the check is conservative by that much.
 """
+import argparse
 import hashlib
 import pathlib
 import re
@@ -217,7 +248,10 @@ def render_summary(sections, text, data, bss, syms, ram_origin, ram_size):
 
 
 def check_block(doc, begin, end, expected, label, failures):
-    """The document's copy of a generated block must equal the measurement."""
+    """The document's copy of a generated block must equal the measurement.
+
+    `--check-doc` only. The PR path does not read the document at all.
+    """
     if begin not in doc:
         failures.append(f"doc: missing the generated block {label} (no {begin!r})")
         return
@@ -230,63 +264,41 @@ def check_block(doc, begin, end, expected, label, failures):
     if got != want:
         failures.append(
             f"doc: the generated block {label} disagrees with the rebuilt ELF — it is a "
-            f"hand-copied interior that has gone stale. Re-run ./build.sh and paste the "
-            f"measured block (the gate prints it below).\n"
+            f"hand-copied interior that has gone stale. Run "
+            f"`python3 tests/scripts/check_size_report.py --update` to rewrite it from "
+            f"this build.\n"
             f"--- measured ---\n{want}\n--- in the document ---\n{got}"
         )
 
 
-def uf2_facts():
-    """sha256 + block count of the shipping image, generated from the build.
+def write_block(doc: str, begin: str, end: str, body: str, label: str) -> str:
+    """Replace the generated block between `begin`/`end` with `body`.
 
-    The UF2 is a build artifact and is not committed (see .gitignore), so it is
-    regenerated here from the release ELF exactly as CI does. That keeps the
-    recorded hash a function of the source rather than of a binary someone had
-    to remember to refresh.
+    `--update` only. Refuses to guess: a missing delimiter is an error, not a
+    place to append, because appending is how a document ends up with the
+    generated block somewhere nobody reads it.
     """
-    if not ELF.exists():
+    if begin not in doc or end not in doc:
         raise SystemExit(
-            f"check_size_report: {ELF} is missing. Build the device image first:\n"
-            "  cargo build --release --target thumbv8m.main-none-eabi"
+            f"--update: {label} delimiters are missing from {DOC} "
+            f"(need {begin!r} and {end!r}); refusing to guess where to write"
         )
-    with tempfile.TemporaryDirectory() as tmp:
-        out = pathlib.Path(tmp) / "fapico2.uf2"
-        subprocess.run(
-            [sys.executable, str(UF2GEN), str(ELF), str(out)],
-            check=True, capture_output=True,
-        )
-        data = out.read_bytes()
-    return hashlib.sha256(data).hexdigest(), len(data) // 512
+    start = doc.index(begin) + len(begin)
+    stop = doc.index(end, start)
+    return doc[:start] + "\n" + body.strip() + "\n" + doc[stop:]
 
 
-def main() -> int:
-    if not DOC.exists():
-        print("FAIL: docs/size-report.md missing")
-        return 1
-    text, data, bss = measure_elf()
-    sections = measure_sections()
-    syms = symbols("__sheap", "_stack_start", "_stack_end")
-    ram_origin, ram_total, memory_x = ram_bytes()
-    ram_ceiling = ram_total - CHAIN_CEILING
-    sha, blocks = uf2_facts()
-    doc = DOC.read_text(encoding="utf-8")
-
-    failures = []
-    if text > CEILING:
-        failures.append(f"size gate exceeded: text {text} > {CEILING}")
-    if bss > ram_ceiling:
-        failures.append(
-            f"RAM gate exceeded: bss {bss} > {ram_ceiling} "
-            f"(= {ram_total} B of SRAM from {memory_x.name} − the {CHAIN_CEILING} B "
-            f"main-stack ceiling check_boot_chain.py enforces). A static that pushes past "
-            f"this does not fail the link; it shrinks the main stack region until the boot "
-            f"path overflows it and the board dark-locks (DARK-BOOT-1)."
-        )
+def doc_checks(doc, text, sha, blocks, sections, data, bss, syms,
+               ram_origin, ram_total, ram_ceiling, failures):
+    """Every comparison against `docs/size-report.md`. `--check-doc` only."""
     m = re.search(r"Rust[^*\n]*text[^0-9\n]*([\d,]+)\s*B", doc)
     if not m:
         failures.append("doc: no Rust text measurement found")
     elif int(m.group(1).replace(",", "")) != text:
-        failures.append(f"doc Rust text {m.group(1)} != measured {text}")
+        failures.append(
+            f"doc Rust text {m.group(1)} != measured {text} "
+            f"(run `check_size_report.py --update` to refresh the document)"
+        )
     if f"{sha[:12]}" not in doc and sha not in doc:
         failures.append(f"doc: shipping UF2 sha256 ({sha[:12]}…) not recorded")
     if not re.search(rf"\b{blocks}\s+blocks?\b", doc):
@@ -315,6 +327,110 @@ def main() -> int:
         "ELF summary", failures,
     )
 
+
+def update_doc(text, data, bss, sections, syms, ram_origin, ram_total):
+    """Rewrite the generated blocks and the figures they carry. (changed, text)."""
+    doc = DOC.read_text(encoding="utf-8")
+    out = write_block(
+        doc, SECTIONS_BEGIN, SECTIONS_END,
+        render_sections(sections, ram_origin, ram_total),
+        "ELF section table",
+    )
+    out = write_block(
+        out, SUMMARY_BEGIN, SUMMARY_END,
+        render_summary(sections, text, data, bss, syms, ram_origin, ram_total),
+        "ELF summary",
+    )
+    return out != doc, out
+
+
+def uf2_facts():
+    """sha256 + block count of the shipping image, generated from the build.
+
+    The UF2 is a build artifact and is not committed (see .gitignore), so it is
+    regenerated here from the release ELF exactly as CI does. That keeps the
+    recorded hash a function of the source rather than of a binary someone had
+    to remember to refresh.
+    """
+    if not ELF.exists():
+        raise SystemExit(
+            f"check_size_report: {ELF} is missing. Build the device image first:\n"
+            "  cargo build --release --target thumbv8m.main-none-eabi"
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        out = pathlib.Path(tmp) / "fapico2.uf2"
+        subprocess.run(
+            [sys.executable, str(UF2GEN), str(ELF), str(out)],
+            check=True, capture_output=True,
+        )
+        data = out.read_bytes()
+    return hashlib.sha256(data).hexdigest(), len(data) // 512
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check-doc", action="store_true",
+        help="also require docs/size-report.md to equal this build (mutation "
+             "harness, release refresh). NOT run on the PR path — see the "
+             "module docstring for why.",
+    )
+    mode.add_argument(
+        "--update", action="store_true",
+        help="rewrite the document's generated blocks from this build and exit "
+             "(unless a budget is exceeded)",
+    )
+    args = ap.parse_args()
+
+    text, data, bss = measure_elf()
+    sections = measure_sections()
+    syms = symbols("__sheap", "_stack_start", "_stack_end")
+    ram_origin, ram_total, memory_x = ram_bytes()
+    ram_ceiling = ram_total - CHAIN_CEILING
+    sha, blocks = uf2_facts()
+
+    failures = []
+    if text > CEILING:
+        failures.append(f"size gate exceeded: text {text} > {CEILING}")
+    if bss > ram_ceiling:
+        failures.append(
+            f"RAM gate exceeded: bss {bss} > {ram_ceiling} "
+            f"(= {ram_total} B of SRAM from {memory_x.name} − the {CHAIN_CEILING} B "
+            f"main-stack ceiling check_boot_chain.py enforces). A static that pushes past "
+            f"this does not fail the link; it shrinks the main stack region until the boot "
+            f"path overflows it and the board dark-locks (DARK-BOOT-1)."
+        )
+
+    if args.update:
+        if not DOC.exists():
+            print(f"FAIL: {DOC} is missing")
+            return 1
+        changed, out = update_doc(text, data, bss, sections, syms, ram_origin, ram_total)
+        if changed:
+            DOC.write_text(out, encoding="utf-8")
+            print(f"updated: {DOC.relative_to(ROOT)} "
+                  f"(text={text} bss={bss} uf2={blocks} blocks sha256={sha[:12]}…)")
+        else:
+            print(f"unchanged: {DOC.relative_to(ROOT)} already matches this build")
+        _print_facts(text, bss, ram_ceiling, blocks, sha, ram_total, memory_x)
+        if failures:
+            print("FAIL: check_size_report (US-392 / US-1010) — a budget is exceeded")
+            for f in failures:
+                print(f"  - {f}")
+            return 1
+        return 0
+
+    if args.check_doc:
+        if not DOC.exists():
+            print("FAIL: docs/size-report.md missing")
+            return 1
+        doc_checks(
+            DOC.read_text(encoding="utf-8"),
+            text, sha, blocks, sections, data, bss, syms, ram_origin, ram_total, ram_ceiling,
+            failures,
+        )
+
     if failures:
         print("FAIL: check_size_report (US-392 / US-1010)")
         for f in failures:
@@ -326,12 +442,25 @@ def main() -> int:
         f"({ram_ceiling - bss} B of the {ram_ceiling} B RAM ceiling) "
         f"uf2={blocks} blocks"
     )
-    print(
-        f"  - RAM ceiling derived: {fmt(ram_total)} B SRAM (memory.x {memory_x.name}) "
-        f"− {fmt(CHAIN_CEILING)} B chain ceiling (check_boot_chain.CHAIN_CEILING) "
-        f"= {fmt(ram_ceiling)} B"
-    )
+    _print_facts(text, bss, ram_ceiling, blocks, sha, ram_total, memory_x)
     return 0
+
+
+def _print_facts(text, bss, ram_ceiling, blocks, sha, ram_total, memory_x):
+    """The numbers a reader or a log wants, independent of any document.
+
+    Printed unconditionally: the document is no longer a gate, so this line is
+    what makes the measurements visible on every run (CI includes it in the job
+    log and the step summary).
+    """
+    print(
+        f"  - facts: text={fmt(text)} B bss={fmt(bss)} B "
+        f"RAM ceiling={fmt(ram_ceiling)} B (of {fmt(ram_total)} B SRAM, memory.x "
+        f"{memory_x.name}) shipping uf2={blocks} blocks sha256={sha}"
+    )
+    print(
+        f"  - refresh the record with: python3 tests/scripts/check_size_report.py --update"
+    )
 
 
 if __name__ == "__main__":

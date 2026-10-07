@@ -68,8 +68,18 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 FLASHMAP = ROOT / "platform" / "src" / "flashmap.rs"
+BOARD_DEF = ROOT / "platform" / "board_def.rs"
 
-# --- the two statements of the same number ---------------------------------
+# --- the three statements of the same number -------------------------------
+#
+# Three, not two, since 2026-10-07. `platform/board_def.rs` carries a mirror of
+# the ratchet — it is compiled into the build scripts without the `platform`
+# crate, so it cannot import `flashmap`'s constant — and it is read by
+# `Board::validate` and printed into the generated linker script while **no gate
+# compared it to anything**. It had already drifted: 1,536 KiB in board_def.rs
+# against 1,621 KiB in ci.yml and flashmap.rs. That is the exact failure this
+# gate's docstring says it exists to prevent, sitting in a file the gate never
+# opened. A mirror is fine; an uncompared mirror is a second source of truth.
 
 CI_BUDGET_RE = re.compile(
     r"^\s*FIRMWARE_FLASH_BUDGET_KIB\s*:\s*([0-9]+)\s*$", re.M
@@ -162,6 +172,38 @@ def main() -> int:
             f"(FIRMWARE_FLASH_BUDGET_BYTES). One of them was edited without the other. "
             f"The Rust constant is the source of truth — a workflow file cannot import it"
         )
+
+    # --- 1b. …and the board_def mirror agrees with them --------------------
+    #
+    # The mirror exists because `build.rs` compiles without the `platform`
+    # crate. It feeds `Board::validate` and the generated linker script's
+    # headroom comment, so a stale mirror means the board validates against a
+    # budget nobody enforces and the linker script prints a headroom figure
+    # that is not the ratchet's. Nothing compared it until this check.
+    board_bytes = None
+    board = _read(BOARD_DEF)
+    if board is None:
+        failures.append(f"{BOARD_DEF.relative_to(ROOT)}: unreadable")
+    else:
+        board_kib = _const(board, "FIRMWARE_FLASH_BUDGET_KIB")
+        if board_kib is None:
+            failures.append(
+                f"{BOARD_DEF.relative_to(ROOT)}: FIRMWARE_FLASH_BUDGET_KIB not found, or "
+                f"written in a form this gate cannot evaluate. The mirror is read by "
+                f"`Board::validate` and the generated linker script; a mirror this gate "
+                f"cannot read is a second source of truth again"
+            )
+        else:
+            board_bytes = board_kib * 1024
+            if code_bytes is not None and board_bytes != code_bytes:
+                failures.append(
+                    f"budget disagreement: board_def.rs mirrors {board_bytes} B "
+                    f"(FIRMWARE_FLASH_BUDGET_KIB) while flashmap.rs owns {code_bytes} B "
+                    f"(FIRMWARE_FLASH_BUDGET_BYTES). Raise both in one step: "
+                    f"`python3 tests/scripts/raise_flash_budget.py <KiB> --reason \"...\"` "
+                    f"does it for you. A stale mirror is what this check was added for — "
+                    f"board_def.rs had drifted 1,536 vs 1,621 KiB while nothing read it"
+                )
 
     budget = code_bytes if code_bytes is not None else ci_bytes
 

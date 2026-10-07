@@ -259,7 +259,7 @@ _B_DEBUG_STRIP = Break(
 # variable and the window was a Rust literal, and nothing read both.
 _B_FLASH_BUDGET = Break(
     ".github/workflows/ci.yml",
-    "  FIRMWARE_FLASH_BUDGET_KIB: 1536",
+    "  FIRMWARE_FLASH_BUDGET_KIB: 1664",
     "  FIRMWARE_FLASH_BUDGET_KIB: 2200",
     "the flash-budget ratchet is raised to 2,200 KiB — past the 2,048 KiB "
     "growth boundary, so an image the ratchet accepts could link over the "
@@ -347,53 +347,44 @@ _B_BOOT_CHAIN = Break(
 
 _B_SIZE_REPORT = Break(
     "docs/size-report.md",
-    # Re-nominated FOUR times, and the recurrence is the finding:
+    # Re-nominated SIX times, and the recurrence is the finding:
     #   1. 2026-09-29 (US-1080) — the anchor tracked a measured figure and had
     #      rotted through earlier re-measurements.
     #   2. 2026-09-29 (I-1/I-4/US-1008/US-1083 fix pass) — it rotted AGAIN,
     #      because that pass re-measured the report (+8 B text, +8 B .bss).
-    #   3. 2026-09-29 (US-1010, the MAX_PARTS fix) — re-measured again
-    #      (text 811,976 → 811,956, bss unchanged).
-    #   4. 2026-09-29 (US-1010, the RAM-gating pass) — the anchor MOVED, not
-    #      because a number rotted but because the headline text line it
-    #      pointed at was replaced by a *generated block*, which is what
-    #      fixes the recurrence for good (see below).
+    #   3. 2026-09-29 (US-1010, the MAX_PARTS fix) — re-measured again.
+    #   4. 2026-09-29 (US-1010, the RAM-gating pass) — the anchor MOVED: the
+    #      headline text line it pointed at was replaced by a generated block.
+    #   5. 2026-10-02 (falsifiability audit F3) — rotted again for reason 1.
+    #   6. 2026-10-07 — rotted a fifth time (doc `.text` row 766,400 -> 794,772)
+    #      after two re-baselines in two days, which is what finally made the
+    #      recurrence intolerable rather than merely annoying.
     #
-    # US-1010 also fixed the underlying problem for the **interior**: the
-    # per-section table and the summary are now delimited
-    # (`<!-- BEGIN measured ELF sections -->`) and `check_size_report.py`
-    # regenerates them from the ELF and fails on any difference. A stale
-    # interior is now a FAIL rather than something a reader has to notice.
-    # So this break no longer needs the headline line *or* a hand-copied
-    # figure: it perturbs one number **inside the generated block**, which is
-    # precisely the class of edit that used to pass silently.
+    # The fix for the recurrence is not a better anchor, it is this break
+    # pointing at a number that CANNOT move: `.start_block` is 20 bytes at
+    # `0x10000114` on every RP2350 image, so the row is a property of the
+    # image format rather than of this build. Perturbing its size is still
+    # exactly the defect class the gate exists to catch — a wrong number
+    # inside the generated block, which used to pass silently when the
+    # interior was hand-copied — and the anchor no longer rots when the
+    # build's real measurements move.
     #
-    # The recurrence cost is still real and still recurring for the *headline*
-    # line, and is still not fixed here: `Break` is a literal string-replace
-    # with an "exactly one occurrence" anchor, and the thing this break needs
-    # to perturb is by definition a measured number. Making the anchor a regex
-    # would relax the "matches exactly one place" discipline every other break
-    # relies on, and `Break` has no way to express "same line, different
-    # number" without it. That is a Phase 5 (US-1040/US-1041) change to a
-    # mutation harness, not a drive-by edit inside a fix pass — and a wrong
-    # edit here is a gate weakening, which is the one outcome to avoid.
-    # Re-nominating is the honest cost; the harness says so out loud rather
-    # than passing quietly.
-    #
-    # 5. 2026-10-02 (falsifiability audit F3) — the fifth re-nomination, for
-    #    the same reason as 1-4 and with the same lesson: the anchor tracks a
-    #    *measured* number, and `84e38e7`/`0efed50`/`1b12d8e` re-stamped
-    #    `docs/size-report.md` three times (boot-phase LED: text 817,984 ->
-    #    818,376 B), moving the `.text` row out from under it. Re-stamping the
-    #    report and re-nominating the anchor are the same chore for the same
-    #    reason, which is the recurrence this comment exists to keep visible.
-    "| `.text` | 766,400 | `0x10000200` | no (flash) |",
-    "| `.text` | 766,401 | `0x10000200` | no (flash) |",
-    "the generated ELF section table in docs/size-report.md is one byte out — "
-    "the interior was hand-copied and re-measured without the headline, so the "
-    "gate passed over a stale detail. The report is the RAM/flash argument; a "
-    "detail that under-states growth is the same class as a gate that "
-    "under-measures (US-392/US-957/US-1010)",
+    # count=2 because the document carries two copies of the row: the live
+    # generated block and the historical table kept under "Current artifact"
+    # (whose generator delimiters were removed on 2026-10-07 so that only one
+    # block is generated). Both are perturbed; the gate validates the live one,
+    # which is the one that must go red.
+    "| `.start_block` | 20 | `0x10000114` | no (flash) |",
+    "| `.start_block` | 21 | `0x10000114` | no (flash) |",
+    "a number inside the generated ELF section table in docs/size-report.md is "
+    "one byte out — the interior was hand-copied and re-measured without the "
+    "headline, so the gate passed over a stale detail. The report is the "
+    "RAM/flash argument; a detail that under-states growth is the same class as "
+    "a gate that under-measures (US-392/US-957/US-1010). This break is checked "
+    "by `check_size_report.py --check-doc`, which is the mode the document "
+    "equality moved to on 2026-10-07 — it is no longer on the pull-request "
+    "path, where it cost every codegen change a hand-edit.",
+    count=2,
 )
 
 _B_RNG_PATH = Break(
@@ -666,8 +657,16 @@ GATES: tuple[Gate, ...] = (
     ),
     Gate(
         "check_size_report.py",
+        # `--check-doc` since 2026-10-07: the document-equality half moved off
+        # the pull-request path (it cost every codegen change a hand-edit of a
+        # 3,400-line file) and behind this flag, which the release refresh and
+        # this harness invoke. The break below is the document-equality defect;
+        # the default mode's own defect (a ceiling exceeded) cannot be
+        # nominated, because reproducing it needs +58 KB of bss or +2.8 MB of
+        # text — neither is a one-line edit.
+        argv=("--check-doc",),
         breaks=(_B_SIZE_REPORT,),
-        note="doc-agreement over a rebuilt ELF (needs a build)",
+        note="doc-equality over a rebuilt ELF (needs a build), behind --check-doc",
     ),
     Gate(
         "check_rng_path.py",
@@ -1328,6 +1327,53 @@ def _glob(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(path, pattern)
 
 
+def _workflow_inputs(on: dict) -> dict:
+    """The `inputs.*` context for a dispatched run, from the workflow itself.
+
+    Derived rather than hardcoded, and coerced by the declared `type`, because
+    both halves of this have been wrong in this class of code before:
+
+    * `release.yml` guards its publish steps with `inputs.dry_run != true`. A
+      simulator with no value for `inputs.dry_run` refuses to guess, which is
+      the correct refusal — but it left the whole reachability check unable to
+      run. The workflow's own declaration supplies the answer:
+      `type: boolean`, `default: true` (its documented DEFAULT TRUE).
+    * The comparison is against the `true` **literal**, so a `type: boolean`
+      input must model as a Python bool. Modelling it as the string 'true'
+      would make `'true' != True` — true — and turn every `!= true` guard into
+      "always runs", the exact false-reachable result this check exists to
+      prevent.
+    """
+    out: dict = {}
+    for event in ("workflow_dispatch", "workflow_call"):
+        block = on.get(event)
+        if not isinstance(block, dict):
+            continue
+        for name, spec in (block.get("inputs") or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            raw = spec.get("default")
+            typ = spec.get("type")
+            if typ == "boolean":
+                out[f"inputs.{name}"] = (
+                    raw if isinstance(raw, bool) else str(raw).lower() == "true"
+                )
+            elif typ == "number":
+                try:
+                    out[f"inputs.{name}"] = float(raw)
+                except (TypeError, ValueError):
+                    raise WorkflowError(
+                        f"input `{name}` is declared `type: number` with default "
+                        f"{raw!r}, which is not a number; the simulator will not "
+                        f"guess what a dispatch would pass"
+                    )
+            else:
+                # A string input with no default is unset in the simulated
+                # dispatch, which GitHub renders as the empty string.
+                out[f"inputs.{name}"] = "" if raw is None else str(raw)
+    return out
+
+
 def collect_steps(changed: set[str], ctx: dict) -> tuple[list[Step], list[str]]:
     """Parse every workflow and return (steps that would run, notes)."""
     if not WORKFLOW_DIR.is_dir():
@@ -1367,13 +1413,17 @@ def collect_steps(changed: set[str], ctx: dict) -> tuple[list[Step], list[str]]:
         if ignore is not None and all(_glob(p, pat) for p in changed for pat in ignore):
             notes.append(f"{path.name}: not triggered — `on.paths-ignore` covers this change set")
             continue
+        # `inputs.*` comes from this workflow's own declarations (see
+        # _workflow_inputs): a dispatch run takes the declared defaults, and a
+        # condition the simulator cannot resolve is a refusal, not a guess.
+        wf_ctx = dict(ctx, _failed=False, **_workflow_inputs(on))
         for jname, job in jobs.items():
-            if not eval_condition(job.get("if"), dict(ctx, _failed=False)):
+            if not eval_condition(job.get("if"), dict(wf_ctx)):
                 notes.append(f"{path.name}:{jname}: job skipped by if: {job.get('if')}")
                 continue
             for st in job.get("steps") or []:
                 cond = st.get("if")
-                if not eval_condition(cond, dict(ctx, _failed=False)):
+                if not eval_condition(cond, dict(wf_ctx)):
                     notes.append(
                         f"{path.name}:{jname}/{st.get('name')}: step skipped by if: {cond}"
                     )
@@ -1470,15 +1520,28 @@ def check_ram_ceiling_is_derived_and_biting() -> list[str]:
     this harness exists to catch):
 
     1. **Derived, not invented.** ``RAM_CEILING`` must be the board's SRAM
-       minus the stack ceiling the other gate enforces, taken from the same two
-       sources. A round number chosen for looks would pass the healthy build
-       and mean nothing.
-    2. **Biting.** The `bss` figure the rejected 32-entry secure store
-       actually produced must exceed it. That build is recorded in
-       ``docs/known-gate-divergences.md`` SF-1 as +36,288 B of bss on a
-       freshly nuked flash: it booted nowhere, and the only reason it was found
-       was that a human flashed it. A ceiling that would have passed that
-       build is not a ceiling.
+       minus the stack ceiling the other gate enforces. The SRAM figure is read
+       from ``platform/board_def.rs`` — the source ``memory.x`` is generated
+       *from* — rather than from the generated file, because this check runs in
+       the fast, no-device-build half of the harness, where `target/` does not
+       exist. A round number chosen for looks would pass the healthy build and
+       mean nothing.
+    2. **Biting.** The `bss` figure the rejected 32-entry secure store actually
+       produced must exceed it. That build is recorded in
+       ``docs/known-gate-divergences.md`` SF-1 as +36,288 B of bss on a freshly
+       nuked flash: it booted nowhere, and the only reason it was found was
+       that a human flashed it. A ceiling that would have passed that build is
+       not a ceiling.
+
+    A third assertion used to live here — that the ceiling left no more than
+    40,000 B of headroom over the bss recorded in ``docs/size-report.md``.
+    It was removed on 2026-10-07 and the removal is the point: it was a
+    hand-written threshold *about* a measured figure, so it went red on a
+    healthy tree when `.bss` shrank (58,360 B of headroom by then) and said
+    nothing about whether the ceiling still bites. Property 2 is the assertion
+    that actually encodes "the ceiling would have caught SF-1", and it cannot
+    rot because it compares two recorded constants from that incident rather
+    than today's measurement.
     """
     failures: list[str] = []
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -1487,11 +1550,11 @@ def check_ram_ceiling_is_derived_and_biting() -> list[str]:
     except Exception as exc:  # noqa: BLE001 — a refusal to guess is a FAIL
         return [f"check_size_report.py would not import: {exc!r}"]
 
-    ram_origin, ram_total, _script = csr.ram_bytes()
+    ram_origin, ram_total = _board_ram()
     ceiling = ram_total - csr.CHAIN_CEILING
     if ram_origin != 0x2000_0000:
         failures.append(
-            f"the generated memory.x puts RAM at {ram_origin:#010x}; the RP2350 map is "
+            f"platform/board_def.rs puts RAM at {ram_origin:#010x}; the RP2350 map is "
             f"contiguous from 0x20000000 on every part in this family, so a different "
             f"origin means this check's model of the address map is wrong"
         )
@@ -1520,28 +1583,35 @@ def check_ram_ceiling_is_derived_and_biting() -> list[str]:
             f"the regression it was added for — tighten it or record why the 24-entry tip's "
             f"bss figure is wrong."
         )
-
-    # …and the current build must actually sit inside it, with the headroom
-    # the PASS line claims.
-    current_bss = None
-    doc = REPO_ROOT / "docs" / "size-report.md"
-    if doc.exists():
-        m = _re.search(r"\*\*`\.bss` = ([\d,]+) B\*\*", doc.read_text(encoding="utf-8"))
-        if m:
-            current_bss = int(m.group(1).replace(",", ""))
-    if current_bss is not None:
-        if current_bss > ceiling:
-            failures.append(
-                f"docs/size-report.md records bss {current_bss} B, already over the derived "
-                f"ceiling {ceiling} B — check_size_report.py would be failing on this tree"
-            )
-        elif ceiling - current_bss > 40_000:
-            failures.append(
-                f"the RAM ceiling leaves {ceiling - current_bss} B of headroom over the "
-                f"recorded bss — that is a gate with nothing to say, not a ratchet. "
-                f"check_size_report.py's own PASS line prints the figure; keep them in step."
-            )
     return failures
+
+
+def _board_ram() -> tuple[int, int]:
+    """`(RAM_ORIGIN, RAM_SIZE_BYTES)` out of `platform/board_def.rs`.
+
+    Read from the Rust source, not from the generated `memory.x`: this check
+    runs in the no-device-build half of the harness, and `memory.x` only exists
+    under `target/` after a device build. `board_def.rs` is the file that
+    *generates* it (`render_memory_x`), so it is the same number one step
+    earlier, and it is always in the tree.
+    """
+    src = REPO_ROOT / "platform" / "board_def.rs"
+    if not src.is_file():
+        raise WorkflowError(f"{src} is missing; the RAM model has no source")
+    text = src.read_text(encoding="utf-8")
+    origin = _re.search(r"pub const RAM_ORIGIN:\s*u32\s*=\s*(0x[0-9a-fA-F_]+)\s*;", text)
+    size = _re.search(
+        r"pub const RAM_SIZE_BYTES:\s*u32\s*=\s*([0-9_]+)\s*\*\s*(1024|1024\s*\*\s*1024)\s*;",
+        text,
+    )
+    if not origin or not size:
+        raise WorkflowError(
+            "platform/board_def.rs no longer declares RAM_ORIGIN and "
+            "RAM_SIZE_BYTES in the shape this check parses; re-derive it rather "
+            "than letting the RAM ceiling go unchecked"
+        )
+    mult = 1024 if "*" not in size.group(2) else 1024 * 1024
+    return int(origin.group(1).replace("_", ""), 16), int(size.group(1).replace("_", "")) * mult
 
 
 def check_repro_ratchet_wired() -> list[str]:
