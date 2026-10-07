@@ -1,0 +1,94 @@
+# Gate falsifiability — the mutation half (US-1040/US-1041; wired 2026-10-07).
+#
+# WHY THIS IS A SEPARATE WORKFLOW
+# ---------------------------------------------------------------------------
+# `tests/scripts/test_gates.py` runs every gate twice on a copy of the tree:
+# once as-is (must be green) and once with a nominated defect (must go red).
+# That second run is the only evidence that a gate *bites* rather than merely
+# existing, and it is the thing that catches a gate which has quietly stopped
+# looking at anything.
+#
+# It also costs cold builds — several gates rebuild the device ELF, others run
+# `cargo test` — so it cannot sit on every pull request. What it must not do is
+# sit on nothing, which is the state it was in until this workflow: referenced
+# by no step anywhere, holding two anchors that had rotted (the harness said so
+# out loud the first time anyone ran it). "A gate that nothing runs is not a
+# gate" is this repository's own rule, and it applied to the harness itself.
+#
+# The fast structural half (`--workflows-only`: docs-only reachability, the
+# US-1043 ratchet wiring, the US-1010 RAM ceiling) runs unconditionally in
+# ci.yml's `gates` job, where it costs about a second and needs no toolchain.
+#
+# WHY `push` AND NOT A SCHEDULE
+# ---------------------------------------------------------------------------
+# GitHub disables scheduled workflows after 60 days of repository inactivity,
+# so a falsifiability check on a cron can stop running silently — precisely the
+# failure mode this workflow exists to end. A push trigger with `paths:` runs
+# it exactly when the things it tests can have changed (a gate script, or a
+# workflow whose wiring the simulator models), and `workflow_dispatch` is the
+# manual override.
+#
+# It is deliberately NOT branch-filtered to main: a branch pushed to this
+# repository that edits a gate script is exactly when the harness is worth
+# running, and gating it to main would mean learning about a broken break only
+# after the merge. (A fork's PR branch lives in the fork, so a fork PR does not
+# trigger this workflow; the gates themselves still run for it through ci.yml,
+# where the fast structural half of the harness also runs.)
+#
+# RESIDUAL RISK
+# ---------------------------------------------------------------------------
+# A gate can rot without its own file changing — the document or the workflow
+# it reads can move instead. That case is not covered here and is not claimed
+# to be: the anchors are chosen so that the inputs they depend on are either
+# in the gate script or a format constant (see `_B_SIZE_REPORT`), and a rot
+# that needs a different file is caught the next time this job runs. The
+# alternative — running the mutation table on every PR — buys that coverage at
+# the price of the minutes this workflow exists to keep off the PR path.
+name: Gates (mutation)
+
+on:
+  push:
+    paths:
+      - 'tests/scripts/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+# Same least-privilege posture as ci.yml: this workflow executes repository
+# code, so the token it hands every job is read-only.
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    name: gate mutation harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fapico2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: fapico2
+      # The pinned toolchain from rust-toolchain.toml, with no channel argument
+      # (naming `stable` installs components on a toolchain cargo does not
+      # select — the defect ci.yml's setup steps document at length).
+      - name: Set up Rust (pinned by rust-toolchain.toml)
+        working-directory: fapico2
+        run: rustup toolchain install --profile minimal --no-self-update
+      - name: Add RP2350 target + ARM ELF linker
+        run: |
+          rustup target add thumbv8m.main-none-eabi
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+      # Several gates build the device ELF inside their own copy of the tree
+      # (`check_boot_chain`, `check_async_frame`, `check_size_report`), and the
+      # harness deliberately gives each gate its own target directory so one
+      # gate's build cannot leak into the next gate's baseline. This step
+      # therefore only warms the cargo registry and fails fast on a tree that
+      # does not build at all.
+      - name: Warm the build (and fail fast on a broken tree)
+        working-directory: fapico2
+        run: cargo build --release --target thumbv8m.main-none-eabi
+      - name: "Mutation harness — every gate run twice, once with a nominated defect"
+        working-directory: fapico2
+        run: python3 tests/scripts/test_gates.py

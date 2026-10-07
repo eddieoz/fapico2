@@ -106,12 +106,21 @@ pub const TRUSSED_FS_KB: u32 = 1024;
 /// print the headroom it leaves.
 ///
 /// **This is a mirror, not the source of truth** — `platform::flashmap` owns
-/// `FIRMWARE_FLASH_BUDGET_BYTES` and `tests/scripts/check_flash_budget.py`
-/// (US-1534) fails the build if the two disagree. It is here because this file
-/// is compiled into both build scripts without the `platform` crate, so it
-/// cannot import the constant. A comment in a generated linker script is a
-/// cheap thing to be approximate about; the gate is not.
-pub const FIRMWARE_FLASH_BUDGET_KIB: u32 = 1536;
+/// `FIRMWARE_FLASH_BUDGET_BYTES`, and `tests/scripts/check_flash_budget.py`
+/// compares all three copies (this one included, since 2026-10-07). It is here
+/// because this file is compiled into both build scripts without the `platform`
+/// crate, so it cannot import the constant.
+///
+/// That gate is not decoration, and this comment used to claim a check existed
+/// while it did not: the constant is read by `Board::validate` and printed into
+/// the generated linker script, **nothing compared it to the other two
+/// copies**, and it had drifted — 1,536 KiB here against 1,621 KiB in `ci.yml`
+/// and `flashmap.rs`. A budget nobody enforced, and a headroom figure that was
+/// not the ratchet's. Raise it with
+/// `python3 tests/scripts/raise_flash_budget.py <KiB> --reason "..."`, which
+/// moves every copy in one step instead of leaving the next reader to find
+/// them one red at a time.
+pub const FIRMWARE_FLASH_BUDGET_KIB: u32 = 1664;
 
 /// The reserved secure-partition region, in KiB, at the **top** of flash.
 ///
