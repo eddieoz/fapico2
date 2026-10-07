@@ -34,6 +34,14 @@ Begin. **Newer libfido2 that honours the `credMgmt` getInfo option sends
 `0x0A`**, which this firmware has always served, so the `0x41` path is only
 reached by 1.14.x-era clients (Ubuntu's OpenSSH links it).
 
+**Triage note — "invalid format" is not always the routing defect.** With the
+fix in place, `ssh-keygen -K` succeeds (PIN; no touch). But `ssh-keygen -Y
+sign` / `ssh -O verify-required` require a **touch**, and without it the device
+answers `0x2D KEEPALIVE_CANCEL`, which OpenSSH maps to the *same*
+`SSH_ERR_INVALID_FORMAT` string as the pre-fix routing failure. So "invalid
+format" on the *sign* path means "no touch", not "misrouted credMgmt" — the
+download path is the one the `0x41` routing defect broke.
+
 ## OpenPGP factory reset: the client's retry loop is shorter than this card's counter
 
 Ten wrong VERIFYs of `00000000` then `00 E6 00 00` + `00 44 00 00`, breaking on
