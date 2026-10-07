@@ -59,9 +59,48 @@ print(CredentialManagement.CMD.__members__)   # GET_CREDS_METADATA=0x01, ENUMERA
 print(CredentialManagement.RESULT.__members__) # RP=0x03, RP_ID_HASH=0x04, TOTAL_RPS=0x05, USER=0x06 ...
 ```
 
-Note the sub-commands use the **CTAP 2.0** order (metadata first), and the
-response keys are **not** the spec's `rp=1, rpID=2, totalRps=7`. This "PicoForge
-dialect" is what Yubico's library speaks.
+Note the sub-commands use the **CTAP 2.0 preview** order (metadata first) and
+the response keys are `rp=3, rpIDHash=4, totalRPs=5` for the RP enumeration and
+`user=6, credentialID=7, publicKey=8, totalCredentials=9, credProtect=0x0A,
+largeBlobKey=0x0B` for credentials. That is the CTAP 2.0 **preview draft**
+dialect — not a PicoForge invention — and libfido2 1.14.0's parsers read
+exactly those keys.
+
+#### credMgmt: one preview dialect, two command bytes
+
+The "PicoForge dialect" is the CTAP2 preview-draft dialect, and its speakers
+are the clients that matter:
+
+| client | command byte | why |
+|---|---|---|
+| python-fido2 2.2.1 (`ykman`, Yubico Authenticator, browsers) | `0x0A` | `base.py` picks `0x0A` when getInfo advertises `credMgmt: true` |
+| PicoForge | `0x0A` | its own `CredentialManagement` opcode |
+| libfido2 1.14.0 → OpenSSH `ssh-keygen -K` | **`0x41`** | `credman_tx` hard-codes `CTAP_CBOR_CRED_MGMT_PRE`; **no `0x0A` fallback in 1.14.0** |
+
+**`0x41` is dual-homed with the RS-Key vendor channel by design.** libfido2's
+credMgmt request and an RS-Key request are the same CBOR shape
+(`{1: subCommand, 2: params?, 3: pinUvAuthProtocol, 4: pinUvAuthParam}`) with
+overlapping sub-command numbers, so the payload's first byte cannot
+discriminate. The discriminator is the **signed message**:
+`vendor41::handle` verifies `0xFF×32 ‖ 0x41 ‖ sub ‖ params`, credMgmt verifies
+`sub ‖ params`; the two are disjoint, so at most one verifies. The
+unauthenticated `enumerate…GetNext` pair (`{1: 0x03}` / `{1: 0x05}`, identical
+in every dialect) is routed by the enumeration already pending on the channel.
+`device_core::cred_mgmt_preview_route` holds the decision for both twins.
+
+The sub-command **numbering is the same in both dialects** — CTAP 2.1 §6.8.2
+final, python-fido2, PicoForge and libfido2 all number `getCredsMetadata 0x01`
+and `enumerateRPsBegin 0x02` (US-1625 corrected a firmware inversion that had
+made the CTAP2-classified `0x01` dispatch to `enumerateRPsBegin`). A
+`CmDialect::Ctap2` response branch still exists for the CTAP 2.1 **final**
+response keys (`rp=1, rpIDHash=2, totalRPs=3`; US-1626 corrected its
+`totalRPs` from a chimera `7` to `3`), but no live client reaches it —
+everyone classifies as preview and reads `3/4/5`.
+
+Do **not** add the CTAP 2.1 `0xFF×32 ‖ 0x0A`-prefixed MAC form to credMgmt:
+every live client signs unprefixed (`docs/known-gate-divergences.md`, US-121).
+A future client that did prefix would be a third form with its own keys —
+argued in writing if it ever appears, per §5.
 
 ### 3. Host apps read `DeviceInfo` over three interfaces, independently.
 

@@ -2989,8 +2989,10 @@ const LB_CHECKSUM_LEN: usize = 16;
 /// * **CTAP2** — what every third-party client speaks (ykman, Yubico
 ///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
 ///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
-///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
-///   getCredsMetadata — the *reverse* of PicoForge's.
+///   `0x06` user. Sub-commands `0x01`/`0x02` are getCredsMetadata /
+///   enumerateRpsBegin — **the same numbering as PicoForge's** (US-1625; both
+///   follow CTAP 2.1 §6.8.2). The old claim that CTAP2 reversed them was
+///   false, and the `CM_*` constants that encoded it have been corrected.
 ///
 /// The two are told apart by the CBOR type at the low keys: PicoForge puts a
 /// map at `0x02` and an integer at `0x03`, CTAP2 puts an integer at `0x02`
@@ -3011,11 +3013,21 @@ pub(crate) enum CmDialect {
 
 /// Canonical credMgmt sub-command identity, independent of the wire dialect.
 ///
-/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
-/// parser maps a PicoForge wire value onto these before anything downstream
-/// looks at it, so the dispatch arms need no dialect branches.
-const CM_GET_METADATA: u8 = 0x02;
-const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+/// These are the CTAP 2.1 §6.8.2 values, and **every real client agrees with
+/// them**: python-fido2 (`GET_CREDS_METADATA = 0x01`), PicoForge
+/// (`CredentialMgmtSubCommand::GetCredsMetadata = 0x01`,
+/// `picoforge/src/hal/fido/constants.rs:225-227`) and libfido2 1.14.0
+/// (`CMD_CRED_METADATA 0x01`, `src/credman.c`). There is no dialect that
+/// swaps the first two — the remap below is therefore the identity, and it is
+/// kept only because a third dialect is conceivable.
+///
+/// **US-1624/1625:** these were `0x02`/`0x01` — inverted — which made a
+/// CTAP2-classified `0x01` (the flat layout every third-party client sends)
+/// dispatch to enumerateRPsBegin. The tests in `credmgmt_ctap2_spec.rs` had
+/// encoded the inversion too, so the suite was green against the wrong
+/// behaviour.
+const CM_GET_METADATA: u8 = 0x01;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
@@ -3058,6 +3070,52 @@ fn cm_dialect(data: &[u8]) -> CmDialect {
         }
     }
     CmDialect::Ctap2
+}
+
+/// US-1617 — the `0x41` discriminator: should this request be answered by the
+/// credential manager (whose responses come out in the PicoForge/preview
+/// keys libfido2 parses) or by the RS-Key vendor channel?
+///
+/// libfido2 1.14.0's `credman_tx` transmits **every** credential-management
+/// operation under the hard-coded command byte `CTAP_CBOR_CRED_MGMT_PRE`
+/// (`0x41`) — no `0x0A` fallback exists in that release — and its request map
+/// is the same CBOR shape the RS-Key vendor channel defines
+/// (`{1: subCommand, 2: params?, 3: pinUvAuthProtocol, 4: pinUvAuthParam}`).
+/// The sub-command numbers overlap too. So the payload's first byte cannot
+/// discriminate; the two **MAC scopes** can, because they sign disjoint
+/// messages (at most one verifies), and the unauthenticated `Next` pair is
+/// resolved by the enumeration state already pending on this channel.
+///
+/// The three branches, in order:
+///
+/// 1. **Authenticated preview request** — the MAC verifies under the preview
+///    scope (`subCommand ‖ cbor(params)`, no `0xFF×32` prefix). Route to
+///    credMgmt. A vendor request cannot land here.
+/// 2. **A MAC-bearing request that did not verify in preview scope** belongs
+///    to vendor41, which verifies the vendor scope (`0xFF×32 ‖ 0x41 ‖ …`) or
+///    refuses. Checked before the latch so a genuine vendor sub-command is
+///    never captured by a pending preview enumeration.
+/// 3. **No MAC** — the `enumerate…GetNext` pair (`{1: 0x03}` / `{1: 0x05}`,
+///    identical in both protocols) continues whatever enumeration is pending
+///    on this channel. The pending state *is* the latch. A cold request with
+///    no pending enumeration keeps today's vendor41 answer.
+pub(crate) fn cred_mgmt_preview_route(
+    data: &[u8],
+    token: Option<&[u8; 32]>,
+    rp_next_on_channel: bool,
+    cred_next_on_channel: bool,
+) -> bool {
+    if token.is_some() && crate::vendor41::preview_authenticates(data, token) {
+        return true;
+    }
+    if crate::vendor41::has_pin_uv_auth_param(data) {
+        return false;
+    }
+    match crate::vendor41::subcommand_byte(data) {
+        Some(0x03) => rp_next_on_channel,
+        Some(0x05) => cred_next_on_channel,
+        _ => false,
+    }
 }
 
 impl FidoApp {
@@ -3369,11 +3427,13 @@ impl FidoApp {
             return Err(err(Ctap2Response::MissingParameter));
         }
 
-        // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
-        // CTAP2 numbers them the other way round. Everything below works in
-        // the canonical CTAP2 numbering, so PicoForge's pair is swapped here
-        // and nowhere else. `wire_subcommand` — not this value — is what goes
-        // into the pinUvAuth message, in both dialects.
+        // Both dialects use the CTAP 2.1 §6.8.2 numbering — getCredsMetadata
+// 0x01, enumerateRpsBegin 0x02 — so the canonical identity is the wire
+// value in both. This match is kept (and is now the identity) only so a
+// future dialect with a genuine swap has a single place to land; the old
+// PicoForge-vs-CTAP2 inversion was false (US-1625). `wire_subcommand` —
+// not this value — is what goes into the pinUvAuth message, in both
+// dialects.
         let subcommand = match (dialect, wire_subcommand) {
             (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
             (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,
@@ -3572,10 +3632,12 @@ impl FidoApp {
                 let rp_str =
                     core::str::from_utf8(rp_id.as_slice()).map_err(|_| err(Ctap2Response::InvalidCbor))?;
                 match self.cm_dialect {
-                    // CTAP2 §12.1.6: rp(1) ‖ rpID(2) ‖ totalRPs(7). A client
-                    // that cannot find keys 1/2/7 has nothing to render,
-                    // which is what left the Slots and Passkeys screens
-                    // spinning forever.
+                    // CTAP 2.1 §6.8.2 final: rp(1) ‖ rpIDHash(2) ‖ totalRPs(3).
+                    // US-1626 corrects `totalRPs` from 7 (a chimera — the
+                    // preview draft puts it at 5, the final spec at 3; nothing
+                    // puts it at 7) to the final value. No live client reaches
+                    // this branch: python-fido2, PicoForge and libfido2 all
+                    // classify as PicoForge and read 3/4/5.
                     CmDialect::Ctap2 => {
                         no_heap::push_map_header(out, 3).ok();
                         no_heap::push_uint(out, 1).ok();
@@ -3584,7 +3646,7 @@ impl FidoApp {
                         no_heap::push_tstr(out, rp_str).ok();
                         no_heap::push_uint(out, 2).ok();
                         no_heap::push_bstr(out, &hash).ok();
-                        no_heap::push_uint(out, 7).ok();
+                        no_heap::push_uint(out, 3).ok();
                         no_heap::push_uint(out, total as u64).ok();
                     }
                     // PicoForge: rp(3) ‖ rpIdHash(4) ‖ totalRps(5), byte for

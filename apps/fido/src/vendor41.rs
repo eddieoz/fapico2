@@ -3039,6 +3039,32 @@ pub fn verify_mac<'a>(
     data: &'a [u8],
     token: Option<&[u8; 32]>,
 ) -> Result<&'a [u8], Ctap2Response> {
+    verify_mac_scope(data, token, MacScope::Vendor)
+}
+
+/// Which message the `pinUvAuthParam` is expected to be an HMAC over.
+///
+/// The two scopes sign **disjoint** messages, so for a given token at most
+/// one of them can verify — that is what makes the `0x41` discriminator
+/// (EPIC `FIDO-SSH-RESIDENT-KEYS`, US-1617) a decision rather than a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacScope {
+    /// The RS-Key vendor scope this module defines:
+    /// `HMAC(token, 0xFF×32 ‖ 0x41 ‖ subCommand ‖ cbor(params))`, protocol 1.
+    Vendor,
+    /// The CTAP2 **preview** credMgmt scope, spoken by libfido2 1.14.0's
+    /// `credman_tx` and python-fido2's `CredentialManagement._call`:
+    /// `HMAC(token, subCommand ‖ cbor(params))` — no `0xFF×32` prefix.
+    /// Protocols 1 and 2 are accepted.
+    Preview,
+}
+
+/// [`verify_mac`] generalised over the signed-message [`MacScope`].
+fn verify_mac_scope<'a>(
+    data: &'a [u8],
+    token: Option<&[u8; 32]>,
+    scope: MacScope,
+) -> Result<&'a [u8], Ctap2Response> {
     // The params are never copied: only their span in `data` is recorded, and
     // the span is handed back. The two fixed buffers left are the param (the
     // vault uses 64 for the same thing in `vendor_vault_inner`) and the
@@ -3148,8 +3174,18 @@ pub fn verify_mac<'a>(
     // senders in this protocol hard-code `1`, so nothing in practice hits it.
     // (A request with no key 3 at all is protocol 1, which is what an
     // unauthenticated request from this client looks like anyway.)
-    if protocol != 1 {
-        return Err(Ctap2Response::InvalidParameter);
+    //
+    // The preview scope accepts protocol 2 as well: libfido2 1.14 sends
+    // protocol 1, but CTAP 2.1 §6.5.7's credMgmt operations are defined for
+    // both and python-fido2 may negotiate either.
+    match scope {
+        MacScope::Vendor if protocol != 1 => {
+            return Err(Ctap2Response::InvalidParameter);
+        }
+        MacScope::Preview if protocol != 1 && protocol != 2 => {
+            return Err(Ctap2Response::InvalidParameter);
+        }
+        _ => {}
     }
 
     // The rest of the order is deliberate too. The protocol check above runs
@@ -3188,15 +3224,25 @@ pub fn verify_mac<'a>(
     // main frame: measured at +2008 B of reservation, with `check_async_frame`
     // unchanged at 9216 B.
     let mut msg: HeaplessVec<u8, 2200> = HeaplessVec::new();
-    for _ in 0..32 {
-        msg.push(0xFF).map_err(|_| Ctap2Response::InvalidLength)?;
+    match scope {
+        // Vendor: `0xFF×32 ‖ 0x41 ‖ subCommand ‖ params`.
+        MacScope::Vendor => {
+            for _ in 0..32 {
+                msg.push(0xFF).map_err(|_| Ctap2Response::InvalidLength)?;
+            }
+            msg.extend_from_slice(&[CMD, sub.byte()])
+                .map_err(|_| Ctap2Response::InvalidLength)?;
+        }
+        // Preview: `subCommand ‖ params` — no null-authenticator-data prefix.
+        MacScope::Preview => {
+            msg.push(sub.byte())
+                .map_err(|_| Ctap2Response::InvalidLength)?;
+        }
     }
-    msg.extend_from_slice(&[CMD, sub.byte()])
-        .map_err(|_| Ctap2Response::InvalidLength)?;
     msg.extend_from_slice(params)
         .map_err(|_| Ctap2Response::InvalidLength)?;
 
-    if !crypto::pin_verify_auth(1, token, &msg, &mac) {
+    if !crypto::pin_verify_auth(protocol as u8, token, &msg, &mac) {
         return Err(Ctap2Response::PinAuthInvalid);
     }
 
@@ -3209,6 +3255,44 @@ pub fn verify_mac<'a>(
         Some((start, end)) => &data[start..end],
         None => &[],
     })
+}
+
+/// US-1617 — does this `0x41` request authenticate under the credMgmt
+/// **preview** scope? `false` when there is no MAC, no token, or the MAC
+/// names the vendor scope instead. The vendor scope signs a disjoint message,
+/// so a `true` here means the request cannot be a vendor request.
+pub fn preview_authenticates(data: &[u8], token: Option<&[u8; 32]>) -> bool {
+    verify_mac_scope(data, token, MacScope::Preview).is_ok()
+}
+
+/// US-1617 — the raw wire sub-command byte (CBOR key 1) of a `0x41` request,
+/// when it names a sub-command this channel recognises. The preview router
+/// uses it to recognise the unauthenticated `enumerate…GetNext` pair
+/// (`0x03`/`0x05`) whose bytes cannot name their own dialect.
+pub fn subcommand_byte(data: &[u8]) -> Option<u8> {
+    extract_subcommand(data).ok().map(|s| s.byte())
+}
+
+/// US-1617 — does the request carry `pinUvAuthParam` (CBOR key 4)? A
+/// MAC-bearing request that verifies under *neither* scope belongs to
+/// vendor41, which will answer it (or refuse it) on its own terms.
+pub fn has_pin_uv_auth_param(data: &[u8]) -> bool {
+    let mut p = Parser::new(data);
+    let Ok(Item::Map(n)) = p.next() else {
+        return false;
+    };
+    for _ in 0..n {
+        let Ok(k) = p.next() else {
+            return false;
+        };
+        if k == Item::U(4) {
+            return true;
+        }
+        if p.skip().is_err() {
+            return false;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

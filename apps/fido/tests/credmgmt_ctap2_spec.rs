@@ -32,9 +32,10 @@ use fapico2_fido::cbor::{self, Value};
 use fapico2_fido::crypto;
 use fapico2_fido::keystore::MemoryKeystore;
 
-// Sub-commands, CTAP2 numbering.
-const CTAP2_ENUMERATE_RPS_BEGIN: u8 = 0x01;
-const CTAP2_GET_CREDS_METADATA: u8 = 0x02;
+// Sub-commands, CTAP 2.1 §6.8.2 numbering (US-1625: the previous constants
+// here encoded an inversion that matched a bug in the implementation).
+const CTAP2_GET_CREDS_METADATA: u8 = 0x01;
+const CTAP2_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CTAP2_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CTAP2_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 
@@ -191,11 +192,12 @@ fn ctap2_request_is_not_rejected_as_invalid_cbor() {
     assert_eq!(resp[0], 0x00, "enumerateRPsBegin must succeed");
 }
 
-/// CTAP2 `0x01` is enumerateRPsBegin and `0x02` is getCredsMetadata — the
-/// reverse of PicoForge's numbering. Getting this backwards makes every
-/// spec client enumerate nothing.
+/// CTAP 2.1 §6.8.2 (US-1625): `0x01` is getCredsMetadata and `0x02` is
+/// enumerateRPsBegin — the numbering python-fido2, PicoForge and libfido2 all
+/// use, and the one this firmware now dispatches. Getting this backwards makes
+/// every spec client enumerate nothing.
 #[test]
-fn ctap2_subcommand_0x01_enumerates_and_0x02_reports_metadata() {
+fn ctap2_subcommand_0x01_reports_metadata_and_0x02_enumerates() {
     let (mut app, client) = setup();
     make_resident(&mut app, &client, "example.com");
     let token = client.get_token(&mut app, 0x09, Some(0x04), None).unwrap();
@@ -203,8 +205,8 @@ fn ctap2_subcommand_0x01_enumerates_and_0x02_reports_metadata() {
     let begin = app.process_ctap2(0x0A, &cm_req_ctap2(CTAP2_ENUMERATE_RPS_BEGIN, &token, &[]), [1, 2, 3, 4]);
     let begin = map_of(&begin);
     assert!(
-        has_key(&begin, 0x07),
-        "enumerateRPsBegin must report totalRps at key 0x07 (got keys {:?})",
+        has_key(&begin, 0x03),
+        "enumerateRPsBegin must report totalRps at key 0x03 (CTAP 2.1 §6.8.2 final; got keys {:?})",
         begin.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
     );
 
@@ -218,8 +220,8 @@ fn ctap2_subcommand_0x01_enumerates_and_0x02_reports_metadata() {
 }
 
 /// The RP listing must arrive under the keys a spec client reads: `rp` (1),
-/// `rpID` (2) and `totalRPs` (7). A client that finds none of them has
-/// nothing to draw, which is the hang.
+/// `rpIDHash` (2) and `totalRPs` (3) — CTAP 2.1 §6.8.2 final. A client that
+/// finds none of them has nothing to draw, which is the hang.
 #[test]
 fn ctap2_enumerate_rps_uses_spec_response_keys() {
     let (mut app, client) = setup();
@@ -244,16 +246,17 @@ fn ctap2_enumerate_rps_uses_spec_response_keys() {
         "rpID (key 0x02) must be the 32-byte SHA-256 of the RP id"
     );
     assert_eq!(
-        uint_at(&m, 0x07),
+        uint_at(&m, 0x03),
         Some(1),
-        "totalRps (key 0x07) must be 1 for a single resident credential"
+        "totalRPs (key 0x03) must be 1 for a single resident credential"
     );
 
-    // PicoForge's keys must NOT leak into a spec reply — they collide with
-    // spec meanings (0x03 is rpName, 0x04 is userID, 0x05 credentialID).
+    // PicoForge's keys must NOT leak into a spec reply. Key 0x03 collides
+    // (PicoForge rp, spec totalRPs) and is the spec totalRPs here; the
+    // PicoForge-only keys 0x04 (rpIDHash) and 0x05 (totalRps) must be absent.
     assert!(
-        !has_key(&m, 0x03) && !has_key(&m, 0x05),
-        "a CTAP2 reply must not carry PicoForge's 0x03/0x05 keys"
+        !has_key(&m, 0x04) && !has_key(&m, 0x05),
+        "a CTAP2 reply must not carry PicoForge's 0x04/0x05 keys"
     );
 }
 
@@ -342,7 +345,10 @@ fn dialect_discriminator_is_the_type_of_key_0x02() {
         has_key(&m, 0x03) && has_key(&m, 0x04) && has_key(&m, 0x05),
         "PicoForge must still be answered with its own 3/4/5 keys"
     );
-    assert!(!has_key(&m, 0x07), "PicoForge must not receive the spec's totalRps key");
+    assert!(
+        !has_key(&m, 0x01) && !has_key(&m, 0x02),
+        "PicoForge must not receive the spec's 0x01 (rp) / 0x02 (rpIDHash) keys"
+    );
 }
 
 /// `getPinUvAuthTokenUsingUvWithPermissions` (clientPIN sub-command `0x06`)
@@ -636,11 +642,11 @@ mod device_twin {
         /// credMgmt in CTAP2's flat layout — the request that used to be
         /// answered `INVALID_CBOR` on this exact path.
         fn enumerate_rps_begin(&mut self, token: &[u8]) -> Vec<u8> {
-            let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x01]);
+            let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x02]);
             let mut req: HV<u8, 64> = HV::new();
             nh::push_map_header(&mut req, 3).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
-            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 0x02).unwrap();
             nh::push_uint(&mut req, 2).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
             nh::push_uint(&mut req, 3).unwrap();
@@ -707,7 +713,7 @@ mod device_twin {
                         saw_rpid = true;
                     }
                 }
-                7 => {
+                3 => {
                     saw_total = matches!(p.next().unwrap(), Item::U(_));
                 }
                 _ => {
@@ -717,7 +723,67 @@ mod device_twin {
         }
         assert!(saw_rp, "rp must be at key 1 (spec), not PicoForge's key 3");
         assert!(saw_rpid, "rpID must be at key 2 (spec)");
-        assert!(saw_total, "totalRps must be at key 7 (spec)");
+        assert!(saw_total, "totalRPs must be at key 3 (CTAP 2.1 §6.8.2 final)");
+    }
+
+    /// **US-1624 — the gate, green since US-1625.** In the CTAP2 flat layout
+    /// (`key 2` = `pinUvAuthProtocol`, an integer → the `CmDialect::Ctap2`
+    /// classification), sub-command `0x01` is `getCredsMetadata` (§6.8.2, and
+    /// python-fido2 / PicoForge / libfido2 all agree). It was answered
+    /// `enumerateRPsBegin` while the canonical `CM_*` constants were inverted.
+    #[test]
+    fn us1624_ctap2_flat_0x01_is_getcredsmetadata() {
+        let mut dev = Dev::boot();
+        dev.make_resident("ssh:example.com");
+        dev.set_pin(b"1234");
+        let token = dev.pin_token(b"1234", 0x04);
+
+        // CTAP2 flat layout: key 2 = protocol (integer), key 3 = MAC.
+        let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x01]);
+        let mut req: HV<u8, 64> = HV::new();
+        nh::push_map_header(&mut req, 3).unwrap();
+        nh::push_uint(&mut req, 1).unwrap();
+        nh::push_uint(&mut req, 0x01).unwrap();
+        nh::push_uint(&mut req, 2).unwrap();
+        nh::push_uint(&mut req, 1).unwrap();
+        nh::push_uint(&mut req, 3).unwrap();
+        nh::push_bstr(&mut req, &mac).unwrap();
+
+        let resp = dev.call(0x0A, req.as_slice());
+        assert_eq!(resp[0], 0x00, "CTAP2 0x01 must succeed");
+        let mut p = Parser::new(&resp[1..]);
+        let Item::Map(n) = p.next().unwrap() else {
+            panic!("map")
+        };
+        let mut key1_is_count = false;
+        for _ in 0..n {
+            let k = match p.next().unwrap() {
+                Item::U(u) => u,
+                other => panic!("key {:?}", other),
+            };
+            if k == 1 {
+                // getCredsMetadata: existingResidentCredentialsCount, an
+                // integer. enumerateRPsBegin puts the `rp` *map* here, whose
+                // pairs must be consumed or they read as outer keys.
+                match p.next().unwrap() {
+                    Item::U(_) => key1_is_count = true,
+                    Item::Map(nr) => {
+                        for _ in 0..nr {
+                            p.next().unwrap();
+                            p.next().unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                p.skip().unwrap();
+            }
+        }
+        assert!(
+            key1_is_count,
+            "CTAP2 0x01 must be getCredsMetadata (key 1 = integer count), \
+             not enumerateRPsBegin (key 1 = rp map, totalRPs at 7)"
+        );
     }
 }
 
@@ -843,4 +909,27 @@ fn picoforge_rps_next_is_answered_in_picoforge_shape() {
         "PicoForge reads rp at 0x03 and rpIdHash at 0x04 on GetNext too"
     );
     assert!(!has_key(&m, 1), "must not be answered in CTAP2's numbering");
+}
+
+/// **US-1624 — the same gate on the host twin, green since US-1625.** A CTAP2
+/// flat-layout `getCredsMetadata` (key 2 = protocol integer, key 3 = MAC) is
+/// answered with the integer counts at keys 1/2, not with an RP map.
+#[test]
+fn us1624_host_ctap2_flat_0x01_is_getcredsmetadata() {
+    let (mut app, client) = setup();
+    make_resident(&mut app, &client, "example.com");
+    let token = client.get_token(&mut app, 0x09, Some(0x04), None).unwrap();
+
+    let req = cbor::encode(&Value::M(vec![
+        (Value::U(0x01), Value::U(0x01)),
+        (Value::U(0x02), Value::U(2)),
+        (Value::U(0x03), Value::B(pin_uv_auth(&token, &[0x01]))),
+    ]));
+    let resp = app.process_ctap2(0x0A, &req, [1, 2, 3, 4]);
+    assert_eq!(resp[0], 0x00, "host CTAP2 0x01 must succeed");
+    let m = map_of(&resp);
+    assert!(
+        matches!(m.iter().find(|(k, _)| *k == Value::U(1)), Some((_, Value::U(_)))),
+        "CTAP2 0x01 must be getCredsMetadata (key 1 = integer count)"
+    );
 }

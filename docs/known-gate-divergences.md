@@ -2608,6 +2608,46 @@ those two sub-commands — treat it as a conformance and future-proofing
 debt, not a live risk, and land the spec form (with a client migration) if
 and when a `0x01`/`0x02` ever starts honouring a parameter.
 
+**Addendum (EPIC `FIDO-SSH-RESIDENT-KEYS`, US-1615):** the standing
+instruction stands, and this addendum is the exhibit for *why OpenSSH
+showed "invalid format" rather than a PIN error*. libfido2 1.14.0's
+`credman_tx` transmits **every** credential-management operation under the
+hard-coded command byte `CTAP_CBOR_CRED_MGMT_PRE` (`0x41`) — there is no
+`0x0A` fallback in that release. fapico2 routes `0x41` to the RS-Key vendor
+channel (`vendor41::CMD`), so `ssh-keygen -K`'s first credMgmt call is
+parsed as RS-Key `Mse`, not as `getCredsMetadata`. The request grammars are
+the same CBOR shape (`{1: subCommand, 2: params?, 3: pinUvAuthProtocol, 4:
+pinUvAuthParam}`), so no syntactic discriminator exists. With the request's
+absence of key-2 params, `vendor_backup::mse` answers
+`Ctap2Response::MissingParameter` (`0x14`) — **measured** on the device twin
+(`apps/fido/tests/ssh_resident_download.rs`, US-1615; green since US-1618).
+`0x14` is outside `sk_usbhid.c:723`'s
+`0x33/0x34/0x36` PIN_REQUIRED class, so OpenSSH maps it to
+`SSH_SK_ERR_GENERAL` → `SSH_ERR_INVALID_FORMAT` → *"invalid format"*. The
+`0x0A` path that PicoForge and python-fido2 use is unaffected, and the
+preview-scope MAC (`subCommand ‖ params`, no prefix) is exactly what the
+standing instruction requires.
+
+**Resolution (US-1617/US-1618).** `0x41` is now **dual-homed**: a request whose
+`pinUvAuthParam` verifies under the preview scope (`subCommand ‖ params`) is
+routed to the credential manager, one that verifies under the vendor scope
+(`0xFF×32 ‖ 0x41 ‖ …`) stays on the RS-Key channel, and the unauthenticated
+`Next` pair is routed by the pending enumeration. The two scopes sign disjoint
+messages, so the choice is a decision, not a guess. **The standing instruction
+survives untouched:** credMgmt's MAC is still the unprefixed
+`subCommand ‖ params`, because every live client — python-fido2, PicoForge,
+libfido2 1.14 — signs it that way.
+
+**Where a prefixed client would plug in (US-1626).** A client that signed
+`0xFF×32 ‖ 0x0A ‖ subCommand ‖ params` (the CTAP 2.1 §6.8.2 form this firmware
+deliberately does not emit) would need a third verification scope and its own
+response keys — the CTAP 2.1 **final** RP shape is `rp=1, rpIDHash=2,
+totalRPs=3` (US-1626 corrected the firmware's `CmDialect::Ctap2` reply, which
+had put `totalRPs` at a chimera key `7`), while the preview shape is `3/4/5`
+and the dialect every live client reads. Adding the prefixed form is a
+recorded non-goal until such a client exists; if one appears, its scope and
+keys are argued in writing first (AGENTS.md §5).
+
 ## D-7 — the PIV pytest suite is red for unimplemented features (2026-09-27)
 
 **`17 failed, 13 passed`** on `tests/piv/`, measured against the Phase G–J

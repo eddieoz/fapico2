@@ -904,6 +904,22 @@ impl FidoApp {
             // *this* path and requires a dispatched answer, so the module's
             // claim cannot be true for the host twin and false here.
             crate::vendor41::CMD => {
+                // US-1617/US-1618 (EPIC FIDO-SSH-RESIDENT-KEYS): the command
+                // byte is dual-homed. libfido2 1.14.0's `credman_tx` sends
+                // *every* credential-management operation on `0x41` — there is
+                // no `0x0A` fallback in that release — and its request map is
+                // the same shape `${vendor41}` parses, so a preview request
+                // must be recognised by its MAC scope, not its first byte.
+                // `cred_mgmt_preview_route` states the three branches; a
+                // request it declines keeps the vendor channel unchanged.
+                if crate::device_core::cred_mgmt_preview_route(
+                    data,
+                    self.pin_token.as_ref(),
+                    matches!(self.cm_rp_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                    matches!(self.cm_cred_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                ) {
+                    return self.handle_cred_mgmt(data, out, store);
+                }
                 let auth = self.pin_token.as_ref().map(|token| crate::vendor41::TokenAuth {
                     token,
                     permissions: self.token_permissions,

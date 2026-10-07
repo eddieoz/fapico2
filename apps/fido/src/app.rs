@@ -139,8 +139,10 @@ struct GaOptions {
 /// * **CTAP2** — what every third-party client speaks (ykman, Yubico
 ///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
 ///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
-///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
-///   getCredsMetadata — the *reverse* of PicoForge's.
+///   `0x06` user. Sub-commands `0x01`/`0x02` are getCredsMetadata /
+///   enumerateRpsBegin — **the same numbering as PicoForge's** (US-1625;
+///   both follow CTAP 2.1 §6.8.2). The claim that CTAP2 reversed them was
+///   false and the constants that encoded it have been corrected.
 ///
 /// The two are told apart by the CBOR type of key `0x02`: PicoForge puts a
 /// map there, CTAP2 puts an integer. The layouts never collide on that key
@@ -162,11 +164,14 @@ enum CmDialect {
 
 /// Canonical sub-command identity, independent of the wire dialect.
 ///
-/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
-/// parser maps a PicoForge wire value onto these before anything downstream
-/// looks at it, so the dispatch below needs no dialect branches.
-const CM_GET_METADATA: u8 = 0x02;
-const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+/// These are the CTAP 2.1 §6.8.2 values, which **every real client** uses —
+/// python-fido2, PicoForge and libfido2 1.14.0 all number getCredsMetadata
+/// `0x01` and enumerateRpsBegin `0x02`. The remap below is therefore the
+/// identity (US-1625 corrected the previous inversion here too, mirroring
+/// `device_core.rs`). Kept so a genuinely-swapped future dialect has one
+/// place to land.
+const CM_GET_METADATA: u8 = 0x01;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
@@ -738,7 +743,14 @@ impl<K: Keystore> FidoApp<K> {
         self.current_channel = channel;
         // CTAP2.1 §6.9: any non-credMgmt command invalidates a pending
         // credMgmt enumeration (enumerateRps/ enumerateCreds begin..next).
-        if command != 0x0A {
+        //
+        // US-1617/US-1618: `0x41` is not exempt for being credMgmt — it is
+        // exempt because the arm below may route a preview-scope request into
+        // `cred_mgmt`, and the pending enumeration a `Next` continues must
+        // survive to that point. The device twin never invalidates per
+        // command (its `reset_session` clears on a new HID client instead),
+        // so this is the host mirroring the device, not a new rule.
+        if command != 0x0A && command != crate::vendor41::CMD {
             self.cm_rp_state = None;
             self.cm_cred_state = None;
         }
@@ -803,6 +815,26 @@ impl<K: Keystore> FidoApp<K> {
             // `tests/vendor41.rs::every_subcommand_is_dispatched_on_the_device_path`
             // is the check that the device twin agrees.
             crate::vendor41::CMD => {
+                // US-1617/US-1618 (EPIC FIDO-SSH-RESIDENT-KEYS): the command
+                // byte is dual-homed — libfido2 1.14.0's `credman_tx` sends
+                // every credential-management operation on `0x41`, with the
+                // same request shape the vendor channel parses. Route a
+                // preview-scope request to the credential manager; the device
+                // twin makes the identical call. `cred_mgmt_preview_route`
+                // holds the decision so the two twins cannot drift.
+                let token32: Option<&[u8; 32]> = self
+                    .pin_token
+                    .as_ref()
+                    .and_then(|t| t.get(..32))
+                    .and_then(|s| <&[u8; 32]>::try_from(s).ok());
+                if crate::device_core::cred_mgmt_preview_route(
+                    data,
+                    token32,
+                    matches!(self.cm_rp_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                    matches!(self.cm_cred_state.as_ref(), Some(s) if s.channel == self.current_channel),
+                ) {
+                    return self.cred_mgmt(data);
+                }
                 // US-114: the `0x41` response is `status || CBOR`, so this
                 // arm has somewhere to put a body.
                 //
@@ -2999,13 +3031,14 @@ impl<K: Keystore> FidoApp<K> {
         let rp_map = cbor::Value::M(vec![
             (cbor::Value::T("id".to_string()), cbor::Value::T(rp.0.clone())),
         ]);
-        // CTAP2 §12.1.6 numbers these rp(1) ‖ rpID(2) ‖ totalRPs(7);
-        // PicoForge numbers the same three things 3/4/5. The sets collide, so
-        // each sender gets its own shape — a client that cannot find keys
-        // 1/2/7 has nothing to render, which is what left the Slots and
-        // Passkeys screens spinning forever.
+        // CTAP 2.1 §6.8.2 final numbers these rp(1) ‖ rpIDHash(2) ‖
+        // totalRPs(3); PicoForge numbers the same three things 3/4/5. The sets
+        // collide, so each sender gets its own shape. US-1626 corrects the
+        // CTAP2 `totalRPs` key from 7 (a chimera — preview puts it at 5, final
+        // at 3) to 3. No live client reaches the Ctap2 branch: python-fido2,
+        // PicoForge and libfido2 all classify as PicoForge and read 3/4/5.
         let (k_rp, k_id, k_total) = match self.cm_dialect {
-            CmDialect::Ctap2 => (0x01u64, 0x02, 0x07),
+            CmDialect::Ctap2 => (0x01u64, 0x02, 0x03),
             CmDialect::PicoForge => (0x03, 0x04, 0x05),
         };
         let mut map: Vec<(cbor::Value, cbor::Value)> = vec![
@@ -4086,10 +4119,10 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
         return Err(FidoError::MissingParameter);
     }
 
-    // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
-    // CTAP2 numbers them the other way round. Everything downstream works
-    // in the canonical CTAP2 numbering, so PicoForge's pair is swapped here
-    // and nowhere else.
+    // Both dialects use the CTAP 2.1 §6.8.2 numbering, so this remap is the
+    // identity (US-1625 — the previous inversion was false; see the `CM_*`
+    // constants above). Kept as a dialect-keyed match so a future genuinely
+    // swapped dialect has one place to land.
     let subcommand = match (dialect, wire_subcommand) {
         (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
         (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,
