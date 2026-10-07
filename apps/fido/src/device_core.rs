@@ -2989,8 +2989,10 @@ const LB_CHECKSUM_LEN: usize = 16;
 /// * **CTAP2** — what every third-party client speaks (ykman, Yubico
 ///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
 ///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
-///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
-///   getCredsMetadata — the *reverse* of PicoForge's.
+///   `0x06` user. Sub-commands `0x01`/`0x02` are getCredsMetadata /
+///   enumerateRpsBegin — **the same numbering as PicoForge's** (US-1625; both
+///   follow CTAP 2.1 §6.8.2). The old claim that CTAP2 reversed them was
+///   false, and the `CM_*` constants that encoded it have been corrected.
 ///
 /// The two are told apart by the CBOR type at the low keys: PicoForge puts a
 /// map at `0x02` and an integer at `0x03`, CTAP2 puts an integer at `0x02`
@@ -3011,11 +3013,21 @@ pub(crate) enum CmDialect {
 
 /// Canonical credMgmt sub-command identity, independent of the wire dialect.
 ///
-/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
-/// parser maps a PicoForge wire value onto these before anything downstream
-/// looks at it, so the dispatch arms need no dialect branches.
-const CM_GET_METADATA: u8 = 0x02;
-const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+/// These are the CTAP 2.1 §6.8.2 values, and **every real client agrees with
+/// them**: python-fido2 (`GET_CREDS_METADATA = 0x01`), PicoForge
+/// (`CredentialMgmtSubCommand::GetCredsMetadata = 0x01`,
+/// `picoforge/src/hal/fido/constants.rs:225-227`) and libfido2 1.14.0
+/// (`CMD_CRED_METADATA 0x01`, `src/credman.c`). There is no dialect that
+/// swaps the first two — the remap below is therefore the identity, and it is
+/// kept only because a third dialect is conceivable.
+///
+/// **US-1624/1625:** these were `0x02`/`0x01` — inverted — which made a
+/// CTAP2-classified `0x01` (the flat layout every third-party client sends)
+/// dispatch to enumerateRPsBegin. The tests in `credmgmt_ctap2_spec.rs` had
+/// encoded the inversion too, so the suite was green against the wrong
+/// behaviour.
+const CM_GET_METADATA: u8 = 0x01;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
@@ -3415,11 +3427,13 @@ impl FidoApp {
             return Err(err(Ctap2Response::MissingParameter));
         }
 
-        // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
-        // CTAP2 numbers them the other way round. Everything below works in
-        // the canonical CTAP2 numbering, so PicoForge's pair is swapped here
-        // and nowhere else. `wire_subcommand` — not this value — is what goes
-        // into the pinUvAuth message, in both dialects.
+        // Both dialects use the CTAP 2.1 §6.8.2 numbering — getCredsMetadata
+// 0x01, enumerateRpsBegin 0x02 — so the canonical identity is the wire
+// value in both. This match is kept (and is now the identity) only so a
+// future dialect with a genuine swap has a single place to land; the old
+// PicoForge-vs-CTAP2 inversion was false (US-1625). `wire_subcommand` —
+// not this value — is what goes into the pinUvAuth message, in both
+// dialects.
         let subcommand = match (dialect, wire_subcommand) {
             (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
             (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,

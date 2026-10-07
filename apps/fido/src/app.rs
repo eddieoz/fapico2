@@ -139,8 +139,10 @@ struct GaOptions {
 /// * **CTAP2** — what every third-party client speaks (ykman, Yubico
 ///   Authenticator, browsers). Keys are flat: `0x02` pinUvAuthProtocol,
 ///   `0x03` pinUvAuthParam, `0x04` rpIdHash, `0x05` credentialID,
-///   `0x06` user. Sub-commands `0x01`/`0x02` are enumerateRPsBegin /
-///   getCredsMetadata — the *reverse* of PicoForge's.
+///   `0x06` user. Sub-commands `0x01`/`0x02` are getCredsMetadata /
+///   enumerateRpsBegin — **the same numbering as PicoForge's** (US-1625;
+///   both follow CTAP 2.1 §6.8.2). The claim that CTAP2 reversed them was
+///   false and the constants that encoded it have been corrected.
 ///
 /// The two are told apart by the CBOR type of key `0x02`: PicoForge puts a
 /// map there, CTAP2 puts an integer. The layouts never collide on that key
@@ -162,11 +164,14 @@ enum CmDialect {
 
 /// Canonical sub-command identity, independent of the wire dialect.
 ///
-/// These are the CTAP2 §12.1.6 values. PicoForge swaps the first two; the
-/// parser maps a PicoForge wire value onto these before anything downstream
-/// looks at it, so the dispatch below needs no dialect branches.
-const CM_GET_METADATA: u8 = 0x02;
-const CM_ENUMERATE_RPS_BEGIN: u8 = 0x01;
+/// These are the CTAP 2.1 §6.8.2 values, which **every real client** uses —
+/// python-fido2, PicoForge and libfido2 1.14.0 all number getCredsMetadata
+/// `0x01` and enumerateRpsBegin `0x02`. The remap below is therefore the
+/// identity (US-1625 corrected the previous inversion here too, mirroring
+/// `device_core.rs`). Kept so a genuinely-swapped future dialect has one
+/// place to land.
+const CM_GET_METADATA: u8 = 0x01;
+const CM_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CM_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CM_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
@@ -4113,10 +4118,10 @@ fn parse_cm_request(data: &[u8]) -> Result<CmRequest, FidoError> {
         return Err(FidoError::MissingParameter);
     }
 
-    // PicoForge numbers getCredsMetadata 0x01 and enumerateRpsBegin 0x02;
-    // CTAP2 numbers them the other way round. Everything downstream works
-    // in the canonical CTAP2 numbering, so PicoForge's pair is swapped here
-    // and nowhere else.
+    // Both dialects use the CTAP 2.1 §6.8.2 numbering, so this remap is the
+    // identity (US-1625 — the previous inversion was false; see the `CM_*`
+    // constants above). Kept as a dialect-keyed match so a future genuinely
+    // swapped dialect has one place to land.
     let subcommand = match (dialect, wire_subcommand) {
         (CmDialect::PicoForge, 0x01) => CM_GET_METADATA,
         (CmDialect::PicoForge, 0x02) => CM_ENUMERATE_RPS_BEGIN,

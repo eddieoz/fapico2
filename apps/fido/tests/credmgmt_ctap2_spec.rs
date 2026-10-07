@@ -32,9 +32,10 @@ use fapico2_fido::cbor::{self, Value};
 use fapico2_fido::crypto;
 use fapico2_fido::keystore::MemoryKeystore;
 
-// Sub-commands, CTAP2 numbering.
-const CTAP2_ENUMERATE_RPS_BEGIN: u8 = 0x01;
-const CTAP2_GET_CREDS_METADATA: u8 = 0x02;
+// Sub-commands, CTAP 2.1 §6.8.2 numbering (US-1625: the previous constants
+// here encoded an inversion that matched a bug in the implementation).
+const CTAP2_GET_CREDS_METADATA: u8 = 0x01;
+const CTAP2_ENUMERATE_RPS_BEGIN: u8 = 0x02;
 const CTAP2_ENUMERATE_RPS_NEXT: u8 = 0x03;
 const CTAP2_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 
@@ -191,11 +192,12 @@ fn ctap2_request_is_not_rejected_as_invalid_cbor() {
     assert_eq!(resp[0], 0x00, "enumerateRPsBegin must succeed");
 }
 
-/// CTAP2 `0x01` is enumerateRPsBegin and `0x02` is getCredsMetadata — the
-/// reverse of PicoForge's numbering. Getting this backwards makes every
-/// spec client enumerate nothing.
+/// CTAP 2.1 §6.8.2 (US-1625): `0x01` is getCredsMetadata and `0x02` is
+/// enumerateRPsBegin — the numbering python-fido2, PicoForge and libfido2 all
+/// use, and the one this firmware now dispatches. Getting this backwards makes
+/// every spec client enumerate nothing.
 #[test]
-fn ctap2_subcommand_0x01_enumerates_and_0x02_reports_metadata() {
+fn ctap2_subcommand_0x01_reports_metadata_and_0x02_enumerates() {
     let (mut app, client) = setup();
     make_resident(&mut app, &client, "example.com");
     let token = client.get_token(&mut app, 0x09, Some(0x04), None).unwrap();
@@ -636,11 +638,11 @@ mod device_twin {
         /// credMgmt in CTAP2's flat layout — the request that used to be
         /// answered `INVALID_CBOR` on this exact path.
         fn enumerate_rps_begin(&mut self, token: &[u8]) -> Vec<u8> {
-            let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x01]);
+            let mac = crypto::pin_uv_auth_param(1, &token.try_into().unwrap(), &[0x02]);
             let mut req: HV<u8, 64> = HV::new();
             nh::push_map_header(&mut req, 3).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
-            nh::push_uint(&mut req, 1).unwrap();
+            nh::push_uint(&mut req, 0x02).unwrap();
             nh::push_uint(&mut req, 2).unwrap();
             nh::push_uint(&mut req, 1).unwrap();
             nh::push_uint(&mut req, 3).unwrap();
@@ -720,18 +722,11 @@ mod device_twin {
         assert!(saw_total, "totalRps must be at key 7 (spec)");
     }
 
-    /// **US-1624 — red gate for the inverted CTAP2 numbering.** In the CTAP2
-    /// flat layout (`key 2` = `pinUvAuthProtocol`, an integer → the
-    /// `CmDialect::Ctap2` classification), sub-command `0x01` is
-    /// `getCredsMetadata` (§6.8.2, and python-fido2 / PicoForge / libfido2 all
-    /// agree). This firmware answers `enumerateRPsBegin` today, because the
-    /// canonical `CM_*` constants are inverted.
-    ///
-    /// `#[ignore]`d with the wrong behaviour recorded; US-1625 fixes the
-    /// mapping and flips this green.
-    #[ignore = "US-1624 red gate: CTAP2-layout sub-command 0x01 is answered \
-                enumerateRPsBegin today (key 1 is a map, totalRPs at 7). \
-                US-1625 swaps CM_GET_METADATA/CM_ENUMERATE_RPS_BEGIN."]
+    /// **US-1624 — the gate, green since US-1625.** In the CTAP2 flat layout
+    /// (`key 2` = `pinUvAuthProtocol`, an integer → the `CmDialect::Ctap2`
+    /// classification), sub-command `0x01` is `getCredsMetadata` (§6.8.2, and
+    /// python-fido2 / PicoForge / libfido2 all agree). It was answered
+    /// `enumerateRPsBegin` while the canonical `CM_*` constants were inverted.
     #[test]
     fn us1624_ctap2_flat_0x01_is_getcredsmetadata() {
         let mut dev = Dev::boot();
@@ -912,12 +907,9 @@ fn picoforge_rps_next_is_answered_in_picoforge_shape() {
     assert!(!has_key(&m, 1), "must not be answered in CTAP2's numbering");
 }
 
-/// **US-1624 — the same red gate on the host twin.** A CTAP2 flat-layout
-/// `getCredsMetadata` (key 2 = protocol integer, key 3 = MAC) must be answered
-/// with the integer counts at keys 1/2, not with an RP map. Both twins carry
-/// the same inverted constants today.
-#[ignore = "US-1624 red gate: host CTAP2-layout 0x01 is enumerateRPsBegin \
-            today. US-1625 fixes both twins."]
+/// **US-1624 — the same gate on the host twin, green since US-1625.** A CTAP2
+/// flat-layout `getCredsMetadata` (key 2 = protocol integer, key 3 = MAC) is
+/// answered with the integer counts at keys 1/2, not with an RP map.
 #[test]
 fn us1624_host_ctap2_flat_0x01_is_getcredsmetadata() {
     let (mut app, client) = setup();
