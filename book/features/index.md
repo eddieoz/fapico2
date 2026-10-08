@@ -20,7 +20,7 @@ What the device does, then what each of these terms means. Everything listed her
 - Extensions: **hmac-secret, credProtect, credBlob, largeBlobKey, minPinLength**
 - Large blobs (`authenticatorLargeBlobs`)
 - User presence enforcement through the physical button; user verification with PIN
-- ECDSA (P-256, P-384, P-521) and EdDSA (Ed25519) authentication
+- **ES256** (ECDSA over P-256) — the algorithm every client requests first, and the one the device path signs with
 - Permissions enforced on every token: **MC, GA, CM, ACFG, LBW**
 - Authenticator configuration; vendor configuration
 - Sealed store: credentials survive a reflash, and a flash dump alone is inert
