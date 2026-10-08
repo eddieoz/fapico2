@@ -14,6 +14,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 - **Sealed at rest.** Everything is AEAD-encrypted under a root key derived from a one-way-fused OTP row plus the chip's own identity. A flash dump lifted off your board is inert somewhere else — recovering the root key from the chip itself takes physical possession and very sophisticated lab methods, not a USB cable. The same reasoning that keeps bitcoin keys off internet-connected machines applies to the keys that guard your email, your code and your accounts.
 - **No network.** The device build has no network stack at all. There is no channel to exfiltrate through, because there is no channel.
 - **No one else's copy.** A passkey synced to a phone vendor's cloud lives on every device signed into that account, and you trust the vendor's sync to keep it. A resident passkey on fapico2 exists on one board you own.
+- **Nothing to revoke, no one to trust.** No account to suspend, no server to breach, subpoena or shut down. The board answers to you and works as long as the board does.
 
 ## What it does
 
