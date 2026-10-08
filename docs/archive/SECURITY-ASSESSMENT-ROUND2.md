@@ -1,5 +1,17 @@
 # Round-2 Red-Team Security Assessment — fapico2 (FA20:0002)
 
+> **Status (added 2026-10-08, post-remediation).** This is the record of the
+> 2026-09-27 build; the findings below describe that build, not today's. The
+> headline CRITICAL (unauthenticated `authenticatorReset`, R2-14) was still
+> present when round 3 ran on 2026-10-05 and is **now FIXED** with hardware
+> evidence — see
+> [`SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md`](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md).
+> The storage findings led to the per-record key store
+> ([`../capacity.md`](../capacity.md)); the secure-boot recommendation shipped
+> as opt-in ([`../secureboot.md`](../secureboot.md)); the OATH applet the
+> round could not test now ships and is tested. Everything below is the
+> published copy as redacted.
+
 > **Published copy — redactions applied.** This report originally contained the
 > literal key material recovered from the device under test, including a
 > hardware-unique OTP row, the derived store key, a FIDO master key, a TOTP

@@ -16,7 +16,7 @@
 //! measured behaviour *before* US-1602/US-1603 put a gate on this command, so
 //! the flip is visible as red→green rather than as a change nobody can date.
 //! The measurement came from the live board (red-team assessment,
-//! `redteam/SECURITY_ASSESSMENT.md`, 2026-10-05): one frame, opcode `0x07`,
+//! `docs/archive/SECURITY-ASSESSMENT-ROUND3.md`, 2026-10-05): one frame, opcode `0x07`,
 //! empty CBOR body, no `pinUvAuthToken`, answered `0x00` in **498 ms**.
 //!
 //! **It is not the gate's test.** US-1601's red test and US-1602's green

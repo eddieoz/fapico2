@@ -113,7 +113,7 @@ INCLUDE_BAN = "include_bytes!"
 #     has been public since before this repository existed;
 #   * the red-team round that extracted it rotated it out of the build — the
 #     current firmware generates per-device attestation keys from the TRNG
-#     (see docs/SECURITY-ASSESSMENT-ROUND2.md §14.1, R4);
+#     (see docs/archive/SECURITY-ASSESSMENT-ROUND2.md §14.1, R4);
 #   * every credential that was ever attested under it is therefore forgeable
 #     by anyone, which is a fact about the past that cannot be un-published.
 #

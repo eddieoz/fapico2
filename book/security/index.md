@@ -27,7 +27,7 @@
 ## What this is not
 
 1. **Not safe from someone who holds it.** Until the first `vX.Y.Z-release` tag, the SWD debug port is open on every published image. Anyone with brief physical access and a debug probe can extract every key the device holds; while that port is open, every other control is a delay, not a barrier. Do not make it the only key to anything. The [threat model](../threat-model.md) covers what else is possible against the chip itself.
-2. **Not independently audited.** A [red-team assessment](https://github.com/eddieoz/fapico2/blob/main/docs/SECURITY-ASSESSMENT-ROUND2.md) of an earlier build is published in full in the repository — some of it has been addressed, not all. No warranty is offered.
+2. **Not independently audited.** Three red-team assessments are published in full in the repository — [round 2](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND2.md) (the deep record of an earlier build), [round 3](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND3.md) (the same-day report), and the [round-3 remediation record](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) marking every finding FIXED, accepted or open, with the hardware evidence. The headline finding of both rounds is fixed; several lower-severity ones are open, and the record says which. No warranty is offered.
 3. **Not certified, and no NFC.** No FIPS/Common Criteria evaluation, and a Pico 2 has no radio.
 
 ## Reporting vulnerabilities

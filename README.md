@@ -47,7 +47,7 @@ Every ceiling's derivation — and which numbers are measured versus reserved �
 ## What this is not
 
 1. **Not safe from someone who holds it.** Until the first `vX.Y.Z-release` tag, the SWD debug port is open on every published image — deliberate, so alpha boards stay recoverable ([ADR 0002](docs/adr/0002-provisioning-policy.md)). Anyone with brief physical access and a debug probe can extract every key the device holds; while that port is open, every other control is a delay, not a barrier ([`docs/debug-access-risk.md`](docs/debug-access-risk.md)). Until it closes, this is evaluation hardware: do not make it the only key to anything.
-2. **Not independently audited.** The published [red-team assessment](docs/SECURITY-ASSESSMENT-ROUND2.md) is of an earlier build; some of it has been addressed, not all. No warranty.
+2. **Not independently audited.** The published [red-team assessment](docs/archive/SECURITY-ASSESSMENT-ROUND2.md) is of an earlier build; some of it has been addressed, not all. No warranty.
 3. **Not certified and not ruggedized.** No FIPS/Common Criteria evaluation, and no NFC — a Pico 2 has no radio.
 4. **Not anonymously attributable.** Default builds carry a public development attestation key, so their attestation proves nothing about key provenance.
 5. **Not finshed on every front.** PIV is deferred; Brainpool P-384r1 is absent from OpenPGP; CTAP1/U2F register attestation fails client-side verification (CTAP2 is unaffected); a known RSA timing advisory (RUSTSEC-2023-0071) has no upstream fix ([`docs/supply-chain.md`](docs/supply-chain.md)).

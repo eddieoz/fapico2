@@ -10,7 +10,7 @@ anything you cannot afford to lose.
 
 ## Known weaknesses
 
-[`docs/SECURITY-ASSESSMENT-ROUND2.md`](docs/SECURITY-ASSESSMENT-ROUND2.md) is a
+[`docs/archive/SECURITY-ASSESSMENT-ROUND2.md`](docs/archive/SECURITY-ASSESSMENT-ROUND2.md) is a
 red-team assessment of an earlier build. It is published, in full, because the
 findings are more useful than the reassurance would be. Read it before
 deploying.

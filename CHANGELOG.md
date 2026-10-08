@@ -58,7 +58,7 @@ CI on any disagreement — the number in the release notes is not the authority.
 - **The USB vendor ID `0xFA20` is not USB-IF-registered.** See the README for
   the `libccid` allowlist step Linux and macOS need.
 - **The firmware is not independently audited.** See [`SECURITY.md`](SECURITY.md)
-  and [`docs/SECURITY-ASSESSMENT-ROUND2.md`](docs/SECURITY-ASSESSMENT-ROUND2.md).
+  and [`docs/archive/SECURITY-ASSESSMENT-ROUND2.md`](docs/archive/SECURITY-ASSESSMENT-ROUND2.md).
 
 [Unreleased]: https://github.com/eddieoz/fapico2/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/eddieoz/fapico2/releases/tag/v1.0.0

@@ -18,7 +18,7 @@ The repository's [`docs/`](https://github.com/eddieoz/fapico2/blob/main/docs/IND
 
 ## Design records
 
-- [**SECURITY-ASSESSMENT-ROUND2.md**](https://github.com/eddieoz/fapico2/blob/main/docs/SECURITY-ASSESSMENT-ROUND2.md) — the published red-team assessment, in full.
+- [**Security assessments**](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND2.md) — three red-team assessments published in full: [round 2](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND2.md) (the deep record), [round 3](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND3.md) (the same-day report), and the [round-3 remediation record](https://github.com/eddieoz/fapico2/blob/main/docs/archive/SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) marking every finding FIXED, accepted or open, with the hardware evidence.
 - [**secure-storage-comparison.md**](https://github.com/eddieoz/fapico2/blob/main/docs/secure-storage-comparison.md) — the adversarial comparison of the key-at-rest design against per-record flash stores.
 - [**ADRs**](https://github.com/eddieoz/fapico2/blob/main/docs/adr/README.md) — architecture decision records: provisioning policy, TrustZone, PIV/RSA.
 
