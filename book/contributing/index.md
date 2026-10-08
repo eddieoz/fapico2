@@ -31,7 +31,7 @@ cargo clippy --target thumbv8m.main-none-eabi -- -D warnings
 ./run_tests.sh
 ```
 
-Testing is three layers: host unit tests; the *same* black-box pytest suites that gate the C build over the emulator; and the hardware matrix.
+Testing is three layers: host unit tests; the same black-box pytest suites run against the emulator; and the hardware matrix.
 
 ## Contribute
 
