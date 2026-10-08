@@ -2,7 +2,7 @@
 
 **The F\*\*king Authenticator.** Your passkeys, PGP keys and 2FA tokens — on hardware you own.
 
-fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) into a multi-applet hardware authenticator: FIDO2/U2F passkeys, OpenPGP 3.4, OATH (TOTP/HOTP) and YubiKey-protocol OTP served by **one firmware, one binary**, over one USB composite device. No vendor account, no cloud, no subscription. Written in Rust, licensed AGPLv3 — build it from source or download the prebuilt image.
+fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) into a multi-applet hardware authenticator: FIDO2 passkeys, OpenPGP 3.4, OATH (TOTP/HOTP) and YubiKey-protocol OTP served by **one firmware, one binary**, over one USB composite device. No vendor account, no cloud, no subscription. Written in Rust, licensed AGPLv3 — build it from source or download the prebuilt image.
 
 ## Read this first
 
@@ -19,7 +19,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 
 | App | What you use it for | Transport | Verified with |
 |---|---|---|---|
-| FIDO2/U2F | passkeys, WebAuthn, SSH (`-sk`), Linux login | CTAP-HID | Chrome, python-fido2 2.2.1, ykman |
+| FIDO2 | passkeys, WebAuthn, SSH (`-sk`), Linux login | CTAP-HID | Chrome, python-fido2 2.2.1, ykman |
 | OpenPGP 3.4 | PGP signing/encryption, SSH auth | CCID | gpg / scdaemon 2.4.4 |
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP | CCID | ykman otp |
@@ -45,6 +45,10 @@ One board replaces a drawer of tokens.
 **3. Use it.** FIDO2 works everywhere, immediately. **Linux/macOS only:** OpenPGP and OATH need a one-time libccid allowlist edit.
 
 See [Getting Started](./getting-started/index.md) for the full procedure.
+
+## Buy me a coffee
+
+fapico2 is free software, built in the open. If it earned its keep, send sats: ⚡ **eddieoz@sats4.life**
 
 ## License
 

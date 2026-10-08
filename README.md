@@ -118,6 +118,10 @@ The device build links an `arm-none-eabi` ELF gated at `text` ≤ 3.5 MiB (CI-en
 - **Client behaviour:** [`docs/hardware-matrix.md`](docs/hardware-matrix.md) · [`docs/client-compatibility.md`](docs/client-compatibility.md)
 - **Design records and past investigations:** [`docs/INDEX.md`](docs/INDEX.md) → the archive
 
+## Buy me a coffee
+
+fapico2 is free software, built in the open. If it earned its keep, send sats: ⚡ **eddieoz@sats4.life**
+
 ## License and security
 
 GNU AGPLv3 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

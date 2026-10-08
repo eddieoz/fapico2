@@ -11,7 +11,7 @@
 
 1. **The store key is derived from one-way-fused silicon, never stored.** An attacker who dumps the flash has ciphertext and no key. The firmware parks the board rather than falling back to a public constant.
 2. **One credential per write.** Every record is committed on its own, so a torn write or a corrupt byte costs one credential, not the whole set — and a neighbour's update never touches the other credentials in its sector.
-3. **Applet isolation in the store.** FIDO, OATH, PIV and OpenPGP share one key hierarchy but scoped writes: a FIDO reset wipes FIDO's sectors and nothing else.
+3. **Applet isolation in the store.** FIDO, OATH and OpenPGP share one key hierarchy but scoped writes: a FIDO reset wipes FIDO's sectors and nothing else.
 4. **PIN and touch are always required on a PIN-set board.** Nothing in the WebAuthn options can switch either off. A stolen key alone opens nothing; a stolen key plus a stolen laptop still needs the PIN.
 5. **Signed secure boot is opt-in** (`./build-signed.sh`): the bootrom refuses unsigned images — a one-way OTP fuse, burned once, at your decision.
 6. **The debug port closes at the first release tag.** Alpha and beta images keep SWD open so boards stay recoverable; `-release` images are the boundary where it stops.
