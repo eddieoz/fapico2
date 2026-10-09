@@ -67,7 +67,7 @@ Each applet replaces a habit that leaks. Six of the everyday ones:
 | OTP | YubiKey-slot OTP | CCID | ykman otp |
 | Management | device config, rescue surface | CCID | ykman, PicoForge |
 
-The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID. See the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
+The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID. The first hour with the board: [Using the device](./using/index.md). Deeper walks: the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
 
 ## Capacity
 

@@ -5,7 +5,7 @@ The practical questions first, then every term this site uses, explained.
 ## The practical questions
 
 **What do I need on my computer to use it?**
-For FIDO2, nothing — browsers and libfido2 clients speak CTAP-HID natively. OpenPGP, OATH and OTP go over CCID, and on Linux/macOS that means a one-time libccid allowlist edit before your host sees the smartcard reader (see [Getting Started](../getting-started/index.md)). Tools worth having: `ykman` and PicoForge for management, GnuPG for the OpenPGP card.
+For FIDO2, nothing — browsers and libfido2 clients speak CTAP-HID natively. OpenPGP, OATH and OTP go over CCID, and on Linux/macOS that means a one-time libccid allowlist edit before your host sees the smartcard reader (see [Getting Started](../getting-started/index.md)). Tools worth having: `ykman` and PicoForge for management, GnuPG for the OpenPGP card. What each tool can and cannot do, quirks included: [What it works with](../interop/index.md).
 
 **What happens if I forget the PIN?**
 Nothing recovers it — that is the design, not an oversight. A factory reset issued from any FIDO2 client clears the PIN and takes every FIDO credential on the board with it; the OATH, OTP and OpenPGP applets keep their records. If a reset is your recovery plan, the credentials were never backed up anywhere — plan for that before you need it.
