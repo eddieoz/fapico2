@@ -14,6 +14,7 @@ deliberately **not in git**.
 
 ## Using and trusting the device
 
+- [backup-seed.md](backup-seed.md) — the vendor master seed as a 24-word phrase: export / restore / finalize with `scripts/backup_fido.py`, and the honest scope (passkeys are NOT in it).
 - [hardware-matrix.md](hardware-matrix.md) — hardware acceptance matrix: USB IDs, algorithms, per-applet results.
 - [release-notes-v1.0.0.md](release-notes-v1.0.0.md) — the published release: image hash, verification procedure.
 - [secureboot.md](secureboot.md) — RP2350 signed secure boot procedure (opt-in, not yet burned on any board).
