@@ -2,6 +2,7 @@
 
 - [Introduction](./index.md)
 - [Getting Started](./getting-started/index.md)
+- [Compatible devices](./hardware/index.md)
 - [How-tos](./how-to/index.md)
     - [SSH keys](./how-to/ssh.md)
     - [Linux local authentication](./how-to/linux-auth.md)

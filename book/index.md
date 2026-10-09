@@ -78,7 +78,7 @@ One board replaces a drawer of tokens.
 
 ## Getting started
 
-**The board:** one Raspberry Pi Pico 2 (RP2350). Nothing else on the shopping list.
+**The board:** one Raspberry Pi Pico 2 (RP2350) — nothing else on the shopping list. [What makes a board compatible.](./hardware/index.md)
 
 **The image:** download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) (sha256 in its release notes) or build from source.
 
