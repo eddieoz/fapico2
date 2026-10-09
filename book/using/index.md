@@ -20,7 +20,7 @@ Add accounts in Yubico Authenticator or `ykman oath accounts`. The codes are com
 
 ## The OpenPGP card
 
-`gpg --card-status` to meet the card, `gpg --card-edit` then `generate` to create the three key slots (sign, encrypt, authenticate) on the chip — the keys are born there and never leave. `gpg --change-pin` changes the card's PIN. Encrypt directly to the recipient's key and the message is unreadable to everyone but the holder — no screenshot of a "secure" note, no trusting the channel.
+`gpg --card-status` to meet the card, `gpg --card-edit` then `generate` to create the three key slots (sign, encrypt, authenticate) on the chip — the keys are born there and never leave. `gpg --change-pin` changes the card's PIN. Encrypt directly to the recipient's key and the message is unreadable to everyone but the holder — no screenshot of a "secure" note, no trusting the channel. Full walks: [git commit signing](../how-to/git-signing.md) and [encrypted mail and files](../how-to/mail-encryption.md).
 
 ## OTP slots
 

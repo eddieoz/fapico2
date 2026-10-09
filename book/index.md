@@ -43,12 +43,12 @@ Each applet replaces a habit that leaks. Six of the everyday ones:
   <div class="usecase">
     <div class="uc-icon">✉️</div>
     <h3>Encrypted to the recipient</h3>
-    <p>OpenPGP 3.4 signs and decrypts from the card: mail and files sealed for one reader, not for the channel.</p>
+    <p>OpenPGP 3.4 signs and decrypts from the card: mail and files sealed for one reader, not for the channel. <a href="./how-to/mail-encryption.md">Walkthrough.</a></p>
   </div>
   <div class="usecase">
     <div class="uc-icon">💾</div>
     <h3>Disk encryption gate</h3>
-    <p>The <code>hmac-secret</code> extension hands LUKS its unlock secret only while the board is present and touched.</p>
+    <p>The <code>hmac-secret</code> extension hands LUKS its unlock secret only while the board is present and touched. <a href="./how-to/disk-encryption.md">Walkthrough.</a></p>
   </div>
   <div class="usecase">
     <div class="uc-icon">⏱️</div>
