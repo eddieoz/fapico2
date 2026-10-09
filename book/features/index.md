@@ -23,7 +23,7 @@ What the device does, and proof that it does it. Everything listed here is imple
 - **ES256** (ECDSA over P-256) — the algorithm every client requests first, and the one the device path signs with
 - Permissions enforced on every token: **MC, GA, CM, ACFG, LBW**
 - Authenticator configuration; vendor configuration
-- **Seed backup**: the FIDO master seed exports once, as a 24-word phrase, and restores onto another board — [the procedure](../how-to/seed-backup.md)
+- **Seed backup**: the vendor seed — the soft-lock key — exports once, as a 24-word phrase, and installs on any board; passkeys themselves are non-exportable by design — [the procedure](../how-to/seed-backup.md)
 - **Enterprise attestation** (`enterpriseAttestation`): a listed enterprise RP can request identifying attestation
 - **Signature counters**: a persistent per-credential counter increments on every assertion
 - Sealed store: credentials survive a reflash, and a flash dump alone is inert

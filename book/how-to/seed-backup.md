@@ -1,39 +1,71 @@
-# Backing up the FIDO seed
+# The seed backup
 
-The FIDO side of the board runs on a 32-byte master seed, and the firmware can export it **once** as a 24-word BIP-39 phrase. Write the phrase down and the FIDO identity survives the board; install it on a spare board and it is the same identity again. PicoForge drives the whole ceremony over the vendor channel — nothing to install on the board, nothing to build.
+The board holds a 32-byte **vendor master seed** — the key material behind the [soft lock](../using/index.md#factory-reset) and PicoForge's Backup screen. The firmware can export it **once**, as a 24-word BIP-39 phrase, and install a phrase (or a fresh seed) on any board running this firmware. Two drivers speak the same channel and print the same words for the same seed: [`scripts/backup_fido.py`](https://github.com/eddieoz/fapico2/blob/feat/backup/scripts/backup_fido.py) on the command line, and PicoForge's Backup screen.
+
+The full record — wire notes, test coverage, failure statuses — is [`docs/backup-seed.md`](https://github.com/eddieoz/fapico2/blob/feat/backup/docs/backup-seed.md). This page is what you need to use it.
 
 <div class="security-callout">
 
-**The phrase is the FIDO identity.** PicoForge's own export dialog puts it plainly: anyone with it can clone this FIDO identity. Give it the discipline you give a wallet seed phrase — written on paper on an offline machine, never a photo, never a cloud note, never a chat window.
+**Your passkeys are not in the phrase, and no tool can export them.** Resident credentials derive from different key material (`device_random`), non-exportable by design. The phrase carries the vendor seed: the lock key. Treat that as a wallet phrase in its own right — anyone holding it can install your seed on their board and, worse, it is the key that opens a locked board. Paper, offline, never a photo or a cloud note.
 
 </div>
 
-## What the phrase does and does not carry
+## What it is for, exactly
 
-- **It carries the FIDO identity** — the master seed the board's FIDO applet runs on. Restoring it makes the restored board's FIDO identity match the backup.
-- **It carries nothing for the other applets.** OpenPGP, OATH and OTP records exist only on the board's flash store; there is no phrase for them. Their backup plan is the keys themselves, exported where they can be, and the spare-board procedure.
-- **Verify a restore before you rely on it.** After installing the phrase on a board, run `ykman fido cred list` and confirm what the restored board actually serves before you retire the original.
+| Claim | Status |
+|---|---|
+| Backs up the vendor master seed — the soft-lock key | **yes** |
+| Backs up passkeys / resident credentials | **no — non-exportable by design** |
+| Survives a CTAP2 factory reset on the board | **yes** — reset clears PIN, credentials and vault state, never the seed |
+| Restoring replaces the previous seed | **yes, permanently** — unless you hold the previous seed's phrase, it is gone |
+| The phrase alone opens a locked board | **yes** — no PIN, no button; the phrase *is* the second factor |
+
+## The four commands
+
+```bash
+python3 scripts/backup_fido.py status              # read the flags — no touch, no PIN
+python3 scripts/backup_fido.py export              # seed → 24 words on stdout (touch)
+python3 scripts/backup_fido.py restore --generate  # draw a fresh seed, install, print phrase
+python3 scripts/backup_fido.py finalize            # close the export window forever
+```
+
+`export --out file.txt` writes the phrase to a `0600` file that refuses to overwrite — a drafting aid; paper is the backup. Prose goes to stderr and the phrase to stdout, so piping into a secret store captures exactly the words. `restore` takes a phrase by hidden prompt, stdin or `--file` — never argv — and validates the BIP-39 checksum before any wire traffic.
 
 ## The export window is one-shot
 
-Exporting opens a window, and **sealing it is final**: the device permanently refuses further exports — no protocol path clears the flag, and only a FIDO factory reset reopens the possibility. That is deliberate. An export that can happen again whenever the holder asks is not a backup control, it is a leak. So the sequence below ends with sealing, and the order matters: **paper first, seal second.**
+Export stays possible until you run `finalize` — and the closing is **monotonic and durable**: the seed can never be exported from that board again. Nothing is erased; a phrase written down before finalize remains a fully working key forever. Finalize protects the *board*, not the phrase.
 
-## The procedure
+One hazard deserves its own warning: **a CTAP2 factory reset does not close the window.** A reset board still exports whatever vendor seed it holds to the next person to press the button. Never hand a board over without finalizing first.
 
-PicoForge connected to the board, and the [FIDO PIN set](../using/index.md#set-the-pin-first) — the dialogs below ask for it.
+## The procedures
 
-1. **Open Backup** in PicoForge's sidebar. The screen reports the current state: whether a seed exists, whether the export window is still open, whether the board is soft-locked.
+**Provision a fresh board** (the normal path — no seed yet):
 
-2. **Export.** The dialog asks for the FIDO PIN — leave it blank and touch instead if no PIN is set. Touch the **BOOTSEL button** when the status line asks for it. The phrase appears once in the window.
+```bash
+python3 scripts/backup_fido.py restore --generate   # prints the phrase once; write it on paper
+python3 scripts/backup_fido.py status              # seed: present, window open
+python3 scripts/backup_fido.py finalize            # window closed forever
+```
 
-3. **Write the 24 words on paper, now, on a machine that is not online.** Then clear the dialog — the view model holds the phrase only until you dismiss it, but the window you are reading this on should not outlive the step.
+**Back up an already-provisioned board:**
 
-4. **Seal the export window.** The confirm dialog repeats the warning: no further exports until a FIDO factory reset. Touch the button to confirm. This step is the point of the whole design — do it even if you are sure you'll never need a second export, because the board that *can* always export is the board someone else can always export.
+```bash
+python3 scripts/backup_fido.py status              # the window must be open — if it says CLOSED, export has already been taken or refused
+python3 scripts/backup_fido.py export --out /dev/shm/fido-seed.txt
+# copy to paper, shred the file, then:
+python3 scripts/backup_fido.py finalize
+```
 
-5. **Check the state.** The Backup screen should now read sealed, with a seed present. If it does not, stop and find out why before walking away from the machine.
+**Migrate to a replacement board:** export on the old board, `restore --file` on the new one, finalize the new board, delete the file.
 
-6. **Restoring** (the day you need it, on the spare board): PicoForge → Backup → **Restore**, enter the 24 words and the PIN (or touch if none is set). The board answers "Seed restored — the FIDO identity now matches the backup." Unplug, run the verification from above, and only then decide what happens to the damaged original.
+**Hand a board over:** `finalize` first — or `restore --generate && finalize` to provision it with a seed nobody holds. Do this every time a board leaves your possession, because the reset does not do it for you.
 
-## Storing the phrase
+**Recover a locked board:** release the soft lock from **PicoForge's Lock screen**, using the 24-word phrase. The CLI deliberately cannot unlock — the phrase is the second factor, and PicoForge is the intended operator.
 
-Paper, away from the machine it guards; stamped metal if the threat includes fire; a second copy in a different building if the threat includes the building. You already know how to store a seed phrase — this one is a seed phrase, with your entire FIDO identity as its wallet.
+## On a PIN-set board: use PicoForge
+
+The CLI is **touch-only by design** — it never asks for a PIN, never mints a token, never charges the three-strike latch. The firmware's own rule (a PIN-set board wants a token *and* a button) means its gated commands answer `0x36` on a PIN-set board, and no amount of button-pressing changes that. So: PIN-free board, use the CLI as written; PIN-set board, use PicoForge's Backup screen, which mints the token from the PIN. Clearing the PIN with a CTAP2 reset is lossless *for the seed* — it is not lossless for passkeys, which a reset destroys.
+
+## Finding the right board
+
+The tool talks CTAPHID and proves it is a fapico2 board with the MSE handshake — a device that answers the vendor channel's MSE sub-command with a pinUvAuth demand (a YubiKey's reading of `0x41`) is refused with a "does not look like a fapico2 board" message instead of proceeding. If the board is invisible altogether, that is the [USB identity](./usb-identity.md) problem, not the tool's.
