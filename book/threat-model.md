@@ -27,6 +27,6 @@ Two of the five have no mitigation at all in current silicon; the chip is expect
 
 - **Every attack needs the board in hand** and equipment that costs orders of magnitude more than the board does. A remote attacker gets nothing: there is no network stack.
 - **The attack within anyone's reach — a plain flash dump — is what the store design stops.** The store key is derived, not stored; ciphertext without the root key is inert. The store key is hashed from the OTP row, which stops a flash-dump attacker; it does not stop an attacker who can read the OTP bits themselves — that is what the lab-level attacks are for.
-- **Signed secure boot raises the bar, not the ceiling.** It is opt-in (`./build-signed.sh`), one-way, and it makes two of the five attacks harder to reach — it does not make the chip a secure element.
+- **Signed secure boot raises the bar, not the ceiling.** It is opt-in (`./build-signed.sh`), one-way, and it makes two of the five attacks harder to reach — it does not make the chip a secure element. The [how-to](./how-to/secure-boot.md) covers the procedure and its disclosures.
 
 Read [Raspberry Pi's full write-up](https://www.raspberrypi.com/news/security-through-transparency-rp2350-hacking-challenge-results-are-in/) — the findings are more useful than the reassurance would be.
