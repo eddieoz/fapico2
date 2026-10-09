@@ -6,6 +6,7 @@
     - [SSH keys](./how-to/ssh.md)
     - [Linux local authentication](./how-to/linux-auth.md)
 - [Features](./features/index.md)
+- [FAQ](./faq/index.md)
 - [Security](./security/index.md)
 - [Threat model](./threat-model.md)
 - [Reference](./reference/index.md)

@@ -110,3 +110,31 @@ a:hover {
 .fg-muted {
     color: var(--fg-muted);
 }
+
+/* Use-case grid on the landing page */
+#index .usecase-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+#index .usecase {
+    border: 1px solid var(--table-header-bg);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+}
+
+#index .usecase .uc-icon {
+    font-size: 1.5rem;
+}
+
+#index .usecase h3 {
+    margin: .4rem 0 .5rem;
+    font-size: 1.02rem;
+}
+
+#index .usecase p {
+    margin: 0;
+    font-size: .93rem;
+}

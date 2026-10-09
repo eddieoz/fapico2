@@ -16,6 +16,43 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 - **No one else's copy.** A passkey synced to a phone vendor's cloud lives on every device signed into that account, and you trust the vendor's sync to keep it. A resident passkey on fapico2 exists on one board you own.
 - **Nothing to revoke, no one to trust.** No account to suspend, no server to breach, subpoena or shut down. The board answers to you and works as long as the board does.
 
+## What it is for
+
+Each applet replaces a habit that leaks. Six of the everyday ones:
+
+<div class="usecase-grid">
+  <div class="usecase">
+    <div class="uc-icon">🔑</div>
+    <h3>Passkey logins</h3>
+    <p>Register once in any browser; from then on, login is a touch and the PIN. Room for <strong>856 resident passkeys</strong> — a YubiKey 5 holds 100.</p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">⌨️</div>
+    <h3>Passwordless SSH</h3>
+    <p>Resident <code>-sk</code> keys with <code>verify-required</code>: the private half never touches a disk. <a href="./how-to/ssh.md">Walkthrough.</a></p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">🔒</div>
+    <h3>Linux login</h3>
+    <p>The board answers PAM at the login prompt — a stolen password alone gets nobody in. <a href="./how-to/linux-auth.md">Walkthrough.</a></p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">✉️</div>
+    <h3>Encrypted to the recipient</h3>
+    <p>OpenPGP 3.4 signs and decrypts from the card: mail and files sealed for one reader, not for the channel.</p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">💾</div>
+    <h3>Disk encryption gate</h3>
+    <p>The <code>hmac-secret</code> extension hands LUKS its unlock secret only while the board is present and touched.</p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">⏱️</div>
+    <h3>Second factor, in your pocket</h3>
+    <p>TOTP and HOTP codes computed on the board, read through Yubico Authenticator — the phone holds none of them.</p>
+  </div>
+</div>
+
 ## What it does
 
 | App | What you use it for | Transport | Verified with |
