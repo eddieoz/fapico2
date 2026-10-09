@@ -19,8 +19,11 @@ One-line verdicts, so nobody has to read 3,000 lines to learn what happened:
 | [`webauthn-us1527-real-sites.md`](webauthn-us1527-real-sites.md) | US-1527: human-run passkey registration on real sites | token2.com and webauthn.io pass; the x.com failure is the US-1531 fix |
 | [`openpgp-default-pin-message.md`](openpgp-default-pin-message.md) | GnuPG "Card error" on factory PINs | The requested fix is not achievable within the spec; deferred, do not re-derive |
 | [`openpgp-kleopatra-pgpony-investigation.md`](openpgp-kleopatra-pgpony-investigation.md) | Kleopatra "test card" / PGPOpony key visibility (2026-10-05) | Serial display is a spec-rendering artifact, not a firmware defect; PGPOpony visibility is client-side |
+| [`SECURITY-ASSESSMENT-ROUND2.md`](SECURITY-ASSESSMENT-ROUND2.md) | Round-2 red-team security assessment (2026-09-27, published copy, redactions applied) | Historical record of that build; the headline CRITICAL is now fixed — per-finding status at the top of the file and in the [round-3 remediation record](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) |
+| [`SECURITY-ASSESSMENT-ROUND3.md`](SECURITY-ASSESSMENT-ROUND3.md) | Round-3 red-team report (2026-10-05, moved from `redteam/`) | F1/F3 fixed, F2 accepted — per-finding status at the top of the file and in the [round-3 remediation record](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) |
 | [`SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md`](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) | Round-3 red-team remediation record (F1/F3 fixed, F2 accepted) | F1/F3 fixed with hardware evidence; F2's accepted-risk record is [`../debug-access-risk.md`](../debug-access-risk.md) |
 
 The two `webauthn-discovery-*.md` files and the security/storage/budget
 records that are still cited from code, CI or other documents were **not**
-archived; they remain at `docs/` — see the index.
+archived; they remain at `docs/` — see the index. The `redteam/` directory
+keeps the assessment's Python tooling; only the reports were archived.

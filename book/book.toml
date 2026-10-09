@@ -12,3 +12,6 @@ build-dir = "build"
 [output.html]
 additional-css = ["theme/css/custom.css"]
 additional-js = ["theme/js/custom.js"]
+
+# Site is served from https://eddieoz.github.io/fapico2/
+site-url = "/fapico2/"

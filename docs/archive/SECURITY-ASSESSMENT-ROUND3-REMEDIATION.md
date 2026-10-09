@@ -1,14 +1,29 @@
 # Round-3 Red-Team Remediation Record — fapico2 (1050:0407)
 
 **Date:** 2026-10-05 · **Branch:** `fix/3rd-security-assessment`
-**Source report:** `redteam/SECURITY_ASSESSMENT.md` (round 3, same-day
-remediation). **Epic:** `docs/tasks/EPIC-presence-gated-destruction-and-getinfo-leak.md`
+**Source report:** [`SECURITY-ASSESSMENT-ROUND3.md`](SECURITY-ASSESSMENT-ROUND3.md)
+(round 3, same-day remediation). **Epic:** `docs/tasks/EPIC-presence-gated-destruction-and-getinfo-leak.md`
 (local, gitignored) — US-1600…US-1614, all executed.
 **Verification probe:** `scripts/verify_getinfo_oracle.py` (commit `cb9dcdd`).
 
 Round 3 found three control-plane defects. This record is the post-fix
 hardware evidence for the two remediated ones (F1, F3) and the release-gate
 story for the accepted one (F2).
+
+## Status of every round-3 finding (as of 2026-10-08)
+
+| Finding | Severity | Status | Where |
+|---|---|---|---|
+| F1 — unauthenticated `authenticatorReset` | CRITICAL | **FIXED** (touch gate, both twins + transport) | evidence below |
+| F2 — open debug interface | HIGH | **ACCEPTED** — release gate, must be re-verified on hardware at the first `-release` tag | evidence below; [`../debug-access-risk.md`](../debug-access-risk.md) |
+| F3 — `encCredStoreState` equality oracle | MEDIUM | **FIXED, verified on hardware** | evidence below |
+| F4 — OATH default access code; PUT/DELETE/RENAME ungated; no validate retry counter | HIGH (latent) | **OPEN** — unchanged: `DEFAULT_ACCESS_CODE` still auto-provisioned (`apps/oath/src/oath_core.rs:396`, `:1089`), presence gates cover SET_CODE/CALC/CALC_ALL/RESET only | report F4 |
+| F5 — normal REBOOT leaves the board non-enumerating | MEDIUM | **OPEN** — `cmd_reboot` unchanged (`apps/rescue/src/lib.rs:1335`); BOOTSEL replacement remains accepted by design | report F5 |
+| F6 — `INS_MIGRATION` unauthenticated passphrase oracle | MEDIUM | **OPEN** — no presence grant on the migration dispatch (`apps/mgmt/src/lib.rs:464`) | report F6 |
+| F7 — full firmware extractable over BOOTSEL | LOW | **ACCEPTED BY DESIGN** — documented in the threat model | report F7 |
+| F8 — deprecated pinUvAuth protocol 1 advertised | LOW | **OPEN** — `pin_protocols` still pushes 1 and 2 (`apps/fido/src/ctap2.rs:839`) | report F8 |
+| F9 — `apdu-trace` release-allowed, fixed drain CID, cleartext PINs | INFORMATIONAL | **PARTIALLY FIXED** — the drain channel is per-boot random (US-922, `firmware/src/dbg_cid.rs`); the feature remains release-allowed as a documented capture-build-only surface | report F9 |
+| F10 — unassigned CLA returns success with no data | INFORMATIONAL | **OPEN** — `// TODO: check CLA` (`vendor/opcard/src/command.rs:244`) | report F10 |
 
 ## F1 — CRITICAL unauthenticated `authenticatorReset` — FIXED
 

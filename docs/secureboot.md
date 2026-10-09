@@ -2,7 +2,7 @@
 
 This is the procedure that closes the hole the round-2 assessment opened. The
 board accepted arbitrary firmware, which is how every secret on it was
-recovered — see `docs/SECURITY-ASSESSMENT-ROUND2.md` §16 and §18.
+recovered — see `docs/archive/SECURITY-ASSESSMENT-ROUND2.md` §16 and §18.
 
 There is no key material in this document. Everything below is either
 produced by `build-signed.sh` or is public.

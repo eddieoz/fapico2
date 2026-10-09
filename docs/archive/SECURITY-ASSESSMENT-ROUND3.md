@@ -1,5 +1,15 @@
 # fapico2 Security Assessment — Red Team Report (final)
 
+> **Status of every finding (added 2026-10-08, post-remediation).** F1
+> **FIXED**, F3 **FIXED, verified on hardware**, F2 **accepted with a release
+> gate** — the evidence is in
+> [`SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md`](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md).
+> F4, F5, F6, F8 and F10 are **open**, verified unchanged against the current
+> tree; F7 is accepted by design and documented in the threat model; F9 is
+> **partially addressed** — the drain channel is per-boot random since US-922,
+> and the feature remains release-allowed as a documented capture-build-only
+> surface. Everything below is the report as filed.
+
 **Target:** fapico2 (RP2350) — YubiKey-class authenticator
 **Identity:** USB `1050:0407`, "The BLOCO Community fapico2", serial `94746395`, chipid `0x60da2f528aa9ce05`, CTAPHID fw 5.4.0
 **Date:** 2026-10-05

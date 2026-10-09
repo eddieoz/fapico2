@@ -15,7 +15,7 @@ condition under which it closes.
 
 While `CRIT1.DEBUG_DISABLE` and `CRIT1.SECURE_DEBUG_DISABLE` are unset, the
 RP2350 accepts an SWD debugger. Measured on the live board
-(`redteam/SECURITY_ASSESSMENT.md` F2, 2026-10-05, `picotool info -a` over
+(`docs/archive/SECURITY-ASSESSMENT-ROUND3.md` F2, 2026-10-05, `picotool info -a` over
 BOOTSEL):
 
 ```
@@ -137,7 +137,7 @@ must never be reported as a closed debug port.
 ### What is verified and what is not
 
 - **Verified:** the parser and the policy, against the one hardware reading
-  this repository holds (`redteam/SECURITY_ASSESSMENT.md` F2) in both
+  this repository holds (`docs/archive/SECURITY-ASSESSMENT-ROUND3.md` F2) in both
   directions. `--self-test` exits 0.
 - **Not verified:** that the closure *fires* on real hardware. No fuse has
   been burned; ADR 0002 defers it to the first `-release` tag, and the
@@ -155,7 +155,7 @@ open window, not a description of a closed one.
   decision that the closure is deferred, and why nothing is burned yet.
 - [`secureboot.md`](secureboot.md) — the signed-boot provisioning procedure
   and the `CRIT1` flags it touches.
-- [`SECURITY-ASSESSMENT-ROUND2.md`](SECURITY-ASSESSMENT-ROUND2.md) §16, §18 —
+- [`archive/SECURITY-ASSESSMENT-ROUND2.md`](archive/SECURITY-ASSESSMENT-ROUND2.md) §16, §18 —
   the flash-extraction chain and the limits of same-domain confidentiality.
 - [`known-gate-divergences.md`](known-gate-divergences.md) — the other places
   this firmware records a deliberate divergence rather than inheriting one.

@@ -43,5 +43,5 @@ bug in the single image can still reach everything.
 Reopen this ADR when (a) the per-record key store is landed and measured, (b) a concrete
 threat requires key isolation from the main image itself (not merely from an off-board
 attacker), and (c) engineering capacity for a two-state image and a secure/NS IPC boundary is
-available. Until then, `docs/SECURITY-ASSESSMENT-ROUND2.md`'s TrustZone notes remain the
+available. Until then, `docs/archive/SECURITY-ASSESSMENT-ROUND2.md`'s TrustZone notes remain the
 honest statement: acknowledged, deferred.

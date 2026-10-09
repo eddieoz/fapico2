@@ -10,7 +10,7 @@ RP2350 signed secure boot is enforced by the **bootrom**: a signing-key
 fingerprint is programmed into OTP, and `CRIT1.SECURE_BOOT_ENABLE` is a
 **one-way fuse**. Without it, any image boots — which is exactly how
 `redteam/` recovered every key on the assessment board (see
-`docs/SECURITY-ASSESSMENT-ROUND2.md` §16).
+`docs/archive/SECURITY-ASSESSMENT-ROUND2.md` §16).
 
 ## Two build scripts, and which to use
 

@@ -1,52 +1,66 @@
 # Features
 
-## FIDO2/U2F
+What the device does, and proof that it does it. Everything listed here is implemented and verified against real clients; nothing on this page is a promise. Every term is explained on the [FAQ](../faq/index.md).
 
-Passkeys and WebAuthn over CTAP2.1, including credProtect, credMgmt, largeBlobs, and hmac-secret. Works with Chrome, python-fido2 2.2.1, ykman, and Yubico Authenticator.
+## The device at a glance
 
-- **856 resident passkeys** — measured to refusal on current builds
-- CTAP-HID transport (works everywhere, no drivers needed)
+| App | What you use it for | Transport | Verified with |
+|---|---|---|---|
+| FIDO2 | passkeys, WebAuthn, SSH (`-sk`), Linux login | CTAP-HID | Chrome, python-fido2 2.2.1, ykman |
+| OpenPGP 3.4 | PGP signing/encryption, SSH auth | CCID | gpg / scdaemon 2.4.4 |
+| OATH (YKOATH) | TOTP/HOTP codes | CCID | ykman, Yubico Authenticator |
+| OTP | YubiKey-slot OTP, challenge-response | CCID | ykman otp |
+| Management | device config, rescue surface | CCID | ykman, PicoForge |
 
-## OpenPGP 3.4
+## FIDO2 / WebAuthn
 
-PGP signing/encryption and SSH auth via the OpenPGP card protocol. On-card ECC key generation. Works with gpg / scdaemon 2.4.4.
-
-- CCID transport
-- Needs libccid allowlist on Linux/macOS (see [Getting Started](../getting-started/index.md))
+- Passkeys (WebAuthn) over **CTAP 2.1** — verified with Chrome, python-fido2 2.2.1, ykman and Yubico Authenticator
+- **856 discoverable credentials (resident keys)** — measured to refusal on hardware
+- Credential management: enumerate, rename, delete — via ykman or PicoForge
+- Extensions: **hmac-secret, credProtect, credBlob, largeBlobKey, minPinLength**
+- Large blobs (`authenticatorLargeBlobs`)
+- User presence enforcement through the physical button; user verification with PIN
+- **ES256** (ECDSA over P-256) — the algorithm every client requests first, and the one the device path signs with
+- Permissions enforced on every token: **MC, GA, CM, ACFG, LBW**
+- Authenticator configuration; vendor configuration
+- **Seed backup**: the vendor seed — the soft-lock key — exports once, as a 24-word phrase, and installs on any board; passkeys themselves are non-exportable by design — [the procedure](../how-to/seed-backup.md)
+- **Enterprise attestation** (`enterpriseAttestation`): a listed enterprise RP can request identifying attestation
+- **Signature counters**: a persistent per-credential counter increments on every assertion
+- Sealed store: credentials survive a reflash, and a flash dump alone is inert
 
 ## OATH (YKOATH)
 
-TOTP/HOTP codes, compatible with Yubico Authenticator and ykman.
-
-- **68 slots reserved** in the key store
-- CCID transport
-- Needs libccid allowlist on Linux/macOS
+- **TOTP and HOTP** — 68 credentials reserved in the key store
+- **Access-code locking** — until the correct access code is presented, the applet answers "locked"; it persists across power cycles (hardware-verified)
+- Challenge-response generation, touch-gated
+- Yubico Authenticator and ykman compatible
 
 ## OTP
 
-YubiKey-slot OTP, compatible with ykman otp.
+- **YubiKey-slot OTP** — the YubiKey one-time-password protocol over CCID
+- Challenge-response generation, touch-gated challenge
+- `ykman otp` compatible
 
-- CCID transport
-- Needs libccid allowlist on Linux/macOS
+## OpenPGP 3.4
 
-## Management
+- **OpenPGP card specification v3.4** — 3 key slots (Signature, Encryption, Authentication)
+- RSA (2048, 3072, 4096), Ed25519, Curve25519, ECDSA (NIST P-256, P-384, P-521), secp256k1, Brainpool P-256r1
+- **Key generation on device**; key import; public-key and certificate export
+- PIN and Admin PIN protection; reset and unblock — via the admin PIN or a dedicated reset code
+- Works with GnuPG, SSH and compatible tools over CCID
 
-Device configuration and rescue surface, compatible with ykman and PicoForge.
+## Platform
 
-- CCID transport
-- Runtime VID/PID configuration
-- Rescue applet for BOOTSEL recovery
-
-## PIV
-
-Smartcard login — **deferred to post-v1.0.0**.
+- **Signed secure boot** (opt-in, `./build-signed.sh`): the bootrom refuses unsigned images
+- **Master key in OTP**: the store key derives from a one-way-fused OTP row — nothing that seals the device lives in flash
+- **Rescue interface**: reboot a running board into the mass-storage bootloader without auth or a button
+- LED slot configuration via PicoForge
 
 ## Capacity
 
 | Resource | Capacity | Notes |
 |---|---|---|
-| FIDO2 resident passkeys | 856 | Measured to refusal |
-| OATH credentials | 68 | Reserved in key store |
-| OTP slots | — | YubiKey-protocol |
+| FIDO2 resident passkeys | 856 | Measured to refusal on hardware |
+| OATH credentials | 68 | Reserved in the key store |
 
 For scale: a YubiKey 5 holds 100 resident passkeys.

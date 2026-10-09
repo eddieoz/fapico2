@@ -24,10 +24,16 @@ deliberately **not in git**.
 
 ## Security and design records
 
-- [SECURITY-ASSESSMENT-ROUND2.md](SECURITY-ASSESSMENT-ROUND2.md) — published red-team assessment of an earlier build, in full.
 - [secure-storage-comparison.md](secure-storage-comparison.md) — adversarial comparison of key-at-rest against pico-fido/pico-openpgp/pico-hsm/RS-Key.
 - [secure-storage-story-matrix.md](secure-storage-story-matrix.md) — tracked evidence index for the secure-storage epic.
 - [adr/](adr/README.md) — architecture decision records (PIV/RSA, provisioning policy, TrustZone).
+
+The three red-team security assessments live in
+[`archive/`](archive/README.md): [round 2](archive/SECURITY-ASSESSMENT-ROUND2.md)
+(the deep record), [round 3](archive/SECURITY-ASSESSMENT-ROUND3.md) (the
+same-day report) and the [round-3 remediation
+record](archive/SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) (what is fixed, with
+the hardware evidence).
 
 ## Living budgets and gates (CI reads these — do not move)
 
