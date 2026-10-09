@@ -5,6 +5,7 @@
 - [How-tos](./how-to/index.md)
     - [SSH keys](./how-to/ssh.md)
     - [Linux local authentication](./how-to/linux-auth.md)
+    - [Changing the USB identity](./how-to/usb-identity.md)
 - [Features](./features/index.md)
 - [FAQ](./faq/index.md)
 - [Security](./security/index.md)

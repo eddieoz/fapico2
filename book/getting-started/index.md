@@ -28,7 +28,7 @@ The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID devic
 
 ## USB identity
 
-The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community", product "fapico2". `0xFA20` is not a USB-IF-registered vendor ID, so Linux and macOS need the libccid `Info.plist` allowlist edited before `pcscd` sees the CCID reader (CTAP-HID is unaffected everywhere). Production deployments need a registered VID.
+The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community", product "fapico2". `0xFA20` is not a USB-IF-registered vendor ID, so Linux and macOS need the libccid `Info.plist` allowlist edited before `pcscd` sees the CCID reader (CTAP-HID is unaffected everywhere). Production deployments need a registered VID — see the [USB identity how-to](../how-to/usb-identity.md) for changing it on a running board.
 
 ## First steps after flashing
 
