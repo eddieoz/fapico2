@@ -1,6 +1,6 @@
 # Security
 
-## The model, in plain terms
+## How the keys are kept
 
 - **Keys are generated on the device** from the RP2350's hardware TRNG and used only there — signing happens on the chip.
 - **At rest, everything is sealed.** Records are AEAD-encrypted under a root key derived from `otp_key_1` (a one-way-fused OTP row) plus the chip's own identity. The firmware **refuses to boot** if that row is unavailable — there is no public-constant fallback. A flash dump alone does not open the store; the store key is not in it.

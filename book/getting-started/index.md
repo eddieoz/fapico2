@@ -1,14 +1,14 @@
 # Getting Started
 
-## What you need
+## The hardware
 
-One Raspberry Pi Pico 2 (RP2350). That is the whole shopping list.
+One Raspberry Pi Pico 2 (RP2350) and a USB cable. That is all the hardware there is.
 
-## Get an image
+## Where the image comes from
 
 Download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) from the release (sha256 in its release notes) or build from source — see [Contributing](../contributing/index.md) for build instructions. A first build takes tens of minutes on Linux/macOS/WSL.
 
-## Flash it
+## Putting it on the board
 
 1. Hold **BOOTSEL** on the Pico 2.
 2. Plug the board into your computer via USB.
@@ -18,7 +18,7 @@ Download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/release
 
 The Rust build supports **physical BOOTSEL** only: hold BOOTSEL while plugging in, or BOOTSEL + tap RESET. Full flashing and recovery reference: [`docs/bootsel.md`](https://github.com/eddieoz/fapico2/blob/main/docs/bootsel.md).
 
-## Use it
+## Talking to it
 
 The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID device.
 

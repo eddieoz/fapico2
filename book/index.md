@@ -6,7 +6,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 
 ## Read this first
 
-**fapico2 is experimental.** It has had no external security audit. The RP2350 is not a secure element — it is a general-purpose microcontroller, and a stolen board is only as strong as the optional OTP / secure-boot hardening you have applied to it. Do not use it to guard credentials you cannot afford to lose or have stolen. Read the [threat model](./threat-model.md) and [limitations](./security/index.md) before trusting it with anything real.
+**fapico2 is experimental.** No audit outside this project has looked at the code, the RP2350 carries no secure element, and what stands between a lab and your keys is the sealing design plus whatever hardening you have burned into the board. Do not put a credential on it whose loss you could not survive. The [threat model](./threat-model.md) and [security](./security/index.md) pages name what the chip cannot stop — read them before the first enrolment, not after the first incident.
 
 ## Keys never touch an online machine
 
@@ -26,7 +26,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 | OTP | YubiKey-slot OTP | CCID | ykman otp |
 | Management | device config, rescue surface | CCID | ykman, PicoForge |
 
-Works with the tooling you already have: the CTAP dialect targets Yubico's own client stack, the OpenPGP card speaks protocol 3.4 to GnuPG, and the OATH applet answers Yubico Authenticator. See the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
+The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID. See the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
 
 ## Capacity
 
@@ -37,13 +37,13 @@ One board replaces a drawer of tokens.
 
 ## Getting started
 
-**0. What you need:** one Raspberry Pi Pico 2 (RP2350). That is the whole shopping list.
+**The board:** one Raspberry Pi Pico 2 (RP2350). Nothing else on the shopping list.
 
-**1. Get an image.** Download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) (sha256 in its release notes) or build from source.
+**The image:** download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) (sha256 in its release notes) or build from source.
 
-**2. Flash it.** Hold **BOOTSEL**, plug the board in, copy the UF2 onto the `RP2350` drive that mounts, and wait — re-enumeration can take up to a minute and that is normal.
+**The flash:** hold **BOOTSEL**, plug the board in, copy the UF2 onto the `RP2350` drive that mounts, and wait — re-enumeration can take up to a minute and that is normal.
 
-**3. Use it.** FIDO2 works everywhere, immediately. **Linux/macOS only:** OpenPGP and OATH need a one-time libccid allowlist edit.
+**The first login:** FIDO2 works in any browser straight away. **Linux/macOS only:** OpenPGP and OATH need a one-time libccid allowlist edit.
 
 See [Getting Started](./getting-started/index.md) for the full procedure.
 
