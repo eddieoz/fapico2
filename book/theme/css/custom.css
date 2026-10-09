@@ -2,11 +2,14 @@
    mdBook 0.4's DOM has no per-page id or body class — page content lives
    in #content > main — so classes used on a single page (the landing)
    are unscoped. Only variables mdBook actually defines are used:
-   --links, --quote-bg, --quote-border, --table-header-bg. */
+   --links, --quote-bg, --quote-border, --table-header-bg.
+
+   NOTE: mdBook sets html { font-size: 62.5% }, so 1rem = 10px here.
+   All rem values below are written against that scale (16px body = 1.6rem). */
 
 /* Hero: the opening paragraphs of the landing page */
 .hero {
-    padding: 1.4rem 1.6rem;
+    padding: 2rem 2.4rem;
     border-left: 3px solid var(--links);
     border-radius: 0 8px 8px 0;
     background: var(--quote-bg);
@@ -14,37 +17,58 @@
 }
 
 .hero p:first-child {
-    font-size: 1.18rem;
-    margin-bottom: 0.9rem;
+    font-size: 1.9rem;
+    margin-bottom: 1.2rem;
 }
 
 .hero p:last-child {
     margin-bottom: 0;
 }
 
+/* "What it is for": answers the first-time visitor's pain point, so the
+   lead and the cards carry the largest body text on the page — this
+   section is the pitch, not a table. */
+.pain-lead {
+    font-size: 1.9rem;
+    line-height: 1.55;
+    margin: 1.6rem 0;
+}
+
+.pain-lead p:first-child {
+    margin-bottom: 1rem;
+}
+
+.pain-lead p:last-child {
+    margin-bottom: 0;
+}
+
+.pain-lead strong {
+    font-size: 2.15rem;
+}
+
 /* Use-case grid on the landing page */
 .usecase-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-    gap: 0.9rem;
-    margin: 1.25rem 0;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.6rem;
+    margin: 1.6rem 0;
 }
 
 .usecase {
     border: 1px solid var(--table-header-bg);
     border-radius: 8px;
     background: var(--quote-bg);
-    padding: 1rem 1.15rem 0.9rem;
+    padding: 1.6rem 1.9rem 1.5rem;
 }
 
 .usecase .uc-icon {
-    font-size: 1.6rem;
+    font-size: 2.4rem;
     line-height: 1;
 }
 
 .usecase h3 {
-    margin: 0.5rem 0 0.4rem;
-    font-size: 1.02rem;
+    margin: 0.8rem 0 0.6rem;
+    font-size: 1.75rem;
 }
 
 /* mdBook wraps heading text in an anchor; keep card titles page-colored */
@@ -54,15 +78,15 @@
 
 .usecase p {
     margin: 0;
-    font-size: 0.93rem;
-    line-height: 1.5;
+    font-size: 1.5rem;
+    line-height: 1.55;
 }
 
 /* Security callout */
 .security-callout {
     border-left: 4px solid var(--quote-border);
-    padding: 1rem 1.5rem;
-    margin: 1.5rem 0;
+    padding: 1.6rem 2.4rem;
+    margin: 2.4rem 0;
     background-color: var(--quote-bg);
 }
 
@@ -70,11 +94,11 @@
 table {
     width: 100%;
     border-collapse: collapse;
-    margin: 1rem 0;
+    margin: 1.6rem 0;
 }
 
 th, td {
-    padding: 0.75rem;
+    padding: 1rem;
     text-align: left;
     border-bottom: 1px solid var(--table-header-bg);
 }

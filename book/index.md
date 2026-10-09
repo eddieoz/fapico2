@@ -22,7 +22,13 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 
 ## What it is for
 
-Each applet replaces a habit that leaks. Six of the everyday ones:
+<div class="pain-lead">
+
+**Tired of opening an app and filling in OTPs on every site?** Tired of passwords a database leak takes away from you?
+
+Then put them on a board you own: tap it, type your PIN once, and you are in. No app to open, no six digits to copy, no password to remember. Each applet below replaces a habit that leaks — six of the everyday ones.
+
+</div>
 
 <div class="usecase-grid">
   <div class="usecase">
