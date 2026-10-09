@@ -23,11 +23,15 @@ What the device does, and proof that it does it. Everything listed here is imple
 - **ES256** (ECDSA over P-256) — the algorithm every client requests first, and the one the device path signs with
 - Permissions enforced on every token: **MC, GA, CM, ACFG, LBW**
 - Authenticator configuration; vendor configuration
+- **Seed backup**: the FIDO master seed exports once, as a 24-word phrase, and restores onto another board — [the procedure](../how-to/seed-backup.md)
+- **Enterprise attestation** (`enterpriseAttestation`): a listed enterprise RP can request identifying attestation
+- **Signature counters**: a persistent per-credential counter increments on every assertion
 - Sealed store: credentials survive a reflash, and a flash dump alone is inert
 
 ## OATH (YKOATH)
 
 - **TOTP and HOTP** — 68 credentials reserved in the key store
+- **Access-code locking** — until the correct access code is presented, the applet answers "locked"; it persists across power cycles (hardware-verified)
 - Challenge-response generation, touch-gated
 - Yubico Authenticator and ykman compatible
 
@@ -42,7 +46,7 @@ What the device does, and proof that it does it. Everything listed here is imple
 - **OpenPGP card specification v3.4** — 3 key slots (Signature, Encryption, Authentication)
 - RSA (2048, 3072, 4096), Ed25519, Curve25519, ECDSA (NIST P-256, P-384, P-521), secp256k1, Brainpool P-256r1
 - **Key generation on device**; key import; public-key and certificate export
-- PIN and Admin PIN protection; reset and unblock functions
+- PIN and Admin PIN protection; reset and unblock — via the admin PIN or a dedicated reset code
 - Works with GnuPG, SSH and compatible tools over CCID
 
 ## Platform

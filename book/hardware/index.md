@@ -29,3 +29,4 @@ Anything on the market with an RP2350 and 4 MiB flash is a candidate, not a prom
 - **4 MiB flash** on board.
 - A **BOOTSEL button** you can hold while plugging in.
 - USB-C or micro-USB, whatever the board carries — the firmware is transport-agnostic.
+- If you would rather not carry a bare board, a **printable case** ships in the repository: [`3dprint/Raspberry_Pi_Pico_2_W_Case-bloco.3mf`](https://github.com/eddieoz/fapico2/blob/main/3dprint/Raspberry_Pi_Pico_2_W_Case-bloco.3mf).

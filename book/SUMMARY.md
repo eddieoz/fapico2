@@ -10,6 +10,7 @@
     - [Unlocking disk encryption](./how-to/disk-encryption.md)
     - [Signing git commits](./how-to/git-signing.md)
     - [Encrypting to the recipient](./how-to/mail-encryption.md)
+    - [Backing up the FIDO seed](./how-to/seed-backup.md)
     - [Changing the USB identity](./how-to/usb-identity.md)
     - [Signed secure boot](./how-to/secure-boot.md)
 - [Features](./features/index.md)

@@ -25,11 +25,13 @@ Enroll on any WebAuthn site — `webauthn.io` is the usual first test. The site 
 
 ## Managing credentials
 
-Resident keys can be enumerated, renamed and deleted from `ykman`'s `fido cred` commands or PicoForge's credential manager. Resident SSH keys re-download to any machine with `ssh-keygen -K` — the key-handle file that lands on disk is a pointer, not a secret. Losing the board means re-enrolling; the credentials were never backed up anywhere else.
+Resident keys can be enumerated, renamed and deleted from `ykman`'s `fido cred` commands or PicoForge's credential manager. Resident SSH keys re-download to any machine with `ssh-keygen -K` — the key-handle file that lands on disk is a pointer, not a secret. Losing the board means re-enrolling — **unless** you have run the [one-shot seed backup](../how-to/seed-backup.md), which carries the FIDO identity off the board as a 24-word phrase.
 
 ## TOTP and HOTP
 
 Add accounts in Yubico Authenticator or `ykman oath accounts` — after [changing the OATH access code](#the-default-pins), which ships as `123456`. The codes are computed on the board when you ask, touch-gated on a PIN-set board — the phone or the laptop holds none of them, which is the point of moving 2FA off an online machine.
+
+Two boundaries worth knowing: the access code is a real lock — until the correct one is presented, `LIST` and every calculation answer "locked", and it is what survives a power cycle (hardware-verified). The OATH **PIN**, by contrast, is session state: it does not survive a reboot, so a `ykman` PIN prompt can reappear after replugging. The access code is the one that guards the applet at rest.
 
 ## The OpenPGP card
 

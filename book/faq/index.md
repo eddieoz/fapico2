@@ -11,7 +11,7 @@ For FIDO2, nothing — browsers and libfido2 clients speak CTAP-HID natively. Op
 Nothing recovers it — that is the design, not an oversight. A factory reset issued from any FIDO2 client clears the PIN and takes every FIDO credential on the board with it; the OATH, OTP and OpenPGP applets keep their records. If a reset is your recovery plan, the credentials were never backed up anywhere — plan for that before you need it.
 
 **What happens if I lose the board?**
-A resident passkey exists on that one board and nowhere else — there is no cloud copy to fall back on, which is the point and also the cost. For accounts you cannot afford to be locked out of, register a second authenticator of any kind and store its recovery codes with your emergency documents.
+A resident passkey exists on that one board and nowhere else — there is no cloud copy to fall back on, which is the point and also the cost. For accounts you cannot afford to be locked out of, register a second authenticator of any kind and store its recovery codes with your emergency documents. One path changes the story, and only if you prepared it: the [FIDO seed backup](../how-to/seed-backup.md) carries the FIDO identity off the board as a 24-word phrase, restorable onto a spare board — but only if you exported and sealed it while the original was still in your hand.
 
 **Why not just buy a YubiKey?**
 Capacity and source. This holds 856 resident passkeys to a YubiKey 5's 100, and the firmware is AGPLv3 — you can build it, read it and change it instead of trusting a vendor's black box. What you give up is on the [threat model](../threat-model.md) page: no secure element (a lab with the board can do things a lab with a YubiKey cannot), no NFC, no certifications.
@@ -40,7 +40,7 @@ A CTAP2.1 extension that lets a site or a tool derive a secret on the device —
 A policy extension that tells the device when a credential may be used without user verification. This firmware requires the PIN and the touch on every operation of a PIN-set board regardless, so credProtect cannot weaken anything here.
 
 **What are credBlob and largeBlobKey / large blobs?**
-Two ways a site can store data alongside a credential: credBlob carries a small blob (32 bytes) readable without unlocking; largeBlobKey points at a large blob stored through `authenticatorLargeBlobs`.
+Two ways a site can store data alongside a credential: credBlob carries a small blob (32 bytes) readable without unlocking; largeBlobKey points at a large blob stored through `authenticatorLargeBlobs`. The store behind it is deliberately small on this board — about 960 bytes — so it carries protocol payloads, not files.
 
 **What is minPinLength?**
 An extension that lets a site learn the device's minimum PIN length, so it can enforce the same floor when the PIN is created or changed from a web page.

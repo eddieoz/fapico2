@@ -7,6 +7,7 @@ End-to-end guides for the things people actually do with the device. Every comma
 - [Unlocking disk encryption](./disk-encryption.md) — LUKS volumes whose secret is derived on the board.
 - [Signing git commits](./git-signing.md) — signatures from a key that was born on the chip.
 - [Encrypting to the recipient](./mail-encryption.md) — mail and files sealed for one reader, with the card.
+- [Backing up the FIDO seed](./seed-backup.md) — the one-shot 24-word phrase that carries the FIDO identity off the board.
 - [Changing the USB identity](./usb-identity.md) — swap the VID:PID from PicoForge or the CLI, without stranding the CCID reader.
 - [Signed secure boot](./secure-boot.md) — sign the firmware and burn the fuse, with every irreversible step named first.
 
