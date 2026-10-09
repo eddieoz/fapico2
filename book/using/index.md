@@ -2,6 +2,19 @@
 
 The whole operating model in one paragraph: a board with a PIN set asks for **the PIN and a touch on every operation**, and nothing in a WebAuthn request can switch either off. That is deliberate — a board that leaves your pocket opens nothing by itself. Everything below is the daily consequence of that one decision.
 
+## The default PINs
+
+Two applets ship with factory PINs:
+
+| Surface | Factory default | Change it with |
+|---|---|---|
+| FIDO2 PIN | none — unset | `ykman fido access change-pin`, or the browser prompt |
+| OATH access code | `123456` | Yubico Authenticator or PicoForge |
+| OpenPGP user PIN | `123456` | `gpg --change-pin` |
+| OpenPGP admin PIN | `12345678` | `gpg --change-pin`, both in one menu |
+
+The OpenPGP card tracks whether its factory values are gone, and while they are in force it **refuses to generate, sign or decrypt** — so if `gpg --card-edit generate` errors out on a fresh card, the default PIN is the reason, not a fault. Change both PINs first, then generate. The OATH access code carries the same posture: until you change it, anyone holding the board who tries `123456` gets in. A documented default is the OpenPGP card's way; your changed PIN is the actual defence.
+
 ## Set the PIN first
 
 Before anything else: `ykman fido access change-pin`, or accept the PIN prompt the first time a browser enrols the board. The PIN guards every applet's token — makeCredential, getAssertion, credential management, configuration — and derives the permission rules those tokens carry.
@@ -16,11 +29,11 @@ Resident keys can be enumerated, renamed and deleted from `ykman`'s `fido cred` 
 
 ## TOTP and HOTP
 
-Add accounts in Yubico Authenticator or `ykman oath accounts`. The codes are computed on the board when you ask, touch-gated on a PIN-set board — the phone or the laptop holds none of them, which is the point of moving 2FA off an online machine.
+Add accounts in Yubico Authenticator or `ykman oath accounts` — after [changing the OATH access code](#the-default-pins), which ships as `123456`. The codes are computed on the board when you ask, touch-gated on a PIN-set board — the phone or the laptop holds none of them, which is the point of moving 2FA off an online machine.
 
 ## The OpenPGP card
 
-`gpg --card-status` to meet the card, `gpg --card-edit` then `generate` to create the three key slots (sign, encrypt, authenticate) on the chip — the keys are born there and never leave. `gpg --change-pin` changes the card's PIN. Encrypt directly to the recipient's key and the message is unreadable to everyone but the holder — no screenshot of a "secure" note, no trusting the channel. Full walks: [git commit signing](../how-to/git-signing.md) and [encrypted mail and files](../how-to/mail-encryption.md).
+`gpg --card-status` to meet the card, `gpg --card-edit` then `generate` to create the three key slots (sign, encrypt, authenticate) on the chip — the keys are born there and never leave. `gpg --change-pin` changes the card's PINs — **before** `generate`, because the card refuses key operations while its [factory PINs](#the-default-pins) are still in force. Encrypt directly to the recipient's key and the message is unreadable to everyone but the holder — no screenshot of a "secure" note, no trusting the channel. Full walks: [git commit signing](../how-to/git-signing.md) and [encrypted mail and files](../how-to/mail-encryption.md).
 
 ## OTP slots
 
