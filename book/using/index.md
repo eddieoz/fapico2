@@ -1,6 +1,6 @@
 # Using the device
 
-The whole operating model in one paragraph: a board with a PIN set asks for **the PIN and a touch on every operation**, and nothing in a WebAuthn request can switch either off. That is deliberate — a board that leaves your pocket opens nothing by itself. Everything below is the daily consequence of that one decision.
+The whole operating model in one paragraph: a board with a PIN set asks for **the PIN and a touch on every operation**, and nothing in a WebAuthn request can switch either off. That is deliberate — a board that leaves your pocket opens nothing by itself. (On a stock Pico 2, the touch is the **BOOTSEL button** — the same button that flashes the board.) Everything below is the daily consequence of that one decision.
 
 ## The default PINs
 
@@ -34,6 +34,8 @@ Add accounts in Yubico Authenticator or `ykman oath accounts` — after [changin
 ## The OpenPGP card
 
 `gpg --card-status` to meet the card, `gpg --card-edit` then `generate` to create the three key slots (sign, encrypt, authenticate) on the chip — the keys are born there and never leave. `gpg --change-pin` changes the card's PINs — **before** `generate`, because the card refuses key operations while its [factory PINs](#the-default-pins) are still in force. Encrypt directly to the recipient's key and the message is unreadable to everyone but the holder — no screenshot of a "secure" note, no trusting the channel. Full walks: [git commit signing](../how-to/git-signing.md) and [encrypted mail and files](../how-to/mail-encryption.md).
+
+On a phone, the same card talks to PGPony and OpenKeychain over a USB OTG cable — [PGPony needs its public key paired](../interop/index.md#the-quirks-worth-knowing) before it offers the device as a signer.
 
 ## OTP slots
 

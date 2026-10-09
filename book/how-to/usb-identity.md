@@ -44,6 +44,18 @@ python3 scripts/fix_usb_identity.py --set 1D50:619B
 - **If the new pair is not in libccid's table**, do the [PC/SC allowlist edit](https://github.com/eddieoz/fapico2/blob/main/docs/identity.md#pcsc-allowlist-libccid) for it — the reader stays invisible to `pcscd` otherwise.
 - **To go back:** `--set FA20:0002` restores the build default.
 
+## Phones need a Yubico identity
+
+Phone apps reach the board over a USB OTG cable — the same CCID surface as the desktop; a Pico 2 has no radio. The Android clients worth using are built around YubiKeys, and several only open readers that claim Yubico's identity: **Yubico Authenticator on Android will not talk to a board enumerating as `FA20:0002`**, and the OpenPGP apps are written to the same expectation. So the phone is the reason to do this deliberately:
+
+```bash
+python3 scripts/fix_usb_identity.py --set 1050:0407
+```
+
+or PicoForge → Configuration → the **YubiKey 5** preset (it asks for the device PIN and a touch). Unplug, replug, and the phone — OTG cable attached — sees a YubiKey. `1050:0407` is in libccid's table on every mainstream desktop, so unlike the bare default this pair needs **no allowlist edit anywhere**: the identity swap is what makes both the phone and a stock Linux desktop work with zero host changes.
+
+The rule from below still applies with force: it is Yubico's identity, borrowed for interop on your own board — never in anything you ship.
+
 ## Which identity to pick
 
 - **A vendor ID registered to you** (pid.codes and OpenMoko allocate one to open-source projects) is the right answer for anything you distribute.

@@ -53,7 +53,7 @@ Each applet replaces a habit that leaks. Six of the everyday ones:
   <div class="usecase">
     <div class="uc-icon">⏱️</div>
     <h3>Second factor, in your pocket</h3>
-    <p>TOTP and HOTP codes computed on the board, read through Yubico Authenticator — the phone holds none of them.</p>
+    <p>TOTP and HOTP codes computed on the board, read through Yubico Authenticator — on the laptop or on your phone over a USB cable. The phone holds none of them.</p>
   </div>
 </div>
 
@@ -67,7 +67,7 @@ Each applet replaces a habit that leaks. Six of the everyday ones:
 | OTP | YubiKey-slot OTP | CCID | ykman otp |
 | Management | device config, rescue surface | CCID | ykman, PicoForge |
 
-The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID. The first hour with the board: [Using the device](./using/index.md). Deeper walks: the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
+The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID — and your phone talks to it over a USB OTG cable once [it claims a Yubico identity](./interop/index.md#on-a-phone). The first hour with the board: [Using the device](./using/index.md). Deeper walks: the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
 
 ## Capacity
 
