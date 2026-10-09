@@ -1,8 +1,12 @@
 # fapico2
 
+<div class="hero">
+
 **The F\*\*king Authenticator.** Your passkeys, PGP keys and 2FA tokens — on hardware you own.
 
 fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) into a multi-applet hardware authenticator: FIDO2 passkeys, OpenPGP 3.4, OATH (TOTP/HOTP) and YubiKey-protocol OTP served by **one firmware, one binary**, over one USB composite device. No vendor account, no cloud, no subscription. Written in Rust, licensed AGPLv3 — build it from source or download the prebuilt image.
+
+</div>
 
 ## Read this first
 
