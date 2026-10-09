@@ -1,8 +1,8 @@
 # The seed backup
 
-The board holds a 32-byte **vendor master seed** — the key material behind the [soft lock](../using/index.md#factory-reset) and PicoForge's Backup screen. The firmware can export it **once**, as a 24-word BIP-39 phrase, and install a phrase (or a fresh seed) on any board running this firmware. Two drivers speak the same channel and print the same words for the same seed: [`scripts/backup_fido.py`](https://github.com/eddieoz/fapico2/blob/feat/backup/scripts/backup_fido.py) on the command line, and PicoForge's Backup screen.
+The board holds a 32-byte **vendor master seed** — the key material behind the [soft lock](../using/index.md#factory-reset) and PicoForge's Backup screen. The firmware can export it **once**, as a 24-word BIP-39 phrase, and install a phrase (or a fresh seed) on any board running this firmware. Two drivers speak the same channel and print the same words for the same seed: [`scripts/backup_fido.py`](https://github.com/eddieoz/fapico2/blob/main/scripts/backup_fido.py) on the command line, and PicoForge's Backup screen.
 
-The full record — wire notes, test coverage, failure statuses — is [`docs/backup-seed.md`](https://github.com/eddieoz/fapico2/blob/feat/backup/docs/backup-seed.md). This page is what you need to use it.
+The full record — wire notes, test coverage, failure statuses — is [`docs/backup-seed.md`](https://github.com/eddieoz/fapico2/blob/main/docs/backup-seed.md). This page is what you need to use it.
 
 <div class="security-callout">
 
