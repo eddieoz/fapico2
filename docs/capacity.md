@@ -143,7 +143,11 @@ acceptance criterion 2's "≥500 KB spare" is therefore **not met, deliberately*
 
 US-1639 carved eight Nostr slots from the top of FIDO's range, so the derived
 number moved 856 → 848; the boundary run below is the US-1563 measurement at
-the pre-carve geometry and its re-run against 848 is US-1675's. The table
+the pre-carve geometry, and **the US-1675 re-run at the carved geometry is
+done: the boundary test re-run at Phase-3 HEAD (b22d750) enrols 848, refuses
+the 849th with `RegionCredentialError::Full` → CTAP2 `0x28`, and leaves
+nothing partial — 6/6 tests green, `cargo test -p fapico2-fido --test
+capacity_boundary` on 2026-10-10.** The table
 above is a **derivation**. It says the region is 960 slots and the
 five reservations tile it — and the compile-time assertions in
 `keyregion/mod.rs` check that the tiling is exact. What it does *not* say is
@@ -161,7 +165,7 @@ enrols credentials until the first refusal and checks four things:
 | the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the five terms sum to `TOTAL_SLOTS` |
 | nothing partial is left | exactly 848 slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
 
-**Measured: 856 at the pre-carve geometry (US-1563); 848 derived after US-1639's carve, re-measure US-1675.** Every record in that run is a real `DeviceCredential`
+**Measured: 856 at the pre-carve geometry (US-1563); 848 derived after US-1639's carve and re-measured at the carved geometry (US-1675, 2026-10-10).** Every record in that run is a real `DeviceCredential`
 encoded by the applet's own codec at its maximum field sizes (63-byte RP ID,
 58-byte `user.name`, 43-byte `displayName`, 64-byte `user.id`, 32-byte
 `credBlob`, `largeBlobKey`, `hmac-secret`) — 596 bytes sealed, against the

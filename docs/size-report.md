@@ -1,3 +1,33 @@
+**Date:** 2026-10-10 (**US-1675 — the Nostr applet arc, re-measured at
+Phase-3 HEAD (b22d750).** `text` 859,372 → **887,880 B (+28,508)**; Berkeley
+`.bss` 375,808 → **402,012 B (+26,204)**; `.data` **0**; `.uninit`
+**1,024 B** (unchanged). `text` sits at 887,880 of the 3,670,016 B flash
+ceiling; `.bss` at 402,012 of the 434,176 B RAM ceiling (**32,164 B
+headroom**); `check_boot_chain.py` worst call chain **93,764 ≤ 98,304 B**;
+task arena demand **14,344 B** of 32,772 B (2.28× floor, measurement stamp
+`adaccd6a…`). UF2 3,344 blocks, sha256 `7e10d501…`. `check_size_report.py`
+green; the 848-credential boundary re-run green (`capacity_boundary.rs`
+6/6, US-1675).)
+
+**The +28,508 text and +26,204 bss is the whole Nostr applet arc, measured
+as one step because the arc landed between ledger entries.** The pieces:
+the `apps/nostr` applet itself (keyring in flash, BIP-340/ECDFS signing and
+NIP-44 v2 ciphering, §2.2 wire vocabulary); the HID vendor arm
+(`nostr_dispatch`, the `PendingUp` refusal widened `2 → 5` bytes for the
+vendor envelope, US-1663's park-and-redrive consent machinery, the
+`NOSTR_HID_GRANT_CONTEXT` transport discriminator); `nostr_wire.rs`'s CBOR
+dialect; and the arena hoist (US-1660) that moved the HID statics out of
+task stack into `.bss` — the reason the bss step and the chain headroom
+(44,584 → 32,164 B against the main stack zone) moved together.
+
+**What the bss bought, bounded:** the `NOSTR_RESP`/frame statics are fixed
+buffers sized by the wire bounds (§2.2's 2,074 B worst request), not by
+call depth — the arena demand measurement (14,344 B, stamped) pins the HID
+task's stack at 4,720 B unchanged from US-1660's measurement. The
+32,164 B RAM headroom is the honest margin; US-1672's hoist moved it
+*down* from 44,584 by design, in exchange for a serve bound (2,750 ms)
+that is asserted rather than hoped.
+
 **Date:** 2026-10-04 (**US-1562 — `getAssertion` over the key region.** `text`
 855,656 → **859,372 B**; Berkeley `.bss` 375,472 → **375,808 B (+336)**;
 `.data` **0**; `.uninit` 1,024 → **1,024 B**. Main stack zone 143,224 →
@@ -40,12 +70,12 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 794,772 | `0x10000200` | no (flash) |
-| `.rodata` | 20,296 | `0x100c2298` | no (flash) |
+| `.text` | 820,336 | `0x10000200` | no (flash) |
+| `.rodata` | 20,700 | `0x100c8670` | no (flash) |
 | `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100ca7c0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 374,792 | `0x200035d8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x2005ede0` | yes |
+| `.gnu.sgstubs` | 0 | `0x100d0d20` | non-alloc, not in Berkeley `text` |
+| `.bss` | 400,988 | `0x200035d8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20065434` | yes |
 | `.defmt` | 41 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -65,12 +95,11 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 861,912 B** · **`.data` = 13,780 B** · **`.bss` = 375,816 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 887,880 B** · **`.data` = 13,780 B** · **`.bss` = 402,012 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 389,596 B** (389,600 B address-to-address: `__sheap` `0x2005f1e0` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2005f1e0` → **main stack zone = 142,880 B** of 532,480 B of SRAM.
+**RAM statics = 415,792 B** (415,796 B address-to-address: `__sheap` `0x20065834` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20065834` → **main stack zone = 116,684 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
-
 <!-- END measured ELF summary -->
 
 **Date: 2026-10-07 (flash ratchet raised 1621 → 1664 KiB — and the mirror that
