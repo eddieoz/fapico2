@@ -1,0 +1,20 @@
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/fapico2_firmware-c867fabe7afdbc68)
+
+running 1 test
+test nostr_wire::tests::an_argument_above_the_wire_cap_is_refused_in_band ... FAILED
+
+failures:
+
+---- nostr_wire::tests::an_argument_above_the_wire_cap_is_refused_in_band stdout ----
+
+thread 'nostr_wire::tests::an_argument_above_the_wire_cap_is_refused_in_band' (581414) panicked at firmware/src/nostr_wire.rs:289:32:
+called `Result::unwrap()` on an `Err` value: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    nostr_wire::tests::an_argument_above_the_wire_cap_is_refused_in_band
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p fapico2-firmware --lib`

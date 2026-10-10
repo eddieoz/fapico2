@@ -60,9 +60,21 @@ pub const NOSTR_CMD_DELETE_KEY: u8 = 0x49;
 /// §2.2 `SET_LABEL`.
 pub const NOSTR_CMD_SET_LABEL: u8 = 0x4A;
 
-/// The largest legal request argument. `NIP44_DECRYPT` is the worst case:
-/// sender key (32) + payload (33 version+nonce ‖ 2 ‖ padded(1792) ‖ 32 mac) —
-/// the applet's own `max_legal` cap. The APDU adds 7 header bytes.
+/// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
+/// above the applet's `MAX_REQUEST_ARG` is decodable, so every vendor arm
+/// inherits the bound and no future command can re-derive it wrong. The
+/// constant is derived from `MAX_PLAINTEXT` (via
+/// `fapico2_nostr::MAX_REQUEST_ARG`), never restated here. A hostile frame
+/// may declare a larger byte string; [`decode_request`] answers it
+/// [`SW_WRONG_DATA`] in band — which is also what makes [`build_apdu`]'s
+/// scratch capacity an upper bound no decoder output can exceed.
+pub const NOSTR_REQ_ARG_MAX: usize = fapico2_nostr::MAX_REQUEST_ARG;
+
+/// The APDU scratch bound: the 7-byte APDU header over the largest legal
+/// argument (`NOSTR_REQ_ARG_MAX` = 1,891), with the padded-upper-bound
+/// headroom (2048) the original derivation priced. The parser cap means the
+/// scratch is never filled to its bound by any decoder output — the
+/// headroom is slack, not reachable capacity.
 pub const NOSTR_APDU_REQ_MAX: usize = 7 + 32 + 33 + 2 + 2048 + 32;
 
 /// D13 §2.2.0 — `wrong data / bad index`: a malformed request envelope.
@@ -111,8 +123,11 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
 
 /// The request envelope: CBOR `array(2) [idx, arg]`. An **empty payload** is
 /// the argument-less form (`ping`): idx 0, empty arg. Anything else that is
-/// not exactly this shape is [`SW_WRONG_DATA`] — reported in band, because a
-/// client that sent garbage still gets a readable answer, not silence.
+/// not exactly this shape — including an argument above the §2.2.1 wire cap
+/// ([`NOSTR_REQ_ARG_MAX`], US-1678) — is [`SW_WRONG_DATA`] — reported in
+/// band, because a client that sent garbage still gets a readable answer,
+/// not silence. The cap lives here, at the parse layer, so every arm
+/// inherits it and no future command re-derives the bound wrong.
 pub fn decode_request(payload: &[u8]) -> Result<(u16, &[u8]), Sw> {
     let Some((idx, arg)) = decode_request_inner(payload) else {
         return Err(SW_WRONG_DATA);
@@ -136,6 +151,14 @@ fn decode_request_inner(payload: &[u8]) -> Option<(u16, &[u8])> {
         return None;
     }
     let (arg, rest) = read_bytes(rest)?;
+    // The §2.2.1 wire cap (US-1678): the CTAPHID frame can carry up to
+    // `CTAPHID_MAX_MSG` and this CBOR shape accepts a byte string to match,
+    // but no legal request argument exceeds `NOSTR_REQ_ARG_MAX` — the same
+    // bound the applet's `nip44_decrypt` gate applies. Refusing here means
+    // every arm inherits the cap and `build_apdu`'s scratch cannot overflow.
+    if arg.len() > NOSTR_REQ_ARG_MAX {
+        return None;
+    }
     if !rest.is_empty() {
         return None; // trailing garbage is malformed, not ignorable
     }
@@ -248,45 +271,81 @@ pub fn decode_response(buf: &[u8]) -> Option<(Sw, &[u8])> {
 
 /// The request envelope's encoder — the mirror of [`decode_request`], for the
 /// client (OpenXrypt's extension speaks the same bytes) and for the tests.
-/// `arg` may be empty (idx-only form).
-pub fn encode_request(idx: u16, arg: &[u8]) -> HeaplessVec<u8, NOSTR_APDU_REQ_MAX> {
+/// `arg` may be empty (idx-only form). `None` = the argument does not fit the
+/// request buffer — same treatment as [`build_apdu`]: the capacity proof is
+/// written at the site (every caller passes arguments at or below
+/// [`NOSTR_REQ_ARG_MAX`], and `4 + 3 + NOSTR_REQ_ARG_MAX` ≤
+/// [`NOSTR_APDU_REQ_MAX`]), the `debug_assert!` documents it, and the
+/// host-side callers unwrap the `Option` themselves because this encoder
+/// never ships on the device.
+pub fn encode_request(idx: u16, arg: &[u8]) -> Option<HeaplessVec<u8, NOSTR_APDU_REQ_MAX>> {
+    debug_assert!(
+        arg.len() <= NOSTR_REQ_ARG_MAX,
+        "argument above the parser cap: encode_request mirrors decode_request's domain"
+    );
+    if arg.len() + 7 > NOSTR_APDU_REQ_MAX {
+        return None;
+    }
     let mut out = HeaplessVec::new();
-    out.push(0x82).unwrap();
+    out.push(0x82).ok()?;
     if idx <= 0x17 {
-        out.push(idx as u8).unwrap();
+        out.push(idx as u8).ok()?;
     } else if idx <= 0xFF {
-        out.extend_from_slice(&[0x18, idx as u8]).unwrap();
+        out.extend_from_slice(&[0x18, idx as u8]).ok()?;
     } else {
         let [hi, lo] = idx.to_be_bytes();
-        out.extend_from_slice(&[0x19, hi, lo]).unwrap();
+        out.extend_from_slice(&[0x19, hi, lo]).ok()?;
     }
     match arg.len() {
-        0..=23 => out.push((0x40 + arg.len()) as u8).unwrap(),
-        24..=255 => out.extend_from_slice(&[0x58, arg.len() as u8]).unwrap(),
+        0..=23 => out.push((0x40 + arg.len()) as u8).ok()?,
+        24..=255 => out.extend_from_slice(&[0x58, arg.len() as u8]).ok()?,
         _ => {
             let [hi, lo] = (arg.len() as u16).to_be_bytes();
-            out.extend_from_slice(&[0x59, hi, lo]).unwrap()
+            out.extend_from_slice(&[0x59, hi, lo]).ok()?
         }
     }
-    out.extend_from_slice(arg).unwrap();
-    out
+    out.extend_from_slice(arg).ok()?;
+    Some(out)
 }
 
 /// Build the applet APDU for one vendor command: `[00, INS, idx, 00, Lc, arg…]`,
 /// extended Lc when the argument needs it. `None` = the argument cannot ride
-/// an APDU of this size (an over-long arg is [`SW_WRONG_DATA`] in band, not a
-/// panic) — `out` must be at least [`NOSTR_APDU_REQ_MAX`].
-pub fn build_apdu(ins: u8, idx: u16, arg: &[u8], out: &mut HeaplessVec<u8, NOSTR_APDU_REQ_MAX>) {
+/// an APDU of this size — the caller answers [`SW_WRONG_DATA`] in band, not a
+/// panic (US-1678: the `unwrap` this replaced was USB-reachable through any
+/// over-cap vendor frame, and `panic = "abort"` makes that a reboot).
+///
+/// **Reachability proof, asserted and tested:** [`decode_request`] refuses
+/// any argument above [`NOSTR_REQ_ARG_MAX`] (1,891 B), and
+/// `7 + NOSTR_REQ_ARG_MAX` ≤ [`NOSTR_APDU_REQ_MAX`] (2,154 B) — so through
+/// `process_vendor_through` the explicit overflow arm below is unreachable,
+/// the `debug_assert!` documents it, and
+/// `an_argument_above_the_wire_cap_is_refused_in_band` pins the whole chain.
+/// Direct callers that bypass the parser still get the `None`, never a
+/// panic.
+pub fn build_apdu(
+    ins: u8,
+    idx: u16,
+    arg: &[u8],
+    out: &mut HeaplessVec<u8, NOSTR_APDU_REQ_MAX>,
+) -> Option<()> {
+    debug_assert!(
+        arg.len() <= NOSTR_REQ_ARG_MAX,
+        "argument above the parser cap: build_apdu is only reachable behind decode_request"
+    );
     out.clear();
-    out.extend_from_slice(&[0x00, ins, idx as u8, 0x00]).unwrap();
-    if arg.len() <= 255 {
-        out.push(arg.len() as u8).unwrap();
-    } else {
-        out.push(0x00).unwrap();
-        let [hi, lo] = (arg.len() as u16).to_be_bytes();
-        out.extend_from_slice(&[hi, lo]).unwrap();
+    if arg.len() + 7 > NOSTR_APDU_REQ_MAX {
+        return None; // the explicit overflow arm — see the reachability proof
     }
-    out.extend_from_slice(arg).unwrap();
+    out.extend_from_slice(&[0x00, ins, idx as u8, 0x00]).ok()?;
+    if arg.len() <= 255 {
+        out.push(arg.len() as u8).ok()?;
+    } else {
+        out.push(0x00).ok()?;
+        let [hi, lo] = (arg.len() as u16).to_be_bytes();
+        out.extend_from_slice(&[hi, lo]).ok()?;
+    }
+    out.extend_from_slice(arg).ok()?;
+    Some(())
 }
 
 /// The one vendor-command body every `NostrDispatch` impl runs: decode the
@@ -319,7 +378,12 @@ pub fn process_vendor_through(
     let Some(ins) = vendor_to_ins(cmd) else {
         return encode_response(SW_INS_NOT_SUPPORTED, &[], out);
     };
-    build_apdu(ins, idx, arg, req);
+    // build_apdu cannot overflow behind this parser (US-1678); its `None`
+    // arm is the belt over that braces, and it is answered with the same
+    // in-band refusal as a malformed envelope.
+    if build_apdu(ins, idx, arg, req).is_none() {
+        return encode_response(SW_WRONG_DATA, &[], out);
+    }
     resp.clear();
     process(req.as_slice(), resp);
     // (data ‖ SW) → the CBOR response; the sw field is the vocabulary
@@ -346,21 +410,28 @@ mod tests {
     #[test]
     fn request_and_response_envelopes_round_trip() {
         // idx-only form (GET_PUBKEY / LIST_KEYS / GENERATE_KEY).
-        let req = encode_request(3, &[]);
+        let req = encode_request(3, &[]).unwrap();
         let (idx, arg) = decode_request(&req).unwrap();
         assert_eq!((idx, arg), (3, &[][..]));
 
         // idx + short arg (SIGN: the 32-byte sighash).
-        let req = encode_request(0, &[0x5A; 32]);
+        let req = encode_request(0, &[0x5A; 32]).unwrap();
         let (idx, arg) = decode_request(&req).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(arg, &[0x5A; 32][..]);
 
-        // u16-head arg (NIP-44: arguments exceed 255 bytes).
-        let req = encode_request(1, &[0x33; 1900]);
+        // u16-head arg (NIP-44: arguments exceed 255 bytes) — at the §2.2.1
+        // wire cap itself, the boundary `decode_request` enforces.
+        let req = encode_request(1, &[0x33; NOSTR_REQ_ARG_MAX]).unwrap();
         let (idx, arg) = decode_request(&req).unwrap();
         assert_eq!(idx, 1);
-        assert_eq!(arg.len(), 1900);
+        assert_eq!(arg.len(), NOSTR_REQ_ARG_MAX);
+        // One byte past the cap is refused at the parse layer (US-1678) —
+        // hand-built, because `encode_request`'s own domain is capped too.
+        let mut over = vec![0x82, 0x01, 0x59];
+        over.extend_from_slice(&(NOSTR_REQ_ARG_MAX as u16 + 1).to_be_bytes());
+        over.extend_from_slice(&[0x33; NOSTR_REQ_ARG_MAX + 1]);
+        assert_eq!(decode_request(&over), Err(SW_WRONG_DATA));
 
         // Empty payload = the argument-less form (`ping`).
         let (idx, arg) = decode_request(&[]).unwrap();
@@ -403,6 +474,41 @@ mod tests {
             &[0x82, 0x1A, 0, 0, 0, 0x01, 0x40, 0][..], // u32 uint head
         ] {
             assert_eq!(decode_request(bad), Err(SW_WRONG_DATA));
+        }
+    }
+
+    /// US-1678 (review P0): an argument above the §2.2.1 wire cap is refused
+    /// in band — the `SW_WRONG_DATA` envelope on the method's own channel —
+    /// and the suite never panics. The 3,000-byte argument is hand-built (a
+    /// legal-shaped `array(2) [idx, arg]` whose byte string declares more
+    /// than any legal request carries) because `encode_request`'s own buffer
+    /// could not hold it. Red against the pre-fix tip: `build_apdu`'s
+    /// `extend_from_slice(..).unwrap()` overflowed the 2,154 B scratch and
+    /// rebooted the device (`panic = "abort"`), USB-reachable from any
+    /// CTAPHID client that can send INIT plus one vendor frame.
+    #[test]
+    fn an_argument_above_the_wire_cap_is_refused_in_band() {
+        let mut payload = vec![0x82, 0x01, 0x59, 0x0B, 0xB8]; // array(2) [1, bytes(3000)]
+        payload.extend_from_slice(&[0xAA; 3000]);
+        for cmd in 0x40..=0x7F {
+            let mut req = HeaplessVec::new();
+            let mut resp = HeaplessVec::new();
+            let mut out = HeaplessVec::new();
+            let n = process_vendor_through(
+                cmd,
+                &payload,
+                &mut req,
+                &mut resp,
+                |apdu, _| {
+                    // The parser cap must refuse before the applet runs: no
+                    // over-cap argument may reach any command body.
+                    panic!("over-cap argument reached the applet: cmd 0x{cmd:02X}, apdu len {}", apdu.len());
+                },
+                &mut out,
+            );
+            let (sw, data) = decode_response(&out[..n]).unwrap();
+            assert_eq!(sw, SW_WRONG_DATA, "cmd 0x{cmd:02X} must refuse in band");
+            assert!(data.is_empty());
         }
     }
 

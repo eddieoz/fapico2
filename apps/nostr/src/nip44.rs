@@ -123,6 +123,26 @@ pub fn message_keys(ck: &[u8; 32], nonce: &[u8; 32]) -> MessageKeys {
     }
 }
 
+/// The compile-time mirror of [`calc_padded_len`], for deriving buffer and
+/// wire capacities from `MAX_PLAINTEXT` at const-eval time (the §2.2.1 wire
+/// cap in `lib.rs`, the APDU scratch in the firmware's `nostr_wire`). The
+/// `len == 0` case yields 0 here — no capacity is derived from it — while
+/// the runtime form keeps its `None`, whose contract is US-1653's. Lockstep
+/// with the runtime form is pinned by `calc_padded_len_const_matches_runtime`
+/// in the test module below.
+pub const fn calc_padded_len_const(len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if len <= 32 {
+        return 32;
+    }
+    let v = len - 1; // ≥ 32 here, so the log2 below is well-defined
+    let next_power = 1u64 << (63 - v.leading_zeros() + 1);
+    let chunk = if next_power <= 256 { 32 } else { next_power / 8 };
+    chunk * ((len - 1) / chunk + 1)
+}
+
 /// NIP-44 v2 `calcPaddedLen`. `None` at `len == 0` — the input is invalid
 /// there, and the expression must not be evaluated (`log2(0)`; the release
 /// profile is `panic = "abort"`, so a literal transcription would reboot
@@ -249,4 +269,22 @@ pub fn decrypt_with_ck(
     // offset 2 inside the decrypted padded region — move it forward.
     out.copy_within(2..2 + unpadded_len, 0);
     Ok(unpadded_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The const mirror must stay in lockstep with the runtime form —
+    /// capacities are derived from the const one, behaviour from the
+    /// runtime one; a drift between them would make the wire cap and the
+    /// applet's own refusal disagree.
+    #[test]
+    fn calc_padded_len_const_matches_runtime() {
+        for len in [0u64, 1, 32, 33, 64, 65, 255, 256, 257, 1791, 1792, 2048, 65_535] {
+            assert_eq!(calc_padded_len_const(len), calc_padded_len(len).unwrap_or(0), "len {len}");
+        }
+        // The capacity derivation anchors on MAX_PLAINTEXT: padded(1792) = 1792.
+        assert_eq!(calc_padded_len_const(super::super::MAX_PLAINTEXT as u64), 1792);
+    }
 }

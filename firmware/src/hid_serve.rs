@@ -4211,7 +4211,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GET_PUBKEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1662: the GET_PUBKEY pass",
@@ -4233,7 +4233,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1662: the GENERATE_KEY pass",
@@ -4289,7 +4289,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1662: the GENERATE_KEY pass",
@@ -4299,7 +4299,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_SIGN,
-            &encode_request(0, &sighash),
+            &encode_request(0, &sighash).unwrap(),
         ));
         block_on(
             "US-1662: the SIGN pass",
@@ -4364,7 +4364,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1662: the GENERATE_KEY pass",
@@ -4383,7 +4383,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_NIP44_ENCRYPT,
-            &encode_request(0, &arg),
+            &encode_request(0, &arg).unwrap(),
         ));
         // The 1.9 KB command rides ~30 HID reports and a pass reads one, so
         // drive the loop until the reply lands — the assembler reassembles
@@ -4410,7 +4410,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_NIP44_DECRYPT,
-            &encode_request(0, &arg),
+            &encode_request(0, &arg).unwrap(),
         ));
         block_on("US-1662: the NIP-44 DECRYPT passes", async {
             let mut passes = 0;
@@ -4464,7 +4464,7 @@ pub(crate) mod tests {
             "US-1662: the INIT pass",
             dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
         );
-        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x50, &encode_request(0, &[])));
+        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x50, &encode_request(0, &[]).unwrap()));
         block_on(
             "US-1662: the unsupported-method pass",
             dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
@@ -4566,7 +4566,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1662: the touch-refusal pass",
@@ -4665,7 +4665,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the park pass",
@@ -4747,7 +4747,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch1,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the park pass",
@@ -4762,7 +4762,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch2,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the busy pass",
@@ -4830,7 +4830,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the nostr park pass",
@@ -4912,7 +4912,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the contending vendor pass",
@@ -4979,7 +4979,7 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(
             ch,
             NOSTR_CMD_GENERATE_KEY,
-            &encode_request(0, &[]),
+            &encode_request(0, &[]).unwrap(),
         ));
         block_on(
             "US-1663: the park pass",

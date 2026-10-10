@@ -220,6 +220,24 @@ pub const APPLET_VERSION: [u8; 2] = [0x00, 0x01];
 /// chunk-rounded function, so the two cannot drift.
 pub const MAX_PLAINTEXT: u16 = 1792;
 
+/// The largest legal `NIP44_DECRYPT` payload — the §2.2.1 worst case, stated
+/// once and derived from [`MAX_PLAINTEXT`]: version+nonce (33) ‖ ct
+/// (2 + padded) ‖ mac (32), with `padded` the chunk-rounded
+/// `calc_padded_len(MAX_PLAINTEXT)`. This is the same arithmetic
+/// `nip44_decrypt` applies at its request gate; the constant is the
+/// compile-time twin (`nip44::calc_padded_len_const`), so the runtime gate
+/// and every derived capacity come from one expression.
+pub const MAX_NIP44_PAYLOAD_ARG: usize =
+    33 + 2 + nip44::calc_padded_len_const(MAX_PLAINTEXT as u64) as usize + 32;
+
+/// The largest legal request argument any §2.2 command accepts — the §2.2.1
+/// **wire cap**, consumed by the transports' parsers (the firmware's
+/// `nostr_wire::decode_request` refuses above it in band, so every vendor
+/// arm inherits the bound without restating it). `NIP44_DECRYPT` is the
+/// worst case: sender key (32) + the largest payload [`MAX_NIP44_PAYLOAD_ARG`]
+/// could be.
+pub const MAX_REQUEST_ARG: usize = 32 + MAX_NIP44_PAYLOAD_ARG;
+
 /// caps bit 0: key management and `SIGN` (`0x13`–`0x15`) are served. Set in
 /// the same edit as US-1644/1645 — an advertised command that refuses is
 /// the §4 failure mode (`apps/fido` getInfo history).
@@ -860,11 +878,11 @@ impl NostrApp {
         }
         let (sender_x, payload) = data.split_at(32);
         // A legal payload cannot exceed the largest one `MAX_PLAINTEXT`
-        // could produce: version+nonce (33) + ct (2 + 2048) + mac (32). The
-        // §2.2.1 cap is what makes the 6-byte (u32) prefix form unreachable.
-        let max_legal = 33 + 2 + nip44::calc_padded_len(MAX_PLAINTEXT as u64).unwrap_or(0) as usize
-            + 32;
-        if payload.len() > max_legal {
+        // could produce — the same expression the §2.2.1 wire cap is derived
+        // from (`MAX_NIP44_PAYLOAD_ARG`, the const twin of this runtime
+        // gate). The cap is what makes the 6-byte (u32) prefix form
+        // unreachable.
+        if payload.len() > MAX_NIP44_PAYLOAD_ARG {
             write_sw(resp, SW_WRONG_DATA);
             return;
         }
