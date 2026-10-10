@@ -51,6 +51,7 @@
 #![cfg_attr(not(feature = "host"), no_std)]
 
 pub mod crypto;
+pub mod nip44;
 
 use fapico2_platform::dispatch::{
     App, MAX_RESPONSE, Sw, SW_CLA_NOT_SUPPORTED, SW_FILE_NOT_FOUND, SW_INS_NOT_SUPPORTED,
