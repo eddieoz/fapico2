@@ -2027,9 +2027,25 @@ const NOSTR: &[Claim] = &[
     ),
     Claim::applet(
         0x6D00,
-        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — every mutating arm \
-         (GENERATE_KEY…EXPORT_KEY, US-1644+) plus unknown INS bytes: the arms US-1643 \
-         did not implement",
+        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — the arms no story has \
+         implemented yet (NIP44_ENCRYPT/DECRYPT 0x16/0x17, SET_LABEL 0x18, \
+         DELETE_KEY 0x19, EXPORT_KEY 0x1A — US-1649/US-1653) plus unknown INS bytes",
+    ),
+    Claim::applet(
+        0x6985,
+        "US-1644: touch required / not granted — the mutating trio's execution gate; \
+         the host build auto-acks, the device denies until US-1646 wires the grant",
+    ),
+    Claim::applet(
+        0x6A84,
+        "US-1644: identity index already occupied — GENERATE_KEY/IMPORT_KEY never \
+         overwrite (design §2.2.0); the occupant need not be a Nostr identity, a \
+         foreign or unopenable record is the same actionable fact",
+    ),
+    Claim::applet(
+        0x6A88,
+        "US-1644: key set full — all eight slots committed, so no index choice \
+         helps; takes precedence over 6A84 because it names the remedy",
     ),
     Claim::applet(
         0x6A86,
@@ -2089,9 +2105,17 @@ fn nostr_cases() -> Vec<Case> {
         // the two different facts §2.2.0 separates.
         case("GET_PUBKEY empty slot", short(0x12, 0x01, 0x00, &[]), 0x6A82),
         case("GET_PUBKEY out-of-range idx", short(0x12, 0xFF, 0x00, &[]), 0x6A80),
-        // SIGN's eventual header (INS 0x15, design §2.2): touch-gated later
-        // (US-1646), refused flat now.
-        case("SIGN-shaped header", short(0x15, 0x00, 0x00, &[0u8; 32]), 0x6D00),
+        // US-1644/US-1645 implemented the key-management trio. GENERATE at
+        // a free index succeeds — the sweep runs with the host build's
+        // auto-ack presence and OS-entropy default, so this case commits
+        // idx 0 to the sweep region (later cases do not depend on it
+        // staying empty). IMPORT with a zero scalar is refused flat — no
+        // touch, no write. SIGN at an in-range empty slot is 6A82; at an
+        // out-of-range one, 6A80.
+        case("GENERATE_KEY free idx", short(0x13, 0x01, 0x00, &[]), 0x9000),
+        case("IMPORT_KEY zero scalar", short(0x14, 0x02, 0x00, &[0u8; 32]), 0x6A80),
+        case("SIGN empty slot", short(0x15, 0x02, 0x00, &[0x5A; 32]), 0x6A82),
+        case("SIGN out-of-range idx", short(0x15, 0xFF, 0x00, &[0x5A; 32]), 0x6A80),
         // US-1643 enforces CLA 0x00 — `0x80` (Rescue's class) is refused with
         // 6E00. US-1648 decides whether that stays.
         case("CLA 0x80", vec![0x80, 0x10, 0x00, 0x00], 0x6E00),
@@ -2099,41 +2123,114 @@ fn nostr_cases() -> Vec<Case> {
     ]
 }
 
-#[test]
-fn reachability_nostr() {
-    // US-1643: the sweep drives a **region-backed** applet — the shape the
-    // device and the emulator register — so the table claims what the real
-    // applet answers, not what a storeless shell would (`6F00` on every
-    // read). The region is a fresh, empty fixture: every read command's
-    // happy path is "n = 0" / "no such identity", which is exactly the
-    // answer a swept empty store gives.
-    let path = std::env::temp_dir().join(format!(
-        "fapico2-us1643-nostr-sweep-{}.bin",
-        std::process::id()
-    ));
-    std::fs::remove_file(&path).ok();
-    let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
-        &path,
-        fapico2_platform::keyregion::TOTAL_SLOTS,
-    )
-    .expect("a fresh nostr sweep region");
+/// The sweep's payload key, derived per scenario — `PayloadKey` is not `Copy`
+/// and each `NostrRegion::new` consumes one.
+fn nostr_sweep_key() -> fapico2_platform::keyregion::crypto::PayloadKey {
     let otp_row: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x11));
-    let chipid: [u8; 8] = 0x0B_AD_C0F_FE_EE_01_02_03_u64.to_be_bytes();
-    let key = fapico2_platform::keyregion::crypto::derive_payload_key(
+    let chipid: [u8; 8] = 0x0000_BADC_0FFE_EE01_0203_u64.to_be_bytes();
+    fapico2_platform::keyregion::crypto::derive_payload_key(
         &otp_row,
         &chipid,
         &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
     )
-    .expect("a non-zero OTP row");
-    let mut app = fapico2_nostr::NostrApp::boot(
-        fapico2_platform::keyregion::nostr_store::NostrRegion::new(
-            Box::new(region),
-            key,
-        ),
-    );
-    let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
-    d.sweep(&nostr_cases(), &NOSTR_SPACE);
-    d.into_report().finish("nostr", NOSTR);
+    .expect("a non-zero OTP row")
+}
+
+#[test]
+fn reachability_nostr() {
+    // The sweep drives a **region-backed** applet — the shape the device and
+    // the emulator register — so the table claims what the real applet
+    // answers, not what a storeless shell would (`6F00` on every read).
+    let path = std::env::temp_dir().join(format!(
+        "fapico2-us1644-nostr-sweep-{}.bin",
+        std::process::id()
+    ));
+    std::fs::remove_file(&path).ok();
+    let mut report = Report::default();
+
+    // Scenario 1 (US-1643) — a fresh, empty fixture: every read command's
+    // happy path is "n = 0" / "no such identity", which is exactly the
+    // answer a swept empty store gives; GENERATE at a free index succeeds
+    // (the host build's auto-ack presence and OS-entropy default).
+    {
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+            &path,
+            fapico2_platform::keyregion::TOTAL_SLOTS,
+        )
+        .expect("a fresh nostr sweep region");
+        let key = nostr_sweep_key();
+        let mut app = fapico2_nostr::NostrApp::boot(
+            fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ),
+        );
+        let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
+        d.sweep(&nostr_cases(), &NOSTR_SPACE);
+        report.absorb(d.into_report());
+    }
+
+    // Scenario 2 (US-1644) — a full set and no presence grant: the three
+    // words a full device answers before it will act. GENERATE is 6A88
+    // (no index choice helps), IMPORT at an occupied index is 6A84 even
+    // with a valid scalar, and SIGN is 6985 — the touch gates the
+    // *execution*, and the state refusals come first because a press the
+    // host could have avoided is a press wasted.
+    {
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+            &path,
+            fapico2_platform::keyregion::TOTAL_SLOTS,
+        )
+        .expect("a full nostr sweep region");
+        {
+            // Fill the set directly — the sweep does not press the button.
+            let key = nostr_sweep_key();
+            let mut region = fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            );
+            let mut store = region.store();
+            for i in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
+                let scalar: [u8; 32] = core::array::from_fn(|b| (i as u8).wrapping_add(b as u8));
+                let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+                store
+                    .write(i, &fapico2_platform::keyregion::nostr_store::NostrIdentity::new(
+                        scalar, npub, b"", 0,
+                    ).expect("a valid identity"))
+                    .expect("fill the set");
+            }
+        }
+        // Reopen the filled region — the applet must not know the sweep
+        // wrote it directly, any more than a client's session would.
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::open(&path)
+            .expect("the filled nostr sweep region");
+        let key = nostr_sweep_key();
+        let mut app = fapico2_nostr::NostrApp::boot(
+            fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ),
+        )
+        .with_presence_grant(|_| false);
+        let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
+        d.run(&[
+            case("GENERATE on a full set", short(0x13, 0x00, 0x00, &[]), 0x6A88),
+            case(
+                "IMPORT at an occupied index",
+                short(0x14, 0x00, 0x00, &{
+                    let mut v = vec![0u8; 32];
+                    v[31] = 0x40;
+                    v
+                }),
+                0x6A84,
+            ),
+            case("SIGN without a grant", short(0x15, 0x00, 0x00, &[0x5A; 32]), 0x6985),
+        ]);
+        d.cross(&NOSTR_SPACE);
+        report.absorb(d.into_report());
+    }
+
+    report.finish("nostr", NOSTR);
     std::fs::remove_file(&path).ok();
 }
 
@@ -2438,8 +2535,8 @@ fn every_applet_answers_6a82_only_through_the_dispatcher() {
     let nostr_6a82_rows = NOSTR.iter().filter(|c| c.sw == 0x6A82).count();
     assert_eq!(
         nostr_6a82_rows, 2,
-        "Nostr carries both origins — the dispatcher row and the applet's own \
-         'no such identity' row (US-1643)"
+        "Nostr carries both origins — the dispatcher row and one applet-layer \
+         'no such identity' row naming every idx-taking read (US-1643/US-1645)"
     );
     // Sanity: the census is not vacuous — every table has at least one
     // applet-layer row, so `Layer` discriminates rather than being constant.

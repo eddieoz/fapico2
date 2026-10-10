@@ -272,6 +272,17 @@ fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegio
     ))
 }
 
+/// US-1644: the Nostr applet's randomness — the boot pool filled from the
+/// DRBG (see `init_nostr_rng_pool`'s call site in `main` for why the pool
+/// and not the generator itself), stretched on exhaustion.
+fn nostr_random(out: &mut [u8]) {
+    // SAFETY: `init_nostr_rng_pool` wrote both slots exactly once on this
+    // boot path, in the DRBG window, before USB; nothing rewrites them.
+    let pool = unsafe { &mut *boot::NOSTR_RNG_POOL.as_mut_ptr() };
+    let cursor = unsafe { &mut *boot::NOSTR_RNG_CURSOR.as_mut_ptr() };
+    fapico2_platform::trng::stretch_pool(pool, cursor, out);
+}
+
 fn boot_oath<T: Trng>(
     trng: &mut T,
     store: &mut boot::DeviceStore,
@@ -793,6 +804,12 @@ async fn main(spawner: Spawner) -> ! {
     // here, on the boot path, before any request has arrived.
     let fido_app = boot_fido(&mut *drbg, store);
     bphase!(crate::dbg::P_BOOT_FIDO);
+    // US-1644: the Nostr applet's boot-time RNG pool. This is the last
+    // point the DRBG is borrowable — `boot::take_drbg`, further down, hands
+    // the generator to the trussed platform by value — so the applet draws
+    // from a pool filled here (the FIDO app's US-380 pattern: every random
+    // byte on the device comes from the DRBG).
+    unsafe { boot::init_nostr_rng_pool(&mut *drbg) };
     // US-921: the shared presence runtime is the FIDO user-presence grant
     // path — one pending-request slot bound to the BOOTSEL latch; a press
     // with no pending request never arms anything. The gate is
@@ -1150,7 +1167,9 @@ async fn main(spawner: Spawner) -> ! {
     // same reason as the six above.
     let nostr_app = boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::NOSTR_APP),
-        NostrApp::new().with_region_provider(nostr_region),
+        NostrApp::new()
+            .with_region_provider(nostr_region)
+            .with_rng_provider(nostr_random),
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the

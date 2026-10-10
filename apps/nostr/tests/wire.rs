@@ -7,7 +7,7 @@
 //! own stories land.
 //!
 //! The wire cap is asserted against the **device** constant
-//! (`fapico2_firmware::ccid_reasm::MAX_WIRE`), not against this host's
+//! (`fapico2_platform::ccid::message::MAX_WIRE`), not against this host's
 //! `MAX_RESPONSE` (4096): `platform/src/emulation.rs:81` writes the whole
 //! dispatch buffer to the socket with no size check, so the emulator cannot
 //! catch a `max_plaintext` claim the wire cannot carry. Over the CCID
@@ -17,7 +17,8 @@
 //! the wire.
 
 use fapico2_nostr::{
-    bech32_npub, NostrApp, APPLET_VERSION, INS_GET_INFO, INS_GET_PUBKEY, INS_LIST_KEYS, MAX_PLAINTEXT,
+    bech32_npub, NostrApp, APPLET_VERSION, CAPS, INS_GET_INFO, INS_GET_PUBKEY, INS_LIST_KEYS,
+    MAX_PLAINTEXT,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -26,10 +27,14 @@ use fapico2_platform::keyregion::nostr_store::{NostrIdentity, NostrRegion};
 use fapico2_platform::keyregion::TOTAL_SLOTS;
 use heapless::Vec as HeaplessVec;
 
-/// The **device** CCID wire cap (`firmware/src/ccid_reasm.rs:28`), reached
-/// through the firmware crate's lib. A dev-dependency, so the dependency
-/// graph itself (the deny-graph gate) still sees no applet→firmware edge.
-use fapico2_firmware::ccid_reasm::MAX_WIRE;
+/// The **device** CCID wire cap — defined on the platform (`ccid.rs`,
+/// US-1644) so this test names the device transport without a
+/// `fapico2-firmware` dev-dependency: that dependency's feature set leaks
+/// into any crate built alongside nostr and distorts their gates (the
+/// `emulation` variant turns on `fapico2-mgmt/piv`, the `device` variant
+/// turns `fapico2-mgmt` into its device shape). The firmware's reassembler
+/// re-exports the same constant, so the device path has not moved.
+use fapico2_platform::ccid::message::MAX_WIRE;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -201,6 +206,7 @@ fn get_info_layout_over_an_empty_store() {
     assert_eq!(sw, SW_OK);
     assert_eq!(data.len(), 8);
     assert_eq!(&data[0..2], &APPLET_VERSION);
+    assert_eq!(u16::from_be_bytes([data[2], data[3]]), CAPS, "the advertised caps");
     assert_eq!(u16::from_be_bytes([data[4], data[5]]), MAX_PLAINTEXT);
     assert_eq!(data[6], 0, "no identities yet");
     assert_eq!(data[7], 0, "flags reserved");
@@ -389,7 +395,9 @@ fn a_storeless_applet_refuses_the_reads() {
 #[test]
 fn unimplemented_commands_stay_refused() {
     let (mut app, path) = booted_app("skeleton-rest");
-    for ins in [0x13u8, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A] {
+    // US-1644/US-1645 implemented 0x13–0x15; the NIP-44 pair and the
+    // §2.2.0a export arm are still their stories'.
+    for ins in [0x16u8, 0x17, 0x18, 0x19, 0x1A] {
         let (_, sw) = call(&mut app, &apdu(ins, 0, 0, &[]));
         assert_eq!(sw, 0x6D00, "INS {ins:#04x} is not this story's");
     }

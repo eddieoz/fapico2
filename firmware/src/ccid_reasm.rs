@@ -23,9 +23,10 @@
 
 use fapico2_platform::ccid::message::HEADER;
 
-/// Max CCID message on the wire: 10-byte standard CCID header + body
-/// (body cap = C `USB_BUFFER_SIZE` parity, 2048 + 16).
-pub const MAX_WIRE: usize = 10 + 2048 + 16;
+/// Max CCID message on the wire — the platform's constant (US-1644 moved the
+/// definition to `platform/src/ccid.rs::message::MAX_WIRE` so host-side crates
+/// can assert against the device transport without a firmware dev-dependency).
+pub use fapico2_platform::ccid::message::MAX_WIRE;
 
 /// A partial message older than this window is dropped and the assembly
 /// state resyncs (US-920; the EPIC's "e.g. 2 s").

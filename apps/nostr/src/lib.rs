@@ -18,19 +18,39 @@
 //! outward-facing act, which is why the design §2.3 consent model is part of
 //! this applet from the start.
 //!
-//! # The command surface so far (US-1643)
+//! # The command surface so far (US-1645)
 //!
 //! The three **touch-free** reads (§2.3) are implemented over the store:
-//! [`INS_GET_INFO`], [`INS_LIST_KEYS`] and [`INS_GET_PUBKEY`]. Every other
-//! command arm is still the US-1642 skeleton refusal (`6D00`) and is
-//! replaced by its own story: US-1644 generate/import, US-1645 sign,
-//! US-1649 label/delete/export, Phase 2 the NIP-44 pair.
+//! [`INS_GET_INFO`], [`INS_LIST_KEYS`] and [`INS_GET_PUBKEY`] — and the key
+//! management trio [`INS_GENERATE_KEY`] / [`INS_IMPORT_KEY`] /
+//! [`INS_SIGN`] (US-1644/US-1645), which are touch-gated (§2.2) and served
+//! from the RNG and presence seams below. Every other command arm is still
+//! the US-1642 skeleton refusal (`6D00`) and is replaced by its own story:
+//! US-1649 label/delete/export, US-1653 the NIP-44 pair.
+//!
+//! # The seams
+//!
+//! Two injectable `fn`-pointer providers shape the device/host split — the
+//! same pattern as the region provider (`install_region_provider`'s OATH
+//! precedent):
+//!
+//! * **randomness** (`with_rng_provider`) — the device boot fills a pool
+//!   from the DRBG (before `take_drbg` hands the generator to trussed) and
+//!   wires a draining provider; a host build with no provider falls back to
+//!   the platform's OS entropy. A draw with *neither* is a wiring bug and
+//!   refuses `6F00` — a fabricated key is the one thing this applet must
+//!   never produce.
+//! * **presence** (`with_presence_grant`) — US-1646's wiring. Absent, the
+//!   applet falls back to a device-denies / host-acks default, the rescue
+//!   applet's fail-closed shape.
 //!
 //! SELECT answers `9000` with no FCI template: the client reads the applet's
 //! identity through [`INS_GET_INFO`], not through the SELECT response, so
 //! there is no template and none is invented.
 
 #![cfg_attr(not(feature = "host"), no_std)]
+
+pub mod crypto;
 
 use fapico2_platform::dispatch::{
     App, MAX_RESPONSE, Sw, SW_CLA_NOT_SUPPORTED, SW_FILE_NOT_FOUND, SW_INS_NOT_SUPPORTED,
@@ -102,6 +122,15 @@ pub const SW_WRONG_P1_P2: Sw = 0x6A86;
 /// Touch required / not granted. Named now so every story reads the same
 /// constant; the touch gate itself arrives with US-1646.
 pub const SW_TOUCH_REQUIRED: Sw = 0x6985;
+/// Identity index already occupied — [`GENERATE_KEY`](INS_GENERATE_KEY) and
+/// [`IMPORT_KEY`](INS_IMPORT_KEY) never overwrite. The occupant need not be
+/// a Nostr identity: a foreign or unopenable record in the slot is the same
+/// actionable fact (pick another index, or delete what owns it).
+pub const SW_INDEX_OCCUPIED: Sw = 0x6A84;
+/// Key set full — all eight slots are committed, so no index choice helps;
+/// something must be deleted first. Takes precedence over
+/// [`SW_INDEX_OCCUPIED`]: it names the remedy, not just the symptom.
+pub const SW_KEY_SET_FULL: Sw = 0x6A88;
 /// The applet cannot answer honestly — no store handle (boot degraded: the
 /// OTP row or the recovery failed) or a slot that would not open. Refusing
 /// with a fault beats reporting `n = 0` about a device that may hold all
@@ -135,12 +164,12 @@ pub const CAP_KEY_MGMT: u16 = 0x0001;
 /// caps bit 1: the NIP-44 pair (`0x16`/`0x17`) is served. Set with US-1653.
 pub const CAP_NIP44: u16 = 0x0002;
 
-/// What `GET_INFO` advertises. **Zero in this revision** — every mutating
-/// command still refuses, so advertising a bit now would be a wire claim the
-/// device does not honour. US-1644/1645 set [`CAP_KEY_MGMT`], US-1653 sets
-/// [`CAP_NIP44`], each in the same edit as the commands themselves
-/// (`tests/wire.rs` re-derives the cap rows when they do).
-pub const CAPS: u16 = 0x0000;
+/// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] — the key-management trio
+/// (`0x13`–`0x15`) is served, set in the same edit as the commands
+/// themselves (US-1644/US-1645; `tests/wire.rs` re-derives the cap rows when
+/// the NIP-44 story adds the next bit). An advertised command that refuses
+/// is the §4 failure mode (`apps/fido` getInfo history).
+pub const CAPS: u16 = CAP_KEY_MGMT;
 
 /// Reserved `flags` byte of `GET_INFO` — zero until a story defines a bit.
 pub const INFO_FLAGS: u8 = 0x00;
@@ -261,15 +290,23 @@ pub struct NostrApp {
     /// on the first read instead. `None` on the test/emulator path, which
     /// boots the region eagerly through [`NostrApp::boot`].
     provider: Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
+    /// The randomness source (US-1644). See the module docs: device = the
+    /// boot pool drained through `with_rng_provider`; host default = the
+    /// platform's OS entropy; *neither* = refuse rather than fabricate.
+    rng: Option<fn(&mut [u8])>,
+    /// The user-presence grant path (US-1646 wires it; US-1644 consults
+    /// it). `None` ⇒ [`default_user_present`] — deny on device, auto-ack on
+    /// host — the rescue applet's shape.
+    presence_grant: Option<fn(u32) -> bool>,
 }
 
 impl NostrApp {
-    /// A bare applet: no store handle.
+    /// A bare applet: no store handle, no randomness, no presence grant.
     ///
     /// The registration test (`apps/tests/registry.rs`) registers this
     /// shape; the firmware and the emulator boot a region instead.
     pub fn new() -> Self {
-        NostrApp { region: None, provider: None }
+        NostrApp { region: None, provider: None, rng: None, presence_grant: None }
     }
 
     /// Boot the applet over `region`, finishing any commit a power cut
@@ -284,8 +321,8 @@ impl NostrApp {
     /// missing OATH payload key).
     pub fn boot(mut region: fapico2_platform::keyregion::nostr_store::NostrRegion) -> Self {
         match region.store().recover() {
-            Ok(_) => NostrApp { region: Some(region), provider: None },
-            Err(_) => NostrApp { region: None, provider: None },
+            Ok(_) => NostrApp { region: Some(region), provider: None, rng: None, presence_grant: None },
+            Err(_) => NostrApp { region: None, provider: None, rng: None, presence_grant: None },
         }
     }
 
@@ -305,6 +342,23 @@ impl NostrApp {
         self
     }
 
+    /// Register the randomness source (US-1644). The device boot wires a
+    /// provider that drains the boot pool filled from the DRBG; a host
+    /// build may leave it unset and draw OS entropy. The tests pin draws
+    /// through it (the BIP-340 vectors' `aux_rand`).
+    pub fn with_rng_provider(mut self, rng: fn(&mut [u8])) -> Self {
+        self.rng = Some(rng);
+        self
+    }
+
+    /// Register the user-presence grant path — the rescue applet's
+    /// `with_presence_grant` shape (US-1536). Wired by US-1646 on the
+    /// device; the tests deny through it to pin the `6985` rows.
+    pub fn with_presence_grant(mut self, grant: fn(u32) -> bool) -> Self {
+        self.presence_grant = Some(grant);
+        self
+    }
+
     /// The applet's region view — attaching the deferred region first when
     /// the provider can — or refusing with [`SW_STORE_FAULT`] when the boot
     /// degraded (see [`NostrApp::boot`]).
@@ -312,26 +366,7 @@ impl NostrApp {
         &mut self,
         resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
     ) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'_>> {
-        if self.region.is_none() {
-            if let Some(provider) = self.provider {
-                if let Some(mut region) = provider() {
-                    // A recovery failure keeps the provider: the next
-                    // read retries the mount rather than pinning a
-                    // transient fault onto the applet for good.
-                    if region.store().recover().is_ok() {
-                        self.provider = None;
-                        self.region = Some(region);
-                    }
-                }
-            }
-        }
-        match self.region.as_mut() {
-            Some(region) => Some(region.store()),
-            None => {
-                write_sw(resp, SW_STORE_FAULT);
-                None
-            }
-        }
+        attach_store(&mut self.region, &mut self.provider, resp)
     }
 
     /// `GET_INFO` — `applet_ver(2) ‖ caps(2) ‖ max_plaintext(2) ‖
@@ -429,6 +464,199 @@ impl NostrApp {
         resp.extend_from_slice(&bech32_npub(&id.npub)).ok();
         write_sw(resp, SW_OK);
     }
+
+    /// `GENERATE_KEY` — P1 = idx, no payload; `npub(32)`. Touch-gated (§2.2).
+    ///
+    /// The refusal order is the one the user can act on: a full set is
+    /// [`SW_KEY_SET_FULL`] (no index choice helps), an occupied index is
+    /// [`SW_INDEX_OCCUPIED`] (pick another), and the touch is **last** — a
+    /// press the host could have avoided by consulting the touch-free reads
+    /// is a press wasted.
+    fn generate_key(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS;
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        // Destructure once: the store borrow must coexist with the RNG pool
+        // draw, and disjoint field borrows compose where a `&mut self`
+        // method call would not.
+        let Self { region, provider, rng, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+
+        // State before the touch (see the doc comment).
+        let mut any_writable = false;
+        let mut idx_writable = false;
+        for i in 0..NOSTR_SLOTS as u16 {
+            match writability(&mut store, i) {
+                Ok(true) => {
+                    any_writable = true;
+                    idx_writable |= i == p1 as u16;
+                }
+                Ok(false) => {}
+                Err(sw) => {
+                    write_sw(resp, sw);
+                    return;
+                }
+            }
+        }
+        if !any_writable {
+            write_sw(resp, SW_KEY_SET_FULL);
+            return;
+        }
+        if !idx_writable {
+            write_sw(resp, SW_INDEX_OCCUPIED);
+            return;
+        }
+        if !user_present(*presence_grant, p1 as u32) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+
+        // A uniform draw is a valid secret scalar unless it is zero or ≥ the
+        // curve order (~2⁻²⁵⁶); retry rather than map an astronomically
+        // unlikely draw onto a fault.
+        let mut scalar = None;
+        for _ in 0..4 {
+            let mut buf = [0u8; 32];
+            match draw_random(*rng, &mut buf) {
+                Some(()) if crypto::scalar_valid(&buf) => {
+                    scalar = Some(buf);
+                    break;
+                }
+                None => break, // the source refused — fault below
+                Some(()) => {}
+            }
+        }
+        let Some(scalar) = scalar else {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        };
+        let Some(npub) = crypto::xonly_pubkey(&scalar) else {
+            // Unreachable for a validated scalar; refuse rather than answer
+            // with a key that was never derived.
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        };
+        if !write_identity(&mut store, p1 as u16, &scalar, &npub, resp) {
+            return;
+        }
+        resp.extend_from_slice(&npub).ok();
+        write_sw(resp, SW_OK);
+    }
+
+    /// `IMPORT_KEY` — P1 = idx, `scalar(32)`; `npub(32)`. Touch-gated.
+    ///
+    /// The scalar is validated **before** anything else (`6A80`): garbage is
+    /// refused without a press, and the same word covers a wrong length, so
+    /// no state leaks through the ordering.
+    fn import_key(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS;
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        let Ok(scalar) = <[u8; 32]>::try_from(data) else {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        };
+        if p1 as u16 >= NOSTR_SLOTS as u16 {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        if !crypto::scalar_valid(&scalar) {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        // IMPORT_KEY draws nothing: the scalar is the host's, and its
+        // validity is checked above.
+        let Self { region, provider, rng: _, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        match writability(&mut store, p1 as u16) {
+            Ok(true) => {}
+            Ok(false) => {
+                write_sw(resp, SW_INDEX_OCCUPIED);
+                return;
+            }
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        }
+        if !user_present(*presence_grant, p1 as u32) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        let Some(npub) = crypto::xonly_pubkey(&scalar) else {
+            // Unreachable for a validated scalar.
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        };
+        if !write_identity(&mut store, p1 as u16, &scalar, &npub, resp) {
+            return;
+        }
+        resp.extend_from_slice(&npub).ok();
+        write_sw(resp, SW_OK);
+    }
+
+    /// `SIGN` — P1 = idx, `sighash(32)`; `npub(32) ‖ sig(64)`. Touch-gated.
+    ///
+    /// The npub rides **alongside** the signature (§2.2.0a): a host that
+    /// signs against the wrong identity cannot paper over it, because the
+    /// answer names the key that produced the signature.
+    fn sign(&mut self, p1: u8, p2: u8, data: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        let Ok(sighash) = <[u8; 32]>::try_from(data) else {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        };
+        let Self { region, provider, rng, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        if !user_present(*presence_grant, p1 as u32) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        let mut aux = [0u8; 32];
+        if draw_random(*rng, &mut aux).is_none() {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+        match crypto::bip340_sign(&id.scalar, &sighash, &aux) {
+            Some(sig) => {
+                resp.extend_from_slice(&id.npub).ok();
+                resp.extend_from_slice(&sig).ok();
+                write_sw(resp, SW_OK);
+            }
+            // A stored scalar that would not sign is a record this device
+            // cannot honour; refusing beats answering with fiction.
+            None => write_sw(resp, SW_STORE_FAULT),
+        }
+    }
 }
 
 impl App for NostrApp {
@@ -464,8 +692,11 @@ impl App for NostrApp {
             INS_GET_INFO => self.get_info(p1, p2, data, resp),
             INS_LIST_KEYS => self.list_keys(p1, p2, data, resp),
             INS_GET_PUBKEY => self.get_pubkey(p1, p2, data, resp),
-            // US-1644 generate/import, US-1645 sign, US-1649 label/delete/
-            // export, US-1653 the NIP-44 pair — each replaces its arm here.
+            INS_GENERATE_KEY => self.generate_key(p1, p2, data, resp),
+            INS_IMPORT_KEY => self.import_key(p1, p2, data, resp),
+            INS_SIGN => self.sign(p1, p2, data, resp),
+            // US-1649 label/delete/export, US-1653 the NIP-44 pair — each
+            // replaces its arm here.
             _ => write_sw(resp, SW_INS_NOT_SUPPORTED),
         }
     }
@@ -473,8 +704,7 @@ impl App for NostrApp {
 
 /// The APDU data field: short (`Lc` in `apdu[4]`) or extended (`00 Hi Lo`)
 /// form — the `apps/mgmt` convention the C-harness encodings share.
-fn parse_data(apdu: &[u8]) -> &[u8] {
-    if apdu.len() >= 7 && apdu[4] == 0x00 {
+fn parse_data(apdu: &[u8]) -> &[u8] {    if apdu.len() >= 7 && apdu[4] == 0x00 {
         let lc = u16::from_be_bytes([apdu[5], apdu[6]]) as usize;
         return apdu.get(7..7 + lc).unwrap_or(&[]);
     }
@@ -519,5 +749,136 @@ fn read_identity(
         Ok(Entry::Undecodable) => Err(SW_STORE_FAULT),
         Err(NostrStoreError::IndexOutOfRange { .. }) => Err(SW_WRONG_DATA),
         Err(_) => Err(SW_STORE_FAULT),
+    }
+}
+
+/// The applet's region view — the store-attach half of the old `store`
+/// method, split out so the mutating commands can hold it beside the
+/// destructured RNG/presence fields (disjoint field borrows compose; a
+/// `&mut self` method call would not). A recovery failure keeps the
+/// provider: the next read retries the mount rather than pinning a
+/// transient fault onto the applet for good.
+fn attach_store<'region>(
+    region: &'region mut Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
+    provider: &mut Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
+    resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'region>> {
+    if region.is_none() {
+        if let Some(attach) = provider {
+            if let Some(mut candidate) = attach() {
+                if candidate.store().recover().is_ok() {
+                    *provider = None;
+                    *region = Some(candidate);
+                }
+            }
+        }
+    }
+    match region.as_mut() {
+        Some(region) => Some(region.store()),
+        None => {
+            write_sw(resp, SW_STORE_FAULT);
+            None
+        }
+    }
+}
+
+/// Draw from the applet's randomness source. `None` when there is none —
+/// the fail-closed answer: the device wiring always provides one, so this
+/// is a wiring bug refusing loudly, never a fabricated key.
+fn draw_random(rng: Option<fn(&mut [u8])>, out: &mut [u8]) -> Option<()> {
+    match rng {
+        Some(f) => {
+            f(out);
+            Some(())
+        }
+        None => platform_random(out),
+    }
+}
+
+/// The host/emulation default — OS entropy (`platform::trng`'s free entry
+/// point). Not compiled on the device: the device path always wires a
+/// provider, so the arm fallback there is the refuse path above.
+#[cfg(not(target_arch = "arm"))]
+fn platform_random(out: &mut [u8]) -> Option<()> {
+    fapico2_platform::trng::random_bytes_into(out);
+    Some(())
+}
+
+#[cfg(target_arch = "arm")]
+fn platform_random(_out: &mut [u8]) -> Option<()> {
+    None
+}
+
+/// The device user-presence source for the applet's own fallback path —
+/// the rescue applet's shape verbatim (`apps/rescue/src/lib.rs`): a
+/// **device** build denies, so the fail-closed case is the one that ships,
+/// while a **host/emulation** build auto-acks so the emulator suites —
+/// which have no button to press — keep exercising the command paths.
+/// US-1646 wires the real grant on the device path.
+fn default_user_present() -> bool {
+    #[cfg(feature = "device")]
+    {
+        false
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        true
+    }
+}
+
+fn user_present(grant: Option<fn(u32) -> bool>, idx: u32) -> bool {
+    match grant {
+        Some(g) => g(idx),
+        None => default_user_present(),
+    }
+}
+
+/// The writers' view of one slot: `true` when a write may commit (erased,
+/// or our own committed tombstone), `false` when the slot is occupied — a
+/// live identity, a record ours would not open, or another domain's record
+/// (the US-1641 occupancy guard refuses all three alike). Occupied is
+/// [`SW_INDEX_OCCUPIED`] for the writers even when the occupant is not a
+/// Nostr identity: the actionable fact is the same.
+fn writability(
+    store: &mut fapico2_platform::keyregion::nostr_store::NostrStore<'_>,
+    index: u16,
+) -> Result<bool, Sw> {
+    use fapico2_platform::keyregion::nostr_store::{Entry, NostrStoreError};
+    match store.read(index) {
+        Ok(Entry::Empty | Entry::Tombstone) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(NostrStoreError::IndexOutOfRange { .. }) => Err(SW_WRONG_DATA),
+        Err(_) => Err(SW_STORE_FAULT),
+    }
+}
+
+/// Commit one identity to `index`, mapping the store's refusals onto the
+/// §2.2.0 words. `true` when committed; the status word is written either
+/// way.
+fn write_identity(
+    store: &mut fapico2_platform::keyregion::nostr_store::NostrStore<'_>,
+    index: u16,
+    scalar: &[u8; 32],
+    npub: &[u8; 32],
+    resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+) -> bool {
+    use fapico2_platform::keyregion::nostr_store::{NostrIdentity, NostrStoreError};
+    let Some(id) = NostrIdentity::new(*scalar, *npub, &[], 0) else {
+        // Unreachable: an empty label is always valid.
+        write_sw(resp, SW_STORE_FAULT);
+        return false;
+    };
+    match store.write(index, &id) {
+        Ok(_) => true,
+        // The guard refused after our own writability check passed — the
+        // same fact twice; the word is the one the host can act on.
+        Err(NostrStoreError::OccupiedForeign { .. }) => {
+            write_sw(resp, SW_INDEX_OCCUPIED);
+            false
+        }
+        Err(_) => {
+            write_sw(resp, SW_STORE_FAULT);
+            false
+        }
     }
 }

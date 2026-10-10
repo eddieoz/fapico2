@@ -694,27 +694,13 @@ pub(crate) fn default_user_present() -> bool {
 /// entropy closure while the app's **other** fields (its keystore, its PIN
 /// token) are borrowed at the same time, and a `&mut self` method would
 /// borrow the whole app. Two disjoint field borrows compose; a whole-struct
-/// borrow does not. The logic is unchanged and lives in exactly one place.
-pub(crate) fn take_random(
-    pool: &mut heapless::Vec<u8, 512>,
-    cursor: &mut usize,
-    out: &mut [u8],
-) {
-    let mut cur = *cursor;
-    for b in out.iter_mut() {
-        if cur >= pool.len() {
-            // Stretch: re-key the pool with its own hash.
-            let mut mixed = [0u8; 32];
-            crypto::sha256_into(pool.as_slice(), &mut mixed);
-            pool.clear();
-            let _ = pool.extend_from_slice(&mixed);
-            cur = 0;
-        }
-        *b = pool[cur];
-        cur += 1;
-    }
-    *cursor = cur;
-}
+/// borrow does not.
+///
+/// The primitive itself lives in [`fapico2_platform::trng::stretch_pool`] as
+/// of US-1644 — the Nostr applet became the second user, and AGENTS §5
+/// forbids a second implementation of a crypto-adjacent primitive. The alias
+/// keeps every caller and test here unchanged.
+pub(crate) use fapico2_platform::trng::stretch_pool as take_random;
 
 impl FidoApp {
     /// Draw `out.len()` bytes from the boot-time TRNG pool (US-380: every

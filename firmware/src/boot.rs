@@ -513,6 +513,34 @@ pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto:
     )
 }
 
+/// US-1644: the Nostr applet's boot-time randomness pool, and its drain
+/// cursor. Filled once from the DRBG in the same window that fills the FIDO
+/// app's pool (the generator is handed to the trussed platform by value —
+/// [`take_drbg`] — and is not borrowable after that), then stretched by
+/// `main.rs`'s provider through [`fapico2_platform::trng::stretch_pool`]
+/// whenever the applet draws for `GENERATE_KEY` or a `SIGN` nonce.
+pub static mut NOSTR_RNG_POOL: core::mem::MaybeUninit<heapless::Vec<u8, 256>> =
+    core::mem::MaybeUninit::uninit();
+pub static mut NOSTR_RNG_CURSOR: core::mem::MaybeUninit<usize> =
+    core::mem::MaybeUninit::uninit();
+
+/// Fill [`NOSTR_RNG_POOL`] from `trng` — the FIDO app's `fill_rng_pool`
+/// shape (4 × 64 B draws; the stretch handles exhaustion). Call in the
+/// DRBG window, before [`take_drbg`].
+pub unsafe fn init_nostr_rng_pool<R: fapico2_platform::trng::Trng>(trng: &mut R) {
+    let mut pool = heapless::Vec::<u8, 256>::new();
+    let mut chunk = [0u8; 64];
+    for _ in 0..4 {
+        trng.random_bytes(&mut chunk);
+        if pool.extend_from_slice(&chunk).is_err() {
+            break;
+        }
+    }
+    let pool: &'static mut heapless::Vec<u8, 256> =
+        init_static_slot(core::ptr::addr_of_mut!(NOSTR_RNG_POOL), pool);
+    init_static_slot(core::ptr::addr_of_mut!(NOSTR_RNG_CURSOR), 0usize);
+}
+
 /// Publish the staged key region. **Called once, after `mark!(RUNG_USB)`.**
 ///
 /// The call site is the claim that the boot path is done touching persistent

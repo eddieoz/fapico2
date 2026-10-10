@@ -56,6 +56,17 @@ pub mod message {
     /// CCID message header size (both directions).
     pub const HEADER: usize = 10;
 
+    /// Max CCID message on the wire: 10-byte standard CCID header + body
+    /// (body cap = C `USB_BUFFER_SIZE` parity, 2048 + 16).
+    ///
+    /// Declared here rather than in the firmware's reassembler so a host-side
+    /// crate can assert against the *device* transport constant without a
+    /// dev-dependency on `fapico2-firmware` — whose feature set would leak
+    /// into any crate built alongside it (`apps/tests/caps.rs`, US-1644).
+    /// The firmware's reassembler re-exports this constant (`ccid_reasm.rs`)
+    /// and is its only consumer on the device path.
+    pub const MAX_WIRE: usize = HEADER + 2048 + 16;
+
     // PC_to_RDR message types (CCID 1.10, Table 6.01-3).
     pub const PC_TO_RDR_ICC_POWER_ON: u8 = 0x62;
     pub const PC_TO_RDR_ICC_POWER_OFF: u8 = 0x63;
