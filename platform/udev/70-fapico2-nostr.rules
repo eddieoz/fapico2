@@ -1,0 +1,22 @@
+# US-1657 — the shipped udev rule for the Nostr vendor-HID interface.
+#
+# Chrome's WebHID opens the device's hidraw node, and on Linux a custom VID
+# owns no uaccess by default: without a rule the device is absent from (or
+# unopenable in) Chrome's chooser *before any extension code runs* — the
+# chooser-absent failure that is pre-grant and unowned (design §A.8.3b #1).
+# Trezor (51-trezor.rules) and Ledger (50-ledger.rules) ship the same shape;
+# this is ours.
+#
+# Install (root):
+#   sudo cp 70-fapico2-nostr.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# The chooser-absent discriminating check (install guide §D16):
+#   lsusb sees the device but Chrome's chooser does not  =>  this rule missing.
+#
+# Scoped to the fapico2 VID. The PID is NOT matched: the identity workflow
+# (scripts/fix_usb_identity.py, docs/identity.md) treats PID as
+# user-changeable and reflash-surviving, so a rule that bound the default
+# PID would silently stop granting access after an operator re-identified
+# the board.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="fa20", TAG+="uaccess", MODE="0660", GROUP="plugdev"

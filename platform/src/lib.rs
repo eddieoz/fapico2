@@ -58,6 +58,7 @@ pub mod ccid;
 
 /// HID class-control decisions + CCID class descriptor (US-391 E7).
 pub mod hid_control;
+pub mod nostr_hid;
 
 // Yubico OTP HID transport (frame protocol + descriptors). Host-testable
 // like `hid_control`; the `usb.rs` glue wires it onto the control endpoint.
