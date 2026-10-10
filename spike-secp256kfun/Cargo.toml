@@ -1,0 +1,27 @@
+[workspace]
+# Detached: the spike must not enter the fapico2 workspace graph, or the
+# supply-chain gates (deny-graph, vet, SBOM) would see it before US-1636
+# updates them for the real dependency set.
+
+[package]
+name = "nostr-secp-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+secp256kfun = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+chacha20 = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+hmac = { version = "0.12", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
