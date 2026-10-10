@@ -218,7 +218,8 @@ use zeroize::Zeroize;
 
 use super::slotmap::{Occupancy, SlotImage};
 use super::{
-    Sealed, Slot, SlotRead, FIDO_RECORD_MAX, FIDO_SLOT_BYTES, OATH_RECORD_MAX, OATH_SLOT_BYTES,
+    Sealed, Slot, SlotRead, FIDO_RECORD_MAX, FIDO_SLOT_BYTES, NOSTR_RECORD_MAX, OATH_RECORD_MAX,
+    OATH_SLOT_BYTES,
     RECORD_HEADER_BYTES,
 };
 use crate::secure_store::crc32;
@@ -342,6 +343,10 @@ pub enum Domain {
     Fido = 0x01,
     /// An OATH credential. Bounded by [`OATH_RECORD_MAX`] (210 B).
     Oath = 0x02,
+    /// A Nostr identity (`apps/nostr`, US-1641). Bounded by
+    /// [`NOSTR_RECORD_MAX`] (125 B): the sealed 97-byte body
+    /// `scalar ‖ npub ‖ label ‖ flags`.
+    Nostr = 0x03,
 }
 
 impl Domain {
@@ -362,6 +367,7 @@ impl Domain {
         match b {
             0x01 => Some(Domain::Fido),
             0x02 => Some(Domain::Oath),
+            0x03 => Some(Domain::Nostr),
             _ => None,
         }
     }
@@ -375,6 +381,7 @@ impl Domain {
         match self {
             Domain::Fido => FIDO_RECORD_MAX,
             Domain::Oath => OATH_RECORD_MAX,
+            Domain::Nostr => NOSTR_RECORD_MAX,
         }
     }
 }

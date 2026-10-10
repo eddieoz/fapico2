@@ -70,6 +70,12 @@ pub const FIDO_RECORD_MAX: u32 = 836;
 /// and properties, sealed.
 pub const OATH_RECORD_MAX: u32 = 210;
 
+/// The largest sealed Nostr record, in bytes (US-1641): the 97-byte plaintext
+/// body `scalar(32) ‖ npub(32) ‖ label(32, zero-padded) ‖ flags(1)` plus the
+/// AEAD's 28 bytes of nonce-and-tag framing. Derived, not asserted — the
+/// identity body is fixed-width, so this is arithmetic and not a measurement.
+pub const NOSTR_RECORD_MAX: u32 = 97 + 28;
+
 /// Header bytes per record: a magic, the domain, the slot, the generation, the
 /// flags, the body length, and a CRC32 over all of it (US-1542).
 ///
@@ -314,6 +320,11 @@ const _: () = {
     assert!(
         OATH_SLOT_BYTES >= OATH_RECORD_MAX + RECORD_HEADER_BYTES,
         "the OATH slot stride cannot hold the largest OATH record"
+    );
+    assert!(
+        FIDO_SLOT_BYTES >= NOSTR_RECORD_MAX + RECORD_HEADER_BYTES,
+        "the shared FIDO-slot stride cannot hold the largest Nostr record — Nostr rides the \
+         region's one grid, so its bound is checked here too (US-1641)"
     );
 
     // Strides must be whole flash pages, and the region must divide into whole
@@ -600,6 +611,7 @@ pub mod device_region;
 pub mod fido_store;
 pub mod host;
 pub mod index;
+pub mod nostr_store;
 pub mod on_demand;
 pub mod oath_store;
 pub mod record;
