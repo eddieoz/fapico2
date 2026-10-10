@@ -177,3 +177,49 @@ the decision, not the accident.
   set through `cargo vet`, the SBOM set-diff and the crate-graph gate — with
   `0BSD` (`secp256kfun`'s licence) added to `deny.toml`'s allow-list as an
   explicitly reviewed edit (US-1635).
+
+## Amendment (US-1686, 2026-10-10): the scalar's RAM lifetime is accepted, not zeroized
+
+**Review finding (P2):** `NostrIdentity` is `Copy`, so its `scalar: [u8; 32]`
+persists in stack/heap memory after `EXPORT_KEY` answers and after
+`DELETE_KEY` tombstones the record — no zeroization on drop, the same shape
+as every existing store (OATH's records carry key material the same way).
+This amendment states the trade the review found unstated.
+
+**The attack zeroize-on-drop would stop:** an attacker with a RAM *scrape of
+freed memory* after a signing ceremony recovers the scalar from `Copy`
+memory the flash seal does not cover.
+
+**Why the answer is accepted for now:** on this hardware that attack has no
+path that zeroization would close. The RP2350 is single-core with a
+cooperative executor — no page cache, no swap, no core dumps, no second
+context whose memory the scalar could linger in; the only realistic
+RAM-scrape path is the SWD debug port, and while it is open the attacker
+reads **live** memory anyway (the scalar in the middle of the ceremony, the
+derived store key, every other applet's key material —
+[`docs/debug-access-risk.md`](../debug-access-risk.md) owns that window and
+its closure). Zeroizing the scalar at drop would add a wrapper-type or
+per-call-site design change to `NostrIdentity` — a `Copy` type cannot
+implement `Drop` — and would leave the OATH, FIDO and OpenPGP stores
+unchanged, protecting exactly one secret against exactly the adversary the
+debug port already hands everything to. Simpler is better security (AGENTS
+§5): the mechanism stops an attack no reachable adversary can mount, and its
+complexity would be inconsistent with every store it sits beside. The
+precedent stays the one `nostr_store.rs` already applies to logs — the
+scalar is never `Debug`-printed — and this amendment applies the same
+discipline to the decision itself: named, not silent.
+
+**Revisit conditions — either of these re-opens the decision:**
+
+1. **The first `-release` tag** (ADR 0002) closes the debug port. Once live
+   RAM is no longer readable by the physical adversary, the residual exposure
+   is precisely the freed-`Copy`-memory scrape — at that point the calculus
+   inverts and a zeroization mechanism (most naturally an explicit
+   `zeroize()` at the EXPORT_KEY/DELETE_KEY/NIP-44 paths, with the size delta
+   carried in `docs/size-report.md`) becomes the honest answer.
+2. **Any multi-core or DMA future** — a second execution context, an
+   I/O engine reading guest RAM, or any feature that widens what can observe
+   memory outside the cooperative executor's model.
+
+Until one of those fires, no code changes: the record of this decision is
+the mechanism.
