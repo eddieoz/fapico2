@@ -24,7 +24,6 @@ use fapico2_rescue::{
     PhySnapshot, PhyUpdate, RebootMode, RescueApp, RescueConfigHandler, RescueDeviceHandler,
 };
 // US-1642: the Nostr applet (AID F0 00 00 00 02), `no_std` like the others.
-use fapico2_nostr::NostrApp;
 // S-721-2: the OpenPGP app owns the trussed platform client by value
 // (taken out of the backend static with `trusted_backend::take_client`).
 use fapico2_platform::trusted_backend::{Client, DevicePlatform, OpcardDispatch};
@@ -1994,13 +1993,6 @@ pub static mut VENDOR_LED_APP: core::mem::MaybeUninit<VendorLedApp> =
 // six (a `u64` chip id, a 20-byte flash word, two status bytes and two
 // `Option<&'static mut dyn>` handles), so the slot costs nothing measurable.
 pub static mut RESCUE_APP: core::mem::MaybeUninit<RescueApp> =
-    core::mem::MaybeUninit::uninit();
-// US-1642: the Nostr applet, static memory for the same reason as the six
-// above — `CCID_DISPATCHER` lives in static memory and borrows every app for
-// `'static`. US-1643 gave it the store handle (`Option<NostrRegion>`, one
-// word of discriminant plus the region's own state), so the slot is no
-// longer zero-cost but is still a word-scale cost.
-pub static mut NOSTR_APP: core::mem::MaybeUninit<NostrApp> =
     core::mem::MaybeUninit::uninit();
 
 // The CCID dispatcher holds the seven apps by reference. Built + registered on

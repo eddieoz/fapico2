@@ -54,7 +54,6 @@ use fapico2_vendor_led::VendorLedApp;
 // are wired in `boot.rs`; only the applet itself is constructed here.
 use fapico2_rescue::RescueApp;
 // US-1642: the Nostr applet (AID F0 00 00 00 02).
-use fapico2_nostr::NostrApp;
 
 // Diagnostic event logging (`dbg-log` feature, off by default): in a
 // diagnostic build the macro records `(task, event, a, b)` into the RAM
@@ -1177,17 +1176,27 @@ async fn main(spawner: Spawner) -> ! {
     // would join another SIGN's open window and inherit its press: a
     // signature over attacker-chosen bytes authorised by a touch for
     // different bytes.
-    let nostr_app = boot::init_static_slot(
-        core::ptr::addr_of_mut!(boot::NOSTR_APP),
-        NostrApp::new()
-            .with_region_provider(nostr_region)
-            .with_rng_provider(nostr_random)
-            .with_presence_grant(fapico2_firmware::presence::request_grant),
+    // US-1658: the applet now lives behind `nostr_shared::NOSTR_APP`'s shared Mutex
+    // (both transports reach it), so the boot path installs the providers
+    // through the lock instead of consuming a builder by value.
+    fapico2_firmware::nostr_shared::install_nostr_providers(
+        nostr_region,
+        nostr_random,
+        fapico2_firmware::presence::request_grant,
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the
     // task frame. Registration is a hard boot error (duplicate AID / capacity):
     // an assert parks here — equivalent to the old in-task parking guard.
+    // The Nostr slot is the mutex proxy (US-1658): the dispatcher holds
+    // `&'static mut dyn App`, and the app behind the Mutex admits no stable
+    // `&mut` — so the CCID arm reaches it through `NostrViaMutex`, which
+    // locks per request. The lock is held only inside the synchronous
+    // `process`, never across a touch wait.
+    let nostr_proxy = boot::init_static_slot(
+        core::ptr::addr_of_mut!(fapico2_firmware::nostr_shared::NOSTR_CCID_PROXY),
+        fapico2_firmware::nostr_shared::NostrViaMutex,
+    );
     let mut dispatcher = Dispatcher::new();
     assert!(
         register_ccid_apps(
@@ -1198,7 +1207,7 @@ async fn main(spawner: Spawner) -> ! {
             openpgp_app,
             vendor_led_app,
             rescue_app,
-            nostr_app,
+            nostr_proxy,
         ),
         "ccid app registration failed (duplicate AID or capacity)"
     );

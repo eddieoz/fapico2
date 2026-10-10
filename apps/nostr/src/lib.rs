@@ -369,7 +369,7 @@ impl NostrApp {
     ///
     /// The registration test (`apps/tests/registry.rs`) registers this
     /// shape; the firmware and the emulator boot a region instead.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         NostrApp { region: None, provider: None, rng: None, presence_grant: None }
     }
 
@@ -421,6 +421,22 @@ impl NostrApp {
     pub fn with_presence_grant(mut self, grant: fn(u32) -> bool) -> Self {
         self.presence_grant = Some(grant);
         self
+    }
+
+    /// The in-place form of the three builders, for the one caller that
+    /// cannot consume the app by value: the device static behind the shared
+    /// `Mutex` (US-1658) — `MutexGuard` derefs to `&mut`, and moving the
+    /// applet out of it would leave the lock guarding an uninitialized
+    /// value. The builders stay for the construction-path callers.
+    pub fn install_providers(
+        &mut self,
+        region_provider: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
+        rng: fn(&mut [u8]),
+        grant: fn(u32) -> bool,
+    ) {
+        self.provider = Some(region_provider);
+        self.rng = Some(rng);
+        self.presence_grant = Some(grant);
     }
 
     /// The applet's region view — attaching the deferred region first when

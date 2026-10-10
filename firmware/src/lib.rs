@@ -89,7 +89,7 @@ pub const TASK_ARENA_DEMAND_B: usize = 21_952;
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "b47cc603aea1be2e16000da2f841335f3de5ae8ab4321ca5b8142524c1769cb8";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "2c5321a5d8abb76c29106b0409b73735ee30ec51b6df15b10c1d890c4a98e271";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -129,6 +129,14 @@ pub mod pending_up;
 /// emulation builds pull in.
 #[cfg(any(feature = "device", feature = "emulation"))]
 pub mod hid_serve;
+/// US-1658: the shared Nostr applet — `NOSTR_APP` behind the first
+/// device-code blocking mutex, with the one `with_nostr` accessor both
+/// transports use and the CCID dispatcher's zero-sized proxy. Gated like
+/// [`hid_serve`] because it needs `embassy-sync` and the applet crate; a
+/// lib module (not a `boot.rs` static) so the shared-ownership shape is
+/// host-testable — the device bin is arm-only and has no host test target.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod nostr_shared;
 /// US-1524: the **emulation binary's** half of the CTAP-HID seam — the
 /// `HidLink`/`HidIo` transport adapter and one iteration of the shared serve
 /// loop — so `emul_main.rs` no longer carries its own assembler, reply framer,
