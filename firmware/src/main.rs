@@ -807,9 +807,11 @@ async fn main(spawner: Spawner) -> ! {
     // US-1644: the Nostr applet's boot-time RNG pool. This is the last
     // point the DRBG is borrowable — `boot::take_drbg`, further down, hands
     // the generator to the trussed platform by value — so the applet draws
-    // from a pool filled here (the FIDO app's US-380 pattern: every random
-    // byte on the device comes from the DRBG).
-    unsafe { boot::init_nostr_rng_pool(&mut *drbg) };
+    // from a pool filled here (the OATH app's `fill_rng_pool` pattern: every
+    // random byte on the device comes from the DRBG). The draw lives in the
+    // applet (`draw_boot_pool`), because boot.rs's RNG-gate cap for the
+    // infallible seam is zero.
+    unsafe { boot::init_nostr_rng_pool(fapico2_nostr::draw_boot_pool(&mut *drbg)) };
     // US-921: the shared presence runtime is the FIDO user-presence grant
     // path — one pending-request slot bound to the BOOTSEL latch; a press
     // with no pending request never arms anything. The gate is

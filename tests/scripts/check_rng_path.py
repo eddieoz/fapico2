@@ -578,6 +578,26 @@ _ALLOWED = (
         "predictable challenge. Recorded, not hidden.",
     ),
     (
+        ("apps", "nostr", "src", "lib.rs"),
+        {"Trng::random_bytes": 1},
+        "US-1644: the Nostr applet's boot pool fill, `draw_boot_pool` — the "
+        "same 256-B boot pool shape the OATH app fills (4 x 64 B), and the "
+        "same routing: `main.rs` calls it with `&mut *drbg` inside the DRBG "
+        "window, before `take_drbg` hands the generator to the trussed "
+        "platform by value.\n"
+        "  The site's history is the reason it is HERE rather than in "
+        "`firmware/src/boot.rs`, where it was first written: ac05bb0 put "
+        "`init_nostr_rng_pool` in the boot module and the gate went red — "
+        "boot.rs's cap for `Trng::random_bytes` is deliberately zero, and "
+        "that cap is the rule, not an oversight (the boot path is where "
+        "unbounded peripheral waits hide). The draw moved into the applet "
+        "that owns the need — the OATH precedent — and boot.rs only "
+        "publishes the returned pool. The same D-9 residual as the FIDO and "
+        "OATH pools applies: a starved generator leaves the 256 B untouched "
+        "and the pool is all zeros, stretched on exhaustion. Recorded, not "
+        "hidden.",
+    ),
+    (
         ("apps", "openpgp", "src", "device_shell.rs"),
         {"Trng::random_bytes": 1},
         "FALSE POSITIVE, declared as such: this is the trussed SERVICE "

@@ -73,6 +73,27 @@ pub const NOSTR_AID: &[u8] = &[0xF0, 0x00, 0x00, 0x00, 0x02];
 /// rebuild owns the final vocabulary.
 pub const CLA_ISO: u8 = 0x00;
 
+/// Draw the applet's boot-time RNG pool (US-1644) — the OATH app's
+/// `fill_rng_pool` shape: 4 × 64 B draws through whatever `R` the boot path
+/// threads in, which `main.rs` points at the DRBG. It lives **here**, in the
+/// applet that owns the need, not in `firmware/src/boot.rs`: the RNG gate's
+/// cap for the infallible [`fapico2_platform::trng::Trng::random_bytes`] in
+/// that file is zero on purpose, and a boot module that names the draw is
+/// the defect the cap exists for. The returned pool is published by
+/// `boot::init_nostr_rng_pool` and stretched on exhaustion by
+/// `main.rs`'s provider through [`fapico2_platform::trng::stretch_pool`].
+pub fn draw_boot_pool<R: fapico2_platform::trng::Trng>(trng: &mut R) -> HeaplessVec<u8, 256> {
+    let mut pool = HeaplessVec::<u8, 256>::new();
+    let mut chunk = [0u8; 64];
+    for _ in 0..4 {
+        trng.random_bytes(&mut chunk);
+        if pool.extend_from_slice(&chunk).is_err() {
+            break;
+        }
+    }
+    pool
+}
+
 // ---------------------------------------------------------------------------
 // Commands (§2.2 wire table)
 // ---------------------------------------------------------------------------
