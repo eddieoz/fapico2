@@ -12,7 +12,9 @@
 //! signature must match the reference byte-exactly — the same signature a
 //! nostr-tools client would verify.
 
-use fapico2_nostr::{NostrApp, INS_GENERATE_KEY, INS_IMPORT_KEY, INS_SIGN};
+use fapico2_nostr::{
+    NostrApp, INS_GENERATE_KEY, INS_GET_PUBKEY, INS_IMPORT_KEY, INS_LIST_KEYS, INS_SIGN,
+};
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
 use fapico2_platform::keyregion::host::FileKeyRegion;
@@ -389,5 +391,192 @@ fn mutating_commands_are_refused_without_a_presence_grant() {
     let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, 0, &[0x5A; 32]));
     assert_eq!(sw, 0x6985, "SIGN without a grant");
 
+    std::fs::remove_file(path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1649 — SET_LABEL, DELETE_KEY, EXPORT_KEY
+// ---------------------------------------------------------------------------
+
+/// A slot-0 identity seeded with a known scalar, for the destructive-trio
+/// tests.
+fn seeded_app(tag: &str) -> (NostrApp, std::path::PathBuf, [u8; 32], [u8; 32]) {
+    let path = region_path(tag);
+    std::fs::remove_file(&path).ok();
+    {
+        let mut region = fixture_region(&path);
+        let mut store = region.store();
+        let scalar: [u8; 32] = core::array::from_fn(|i| 0xA0 + i as u8);
+        let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+        store
+            .write(0, &NostrIdentity::new(scalar, npub, b"seed", 0).expect("valid"))
+            .expect("seed idx 0");
+    }
+    let app = NostrApp::boot(open_region(&path));
+    let scalar: [u8; 32] = core::array::from_fn(|i| 0xA0 + i as u8);
+    let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+    (app, path, scalar, npub)
+}
+
+fn npub_of(app: &mut NostrApp, idx: u8) -> Option<[u8; 32]> {
+    let (data, sw) = call(app, &apdu(INS_GET_PUBKEY, idx, 0, &[]));
+    if sw != 0x9000 {
+        return None;
+    }
+    let mut npub = [0u8; 32];
+    npub.copy_from_slice(&data[..32]);
+    Some(npub)
+}
+
+/// `SET_LABEL` writes a ≤32-byte UTF-8 label; `LIST_KEYS` shows it.
+#[test]
+fn set_label_round_trips_through_list() {
+    let (mut app, path, _, _) = seeded_app("set-label");
+    let (_, sw) = call(&mut app, &apdu(0x18, 0, 0, b"my wallet"));
+    assert_eq!(sw, 0x9000, "SET_LABEL succeeds on a live identity");
+
+    let (data, sw) = call(&mut app, &apdu(INS_LIST_KEYS, 0, 0, &[]));
+    assert_eq!(sw, 0x9000);
+    assert_eq!(data[0], 1, "one identity");
+    // idx ‖ flags ‖ npub(32) ‖ label_len(1) ‖ label
+    assert_eq!(data[1 + 1 + 1 + 32], 9, "the label length rides LIST_KEYS");
+    assert_eq!(&data[1 + 1 + 1 + 32 + 1..1 + 1 + 1 + 32 + 1 + 9], b"my wallet");
+    std::fs::remove_file(path).ok();
+}
+
+/// A label over 32 bytes — or one that is not UTF-8 — is refused `6A80`
+/// before the touch, because a label that is not a string is not a label.
+#[test]
+fn set_label_refuses_oversized_and_non_utf8() {
+    let (mut app, path, _, _) = seeded_app("set-label-bad");
+    let (_, sw) = call(&mut app, &apdu(0x18, 0, 0, &[b'x'; 33]));
+    assert_eq!(sw, 0x6A80, "a 33-byte label is refused");
+    let (_, sw) = call(&mut app, &apdu(0x18, 0, 0, &[0xFF, 0xFE]));
+    assert_eq!(sw, 0x6A80, "a non-UTF-8 label is refused");
+    std::fs::remove_file(path).ok();
+}
+
+/// `SET_LABEL` on an empty slot is `6A82` — there is nothing to name.
+#[test]
+fn set_label_on_an_empty_slot_is_6a82() {
+    let (mut app, path, _, _) = seeded_app("set-label-empty");
+    let (_, sw) = call(&mut app, &apdu(0x18, 5, 0, b"nothing"));
+    assert_eq!(sw, 0x6A82);
+    std::fs::remove_file(path).ok();
+}
+
+/// `DELETE_KEY` answers with the npub it destroyed, names what is gone, and
+/// leaves the slot reusable.
+#[test]
+fn delete_key_returns_the_npub_it_destroyed() {
+    let (mut app, path, _, npub) = seeded_app("delete-key");
+    let (data, sw) = call(&mut app, &apdu(0x19, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "DELETE_KEY succeeds on a live identity");
+    assert_eq!(data.as_slice(), npub.as_slice(), "the answer names the identity");
+
+    // The slot is reusable, not merely silent.
+    let (_, sw) = call(&mut app, &apdu(INS_GET_PUBKEY, 0, 0, &[]));
+    assert_eq!(sw, 0x6A82, "the identity is gone");
+    let (_, sw) = call(&mut app, &apdu(INS_GENERATE_KEY, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "the slot accepts a new identity");
+    std::fs::remove_file(path).ok();
+}
+
+/// `DELETE_KEY` on an empty slot is `6A82`.
+#[test]
+fn delete_key_on_an_empty_slot_is_6a82() {
+    let (mut app, path, _, _) = seeded_app("delete-key-empty");
+    let (_, sw) = call(&mut app, &apdu(0x19, 5, 0, &[]));
+    assert_eq!(sw, 0x6A82);
+    std::fs::remove_file(path).ok();
+}
+
+/// `EXPORT_KEY` hands back the scalar whose npub is the one GET_PUBKEY
+/// serves — the migration path (§2.2.0a) must be verifiable, not trusted.
+#[test]
+fn export_key_returns_the_scalar_that_matches_get_pubkey() {
+    let (mut app, path, scalar, npub) = seeded_app("export-key");
+    let (data, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
+    assert_eq!(sw, 0x9000, "EXPORT_KEY succeeds on a live identity");
+    assert_eq!(data.as_slice(), scalar.as_slice(), "the scalar comes back");
+
+    let served = npub_of(&mut app, 0).expect("GET_PUBKEY still serves the identity");
+    assert_eq!(served, npub, "and the exported scalar derives the served npub");
+    std::fs::remove_file(path).ok();
+}
+
+/// `EXPORT_KEY` on an empty slot is `6A82`.
+#[test]
+fn export_key_on_an_empty_slot_is_6a82() {
+    let (mut app, path, _, _) = seeded_app("export-key-empty");
+    let (_, sw) = call(&mut app, &apdu(0x1A, 5, 0, &[]));
+    assert_eq!(sw, 0x6A82);
+    std::fs::remove_file(path).ok();
+}
+
+/// The destructive trio is touch-gated like every other mutating command.
+#[test]
+fn the_destructive_trio_is_refused_without_a_presence_grant() {
+    let path = region_path("trio-deny");
+    std::fs::remove_file(&path).ok();
+    {
+        let mut region = fixture_region(&path);
+        let mut store = region.store();
+        store
+            .write(0, &identity(0x20, [0x44; 32], b""))
+            .expect("seed idx 0");
+    }
+    let mut app = NostrApp::boot(open_region(&path)).with_presence_grant(|_| false);
+
+    // SET_LABEL carries the label; DELETE_KEY and EXPORT_KEY take none.
+    let (_, sw) = call(&mut app, &apdu(0x18, 0, 0, b"x"));
+    assert_eq!(sw, 0x6985, "SET_LABEL without a grant");
+    let (_, sw) = call(&mut app, &apdu(0x19, 0, 0, &[]));
+    assert_eq!(sw, 0x6985, "DELETE_KEY without a grant");
+    let (_, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
+    assert_eq!(sw, 0x6985, "EXPORT_KEY without a grant");
+    std::fs::remove_file(path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1650 — factory_wipe is deliberate
+// ---------------------------------------------------------------------------
+
+/// The wipe empties the key set: a seeded applet comes back from
+/// `factory_wipe` answering `LIST_KEYS` with `n = 0`, and nothing lingers
+/// — every slot is reusable by the writers afterwards.
+#[test]
+fn factory_wipe_empties_the_key_set() {
+    let path = region_path("factory-wipe");
+    std::fs::remove_file(&path).ok();
+    {
+        let mut region = fixture_region(&path);
+        let mut store = region.store();
+        for i in 0..3u16 {
+            let scalar: [u8; 32] = core::array::from_fn(|b| (i as u8).wrapping_add(b as u8));
+            let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+            store
+                .write(i, &NostrIdentity::new(scalar, npub, b"", 0).expect("valid"))
+                .expect("seed");
+        }
+    }
+    let mut app = NostrApp::boot(open_region(&path));
+
+    // The host's pre-flight obligation (§2.2.0a) starts by enumerating.
+    let (data, sw) = call(&mut app, &apdu(INS_LIST_KEYS, 0, 0, &[]));
+    assert_eq!(sw, 0x9000);
+    assert_eq!(data[0], 3, "three identities to announce before the wipe");
+
+    use fapico2_platform::dispatch::App as _;
+    app.factory_wipe();
+
+    let (data, sw) = call(&mut app, &apdu(INS_LIST_KEYS, 0, 0, &[]));
+    assert_eq!(sw, 0x9000);
+    assert_eq!(data[0], 0, "the wipe left no identity behind");
+    // And nothing lingers: all eight slots take a fresh GENERATE.
+    for idx in 0..8u8 {
+        let (_, sw) = call(&mut app, &apdu(INS_GENERATE_KEY, idx, 0, &[]));
+        assert_eq!(sw, 0x9000, "slot {idx} is reusable after the wipe");
+    }
     std::fs::remove_file(path).ok();
 }

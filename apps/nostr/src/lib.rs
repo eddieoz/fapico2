@@ -692,6 +692,142 @@ impl NostrApp {
             None => write_sw(resp, SW_STORE_FAULT),
         }
     }
+
+    /// `SET_LABEL` — P1 = idx, data = UTF-8 label ≤ 32 bytes; no response
+    /// data. Touch-gated. Refusal order: shape (P2, payload), label validity
+    /// (`6A80` — a label that is not a string is not a label, the same
+    /// refusal `capacity_boundary.rs`'s fixture records for a non-UTF-8 RP
+    /// ID), state (`6A82`), then the touch.
+    fn set_label(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::NOSTR_LABEL_MAX;
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() > NOSTR_LABEL_MAX {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        let Self { region, provider, rng: _, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        // A label that is too long or not UTF-8 names no identity change —
+        // refuse before the press.
+        let Some(relabelled) =
+            fapico2_platform::keyregion::nostr_store::NostrIdentity::new(
+                id.scalar, id.npub, data, id.flags,
+            )
+        else {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        };
+        if !user_present(*presence_grant, p1 as u16) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        // The slot was just read live, so a write guard refusal here is a
+        // region fault, not an occupancy dispute — mirror write_identity's
+        // mapping anyway and let the word say which.
+        use fapico2_platform::keyregion::nostr_store::NostrStoreError;
+        match store.write(p1 as u16, &relabelled) {
+            Ok(_) => {}
+            Err(NostrStoreError::OccupiedForeign { .. }) => {
+                write_sw(resp, SW_INDEX_OCCUPIED);
+                return;
+            }
+            Err(_) => {
+                write_sw(resp, SW_STORE_FAULT);
+                return;
+            }
+        }
+        write_sw(resp, SW_OK);
+    }
+
+    /// `DELETE_KEY` — P1 = idx; answers `npub(32)` naming what was
+    /// destroyed (§2.2: the host and the user learn *which* identity is
+    /// gone). Touch-gated; the slot becomes reusable (our own tombstone).
+    fn delete_key(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        let Self { region, provider, rng: _, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        if !user_present(*presence_grant, p1 as u16) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        if store.delete(p1 as u16).is_err() {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+        resp.extend_from_slice(&id.npub).ok();
+        write_sw(resp, SW_OK);
+    }
+
+    /// `EXPORT_KEY` — P1 = idx; answers `scalar(32)`. Touch-gated and
+    /// permanent (§2.2.0a): the real threat-model downgrade, offered because
+    /// a key nobody can back up is a single point of failure. The README
+    /// (US-1676) says so in the user's terms.
+    fn export_key(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        let Self { region, provider, rng: _, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        if !user_present(*presence_grant, p1 as u16) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        resp.extend_from_slice(&id.scalar).ok();
+        write_sw(resp, SW_OK);
+    }
+
 }
 
 impl App for NostrApp {
@@ -705,6 +841,32 @@ impl App for NostrApp {
     }
 
     fn deselect(&mut self) {}
+
+    /// US-1650: the wipe is **deliberate** (§2.4.1a) — the management RESET
+    /// path calls this through the dispatcher with no prior SELECT and no
+    /// status word to answer with, so the default no-op would leave every
+    /// record standing, sealed under a key that still exists and
+    /// indistinguishable from valid data. Tombstone every slot through the
+    /// full commit path (admission, seal, durable commit): afterwards every
+    /// slot is reusable by the writers and nothing in the region can be
+    /// mistaken for a live identity. The host's announcement duty —
+    /// enumerate with `LIST_KEYS`, show what will be destroyed, refuse to
+    /// proceed unacknowledged — is a pre-flight obligation named in the
+    /// host stories (US-1666, US-1671).
+    fn factory_wipe(&mut self) {
+        let Self { region, provider, .. } = self;
+        let mut resp = HeaplessVec::new();
+        if let Some(mut store) = attach_store(region, provider, &mut resp) {
+            for index in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
+                // Best effort per slot — `factory_wipe` has no status-word
+                // channel, and a slot that will not commit is reported by
+                // the next read's honest answer, not by a fault here.
+                if read_identity(&mut store, index).is_ok() {
+                    let _ = store.delete(index);
+                }
+            }
+        }
+    }
 
     /// Dispatch the §2.2 wire table. Unimplemented arms are the US-1642
     /// skeleton refusal until their stories replace them.
@@ -730,8 +892,10 @@ impl App for NostrApp {
             INS_GENERATE_KEY => self.generate_key(p1, p2, data, resp),
             INS_IMPORT_KEY => self.import_key(p1, p2, data, resp),
             INS_SIGN => self.sign(p1, p2, data, resp),
-            // US-1649 label/delete/export, US-1653 the NIP-44 pair — each
-            // replaces its arm here.
+            INS_SET_LABEL => self.set_label(p1, p2, data, resp),
+            INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
+            INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
+            // US-1653 the NIP-44 pair replaces its arms here.
             _ => write_sw(resp, SW_INS_NOT_SUPPORTED),
         }
     }

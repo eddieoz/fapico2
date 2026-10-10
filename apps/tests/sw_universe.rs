@@ -2028,13 +2028,14 @@ const NOSTR: &[Claim] = &[
     Claim::applet(
         0x6D00,
         "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — the arms no story has \
-         implemented yet (NIP44_ENCRYPT/DECRYPT 0x16/0x17, SET_LABEL 0x18, \
-         DELETE_KEY 0x19, EXPORT_KEY 0x1A — US-1649/US-1653) plus unknown INS bytes",
+         implemented yet (NIP44_ENCRYPT/DECRYPT 0x16/0x17 — US-1653) plus unknown \
+         INS bytes; US-1649's trio (0x18/0x19/0x1A) left this row",
     ),
     Claim::applet(
         0x6985,
-        "US-1644: touch required / not granted — the mutating trio's execution gate; \
-         the host build auto-acks, the device denies until US-1646 wires the grant",
+        "US-1644: touch required / not granted — every mutating command's execution \
+         gate (GENERATE/IMPORT/SIGN, and US-1649's SET_LABEL/DELETE_KEY/EXPORT_KEY); \
+         the host build auto-acks, the device grant is US-1646's strict request path",
     ),
     Claim::applet(
         0x6A84,
@@ -2056,7 +2057,7 @@ const NOSTR: &[Claim] = &[
         0x6A80,
         "US-1643: bad index — GET_PUBKEY's P1 outside the 8-slot range (design §2.2.0: \
          an out-of-range idx is a bad *handle*, not a missing identity) — and a payload \
-         on a command that takes none",
+         on a command that takes none; US-1649 adds SET_LABEL's oversized/non-UTF-8 label",
     ),
     Claim::applet(
         0x6A82,

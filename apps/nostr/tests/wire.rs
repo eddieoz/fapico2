@@ -395,9 +395,9 @@ fn a_storeless_applet_refuses_the_reads() {
 #[test]
 fn unimplemented_commands_stay_refused() {
     let (mut app, path) = booted_app("skeleton-rest");
-    // US-1644/US-1645 implemented 0x13–0x15; the NIP-44 pair and the
-    // §2.2.0a export arm are still their stories'.
-    for ins in [0x16u8, 0x17, 0x18, 0x19, 0x1A] {
+    // US-1644/US-1645 implemented 0x13–0x15 and US-1649 the §2.2.0a trio
+    // (0x18–0x1A); the NIP-44 pair is still Phase 2's.
+    for ins in [0x16u8, 0x17] {
         let (_, sw) = call(&mut app, &apdu(ins, 0, 0, &[]));
         assert_eq!(sw, 0x6D00, "INS {ins:#04x} is not this story's");
     }
