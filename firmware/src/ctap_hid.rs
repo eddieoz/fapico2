@@ -419,12 +419,31 @@ impl HidAssembler {
 /// story removes. The nonce stays in the signature as the allocation trigger.)
 pub struct CidAllocator {
     counter: u32,
+    /// The exclusive upper bound this allocator's CIDs stay under — its own
+    /// wrap constant. The FIDO interface wraps at [`HID_CID_DOMAIN_SEPARATED`]
+    /// (bit 31 is the HID presence-tag domain); the Nostr interface
+    /// (US-1659, design §A.8.3a #2) wraps at `0x2000_0000` because its tags
+    /// are `0x6000_0000 | CID` (bits 30+29) and OR-folding is not injective:
+    /// a free-running cid ≥ 0x2000_0000 would set bit 29 inside the CID
+    /// itself, and cid `0x0000_0002`, `0x2000_0002` and `0x6000_0002` would
+    /// all fold onto tag `0x6000_0002` — a silent cross-tab grant.
+    limit: u32,
 }
 
 impl CidAllocator {
-    /// Starts above the all-zero reserved channel.
+    /// Starts above the all-zero reserved channel, in the FIDO interface's
+    /// 31-bit space.
     pub const fn new() -> Self {
-        Self { counter: 0 }
+        Self { counter: 0, limit: HID_CID_DOMAIN_SEPARATED }
+    }
+
+    /// A clamped allocator for an interface whose presence tags are
+    /// OR-folded onto the CID: the counter may never reach the bits the tag
+    /// mask occupies. The Nostr interface's tag domain starts at
+    /// `0x6000_0000`, so its CID space is clamped to cid < `0x2000_0000`
+    /// (US-1659).
+    pub const fn clamped(limit: u32) -> Self {
+        Self { counter: 0, limit }
     }
 }
 
@@ -440,7 +459,13 @@ impl CidAllocator {
     /// (US-921 review P0-1: lets the wraparound guard be exercised without
     /// 2^31 allocations).
     fn from_counter(counter: u32) -> Self {
-        Self { counter }
+        Self { counter, limit: HID_CID_DOMAIN_SEPARATED }
+    }
+
+    /// Test-only companion: place the counter under an arbitrary limit,
+    /// for the clamped allocator's wrap tests (US-1659).
+    fn from_counter_limited(counter: u32, limit: u32) -> Self {
+        Self { counter, limit }
     }
 }
 
@@ -458,10 +483,10 @@ impl CidAllocator {
         let _ = nonce;
         loop {
             self.counter = self.counter.wrapping_add(1);
-            if self.counter >= HID_CID_DOMAIN_SEPARATED {
-                // The 31-bit CID space is exhausted: wrap to the start
-                // (the next increment lands on 1 — the bridge channel,
-                // skipped below like every reserved value).
+            if self.counter >= self.limit {
+                // This allocator's CID space is exhausted: wrap to the
+                // start (the next increment lands on 1 — the bridge
+                // channel, skipped below like every reserved value).
                 self.counter = 0;
                 continue;
             }
@@ -520,6 +545,74 @@ mod tests {
         f[4] = seq;
         f[5..5 + bytes.len()].copy_from_slice(bytes);
         f
+    }
+
+    /// US-1659 (design §A.8.3a #2, §2.7.1): the Nostr interface's allocator
+    /// is range-clamped to cid < `0x2000_0000` and the interface's tags
+    /// (`0x6000_0000 | CID`, `fapico2_nostr::hid_presence_tag`) are injective
+    /// over that space and disjoint from the other two domains. OR-folding
+    /// is not injective in general: for a free-running cid ≥ 0x2000_0000,
+    /// bits 29/30 of the cid fold into the tag mask — cid 0x0000_0002,
+    /// 0x2000_0002 and 0x6000_0002 would all yield tag 0x6000_0002 — which
+    /// is a silent cross-tab grant: a press armed for one tab consumable by
+    /// another.
+    #[test]
+    #[cfg(feature = "device")]
+    fn nostr_cid_allocator_is_clamped_and_tags_injective() {
+        use fapico2_nostr::{hid_presence_tag, NOSTR_HID_TAG_DOMAIN, NOSTR_TAG_DOMAIN};
+
+        // The Nostr allocator wraps under its own limit — the clamp is the
+        // fix, so it is what the test exercises.
+        const NOSTR_CID_LIMIT: u32 = 0x2000_0000;
+        let mut alloc = CidAllocator::clamped(NOSTR_CID_LIMIT);
+        assert_eq!(alloc.allocate(&[]), [0, 0, 0, 2], "bridge CID skipped, counting from 2");
+
+        // Boundary: at the top of the clamped space the counter wraps back
+        // into the safe range instead of stepping into the tag mask's bits —
+        // the fold would live exactly here.
+        let mut at_edge = CidAllocator::from_counter_limited(NOSTR_CID_LIMIT - 2, NOSTR_CID_LIMIT);
+        let last = at_edge.allocate(&[]);
+        assert_eq!(last, [0x1F, 0xFF, 0xFF, 0xFF], "the last clamped CID is issued");
+        // …then the counter wraps to the start of the safe range (bridge
+        // channel skipped), never crossing the clamp.
+        assert_eq!(at_edge.allocate(&[]), [0, 0, 0, 2]);
+        // Every issued CID keeps the clamp's bits clear — the property the
+        // tag injectivity below depends on.
+        assert_eq!(u32::from_be_bytes(last) & NOSTR_CID_LIMIT, 0);
+
+        // Injectivity within the Nostr-HID domain: distinct channels yield
+        // distinct tags (exercised over the interesting bit patterns — the
+        // full space is 2^29, the fold lives at the mask's edges).
+        for cid_u32 in [
+            0x0000_0002u32,      // the first legal CID
+            0x1FFF_FFFFu32,      // the last CID under the clamp
+            0x0000_0003u32,      // the one the fold example collides on
+            0x0100_0000u32,      // a CID with interior bits set
+        ] {
+            let cid = cid_u32.to_be_bytes();
+            let tag = hid_presence_tag(cid);
+            // The mask's bits must be exactly the domain's — a cid under the
+            // clamp cannot steal bit 29 or bit 30 or reach bit 31.
+            assert_eq!(tag & 0xE000_0000, NOSTR_HID_TAG_DOMAIN);
+            assert_eq!(tag & !0xE000_0000, cid_u32 & 0x1FFF_FFFF);
+        }
+
+        // Cross-domain disjointness (§A.8.3 #1): the three presence-tag
+        // domains never overlap. FIDO HID is `0x8000_0000 | CID`
+        // (fapico2_fido::presence_tag_from_channel), the CCID Nostr applet
+        // is `0x4000_0000 | idx` (fapico2_nostr::presence_tag), and this
+        // interface is `0x6000_0000 | CID`.
+        let cid = [0x00, 0x00, 0x00, 0x02];
+        let nostr_hid = hid_presence_tag(cid);
+        let fido_hid = 0x8000_0000 | u32::from_be_bytes(cid); // the FIDO encoding
+        let ccid_nostr = NOSTR_TAG_DOMAIN | 2u32; // the CCID applet's idx-2 tag
+        assert_ne!(nostr_hid, fido_hid);
+        assert_ne!(nostr_hid, ccid_nostr);
+        assert_ne!(fido_hid, ccid_nostr);
+        // …and the FIDO domain's bit-31 invariant holds under this one: no
+        // Nostr-HID tag can have bit 31 set, so a Nostr press can never arm
+        // (or arm-consume) a FIDO window.
+        assert_eq!(nostr_hid & 0x8000_0000, 0);
     }
 
     fn busy_check(alloc: &mut CidAllocator, _asm: &mut HidAssembler, nonce: &[u8]) -> [u8; 4] {

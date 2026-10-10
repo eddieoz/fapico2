@@ -1277,6 +1277,29 @@ pub fn presence_tag(idx: u16) -> u32 {
     NOSTR_TAG_DOMAIN | (idx as u32 & 0xFFFF)
 }
 
+/// The presence tag domain of the Nostr **HID** interface (US-1659, design
+/// §A.8.3 #1): bits 30+29, `0x6000_0000 | CID` where CID is the CTAPHID
+/// channel the interface's own allocator issued. Disjoint from the FIDO HID
+/// domain (`0x8000_0000 | CID`, bit 31) and from the CCID domain above —
+/// the exact fix for the Skeptic's critical #1: with two HID interfaces
+/// running identical per-CID allocators, a press armed for Nostr must never
+/// be consumable by FIDO on the other interface (or vice versa).
+pub const NOSTR_HID_TAG_DOMAIN: u32 = 0x6000_0000;
+
+/// The presence tag for one Nostr-HID channel's touch gate:
+/// `0x6000_0000 | u32::from_be_bytes(CID)`.
+///
+/// Injective over the tags only because the interface's [`CidAllocator`]
+/// (`firmware/src/ctap_hid.rs::CidAllocator::clamped`) is range-clamped to
+/// cid < `0x2000_0000` (§A.8.3a #2): OR-folding is not injective, and a
+/// free-running cid would set bit 29 inside the CID itself — three
+/// different channels folding onto one tag is a silent cross-tab grant.
+/// The clamp makes `0x6000_0000 | cid` leave bits 29/30 as the mask wrote
+/// them, and bit 31 clear by construction.
+pub fn hid_presence_tag(cid: [u8; 4]) -> u32 {
+    NOSTR_HID_TAG_DOMAIN | u32::from_be_bytes(cid)
+}
+
 fn user_present(grant: Option<fn(u32) -> bool>, idx: u16) -> bool {
     match grant {
         // The device injects the strict one-shot path
