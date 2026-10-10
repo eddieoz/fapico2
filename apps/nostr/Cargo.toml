@@ -30,3 +30,11 @@ host = []
 # Device (RP2350) back end marker: the firmware enables this to build the applet
 # for `thumbv8m` `no_std`.
 device = []
+
+[dev-dependencies]
+# US-1643: the wire-cap test asserts against the **device** constant
+# (`ccid_reasm::MAX_WIRE`), not this host's 4096 dispatch buffer — the
+# emulator has no size check, so only the device constant tells the truth
+# about what fits the CCID transport. A dev-dependency, so the crate graph
+# (deny-graph gate) still carries no applet→firmware edge.
+fapico2-firmware = { path = "../../firmware", default-features = false, features = ["emulation"] }

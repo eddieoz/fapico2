@@ -182,11 +182,13 @@ fn no_boot_path_call_site_reaches_the_accessor_before_rung_usb() {
 /// construction call per owner, and no other region symbol in that
 /// neighbourhood.
 ///
-/// **Two owners, two handles (US-1553).** FIDO re-borrows one handle per command;
-/// OATH has to own its own, because `OathApp::attach_region` holds the handle
-/// for the life of the process and a permanent `&mut` beside a stream of
-/// transient ones is UB (the `DRBG_SEED_PROBE` rule). So the count here is two
-/// and the assertion names which is which — what it still forbids is a *third*
+/// **Three owners, three handles (US-1553, then US-1643).** FIDO re-borrows one
+/// handle per command; OATH has to own its own, because `OathApp::attach_region`
+/// holds the handle for the life of the process and a permanent `&mut` beside a
+/// stream of transient ones is UB (the `DRBG_SEED_PROBE` rule); Nostr owns its
+/// own for the same reason (`NostrApp`'s region field holds it across the
+/// session, attached lazily by its provider). So the count here is three and
+/// the assertion names which is which — what it still forbids is a *fourth*
 /// construction, or any of these handles being read before the release.
 #[test]
 fn the_only_pre_usb_region_mention_is_the_handle_construction() {
@@ -198,6 +200,7 @@ fn the_only_pre_usb_region_mention_is_the_handle_construction() {
     for (init, why) in [
         ("boot::init_key_region(", "FIDO's handle"),
         ("boot::init_oath_key_region(", "OATH's handle"),
+        ("boot::init_nostr_key_region(", "Nostr's handle (US-1643)"),
     ] {
         let inits = all_lines(before, init);
         assert_eq!(
@@ -209,17 +212,17 @@ fn the_only_pre_usb_region_mention_is_the_handle_construction() {
         );
     }
 
-    // Two `KeyRegionHandle::new` expressions, and nothing else naming the type.
-    // The count is the point: a third handle would mean another owner nobody
-    // accounted for, and a handle used rather than parked would mean a boot-path
-    // read.
+    // Three `KeyRegionHandle::new` expressions, and nothing else naming the
+    // type. The count is the point: a fourth handle would mean another owner
+    // nobody accounted for, and a handle used rather than parked would mean a
+    // boot-path read.
     let names = all_lines(before, "KeyRegionHandle");
     assert_eq!(
         names.len(),
-        2,
-        "the pre-USB block must name `KeyRegionHandle` exactly twice — one construction \
-         expression per owner (FIDO and OATH). More would mean a third owner or the boot path \
-         doing something with a region beyond parking a handle: {}",
+        3,
+        "the pre-USB block must name `KeyRegionHandle` exactly thrice — one construction \
+         expression per owner (FIDO, OATH and Nostr). More would mean a fourth owner or the \
+         boot path doing something with a region beyond parking a handle: {}",
         names
             .iter()
             .map(|(n, _)| format!("{MAIN_RS}:{n}"))
@@ -234,14 +237,21 @@ fn the_only_pre_usb_region_mention_is_the_handle_construction() {
     // take_oath_key_region` answers `None` until `KEY_REGION_READY`, which
     // `the_accessor_refuses_before_the_release` pins. What *is* checkable here
     // is that the take exists in exactly one place: a second caller would be a
-    // second owner racing for the same handle.
-    assert_eq!(
-        all_lines(&main, "take_oath_key_region(").len(),
-        1,
-        "exactly one call site for `take_oath_key_region` in `main.rs`, and it must be the \
-         provider `fn`. A second caller would be a second owner racing for one handle: {}",
-        cite(MAIN_RS, &main, "take_oath_key_region(")
-    );
+    // second owner racing for the same handle. US-1643: Nostr's take has the
+    // same one-site property, for the same reason.
+    for (take, why) in [
+        ("take_oath_key_region(", "OATH"),
+        ("take_nostr_key_region(", "Nostr (US-1643)"),
+    ] {
+        assert_eq!(
+            all_lines(&main, take).len(),
+            1,
+            "exactly one call site for `{take}` in `main.rs`, and it must be the \
+             provider `fn`. A second caller would be a second owner racing for one handle \
+             ({why}): {}",
+            cite(MAIN_RS, &main, take)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -249,6 +249,29 @@ fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
     ))
 }
 
+/// US-1643: the Nostr region, asked lazily by the applet's provider on its
+/// first read — the same shape as [`oath_region`], with no legacy fallback:
+/// Nostr has only ever had the keyregion store, so `None` means the applet
+/// refuses its reads with the store-fault status word (`6F00`) rather than
+/// answering from anywhere else. There is no legacy Nostr store to degrade
+/// to, and S10's "degrade" here is exactly that refusal.
+///
+/// The handle cannot be taken before the boot's key-region release gate runs,
+/// and the applet is constructed before that line — which is why this is a
+/// provider the applet asks on demand rather than an eager `NostrApp::boot`.
+///
+/// (The gate in `platform/tests/key_region_boot_gate.rs` reads this file as
+/// text, so this comment does not spell the release call the way the source
+/// does — that is the gate's needle, not prose.)
+fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
+    let key = boot::derive_nostr_payload_key()?;
+    let region = boot::take_nostr_key_region()?;
+    Some(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+        ::alloc::boxed::Box::new(region),
+        key,
+    ))
+}
+
 fn boot_oath<T: Trng>(
     trng: &mut T,
     store: &mut boot::DeviceStore,
@@ -890,6 +913,24 @@ async fn main(spawner: Spawner) -> ! {
         )))
     };
 
+    // US-1643: Nostr needs a **FIFTH** handle over the same physical window,
+    // for the same two reasons OATH needed a fourth: `NostrApp::boot` takes
+    // ownership of its handle for the life of the process, and two `&mut` to
+    // one object is UB whether or not the non-overlap argument holds. Nostr
+    // owns `[NOSTR_FIRST_SLOT, NOSTR_SLOT_LIMIT)` at the top of FIDO's former
+    // range — disjoint from OATH's head and FIDO's body by geometry
+    // (`keyregion/mod.rs`'s tiling check) — and the same single-core, no-yield
+    // serialization applies.
+    //
+    // SAFETY: as for the fourth handle above. `boot::init_nostr_key_region` —
+    // single-core boot path, before any task exists; the slot is written once
+    // here and not read until `release_key_region`.
+    unsafe {
+        boot::init_nostr_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
     let flash: boot::DevFlash = Flash::new_blocking(p.FLASH);
     // S-701-3: hand the flash handle to the write-once static (single init,
     // boot path) so the HID task can persist FIDO keystore changes too.
@@ -1101,14 +1142,15 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
-    // US-1642: the Nostr applet (AID `F0 00 00 00 02`). A stateless skeleton
-    // in this revision — no store handle yet, so there is nothing to boot
-    // from and no injection to attach; Phase 1 stories add both
-    // (`platform/src/keyregion/nostr_store.rs` is the store that will back
-    // it). Static memory for the same reason as the six above.
+    // US-1642/US-1643: the Nostr applet (AID `F0 00 00 00 02`). The region
+    // cannot be attached eagerly here — `boot::take_nostr_key_region` answers
+    // `None` until `release_key_region()`, several lines below — so the
+    // applet is constructed bare and asks `nostr_region` on its first read
+    // (`install_region_provider`'s OATH precedent). Static memory for the
+    // same reason as the six above.
     let nostr_app = boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::NOSTR_APP),
-        NostrApp::new(),
+        NostrApp::new().with_region_provider(nostr_region),
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the

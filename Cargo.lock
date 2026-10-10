@@ -1399,6 +1399,7 @@ name = "fapico2-nostr"
 version = "0.1.0"
 dependencies = [
  "chacha20",
+ "fapico2-firmware",
  "fapico2-platform",
  "heapless 0.8.0",
  "hmac 0.12.1",

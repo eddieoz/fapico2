@@ -465,6 +465,54 @@ pub fn derive_oath_payload_key() -> Option<fapico2_platform::keyregion::crypto::
     )
 }
 
+/// US-1643: the Nostr applet's **own** key-region handle — a fifth
+/// `DeviceKeyRegion` over the same physical window, with disjoint slot ranges
+/// by geometry (Nostr owns `[NOSTR_FIRST_SLOT, NOSTR_SLOT_LIMIT)`, asserted
+/// by `keyregion/mod.rs`'s tiling). The same `Option` take-once shape as
+/// [`OATH_KEY_REGION`]: a bare `MaybeUninit<KeyRegionHandle>` would make a
+/// double-take a silent double-move.
+pub static mut NOSTR_KEY_REGION: core::mem::MaybeUninit<Option<KeyRegionHandle>> =
+    core::mem::MaybeUninit::uninit();
+
+/// Stage Nostr's key-region handle. Single-core boot path, once, before any
+/// task exists — the [`init_key_region`] discipline.
+pub unsafe fn init_nostr_key_region(region: KeyRegionHandle) {
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).write(Some(region)) };
+}
+
+/// Take Nostr's region handle by value, once.
+///
+/// Shares [`KEY_REGION_READY`] rather than carrying its own flag, exactly as
+/// [`take_oath_key_region`] does: one release publishes both.
+pub fn take_nostr_key_region() -> Option<KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `init_nostr_key_region` wrote the slot exactly once on the boot
+    // path before any task existed, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that. The `Option` is `.take()`n, so at most
+    // one caller ever moves the value out and any later caller reads `None`.
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).assume_init_mut().take() }
+}
+
+/// US-1643: the key the Nostr region's records are sealed under.
+///
+/// Same root as every other store key on the device, the same shape as
+/// [`derive_oath_payload_key`] — and the same **`Option`, never
+/// [`fatal_boot`]** reasoning: a missing OTP row or chipid degrades Nostr to
+/// an applet that answers APDUs and refuses its reads with the store-fault
+/// status word rather than reporting a fiction about what is on the device.
+#[inline(never)]
+pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
+    let otp_key_1 = read_otp_key_1()?;
+    let chipid = embassy_rp::otp::get_chipid().ok()?;
+    fapico2_platform::keyregion::crypto::derive_payload_key(
+        &otp_key_1,
+        &chipid.to_be_bytes(),
+        &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
+    )
+}
+
 /// Publish the staged key region. **Called once, after `mark!(RUNG_USB)`.**
 ///
 /// The call site is the claim that the boot path is done touching persistent
@@ -1927,8 +1975,9 @@ pub static mut RESCUE_APP: core::mem::MaybeUninit<RescueApp> =
     core::mem::MaybeUninit::uninit();
 // US-1642: the Nostr applet, static memory for the same reason as the six
 // above — `CCID_DISPATCHER` lives in static memory and borrows every app for
-// `'static`. The skeleton is stateless (zero-sized), so the slot costs
-// nothing until Phase 1 stories give the applet its store handle.
+// `'static`. US-1643 gave it the store handle (`Option<NostrRegion>`, one
+// word of discriminant plus the region's own state), so the slot is no
+// longer zero-cost but is still a word-scale cost.
 pub static mut NOSTR_APP: core::mem::MaybeUninit<NostrApp> =
     core::mem::MaybeUninit::uninit();
 
