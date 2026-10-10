@@ -275,14 +275,9 @@ pub fn decode_response(buf: &[u8]) -> Option<(Sw, &[u8])> {
 /// request buffer — same treatment as [`build_apdu`]: the capacity proof is
 /// written at the site (every caller passes arguments at or below
 /// [`NOSTR_REQ_ARG_MAX`], and `4 + 3 + NOSTR_REQ_ARG_MAX` ≤
-/// [`NOSTR_APDU_REQ_MAX`]), the `debug_assert!` documents it, and the
-/// host-side callers unwrap the `Option` themselves because this encoder
-/// never ships on the device.
+/// [`NOSTR_APDU_REQ_MAX`]), and the host-side callers unwrap the `Option`
+/// themselves because this encoder never ships on the device.
 pub fn encode_request(idx: u16, arg: &[u8]) -> Option<HeaplessVec<u8, NOSTR_APDU_REQ_MAX>> {
-    debug_assert!(
-        arg.len() <= NOSTR_REQ_ARG_MAX,
-        "argument above the parser cap: encode_request mirrors decode_request's domain"
-    );
     if arg.len() + 7 > NOSTR_APDU_REQ_MAX {
         return None;
     }
@@ -314,24 +309,20 @@ pub fn encode_request(idx: u16, arg: &[u8]) -> Option<HeaplessVec<u8, NOSTR_APDU
 /// panic (US-1678: the `unwrap` this replaced was USB-reachable through any
 /// over-cap vendor frame, and `panic = "abort"` makes that a reboot).
 ///
-/// **Reachability proof, asserted and tested:** [`decode_request`] refuses
-/// any argument above [`NOSTR_REQ_ARG_MAX`] (1,891 B), and
+/// **Reachability proof, written here and tested:** [`decode_request`]
+/// refuses any argument above [`NOSTR_REQ_ARG_MAX`] (1,891 B), and
 /// `7 + NOSTR_REQ_ARG_MAX` ≤ [`NOSTR_APDU_REQ_MAX`] (2,154 B) — so through
-/// `process_vendor_through` the explicit overflow arm below is unreachable,
-/// the `debug_assert!` documents it, and
+/// `process_vendor_through` the overflow arm below is unreachable, and
 /// `an_argument_above_the_wire_cap_is_refused_in_band` pins the whole chain.
-/// Direct callers that bypass the parser still get the `None`, never a
-/// panic.
+/// Direct callers that bypass the parser (and
+/// `every_derived_capacity_refuses_above_itself`, which probes this bound
+/// directly) still get the `None`, never a panic.
 pub fn build_apdu(
     ins: u8,
     idx: u16,
     arg: &[u8],
     out: &mut HeaplessVec<u8, NOSTR_APDU_REQ_MAX>,
 ) -> Option<()> {
-    debug_assert!(
-        arg.len() <= NOSTR_REQ_ARG_MAX,
-        "argument above the parser cap: build_apdu is only reachable behind decode_request"
-    );
     out.clear();
     if arg.len() + 7 > NOSTR_APDU_REQ_MAX {
         return None; // the explicit overflow arm — see the reachability proof
@@ -510,6 +501,69 @@ mod tests {
             assert_eq!(sw, SW_WRONG_DATA, "cmd 0x{cmd:02X} must refuse in band");
             assert!(data.is_empty());
         }
+    }
+
+    /// US-1679: every derived capacity refuses above itself. The arc's
+    /// buffer bounds come from the *legitimate* worst case, so only a
+    /// hostile frame can exercise an overflow — each bound therefore gets an
+    /// over-capacity row that drives one byte past it and asserts the
+    /// defined refusal:
+    ///
+    /// - the APDU request scratch (`NOSTR_APDU_REQ_MAX` = 2,154): a direct
+    ///   `build_apdu` at its own bound (2,147-byte arg) is `Some`; one byte
+    ///   past is `None` — the in-band `SW_WRONG_DATA` once
+    ///   `process_vendor_through` maps it (row below);
+    /// - the park payload (`PendingUp<2048>` on the Nostr interface): one
+    ///   byte past the bound is `PayloadTooLarge`, the synchronous refusal —
+    ///   the FIDO slot's own row is pinned as
+    ///   `pending_up::tests::the_payload_bound_is_1024_and_is_never_parked_over`;
+    ///   this row adds the Nostr slot's bound at 2,048;
+    /// - the response scratch (`NOSTR_RESP_MAX` = 2,048): a larger reply
+    ///   truncates with the `sw` field intact — pinned, keep it:
+    ///   `nostr_wire::tests::an_oversized_response_truncates_but_keeps_the_sw_field`.
+    ///
+    /// The two pinned rows are named here so a future deletion is a grep
+    /// hit; the serve-loop end of this story is
+    /// `an_oversized_vendor_frame_answers_in_band` (hid_serve tests).
+    #[test]
+    fn every_derived_capacity_refuses_above_itself() {
+        // Row 1: the APDU request scratch, probed directly at build_apdu
+        // (the parser's own cap, NOSTR_REQ_ARG_MAX = 1,891, is stricter and
+        // is pinned by the round-trip and wire-cap rows above).
+        let at_bound = [0x5Au8; NOSTR_APDU_REQ_MAX - 7];
+        let mut out = HeaplessVec::new();
+        assert!(
+            build_apdu(fapico2_nostr::INS_SIGN, 0, &at_bound, &mut out).is_some(),
+            "the legitimate worst case must exactly fit the scratch"
+        );
+        assert_eq!(out.len(), NOSTR_APDU_REQ_MAX);
+        let over = [0x5Au8; NOSTR_APDU_REQ_MAX - 6];
+        assert!(
+            build_apdu(fapico2_nostr::INS_SIGN, 0, &over, &mut out).is_none(),
+            "one byte past the scratch bound is a refusal, never a panic"
+        );
+        assert!(out.is_empty(), "the refused build left no partial APDU");
+
+        // Row 2: the Nostr slot's park payload bound (PendingUp<2048>).
+        use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
+        let ticket = WindowTicket {
+            kind: PendingKind::Vendor,
+            channel: [0, 0, 0, 9],
+            tag: 1,
+            ctap_cmd: 0x42,
+            deadline_ms: 30_000,
+        };
+        let mut slot = PendingUp::<2048>::new();
+        let at_park_bound = [0x5Au8; 2048];
+        assert_eq!(slot.park(ticket, &at_park_bound), Ok(()), "2,048 parks");
+        slot.take();
+        let over_park = [0x5Au8; 2049];
+        assert_eq!(
+            slot.park(ticket, &over_park),
+            Err(ParkRefusal::PayloadTooLarge),
+            "the synchronous refusal survives one byte past the park bound"
+        );
+        assert!(!slot.is_occupied(), "an oversize park must not leave a window");
     }
 
     /// The vendor range is exactly `0x40–0x7F`, and the method mapping covers

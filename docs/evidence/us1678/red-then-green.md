@@ -22,7 +22,11 @@ called `Result::unwrap()` on an `Err` value: ()
 ```
 
 (`nostr_wire.rs:289` on that tip is the `out.extend_from_slice(arg).unwrap()`
-in `build_apdu`; full transcript in `red-pre-fix.txt`.)
+in `build_apdu`; full transcript in `red-pre-fix.txt`. A note for the
+record: the first cut of the fix carried a `debug_assert!` beside the
+reachability proof; US-1679's over-capacity row probes `build_apdu`'s own
+bound directly, so the assert was dropped in favour of the explicit
+overflow arm alone — the proof stays written, and the tests carry it.)
 
 ## The green
 

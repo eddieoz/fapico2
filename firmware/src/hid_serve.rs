@@ -4426,6 +4426,77 @@ pub(crate) mod tests {
         assert_eq!(back, &plaintext[..], "the decrypted plaintext matches byte for byte");
     }
 
+    /// US-1679: the serve-loop end of the capacity story — a **full
+    /// 7,609-byte vendor frame** (`CTAPHID_MAX_MSG`, the largest the CTAPHID
+    /// framing can carry) whose CBOR argument sits far above the §2.2.1 wire
+    /// cap answers the `SW_WRONG_DATA` (0x6A80) envelope on the method's own
+    /// command byte: a hostile frame dies as a status word, not a wedge and
+    /// not a panic. Red against the pre-US-1678 tip, where the same frame
+    /// rebooted the device in `build_apdu`'s `unwrap`
+    /// (`an_argument_above_the_wire_cap_is_refused_in_band` is its
+    /// unit-level twin).
+    #[test]
+    fn an_oversized_vendor_frame_answers_in_band() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("oversize", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::ctap_hid::CTAPHID_MAX_MSG;
+        use crate::nostr_wire::{decode_response, NOSTR_CMD_SIGN, SW_WRONG_DATA};
+
+        // Pass 1: INIT handshake on the Nostr interface.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1679: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // Pass 2: one full 7,609-byte vendor frame — `array(2) [1, bytes(7,604)]`,
+        // hand-built because `encode_request`'s buffer is itself a derived
+        // capacity and cannot hold the hostile shape.
+        let mut msg = vec![0x82, 0x01, 0x59];
+        msg.extend_from_slice(&((CTAPHID_MAX_MSG - 5) as u16).to_be_bytes());
+        msg.extend_from_slice(&[0xC3; CTAPHID_MAX_MSG - 5]);
+        assert_eq!(msg.len(), CTAPHID_MAX_MSG, "the frame is the wire maximum");
+        bus_n.lock().unwrap().inbound.extend(frame(ch, NOSTR_CMD_SIGN, &msg));
+        block_on("US-1679: the oversized frame passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 2 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 300, "the oversized frame's reply never landed");
+            }
+        });
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2, "the INIT reply, then the in-band refusal");
+        assert_eq!(nostr_sent[1].cmd, NOSTR_CMD_SIGN, "answered on the method's own command byte");
+        assert_eq!(nostr_sent[1].channel, ch);
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, SW_WRONG_DATA, "the in-band 6A80 — the defined refusal");
+        assert!(data.is_empty());
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "nothing crossed to the FIDO bus");
+        assert!(app.up_calls.is_empty(), "the FIDO app never ran");
+    }
+
     /// US-1662: an unsupported method is answered **in band** on its own
     /// channel — the D20 `error unsupported-method` semantics as the
     /// vocabulary's `0x6D00` — not as a CTAPHID framing error, and never
