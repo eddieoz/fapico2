@@ -277,8 +277,12 @@ fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegio
 fn nostr_random(out: &mut [u8]) {
     // SAFETY: `init_nostr_rng_pool` wrote both slots exactly once on this
     // boot path, in the DRBG window, before USB; nothing rewrites them.
-    let pool = unsafe { &mut *boot::NOSTR_RNG_POOL.as_mut_ptr() };
-    let cursor = unsafe { &mut *boot::NOSTR_RNG_CURSOR.as_mut_ptr() };
+    let pool = unsafe {
+        &mut *(*core::ptr::addr_of_mut!(boot::NOSTR_RNG_POOL)).as_mut_ptr()
+    };
+    let cursor = unsafe {
+        &mut *(*core::ptr::addr_of_mut!(boot::NOSTR_RNG_CURSOR)).as_mut_ptr()
+    };
     fapico2_platform::trng::stretch_pool(pool, cursor, out);
 }
 
@@ -1350,6 +1354,8 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(tasks::hid_task(
             parts.hid_in,
             parts.hid_out,
+            parts.nostr_in,
+            parts.nostr_out,
             fido_app,
             hid_store,
             hid_flash,

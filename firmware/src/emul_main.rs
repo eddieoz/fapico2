@@ -1003,7 +1003,7 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     // a private `HidAssembler` and three private consent loops.
     let mut ctap_out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
     let mut srv = HidServe::new(emul_now_ms, &mut ctap_out);
-    let mut slot = PendingUp::new();
+    let mut slot = PendingUp::<{ fapico2_firmware::pending_up::PENDING_UP_PAYLOAD_MAX }>::new();
     let mut app = EmulFido {
         app: fido_app,
         store,
@@ -1141,7 +1141,7 @@ mod us1524_tests {
         fn assert_shared(_: &HidServe<'_>, _: &PendingUp) {}
         let mut out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
         let mut srv = HidServe::new(emul_now_ms, &mut out);
-        assert_shared(&srv, &PendingUp::new());
+        assert_shared(&srv, &PendingUp::<{ fapico2_firmware::pending_up::PENDING_UP_PAYLOAD_MAX }>::new());
     }
 
     /// US-1524: `CTAP_READ_CONFIG` (`0x42`) used to answer

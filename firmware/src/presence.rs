@@ -163,6 +163,20 @@ pub const CTAP_KEEPALIVE_PERIOD_MS: u64 = 250;
 /// refusal is observable as SW=6985 rather than a host-side abort.
 pub const CCID_WINDOW_MS: u64 = 15_000;
 
+/// US-1660 (design §A.8.3a #4, §A.8.3 #2): the Nostr vendor interface's own
+/// touch window — **15 s, not the CTAP2 30 s**, and not [`CCID_WINDOW_MS`]
+/// either. Reusing either would couple two unrelated rationales: the CTAP2
+/// window is 30 s because that is what the CTAP2 hosts we serve tolerate
+/// (measured: 30047.7 ms), while the Nostr window is short because a flappy
+/// browser tab must not be able to hold the single consent slot against a
+/// Chrome WebAuthn ceremony for half a minute — the cross-transport
+/// contention is bounded by the *shorter* of the two windows, so the Nostr
+/// side is the one that moves. 15 s matches [`CCID_WINDOW_MS`]'s ceiling by
+/// coincidence of the same constraint family (a host-side transaction abort
+/// is one of the things a too-long window risks), but the constants stay
+/// separate on purpose: change one, the other does not follow.
+pub const NOSTR_TOUCH_WINDOW_MS: u64 = 15_000;
+
 /// US-921: the CTAP2 touch window as a value — the pure policy piece the
 /// HID loop bounds its keepalive retries with (`open` stamps the budget
 /// from the current clock; `expired` is the loop's exit condition). The
@@ -177,12 +191,22 @@ pub struct TouchWindow {
 }
 
 impl TouchWindow {
-    /// Open a touch window for `tag` at `now_ms`.
-    pub fn open(tag: u32, now_ms: u64) -> Self {
+    /// Open a touch window for `tag` at `now_ms`, with the caller's budget.
+    ///
+    /// US-1660: parameterized so the Nostr interface can open its own,
+    /// shorter window ([`NOSTR_TOUCH_WINDOW_MS`]) without inheriting the
+    /// CTAP2 decision — the hard-wired form was exactly the coupling
+    /// §A.8.3a #4 forbids.
+    pub fn open_for(tag: u32, now_ms: u64, window_ms: u64) -> Self {
         Self {
             tag,
-            deadline_ms: now_ms.saturating_add(CTAP_TOUCH_WINDOW_MS),
+            deadline_ms: now_ms.saturating_add(window_ms),
         }
+    }
+
+    /// Open a touch window for `tag` at `now_ms`, on the CTAP2 budget.
+    pub fn open(tag: u32, now_ms: u64) -> Self {
+        Self::open_for(tag, now_ms, CTAP_TOUCH_WINDOW_MS)
     }
 
     /// Whether the window has run out at `now_ms`.

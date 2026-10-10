@@ -498,12 +498,20 @@ impl CidAllocator {
     /// A clamped allocator for an interface whose presence tags are
     /// OR-folded onto the CID: the counter may never reach the bits the tag
     /// mask occupies. The Nostr interface's tag domain starts at
-    /// `0x6000_0000`, so its CID space is clamped to cid < `0x2000_0000`
+    /// `0x6000_0000`, so its CID space is clamped to cid < [`NOSTR_CID_LIMIT`]
     /// (US-1659).
     pub const fn clamped(limit: u32) -> Self {
         Self { counter: 0, limit }
     }
 }
+
+/// US-1659: the Nostr interface's CID clamp — the wrap constant of a
+/// `CidAllocator::clamped` allocator. The Nostr presence tags are
+/// `0x6000_0000 | cid` (bits 30+29), so a free-running cid at or above
+/// `0x2000_0000` would fold bits into the tag mask and OR-folding stops
+/// being injective. `pub` for US-1660's serve state, which constructs the
+/// clamped allocator at the device seam.
+pub const NOSTR_CID_LIMIT: u32 = 0x2000_0000;
 
 impl Default for CidAllocator {
     fn default() -> Self {
@@ -621,7 +629,6 @@ mod tests {
 
         // The Nostr allocator wraps under its own limit — the clamp is the
         // fix, so it is what the test exercises.
-        const NOSTR_CID_LIMIT: u32 = 0x2000_0000;
         let mut alloc = CidAllocator::clamped(NOSTR_CID_LIMIT);
         assert_eq!(alloc.allocate(&[]), [0, 0, 0, 2], "bridge CID skipped, counting from 2");
 

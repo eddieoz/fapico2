@@ -152,11 +152,20 @@ pub enum SlotPoll<'a> {
 ///
 /// Single occupancy, fail-closed, bounded payload. See the module docs for
 /// why this is a pure value type rather than a set of atomics.
-pub struct PendingUp {
+///
+/// The payload bound is a const-generic parameter, defaulting to
+/// [`PENDING_UP_PAYLOAD_MAX`]: every existing use is unchanged
+/// (`PendingUp` bare = the 1024 B CTAPHID slot), and US-1660 instantiates
+/// the Nostr interface's own slot as `PendingUp<2048>` — its parked
+/// `NIP44_ENCRYPT` request (peer key + ~1.8 KiB of plaintext) does not fit
+/// the CTAPHID bound (design §A.8.3 #6). The behaviour (occupancy, cadence,
+/// refusals) is identical at any bound by construction — the parameter
+/// sizes the array and nothing else.
+pub struct PendingUp<const PAYLOAD_MAX: usize = PENDING_UP_PAYLOAD_MAX> {
     occupied: bool,
     ticket: WindowTicket,
     payload_len: u16,
-    payload: [u8; PENDING_UP_PAYLOAD_MAX],
+    payload: [u8; PAYLOAD_MAX],
     /// The refusal the parked command last answered with while it still
     /// needed the touch: one byte of CTAP2 (`0x3B`), or the two-byte U2F
     /// `6985` / `0700` shape (`presence::u2f_up_refusal` admits nothing
@@ -189,7 +198,7 @@ impl Default for PendingUp {
     }
 }
 
-impl PendingUp {
+impl<const PAYLOAD_MAX: usize> PendingUp<PAYLOAD_MAX> {
     /// An empty slot. `const` so the device can park one in `.bss`
     /// (`boot::PENDING_UP`) with no runtime initialisation.
     pub const fn new() -> Self {
@@ -203,7 +212,7 @@ impl PendingUp {
                 deadline_ms: 0,
             },
             payload_len: 0,
-            payload: [0; PENDING_UP_PAYLOAD_MAX],
+            payload: [0; PAYLOAD_MAX],
             refusal: [0; 2],
             refusal_len: 0,
             last_keepalive_ms: 0,
@@ -276,7 +285,7 @@ impl PendingUp {
         if self.occupied {
             return Err(ParkRefusal::Occupied);
         }
-        if payload.len() > PENDING_UP_PAYLOAD_MAX {
+        if payload.len() > PAYLOAD_MAX {
             return Err(ParkRefusal::PayloadTooLarge);
         }
         self.payload[..payload.len()].copy_from_slice(payload);
@@ -379,7 +388,7 @@ mod tests {
     /// harvested, which is US-921's defect with the sign flipped.
     #[test]
     fn a_second_park_is_refused_not_queued() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert_eq!(slot.park(ticket(0x8000_0009, 30_000), &[1, 2, 3]), Ok(()));
         assert!(slot.is_occupied());
         assert_eq!(
@@ -416,7 +425,7 @@ mod tests {
              MakeCredential/GetAssertion must fit, and a hostile one must not be \
              able to turn the slot into a memory-growth lever"
         );
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let at_bound = [0x5Au8; PENDING_UP_PAYLOAD_MAX];
         assert_eq!(slot.park(ticket(1, 30_000), &at_bound), Ok(()));
         let live = slot.parked().expect("at the bound parks");
@@ -442,7 +451,7 @@ mod tests {
     #[test]
     fn poll_walks_idle_live_expired_and_take_closes_once() {
         NOW.store(1_000, Ordering::Relaxed);
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert!(matches!(slot.poll(NOW.load(Ordering::Relaxed)), SlotPoll::Idle));
         assert_eq!(slot.take(), None, "nothing to close");
 
@@ -473,7 +482,7 @@ mod tests {
     /// with — the exact bytes the command last produced, and nothing else.
     #[test]
     fn the_refusal_is_recorded_bounded_and_survives_until_close() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         slot.park(ticket(1, 10), &[0x01]).unwrap();
         assert!(slot.refusal().is_empty(), "nothing recorded before the first re-drive");
         slot.note_refusal(&[0x3B]);
@@ -498,7 +507,7 @@ mod tests {
     /// app, instead of letting it consume a grant armed for the parked one.
     #[test]
     fn contention_is_decided_by_presence_tag() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert!(!slot.contends_with(0x8000_0009), "an empty slot contends with nothing");
         slot.park(ticket(0x8000_0009, 10), &[0x01]).unwrap();
         assert!(slot.contends_with(0x8000_0009));

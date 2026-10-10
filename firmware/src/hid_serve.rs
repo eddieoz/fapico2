@@ -639,7 +639,7 @@ const fn frame_cmd(kind: PendingKind) -> u8 {
 /// can grant again for the life of the process. One function, so the three
 /// calls cannot drift apart — this is the pairing US-921's leak analysis
 /// turned on, and it is why there is no other way out of a window.
-fn close_window(slot: &mut PendingUp) -> WindowTicket {
+fn close_window<const PAYLOAD_MAX: usize>(slot: &mut PendingUp<PAYLOAD_MAX>) -> WindowTicket {
     match slot.take() {
         Some(ticket) => {
             presence::end_window(ticket.tag);
@@ -1196,6 +1196,357 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         }
     } else {
         // Unknown init command — CTAPHID ERROR frame, INVALID_COMMAND.
+        reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// US-1660: one task serves both HID interfaces
+//
+// A second hid-sized task future does not fit the arena headroom (design
+// §A.8.3 #4), so the Nostr interface is served by the SAME task as the
+// FIDO interface: each interface keeps its own assembler, its own CID
+// allocator, its own response buffer and its own parked-window slot
+// (`HidServe` / `PENDING_UP` for FIDO, [`NostrServe`] /
+// `boot::NOSTR_PENDING_UP` for Nostr), and one serve pass reads whichever
+// interface has a report first. The policy (window redrive, keepalive
+// cadence, reply deadlines) stays in the shared helpers —
+// [`redrive_window`], [`reply`], [`read_one`]'s bound — exactly so the
+// second interface inherits it rather than a copy of it.
+//
+// ## The .bss arithmetic, recorded for US-1664's re-measure
+//
+// The big buffers are hoisted to write-once statics
+// (`boot::NOSTR_RESP`, `boot::NOSTR_PENDING_UP`) because the task's async
+// frame is byte-accounted (`TASK_ARENA_DEMAND_B`): 2,048 (response
+// buffer) + 2,112 (`PendingUp<2048>`) ≈ 4.2 KB of .bss — against the
+// design's 12–17 KB estimate, which priced a second CTAP2-sized (7,609 B)
+// buffer; the Nostr interface never answers a largeBlobs reply, so a
+// 2 KiB bound is honest for it (derivation on [`NOSTR_RESP_MAX`]). The
+// rest of the second serve state (assembler, allocator, two 64-byte
+// reports) is frame-resident, and the nightly re-measure charges it where
+// it actually lands.
+// ---------------------------------------------------------------------------
+
+/// US-1660: the Nostr interface's response-buffer bound, in bytes.
+///
+/// The largest reply a Nostr command produces is the `NIP44_ENCRYPT`
+/// payload — `0x02 ‖ nonce(32) ‖ ct(2+1+padded) ‖ mac(32)` with
+/// `padded = calc_padded_len(1792) = 1792` — 1,862 B at apps/nostr's
+/// `MAX_PLAINTEXT`, plus 7 bytes of CTAPHID reply framing (channel,
+/// command, length): 1,869 B. 2,048 bounds that and never truncates a
+/// legal reply; the CTAPHID 7,609 bound would be a buffer for a capability
+/// the Nostr interface does not have (it never answers a CTAP2 largeBlobs
+/// reply).
+pub const NOSTR_RESP_MAX: usize = 2048;
+
+/// US-1660: the Nostr interface's half of the dual serve state.
+///
+/// The same pieces [`HidServe`] carries for FIDO — assembler, CID
+/// allocator, report, response buffer — sized and clamped for the Nostr
+/// interface: the allocator is [`crate::ctap_hid::NOSTR_CID_LIMIT`]-clamped
+/// (US-1659; a free-running cid would fold into the presence-tag mask), and
+/// the response buffer is [`NOSTR_RESP_MAX`]-bounded. There is deliberately
+/// no `reads`/`blocked_live_passes` instrumentation here: those exist for
+/// the US-1509 blackout assertions on the FIDO loop, and the Nostr loop's
+/// own consent semantics are US-1663's stories.
+pub struct NostrServe<'a> {
+    assembler: HidAssembler,
+    cid_alloc: CidAllocator,
+    report: [u8; HID_REPORT_SIZE],
+    out: &'a mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    now_ms: fn() -> u64,
+}
+
+impl<'a> NostrServe<'a> {
+    /// `now_ms` and the response buffer borrow, as [`HidServe::new`]. The
+    /// allocator is the clamped one; nothing else about the Nostr interface
+    /// is specialized at construction.
+    pub fn new(now_ms: fn() -> u64, out: &'a mut HeaplessVec<u8, NOSTR_RESP_MAX>) -> Self {
+        Self {
+            assembler: HidAssembler::new(now_ms),
+            cid_alloc: CidAllocator::clamped(crate::ctap_hid::NOSTR_CID_LIMIT),
+            report: [0u8; HID_REPORT_SIZE],
+            out,
+            now_ms,
+        }
+    }
+}
+
+/// The serve loop over both interfaces. Never returns: `hid_task` is a
+/// `#[task]`.
+pub async fn serve_loop_dual<S: HidIo, A: FidoDispatch>(
+    fido: &mut HidServe<'_>,
+    io_f: &mut S,
+    app: &mut A,
+    slot_f: &mut PendingUp,
+    nostr: &mut NostrServe<'_>,
+    io_n: &mut S,
+    slot_n: &mut PendingUp<2048>,
+) -> ! {
+    loop {
+        serve_once_dual(fido, io_f, app, slot_f, nostr, io_n, slot_n).await;
+    }
+}
+
+/// Which interface a read came from — or none.
+enum Picked {
+    Fido(usize),
+    Nostr(usize),
+    /// A bounded read expired with both windows live, or a read delivered a
+    /// zero-length report: nothing to feed this pass.
+    Quiet,
+}
+
+/// One serve-loop iteration over BOTH interfaces. The order per interface is
+/// the same contract [`serve_once`] states; the cross-interface order is:
+///
+/// 1. re-drive the FIDO consent window (US-1509) — the Nostr slot cannot
+///    hold a window until US-1662 adds its vendor commands, so there is
+///    nothing to re-drive on that half yet;
+/// 2. expire stale fragmented transactions on both interfaces
+///    (CTAP-HID §11.2.3);
+/// 3. **read whichever OUT endpoint has a report first** — bounded by one
+///    keepalive period while ANY window is open (either interface's), so one
+///    interface's window cannot starve the other's keepalive cadence, nor
+///    an idle interface's frame starvation. The loser of the race is not
+///    dropped: its report stays in the endpoint buffer (the [`HidIo`]
+///    cancellation contract) and the next pass picks it up;
+/// 4. feed the winner's assembler and dispatch on the winner's path — a
+///    frame that arrived on the Nostr interface NEVER reaches the FIDO
+///    dispatch, and vice versa.
+pub async fn serve_once_dual<S: HidIo, A: FidoDispatch>(
+    fido: &mut HidServe<'_>,
+    io_f: &mut S,
+    app: &mut A,
+    slot_f: &mut PendingUp,
+    nostr: &mut NostrServe<'_>,
+    io_n: &mut S,
+    slot_n: &mut PendingUp<2048>,
+) {
+    #[cfg(test)]
+    {
+        fido.reads += 1;
+    }
+
+    let HidServe {
+        assembler: asm_f,
+        cid_alloc: cid_f,
+        report: rep_f,
+        ctap_out,
+        now_ms: now_f,
+        ..
+    } = fido;
+    let ctap_out = &mut **ctap_out;
+    let now_f = *now_f;
+    let NostrServe {
+        assembler: asm_n,
+        cid_alloc: cid_n,
+        report: rep_n,
+        out: nostr_out,
+        now_ms: now_n,
+    } = nostr;
+    let nostr_out = &mut **nostr_out;
+    let now_n = *now_n;
+
+    redrive_window(now_f, ctap_out, io_f, app, slot_f).await;
+
+    if let Some((channel, code)) = asm_f.check_timeout() {
+        reply(io_f, &channel, CTAP_HID_ERROR, &[code]).await;
+    }
+    if let Some((channel, code)) = asm_n.check_timeout() {
+        reply(io_n, &channel, CTAP_HID_ERROR, &[code]).await;
+    }
+
+    let bounded = slot_f.is_occupied() || slot_n.is_occupied();
+    let picked = read_either(rep_f, rep_n, io_f, io_n, bounded).await;
+    match picked {
+        Picked::Quiet => {}
+        Picked::Fido(n) => {
+            match asm_f.feed(&rep_f[..n]) {
+                HidFeed::NeedMore => {}
+                HidFeed::Err(channel, code) => {
+                    reply(io_f, &channel, CTAP_HID_ERROR, &[code]).await;
+                }
+                HidFeed::Ready(cmd) => {
+                    let channel = asm_f.channel();
+                    io_f.note_command(
+                        cmd,
+                        asm_f.payload().len() as u16,
+                        u32::from_be_bytes(channel),
+                    );
+                    app.sync_generations();
+                    dispatch(
+                        cid_f,
+                        ctap_out,
+                        now_f,
+                        io_f,
+                        app,
+                        slot_f,
+                        &channel,
+                        cmd,
+                        asm_f.payload(),
+                    )
+                    .await;
+                }
+            }
+        }
+        Picked::Nostr(n) => {
+            match asm_n.feed(&rep_n[..n]) {
+                HidFeed::NeedMore => {}
+                HidFeed::Err(channel, code) => {
+                    reply(io_n, &channel, CTAP_HID_ERROR, &[code]).await;
+                }
+                HidFeed::Ready(cmd) => {
+                    let channel = asm_n.channel();
+                    io_n.note_command(
+                        cmd,
+                        asm_n.payload().len() as u16,
+                        u32::from_be_bytes(channel),
+                    );
+                    nostr_dispatch(
+                        cid_n,
+                        nostr_out,
+                        now_n,
+                        io_n,
+                        slot_n,
+                        &channel,
+                        cmd,
+                        asm_n.payload(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Read whichever interface has a report first (US-1660).
+///
+/// `embassy_futures::select` races the two reads; the loser is dropped, and
+/// the [`HidIo`] cancellation contract says its packet (if any) stays in the
+/// endpoint buffer for the next pass. While a window is open on EITHER
+/// interface the race is bounded by one keepalive period — the same bound
+/// [`read_one`] gives the single-interface loop, now covering both windows'
+/// cadence from one clock. A read failure on either side is noted on that
+/// side and the pass backs off, exactly as [`serve_once`] does.
+async fn read_either<S: HidIo>(
+    rep_f: &mut [u8; HID_REPORT_SIZE],
+    rep_n: &mut [u8; HID_REPORT_SIZE],
+    io_f: &mut S,
+    io_n: &mut S,
+    bounded: bool,
+) -> Picked {
+    // The race future borrows both transports, so the failure notes below
+    // can only run after it is dropped — the block scopes it out before the
+    // match, and the winner/loser outputs are values that outlive it.
+    let outcome = {
+        let race = core::pin::pin!(embassy_futures::select::select(
+            io_f.read_report(rep_f),
+            io_n.read_report(rep_n),
+        ));
+        if !bounded {
+            race.await
+        } else {
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_millis(CTAP_KEEPALIVE_PERIOD_MS),
+                race,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                // One keepalive period elapsed with both windows live and no
+                // report on either interface: not an error — the next pass
+                // re-drives both windows and races again.
+                Err(_) => return Picked::Quiet,
+            }
+        }
+    };
+    match outcome {
+        embassy_futures::select::Either::First(Ok(n)) if n > 0 => Picked::Fido(n),
+        embassy_futures::select::Either::Second(Ok(n)) if n > 0 => Picked::Nostr(n),
+        embassy_futures::select::Either::First(Err(_)) => {
+            io_f.note(HidNote::ReadFailed);
+            embassy_time::Timer::after_millis(10).await;
+            Picked::Quiet
+        }
+        embassy_futures::select::Either::Second(Err(_)) => {
+            io_n.note(HidNote::ReadFailed);
+            embassy_time::Timer::after_millis(10).await;
+            Picked::Quiet
+        }
+        // A zero-length report on either side — [`serve_once`]'s `n == 0`
+        // early return, per side.
+        _ => Picked::Quiet,
+    }
+}
+
+/// Dispatch one complete CTAP-HID message on the NOSTR interface.
+///
+/// US-1660 ships the generic framing arms only — INIT (the honest reply,
+/// US-1661), PING, WINK, CANCEL (which closes the Nostr slot's window; the
+/// slot cannot hold one until US-1662) — and refuses everything else with
+/// `INVALID_CMD`. The vendor-range commands (`0x40–0x7F`, the NIP-46
+/// semantics of design §A.8.2) and the consent-window arms arrive with
+/// US-1662/US-1663; until then a browser client can handshake and ping and
+/// nothing more, and the refusal is loud rather than silent.
+#[allow(clippy::too_many_arguments)]
+async fn nostr_dispatch<S: HidIo>(
+    cid_alloc: &mut CidAllocator,
+    out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    now_ms: fn() -> u64,
+    io: &mut S,
+    slot: &mut PendingUp<2048>,
+    channel: &[u8; 4],
+    cmd: u8,
+    payload: &[u8],
+) {
+    let _ = out;
+    let _ = now_ms;
+    let _ = slot;
+    if cmd == CTAP_HID_INIT {
+        let nonce = if payload.len() >= 8 {
+            &payload[..8]
+        } else {
+            payload
+        };
+        let new_channel = cid_alloc.allocate(nonce);
+        // US-1661: the honest reply — capFlags claim nothing CTAP2, and the
+        // vendor version bytes track the applet, not the YubiKey firmware.
+        let inner = crate::ctap_hid::nostr_init_reply(nonce, &new_channel);
+        reply(io, channel, CTAP_HID_INIT, &inner).await;
+    } else if cmd == CTAP_HID_PING {
+        reply(io, channel, CTAP_HID_PING, payload).await;
+    } else if cmd == CTAP_HID_WINK {
+        reply(io, channel, CTAP_HID_WINK, &[]).await;
+    } else if cmd == CTAP_HID_CANCEL {
+        // The Nostr slot's window close (US-1663 owns the consent semantics;
+        // the arm is here now so a client can always CANCEL and the close
+        // path exists before a window can exist to close).
+        if slot.is_occupied() {
+            let mut answer = [0u8; 2];
+            let n = slot.refusal().len().min(answer.len());
+            answer[..n].copy_from_slice(&slot.refusal()[..n]);
+            let ticket = close_window(slot);
+            let len = match ticket.kind {
+                PendingKind::Ctap2 => {
+                    answer[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
+                    1
+                }
+                PendingKind::U2f => {
+                    if n == 0 {
+                        answer[..2].copy_from_slice(&[0x69, 0x85]);
+                        2
+                    } else {
+                        n
+                    }
+                }
+            };
+            reply(io, &ticket.channel, frame_cmd(ticket.kind), &answer[..len]).await;
+        }
+        // No window: silence, as [`dispatch`]'s CANCEL arm does (CTAPHID
+        // spec; a CANCEL is never acknowledged).
+    } else {
         reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
     }
 }
@@ -1828,7 +2179,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         block_on(
             "a windowed command mid-window is refused without reaching the app",
             drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(900)),
@@ -1870,7 +2221,7 @@ pub(crate) mod tests {
         let mut srv2 = HidServe::new(host_now_ms, &mut ctap_out2);
         let mut io2 = Script::new(bus2.clone());
         let mut app2 = FakeApp::new(grant2.clone());
-        let mut slot2 = PendingUp::new();
+        let mut slot2 = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         block_on(
             "a non-windowed command mid-window runs to completion in the same pass",
             drive(&mut srv2, &mut io2, &mut app2, &mut slot2, StdDuration::from_millis(900)),
@@ -1975,7 +2326,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1502: PING on a second channel during a consent window",
@@ -2038,7 +2389,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1508: getInfo on a second channel during a consent window",
@@ -2087,7 +2438,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1509: serve loop keeps reading during a window",
@@ -2193,7 +2544,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let sent: Arc<Mutex<Vec<(StdInstant, Sent)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let bound = StdDuration::from_millis(SERVE_BOUND_MS);
@@ -2275,7 +2626,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: second UP request while a window is open",
@@ -2364,7 +2715,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1604: a reset with no press",
@@ -2515,7 +2866,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: oversize request",
@@ -2631,7 +2982,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         let (mut worst, mut passes) = (0usize, 0usize);
         block_on("US-1506: per-pass reply count", async {
@@ -2748,7 +3099,7 @@ pub(crate) mod tests {
             let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
             let mut io = Script::new(bus.clone());
             let mut app = FakeApp::new(grant.clone());
-            let mut slot = PendingUp::new();
+            let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
             let t0 = StdInstant::now();
             if let Some(at) = grant_at {
@@ -2939,7 +3290,7 @@ pub(crate) mod tests {
             let mut srv = HidServe::new(fake_now, &mut ctap_out);
             let mut io = Script::new(bus.clone());
             let mut app = FakeApp::new(grant.clone());
-            let mut slot = PendingUp::new();
+            let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
             // A couple of real-time passes so the window is live and has sent
             // at least its 0x01. The clock is then moved past the deadline;
@@ -3009,7 +3360,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel during a consent window",
@@ -3084,7 +3435,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel with no window open",
@@ -3127,7 +3478,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel during a U2F consent window",
@@ -3189,7 +3540,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "U2F: register parks and the loop keeps reading",
@@ -3252,7 +3603,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: second U2F request while a window is open",
@@ -3280,5 +3631,157 @@ pub(crate) mod tests {
             "US-1510: release the U2F window",
             drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
         );
+    }
+
+    // ── US-1660: one task, two interfaces ──────────────────────────────────
+
+    /// One pass of the dual-interface loop, abandoned like [`drive_one_pass`]
+    /// when it parks (no window can be open in these tests, so the abandon
+    /// only ever fires on the final idle pass).
+    async fn dual_pass<S: HidIo, A: FidoDispatch>(
+        fido: &mut HidServe<'_>,
+        io_f: &mut S,
+        app: &mut A,
+        slot_f: &mut PendingUp,
+        nostr: &mut NostrServe<'_>,
+        io_n: &mut S,
+        slot_n: &mut PendingUp<2048>,
+    ) {
+        let _ = embassy_time::with_timeout(
+            DRIVE_IDLE_PARK,
+            serve_once_dual(fido, io_f, app, slot_f, nostr, io_n, slot_n),
+        )
+        .await
+        .is_err();
+    }
+
+    /// US-1660: a frame that arrives on one interface is answered ON THAT
+    /// interface, by that interface's dispatcher — and the two interfaces'
+    /// answers are visibly different where they should be.
+    ///
+    /// The distinguishing observation: an INIT on the FIDO interface gets
+    /// [`init_reply`]'s YubiKey-5.4/CTAP2-capable bytes, an INIT on the Nostr
+    /// interface gets [`nostr_init_reply`]'s vendor bytes (US-1661) — same
+    /// command, same report shape, different interface, and each reply must
+    /// land on its OWN interface. A cross-wiring (the Nostr report read by
+    /// the FIDO half, or the reply written to the other IN endpoint) would
+    /// put a CTAP2-capable reply on the browser-facing interface or a vendor
+    /// reply on ykman's — exactly the claim-vs-honour failures §A.8.3 #8
+    /// exists to prevent.
+    #[test]
+    fn us1660_a_frame_is_answered_on_its_own_interface() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let nonce = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        // Pass 1: an INIT on the FIDO interface only.
+        bus_f.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
+        block_on(
+            "US-1660: the FIDO INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+        );
+        // Pass 2: an INIT on the Nostr interface only.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
+        block_on(
+            "US-1660: the Nostr INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+        );
+
+        // The FIDO interface answered with the FIDO INIT: capFlags 0x05 and
+        // the YubiKey 5.4 version pair (US-1507), and a FIDO-domain channel.
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 1, "exactly the INIT reply, nothing else");
+        assert_eq!(fido_sent[0].cmd, CTAP_HID_INIT);
+        // reply layout: nonce(8) ‖ cid(4) ‖ iface-version(0x02) ‖ major ‖
+        // minor ‖ build ‖ capFlags — so bytes 13..16 are the version triple
+        // and 16 is capFlags (US-1507).
+        assert_eq!(&fido_sent[0].payload[12..17], &[0x02, 5, 4, 0, 0x05], "FIDO interface claims CTAP2 + YubiKey 5.4");
+        assert_eq!(fido_sent[0].channel, bc, "the INIT reply goes out on the broadcast channel per spec");
+
+        // The Nostr interface answered with the honest vendor INIT: capFlags
+        // 0x00 under both conventions and the applet version (US-1661), on
+        // ITS OWN bus — no FIDO reply crossed over, no Nostr reply crossed
+        // onto the FIDO bus.
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 1, "exactly the INIT reply, nothing else");
+        assert_eq!(nostr_sent[0].cmd, CTAP_HID_INIT);
+        // Same layout, nostr_init_reply's values: version bytes 0.1.0 and
+        // capFlags 0x00 under both conventions (US-1661).
+        assert_eq!(&nostr_sent[0].payload[12..17], &[0x02, 0x00, 0x01, 0x00, 0x00], "Nostr interface claims vendor 0.1.0 and no CTAP2");
+
+        // And the app never ran: INIT is transport-only on both interfaces.
+        assert!(app.up_calls.is_empty());
+    }
+
+    /// US-1660: a command the Nostr interface does not serve is refused with
+    /// a loud CTAPHID ERROR frame ON the Nostr interface — it never reaches
+    /// the FIDO dispatch, and it never crosses interfaces.
+    ///
+    /// US-1662 replaces this refusal with the vendor-range arms; until then
+    /// this is the pin that keeps the routing honest while the command set
+    /// grows.
+    #[test]
+    fn us1660_a_nostr_command_is_refused_loudly_and_never_reaches_fido() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        // The INIT handshake first (allocates the Nostr channel).
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1660: INIT",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+        );
+
+        // A CTAP2 CBOR command on the NOSTR interface: refused INVALID_CMD.
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CBOR, &[0x01]));
+        block_on(
+            "US-1660: the refused command pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        assert_eq!(nostr_sent[1].cmd, CTAP_HID_ERROR);
+        assert_eq!(nostr_sent[1].payload, vec![HID_ERR_INVALID_CMD]);
+        assert_eq!(nostr_sent[1].channel, ch, "the error is answered on the command's channel");
+
+        // The FIDO interface saw nothing, and the FIDO app never ran.
+        assert!(bus_f.lock().unwrap().sent.is_empty());
+        assert!(app.up_calls.is_empty());
     }
 }

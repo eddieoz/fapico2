@@ -28,8 +28,8 @@ use heapless::Vec as HeaplessVec;
 pub static DEVICE_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 use crate::boot::{
-    DevFlash, HID_RESP, PENDING_UP, SECURE_PRIMARY_OFFSET, SECURE_SHADOW_OFFSET,
-    SECURE_SLOT_BYTES,
+    DevFlash, FIDO_SERVE, HID_RESP, NOSTR_PENDING_UP, NOSTR_RESP, NOSTR_SERVE, PENDING_UP,
+    SECURE_PRIMARY_OFFSET, SECURE_SHADOW_OFFSET, SECURE_SLOT_BYTES,
 };
 use fapico2_firmware::ccid_reasm::{CcidReassembler, Reasm, MAX_WIRE};
 use fapico2_firmware::ctap_hid::*;
@@ -678,11 +678,20 @@ impl FidoDispatch for DeviceFido<'_> {
 pub async fn hid_task(
     hid_in: Endpoint<'static, USB, In>,
     hid_out: Endpoint<'static, USB, Out>,
+    nostr_in: Endpoint<'static, USB, In>,
+    nostr_out: Endpoint<'static, USB, Out>,
     fido_app: &'static mut FidoApp,
     mut store: DeviceStore,
     flash: &'static mut DevFlash,
 ) {
     let mut io = DeviceHid { hid_in, hid_out };
+    // US-1660: the Nostr interface's transport adapter — the same
+    // `DeviceHid` shape over the third interface's endpoint pair, so the
+    // serve loop races two structurally-identical `HidIo`s.
+    let mut io_nostr = DeviceHid {
+        hid_in: nostr_in,
+        hid_out: nostr_out,
+    };
     let mut app = DeviceFido {
         app: fido_app,
         store: &mut store,
@@ -705,8 +714,42 @@ pub async fn hid_task(
     // between two *tasks*, and nothing here does.
     let slot: &'static mut fapico2_firmware::pending_up::PendingUp =
         unsafe { &mut *core::ptr::addr_of_mut!(PENDING_UP) };
-    let mut srv = HidServe::new(now_ms, ctap_out);
-    fapico2_firmware::hid_serve::serve_loop(&mut srv, &mut io, &mut app, slot).await
+    // SAFETY: US-1660 — each serve struct carries a CTAPHID reassembly buffer
+    // (`CTAPHID_MAX_MSG`, 7,609 B); owning both by value in the task body put
+    // 15.4 KB in the byte-accounted async frame (`measure_task_arena.py`
+    // read `hid_task` at 20,160 B against a 32,772 B arena — inside the
+    // 1.25× floor's fail band). They live in `boot::{FIDO_SERVE,NOSTR_SERVE}`
+    // instead, written straight into the slot by `init_static_slot_with` so
+    // the value never transits this frame. The writes happen here, once,
+    // before the first `.await`: this task is spawned exactly once, is the
+    // sole owner of both slots from the write on, and nothing can observe the
+    // half-initialised state (see `boot::FIDO_SERVE` for the contract).
+    let srv: &'static mut HidServe<'static> =
+        crate::boot::init_static_slot_with(core::ptr::addr_of_mut!(FIDO_SERVE), || {
+            HidServe::new(now_ms, ctap_out)
+        });
+    // SAFETY: S-701-1 — the Nostr interface's static response buffer and
+    // parked-window slot, US-1660 (`boot::NOSTR_RESP`, `boot::NOSTR_PENDING_UP`).
+    // Write-once, single owner (this task's Nostr half), reached by the same
+    // `addr_of_mut!` borrow discipline as `HID_RESP`/`PENDING_UP` above.
+    let nostr_out: &'static mut HeaplessVec<u8, { fapico2_firmware::hid_serve::NOSTR_RESP_MAX }> =
+        unsafe { &mut *core::ptr::addr_of_mut!(NOSTR_RESP) };
+    let nostr_slot: &'static mut fapico2_firmware::pending_up::PendingUp<2048> =
+        unsafe { &mut *core::ptr::addr_of_mut!(NOSTR_PENDING_UP) };
+    let srv_nostr: &'static mut fapico2_firmware::hid_serve::NostrServe<'static> =
+        crate::boot::init_static_slot_with(core::ptr::addr_of_mut!(NOSTR_SERVE), || {
+            fapico2_firmware::hid_serve::NostrServe::new(now_ms, nostr_out)
+        });
+    fapico2_firmware::hid_serve::serve_loop_dual(
+        srv,
+        &mut io,
+        &mut app,
+        slot,
+        srv_nostr,
+        &mut io_nostr,
+        nostr_slot,
+    )
+    .await
 }
 
 /// The secure-partition image sink (US-422/US-391): the primary/shadow slot

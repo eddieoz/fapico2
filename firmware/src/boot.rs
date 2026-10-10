@@ -1436,6 +1436,55 @@ pub static mut HID_RESP: HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }> = Heap
 pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
     fapico2_firmware::pending_up::PendingUp::new();
 
+/// US-1660: the Nostr interface's own response buffer — **2,048 B, not
+/// 7,609**: the largest reply a Nostr command produces is the 1,862-byte
+/// `NIP44_ENCRYPT` payload plus 7 bytes of CTAPHID framing, and the CTAPHID
+/// 7,609 bound would be a buffer for a capability this interface does not
+/// have (see `hid_serve::NOSTR_RESP_MAX` for the derivation). A static for
+/// the same reason [`HID_RESP`] is: inside `hid_task` it would sit in the
+/// byte-accounted async frame. Same single-owner discipline: the HID task's
+/// Nostr half is the only reader.
+pub static mut NOSTR_RESP: HeaplessVec<u8, { fapico2_firmware::hid_serve::NOSTR_RESP_MAX }> =
+    HeaplessVec::new();
+
+/// US-1660: the Nostr interface's own parked consent window —
+/// `PendingUp<2048>`, not the CTAPHID slot's `PendingUp` (default 1024): a
+/// parked `NIP44_ENCRYPT` request carries the 33-byte peer key plus up to
+/// ~1.8 KiB of plaintext, which does not fit 1024 (design §A.8.3 #6). Its
+/// own instance — not the shared one — because one task serves two
+/// interfaces and each interface's window must be closable, expirable and
+/// keepalive-cadenced independently; the single consent SLOT on the presence
+/// runtime is still one, which is exactly the cross-transport contention
+/// US-1663 bounds. Same `.bss`-not-frame reasoning as [`PENDING_UP`].
+pub static mut NOSTR_PENDING_UP: fapico2_firmware::pending_up::PendingUp<2048> =
+    fapico2_firmware::pending_up::PendingUp::new();
+
+/// US-1660: the FIDO interface's serve struct, hoisted out of `hid_task`'s
+/// async frame. `HidServe` owns a CTAPHID reassembly buffer of
+/// `CTAPHID_MAX_MSG` (7,609 B); owning it by value in the task body is what
+/// the arena measurement (`lib.rs::TASK_ARENA_DEMAND_B`) accounts — and a
+/// second, Nostr-sized copy of the same struct pushed `hid_task` to 20,160 B
+/// against the 32,772 B arena (1.10×, inside the 1.25× floor's fail band).
+/// Written straight into the slot by `init_static_slot_with` on the task's
+/// first poll — the value never transits the frame — and from then on
+/// `hid_task` holds the sole `&'static mut`.
+///
+/// Initialisation happens at the top of `hid_task`, not on the boot path,
+/// which is a deliberate relaxation of [`init_static_slot`]'s "before any
+/// task exists" boot-path timing: the slot is still written **exactly once**,
+/// before the first `.await` of the only task that reads it, so no observer
+/// can see the half-initialised state the boot-path rule exists to prevent.
+pub static mut FIDO_SERVE: core::mem::MaybeUninit<fapico2_firmware::hid_serve::HidServe<'static>> =
+    core::mem::MaybeUninit::uninit();
+
+/// US-1660: the Nostr interface's serve struct — same reasoning as
+/// [`FIDO_SERVE`], one instance per interface so each keeps its own
+/// reassembly state and CID allocator. Written once by `hid_task`, read by
+/// nobody else.
+pub static mut NOSTR_SERVE: core::mem::MaybeUninit<
+    fapico2_firmware::hid_serve::NostrServe<'static>,
+> = core::mem::MaybeUninit::uninit();
+
 /// US-413 S-413-4: the C key row (`OTP_MKEK_ROW 0xE90`, 32 bytes = 16 ECC
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
 /// firmware does (readable from any code — no read-protect; the boot-path

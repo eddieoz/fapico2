@@ -72,6 +72,9 @@ env_logger = { version = "0.11", optional = true }
 # them, and the lock gains no duplicate. Checked against
 # `tests/scripts/check_crate_graph.py`'s rules, not assumed.
 embassy-sync = { version = "0.8", optional = true }
+# US-1660: the dual-interface read race (`select` of the two OUT reads).
+# Transitive through embassy-rp already; promoted so the serve loop may name it.
+embassy-futures = { version = "0.1", optional = true }
 [target.'cfg(target_arch = "arm")'.dependencies]
 # `set-msplim`: every hardware-observed artifact in the US-391 boot ladder
 # (E1 baseline disasm onward) was built with cortex-m-rt's MSPLIM setup
@@ -223,7 +226,7 @@ device = [
     # US-1642: the seventh CCID app (Nostr, AID F0 00 00 00 02).
     "dep:fapico2-nostr", "fapico2-nostr/device",
     # US-1658: the shared applet mutex (device code lives in boot.rs).
-    "dep:embassy-sync", "dep:critical-section",
+    "dep:embassy-sync", "dep:critical-section", "dep:embassy-futures",
 ]
 emulation = [
     "dep:env_logger",
@@ -261,5 +264,5 @@ emulation = [
     # drive the real applet over CCID.
     "dep:fapico2-nostr", "fapico2-nostr/host",
     # US-1658: the emulator runs the same shared-mutex shape as the board.
-    "dep:embassy-sync", "dep:critical-section",
+    "dep:embassy-sync", "dep:critical-section", "dep:embassy-futures",
 ]
