@@ -167,6 +167,39 @@ pub const CTAPHID_INIT_CAP_FLAGS: u8 = 0x05;
 /// capFlags(1).
 pub const CTAPHID_INIT_REPLY_LEN: usize = 17;
 
+/// The Nostr interface's INIT `capFlags` (US-1661, design §A.8.3 #8): **0x00
+/// — a claim of nothing**.
+///
+/// The `capFlags` conventions disagree on which bit says what (see
+/// [`CTAPHID_INIT_CAP_FLAGS`]'s history: the CTAP 2.1 spec reads 0x01 as CBOR,
+/// the de-facto `fido2`/pico-keys-sdk reading reads 0x04 as CBOR — which is
+/// why the FIDO interface's `0x05` sets both). The disagreement is exactly
+/// what this constant exploits: under *either* convention, any nonzero value
+/// among 0x01/0x04/0x05 claims CTAP2 or WINK capability. The Nostr interface
+/// serves neither — it speaks the CTAPHID **framing** (INIT handshake, CID
+/// allocation, PING, sequence packets, CANCEL, error codes) with the Nostr
+/// command set in the vendor range 0x40–0x7F, and a generic CTAPHID client
+/// must see a **non-CTAP2 vendor device**, not a second authenticator
+/// competing with the FIDO interface. `NOSTR_INIT_CAP_FLAGS = 0x00` is the
+/// only value that reads as CTAP2-incapable under both conventions at once.
+///
+/// `nostr_init_reply_claims_only_what_it_serves` decodes the reply under both
+/// assignments and fails if either reader could conclude "CTAP2".
+pub const NOSTR_INIT_CAP_FLAGS: u8 = 0x00;
+
+/// The Nostr interface's vendor version bytes (US-1661): the **applet's**
+/// version, not the YubiKey firmware pair the FIDO interface carries. The
+/// FIDO interface reports the management applet's 5.4 pair because yubikit
+/// reads INIT bytes 13..15 as `device_version` and gates YubiKey
+/// management-protocol work on them; that rationale is FIDO-client-specific
+/// and the Nostr interface must not inherit the claim — a yubikit client
+/// never opens this interface (it selects on the FIDO usage page), and a
+/// generic CTAPHID client should see *fapico2's* applet version. Kept in
+/// step with `apps/nostr`'s `APPLET_VERSION` (major, minor) by test:
+/// `nostr_init_reply_claims_only_what_it_serves` asserts the pair, so a
+/// version bump that leaves this constant behind is a red.
+pub const NOSTR_VENDOR_VERSION: (u8, u8, u8) = (0x00, 0x01, 0x00);
+
 /// Build the 17-byte CTAPHID_INIT reply payload.
 ///
 /// US-1507: extracted verbatim from the INIT arm of `dispatch` in
@@ -200,6 +233,31 @@ pub fn init_reply(
     inner[14] = version_minor;
     inner[15] = version_build;
     inner[16] = CTAPHID_INIT_CAP_FLAGS;
+    inner
+}
+
+/// Build the 17-byte CTAPHID_INIT reply payload for the **Nostr** interface
+/// (US-1661).
+///
+/// The framing is the shared CTAPHID v2 one (versionInterface stays 0x02 —
+/// that is what the framing is), but the capability claim is
+/// [`NOSTR_INIT_CAP_FLAGS`] (0x00 — CTAP2-incapable under both conventions)
+/// and the version bytes are [`NOSTR_VENDOR_VERSION`], the applet's own, not
+/// the YubiKey firmware pair. The body is a deliberate near-copy of
+/// [`init_reply`] rather than a parameterized call: the FIDO reply's
+/// capability byte is a *documented decision* ([`CTAPHID_INIT_CAP_FLAGS`])
+/// that this interface must not inherit silently, and a `cap_flags`
+/// parameter would let a future caller do exactly that.
+pub fn nostr_init_reply(nonce: &[u8], new_channel: &[u8; 4]) -> [u8; CTAPHID_INIT_REPLY_LEN] {
+    let mut inner = [0u8; CTAPHID_INIT_REPLY_LEN];
+    let n = nonce.len().min(8);
+    inner[..n].copy_from_slice(&nonce[..n]);
+    inner[8..12].copy_from_slice(new_channel);
+    inner[12] = 0x02; // versionInterface (2 = CTAP HID v2) — the framing
+    inner[13] = NOSTR_VENDOR_VERSION.0;
+    inner[14] = NOSTR_VENDOR_VERSION.1;
+    inner[15] = NOSTR_VENDOR_VERSION.2;
+    inner[16] = NOSTR_INIT_CAP_FLAGS;
     inner
 }
 
@@ -841,5 +899,55 @@ mod tests {
         // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04 CBOR).
         assert_ne!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: no CTAP2 support");
         assert_ne!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: no WINK");
+    }
+
+    /// US-1661 (design §A.8.3 #8, §2.7.1): the Nostr interface's INIT reply
+    /// must not read as a CTAP2-capable YubiKey under **either** capFlags
+    /// convention, and its version bytes are the applet's, not the YubiKey
+    /// firmware pair. A generic CTAPHID client opening the vendor interface
+    /// must see a non-CTAP2 vendor device — the claim-vs-honour failure
+    /// AGENTS §4 exists to prevent, one interface earlier than the CBOR path.
+    #[test]
+    fn nostr_init_reply_claims_only_what_it_serves() {
+        let nonce: [u8; 8] = [0xB0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let mut alloc = CidAllocator::clamped(crate::ctap_hid::HID_CID_DOMAIN_SEPARATED >> 2);
+        let channel = alloc.allocate(&nonce);
+
+        let inner = nostr_init_reply(&nonce, &channel);
+
+        // The framing half is still CTAPHID: nonce echo, fresh CID,
+        // versionInterface 2.
+        assert_eq!(&inner[..8], &nonce[..]);
+        assert_eq!(&inner[8..12], &channel[..]);
+        assert_eq!(inner[12], 0x02, "versionInterface must be 2 — the framing is CTAPHID v2");
+
+        let cap = inner[16];
+        assert_eq!(cap, NOSTR_INIT_CAP_FLAGS);
+
+        // Decoder 1 — CTAP 2.1 spec §11.2.1.1 (0x01 CBOR, 0x04 WINK): neither
+        // bit set, so a spec reader cannot conclude CTAP2 (or WINK).
+        assert_eq!(cap & SPEC_CBOR, 0, "spec reader concluded: CTAP2 capable");
+        assert_eq!(cap & SPEC_WINK, 0, "spec reader concluded: WINK capable");
+
+        // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04
+        // CBOR): same conclusion, opposite assignment.
+        assert_eq!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: CTAP2 capable");
+        assert_eq!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: WINK capable");
+
+        // The version bytes are the vendor's own — not the 5.4 pair the FIDO
+        // interface carries for yubikit's device_version gate.
+        assert_ne!(
+            (inner[13], inner[14], inner[15]),
+            (5, 4, 0),
+            "the Nostr interface must not claim YubiKey firmware"
+        );
+        // …and they track the applet's own version pair, so a version bump
+        // that leaves the constant behind is a red.
+        #[cfg(feature = "device")]
+        assert_eq!(
+            (inner[13], inner[14]),
+            (fapico2_nostr::APPLET_VERSION[0], fapico2_nostr::APPLET_VERSION[1]),
+            "NOSTR_VENDOR_VERSION must track apps/nostr's APPLET_VERSION"
+        );
     }
 }
