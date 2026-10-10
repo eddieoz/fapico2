@@ -106,7 +106,31 @@ pub const INS_DELETE_KEY: u8 = 0x19;
 pub const INS_EXPORT_KEY: u8 = 0x1A;
 
 // ---------------------------------------------------------------------------
-// Status words (§2.2.0 — US-1648 owns the full rebuild)
+// Status words (§2.2.0)
+//
+// The device has no screen, so **every refusal is a status word a host
+// must render** (D13) — the vocabulary is part of the wire spec, not an
+// implementation detail. Written out in one place so this applet's
+// refusals are readable in one place (the rescue precedent,
+// `apps/rescue/src/lib.rs` "ISO 7816-4 status words"). US-1648 owns the
+// rebuild; the two NIP-44-only words are declared with the vocabulary so
+// the table and the commands land in step.
+//
+// | SW     | meaning                                  | commands            |
+// |--------|------------------------------------------|---------------------|
+// | 6A80   | wrong data / bad index                   | all                 |
+// | 6A82   | no such identity at `idx`                | all idx-taking      |
+// | 6985   | touch required / not granted             | all touch-gated     |
+// | 6A84   | identity index already occupied          | GENERATE/IMPORT     |
+// | 6A88   | key set full (8 identities)              | GENERATE/IMPORT     |
+// | 6B00   | ECC key form unsupported (`f9308a…`)     | NIP44_ENCRYPT/DECRYPT |
+// | 6A87   | peer/sender key not a valid curve point  | NIP44_ENCRYPT/DECRYPT |
+//
+// The last two matter most in practice: they separate "the counterparty's
+// client is broken" (6A87, or an ECC peer) from "your device is broken".
+// Besides the seven §2.2.0 words this applet also emits `6A86` (wrong
+// P1/P2), `6F00` (the store/degraded fault) and the dispatcher's `6D00`
+// for an unimplemented INS — all named below or in the command docs.
 // ---------------------------------------------------------------------------
 
 /// Wrong data / bad index — an index outside the 8-slot range, or a payload
@@ -136,6 +160,17 @@ pub const SW_KEY_SET_FULL: Sw = 0x6A88;
 /// with a fault beats reporting `n = 0` about a device that may hold all
 /// eight identities.
 pub const SW_STORE_FAULT: Sw = 0x6F00;
+/// ECC key form unsupported — the peer is using a key type this device
+/// cannot derive with (NIP-44 `f9308a…` compressed-ECC form). A *user*
+/// problem, not a bug: the §2.2.0 table's "that key type is not supported
+/// yet". Emitted by `NIP44_ENCRYPT`/`NIP44_DECRYPT` (US-1653/US-1654).
+pub const SW_ECC_UNSUPPORTED: Sw = 0x6B00;
+/// Peer/sender key is not a valid curve point — refused before any key
+/// schedule runs, so a well-meaning user pasting a corrupted npub is told
+/// "that key is not a valid Nostr key" rather than getting a silent
+/// decrypt failure. Emitted by `NIP44_ENCRYPT`/`NIP44_DECRYPT`
+/// (US-1653/US-1654).
+pub const SW_INVALID_PEER_KEY: Sw = 0x6A87;
 
 // ---------------------------------------------------------------------------
 // GET_INFO fields
@@ -517,7 +552,7 @@ impl NostrApp {
             write_sw(resp, SW_INDEX_OCCUPIED);
             return;
         }
-        if !user_present(*presence_grant, p1 as u32) {
+        if !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -598,7 +633,7 @@ impl NostrApp {
                 return;
             }
         }
-        if !user_present(*presence_grant, p1 as u32) {
+        if !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -637,7 +672,7 @@ impl NostrApp {
                 return;
             }
         };
-        if !user_present(*presence_grant, p1 as u32) {
+        if !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -826,9 +861,32 @@ fn default_user_present() -> bool {
     }
 }
 
-fn user_present(grant: Option<fn(u32) -> bool>, idx: u32) -> bool {
+/// The presence tag's domain bit (§2.3.1 requirement 2): bit 30, which
+/// nothing else in the tree sets — disjoint from FIDO's bit-31 HID domain
+/// (`0x8000_0000 | channel`) and from every small-integer CCID tag in the
+/// inventory (mgmt `0x1C`/`0x1E`, OATH, OTP `0x0527_2001`, OpenPGP's
+/// three). The complete encoding is [`presence_tag`].
+pub const NOSTR_TAG_DOMAIN: u32 = 0x4000_0000;
+
+/// The presence tag for one identity's touch gate (§2.3.1 requirement 3):
+/// `0x4000_0000 | (idx & 0xFFFF)`. The tag binds a press to *this*
+/// identity's request — not to the opcode, and not to a window a second
+/// request could join. An earlier draft's `0x50 | ins | idx<<4` encoding
+/// silently collided (bit 4 already set by `0x50`; 8 identities collapsed
+/// onto 2 tags); this one is collision-free by construction, and the INS
+/// is deliberately absent — the identity is what a press consents to.
+pub fn presence_tag(idx: u16) -> u32 {
+    NOSTR_TAG_DOMAIN | (idx as u32 & 0xFFFF)
+}
+
+fn user_present(grant: Option<fn(u32) -> bool>, idx: u16) -> bool {
     match grant {
-        Some(g) => g(idx),
+        // The device injects the strict one-shot path
+        // (`fapico2_firmware::presence::request_grant`): begin_request /
+        // poll / request / end_request under this tag — never the
+        // join-or-open `window_grant`, which would let a same-tag SIGN
+        // join another SIGN's open window (§2.3.1 requirement 1).
+        Some(g) => g(presence_tag(idx)),
         None => default_user_present(),
     }
 }

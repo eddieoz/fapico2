@@ -714,6 +714,16 @@ fn main() {
             NostrApp::new()
         }
     };
+    // US-1646: the nostr deny hook — the OATH one's exact shape above. The
+    // nostr applet's host default auto-acks (`default_user_present()`), so
+    // without this hook the 6985 touch refusal is un-exercisable over CCID
+    // and the presence suites only ever prove the grant path.
+    if let Ok(v) = std::env::var("FAPICO2_NOSTR_PRESENCE") {
+        if v == "deny" {
+            nostr_app = nostr_app.with_presence_grant(|_| false);
+            eprintln!("nostr presence: denied (FAPICO2_NOSTR_PRESENCE=deny)");
+        }
+    }
     // Registered apps must outlive the dispatcher, so it is declared last.
     // S-721-2 (D-D): the OpenPGP client is the S-721-1 no_std "call thyself"
     // `SyscallRunner` client on the host backend (option A — the same

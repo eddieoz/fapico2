@@ -1165,11 +1165,22 @@ async fn main(spawner: Spawner) -> ! {
     // applet is constructed bare and asks `nostr_region` on its first read
     // (`install_region_provider`'s OATH precedent). Static memory for the
     // same reason as the six above.
+    // US-1646: the presence wiring is a **required** edit (§2.6) — the
+    // builder call's absence would degrade to `default_user_present()`,
+    // which is `false` on device and bricks every private operation with
+    // nothing failing to point at. The injected grant is the STRICT one-shot
+    // path (`begin_request`/`poll_press`/`request`/`end_request` under the
+    // §2.3.1 bit-30 tag `presence_tag(idx)`) — never the join-or-open
+    // `window_grant` the OATH/mgmt apps use, under which a same-tag SIGN
+    // would join another SIGN's open window and inherit its press: a
+    // signature over attacker-chosen bytes authorised by a touch for
+    // different bytes.
     let nostr_app = boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::NOSTR_APP),
         NostrApp::new()
             .with_region_provider(nostr_region)
-            .with_rng_provider(nostr_random),
+            .with_rng_provider(nostr_random)
+            .with_presence_grant(fapico2_firmware::presence::request_grant),
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the
