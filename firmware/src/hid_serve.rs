@@ -1273,19 +1273,45 @@ impl<'a> NostrServe<'a> {
     }
 }
 
+/// US-1662: the Nostr arm's dispatch seam, beside [`FidoDispatch`]. The
+/// vendor command byte and its CBOR payload go in; the CBOR response (D13's
+/// status vocabulary as fields — see `nostr_wire`) goes into `out`, and the
+/// return value is the response length.
+///
+/// Synchronous, like everything behind the applet: `App::process` is, and the
+/// vendor arm must not hold its request/response scratch across an `.await`
+/// (the hoisted-static discipline of `boot::NOSTR_RESP` applies to any buffer
+/// the impl owns).
+pub trait NostrDispatch {
+    /// One vendor command. `cmd` is in the spec-reserved range `0x40–0x7F`
+    /// (`nostr_wire::is_vendor_command`); an unmapped method is answered
+    /// **in band** with `sw = SW_INS_NOT_SUPPORTED` (the D20
+    /// `error unsupported-method`), never as a CTAPHID framing error.
+    fn process_vendor(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+        out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    ) -> usize;
+}
+
 /// The serve loop over both interfaces. Never returns: `hid_task` is a
 /// `#[task]`.
-pub async fn serve_loop_dual<S: HidIo, A: FidoDispatch>(
+// The two arms are symmetric by design — four params per interface — and
+// collapsing them into a struct would hide that symmetry from the reader.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_loop_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
     fido: &mut HidServe<'_>,
     io_f: &mut S,
     app: &mut A,
     slot_f: &mut PendingUp,
     nostr: &mut NostrServe<'_>,
+    nostr_app: &mut N,
     io_n: &mut S,
     slot_n: &mut PendingUp<2048>,
 ) -> ! {
     loop {
-        serve_once_dual(fido, io_f, app, slot_f, nostr, io_n, slot_n).await;
+        serve_once_dual(fido, io_f, app, slot_f, nostr, nostr_app, io_n, slot_n).await;
     }
 }
 
@@ -1315,12 +1341,14 @@ enum Picked {
 /// 4. feed the winner's assembler and dispatch on the winner's path — a
 ///    frame that arrived on the Nostr interface NEVER reaches the FIDO
 ///    dispatch, and vice versa.
-pub async fn serve_once_dual<S: HidIo, A: FidoDispatch>(
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_once_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
     fido: &mut HidServe<'_>,
     io_f: &mut S,
     app: &mut A,
     slot_f: &mut PendingUp,
     nostr: &mut NostrServe<'_>,
+    nostr_app: &mut N,
     io_n: &mut S,
     slot_n: &mut PendingUp<2048>,
 ) {
@@ -1410,6 +1438,7 @@ pub async fn serve_once_dual<S: HidIo, A: FidoDispatch>(
                         now_n,
                         io_n,
                         slot_n,
+                        nostr_app,
                         &channel,
                         cmd,
                         asm_n.payload(),
@@ -1491,17 +1520,17 @@ async fn read_either<S: HidIo>(
 /// US-1662/US-1663; until then a browser client can handshake and ping and
 /// nothing more, and the refusal is loud rather than silent.
 #[allow(clippy::too_many_arguments)]
-async fn nostr_dispatch<S: HidIo>(
+async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
     cid_alloc: &mut CidAllocator,
     out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
     now_ms: fn() -> u64,
     io: &mut S,
     slot: &mut PendingUp<2048>,
+    nostr_app: &mut N,
     channel: &[u8; 4],
     cmd: u8,
     payload: &[u8],
 ) {
-    let _ = out;
     let _ = now_ms;
     let _ = slot;
     if cmd == CTAP_HID_INIT {
@@ -1546,6 +1575,14 @@ async fn nostr_dispatch<S: HidIo>(
         }
         // No window: silence, as [`dispatch`]'s CANCEL arm does (CTAPHID
         // spec; a CANCEL is never acknowledged).
+    } else if crate::nostr_wire::is_vendor_command(cmd) {
+        // US-1662: the vendor range carries the Nostr command set. The
+        // dispatch impl is synchronous — its scratch (the request APDU and
+        // the applet's `MAX_RESPONSE` answer) never crosses this `.await` —
+        // and the reply goes out on the method's own channel with the same
+        // command byte, the CBOR response in the payload.
+        let n = nostr_app.process_vendor(cmd, payload, out);
+        reply(io, channel, cmd, &out[..n]).await;
     } else {
         reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
     }
@@ -1584,6 +1621,7 @@ pub(crate) mod tests {
 
     use crate::ctap_hid::HID_CONT_PAYLOAD;
     use crate::pending_up::PENDING_UP_PAYLOAD_MAX;
+    use fapico2_nostr::NostrApp;
 
     /// Wall-clock ceiling for one drive of the serve loop in the harness.
     ///
@@ -3638,18 +3676,19 @@ pub(crate) mod tests {
     /// One pass of the dual-interface loop, abandoned like [`drive_one_pass`]
     /// when it parks (no window can be open in these tests, so the abandon
     /// only ever fires on the final idle pass).
-    async fn dual_pass<S: HidIo, A: FidoDispatch>(
+    async fn dual_pass<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
         fido: &mut HidServe<'_>,
         io_f: &mut S,
         app: &mut A,
         slot_f: &mut PendingUp,
         nostr: &mut NostrServe<'_>,
+        nostr_app: &mut N,
         io_n: &mut S,
         slot_n: &mut PendingUp<2048>,
     ) {
         let _ = embassy_time::with_timeout(
             DRIVE_IDLE_PARK,
-            serve_once_dual(fido, io_f, app, slot_f, nostr, io_n, slot_n),
+            serve_once_dual(fido, io_f, app, slot_f, nostr, nostr_app, io_n, slot_n),
         )
         .await
         .is_err();
@@ -3687,6 +3726,7 @@ pub(crate) mod tests {
         let mut srv_n = NostrServe::new(now, &mut resp_n);
         let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let mut slot_n = PendingUp::<2048>::new();
+        let mut never = NeverVendor;
 
         let bc = [0xFF, 0xFF, 0xFF, 0xFF];
         let nonce = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -3695,13 +3735,13 @@ pub(crate) mod tests {
         bus_f.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
         block_on(
             "US-1660: the FIDO INIT pass",
-            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
         );
         // Pass 2: an INIT on the Nostr interface only.
         bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
         block_on(
             "US-1660: the Nostr INIT pass",
-            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
         );
 
         // The FIDO interface answered with the FIDO INIT: capFlags 0x05 and
@@ -3756,6 +3796,7 @@ pub(crate) mod tests {
         let mut srv_n = NostrServe::new(now, &mut resp_n);
         let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let mut slot_n = PendingUp::<2048>::new();
+        let mut never = NeverVendor;
 
         let bc = [0xFF, 0xFF, 0xFF, 0xFF];
         let ch = [0x00, 0x00, 0x00, 0x02];
@@ -3764,14 +3805,14 @@ pub(crate) mod tests {
         bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
         block_on(
             "US-1660: INIT",
-            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
         );
 
         // A CTAP2 CBOR command on the NOSTR interface: refused INVALID_CMD.
         bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CBOR, &[0x01]));
         block_on(
             "US-1660: the refused command pass",
-            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut io_n, &mut slot_n),
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
         );
 
         let nostr_sent = bus_n.lock().unwrap().sent.clone();
@@ -3783,5 +3824,521 @@ pub(crate) mod tests {
         // The FIDO interface saw nothing, and the FIDO app never ran.
         assert!(bus_f.lock().unwrap().sent.is_empty());
         assert!(app.up_calls.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // US-1662 — the vendor command set over the Nostr interface
+    //
+    // Every round-trip below drives the REAL applet over a fresh region: the
+    // path under test is vendor frame → CBOR request → applet APDU →
+    // (data ‖ SW) → CBOR response, with the `sw` field asserted as D13's
+    // vocabulary crossing (§A.8.3b #8) — the same codes the CCID path answers.
+    // The harness discipline is the US-1660 one, unchanged: one report per
+    // pass, so every frame below gets its own `dual_pass`.
+    // -----------------------------------------------------------------------
+
+    /// A dispatch that must never run: US-1660's transport-routing pins are
+    /// transport-only, and a vendor command reaching the applet there would
+    /// be a routing defect, not a stub gap.
+    struct NeverVendor;
+    impl NostrDispatch for NeverVendor {
+        fn process_vendor(
+            &mut self,
+            _cmd: u8,
+            _payload: &[u8],
+            _out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+        ) -> usize {
+            panic!("a vendor command reached the dispatch in a transport-only test");
+        }
+    }
+
+    /// The vendor arm's fixture: the real applet booted over a fresh region —
+    /// the same shape `apps/nostr`'s suites and `nostr_shared`'s US-1658 test
+    /// boot — with a constant RNG (a uniform `0x01` fill is a valid secret
+    /// scalar, so `GENERATE_KEY` succeeds) and an injectable presence grant.
+    /// It runs the same `process_vendor_through` body the device impl runs;
+    /// the buffers are host stack, which is exactly the point of the seam.
+    struct VendorNostr {
+        app: NostrApp,
+    }
+
+    fn rng_constant(out: &mut [u8]) {
+        out.fill(0x01);
+    }
+
+    /// The host-default presence grant: every touch auto-acks, so the
+    /// success-path tests never depend on a button.
+    fn auto_grant(_tag: u32) -> bool {
+        true
+    }
+
+    /// The never-granting presence fixture: the touch-refusal vocabulary
+    /// crossing is the row of §2.2.0 a browser client meets first.
+    fn no_grant(_tag: u32) -> bool {
+        false
+    }
+
+    impl VendorNostr {
+        fn booted(tag: &str, grant: fn(u32) -> bool) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fapico2-us1662-{tag}-{}.bin",
+                std::process::id()
+            ));
+            std::fs::remove_file(&path).ok();
+            let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+                &path,
+                fapico2_platform::keyregion::TOTAL_SLOTS,
+            )
+            .expect("a fresh region file");
+            let otp_row: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x11));
+            let chipid: [u8; 8] = 0x0000_BADC_0FFE_EE01_0203_u64.to_be_bytes();
+            let key = fapico2_platform::keyregion::crypto::derive_payload_key(
+                &otp_row,
+                &chipid,
+                &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
+            )
+            .expect("a non-zero OTP row");
+            let app = NostrApp::boot(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ))
+            .with_rng_provider(rng_constant)
+            .with_presence_grant(grant);
+            Self { app }
+        }
+    }
+
+    impl NostrDispatch for VendorNostr {
+        fn process_vendor(
+            &mut self,
+            cmd: u8,
+            payload: &[u8],
+            out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+        ) -> usize {
+            use fapico2_platform::dispatch::App as _;
+            let mut req: HeaplessVec<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }> =
+                HeaplessVec::new();
+            let mut resp: HeaplessVec<u8, MAX_RESPONSE> = HeaplessVec::new();
+            crate::nostr_wire::process_vendor_through(
+                cmd,
+                payload,
+                &mut req,
+                &mut resp,
+                |apdu, resp| self.app.process(apdu, resp),
+                out,
+            )
+        }
+    }
+
+    /// US-1662: `GET_PUBKEY` and `GENERATE_KEY` round-trip over the vendor
+    /// interface with the vocabulary fields intact — `6A82` ("that identity
+    /// is not on the device") for an empty slot, then `9000` with the 32-byte
+    /// `npub` once it exists.
+    #[test]
+    fn us1662_pubkey_round_trip_with_vocabulary_fields() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("pubkey", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_GET_PUBKEY,
+        };
+
+        // Pass 1: INIT handshake on the Nostr interface.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // Pass 2: GET_PUBKEY on the empty set.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GET_PUBKEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1662: the GET_PUBKEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2, "the INIT reply, then the command reply");
+        assert_eq!(nostr_sent[1].cmd, NOSTR_CMD_GET_PUBKEY, "the reply rides the method's own command byte");
+        assert_eq!(nostr_sent[1].channel, ch, "answered on the command's channel");
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6A82, "an empty slot is the no-such-identity word");
+        assert!(data.is_empty());
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "nothing crossed to the FIDO bus");
+        assert!(app.up_calls.is_empty(), "the FIDO app never ran");
+
+        // Pass 3: GENERATE_KEY (touch auto-acked on the host, RNG pinned)
+        // → 9000, npub(32) — and the npub survives the transport.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        let (sw, npub) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(npub.len(), 32, "GENERATE_KEY returns the 32-byte npub");
+    }
+
+    /// US-1662: `sign_event`'s contract is the 32-byte sighash split (D20) —
+    /// the sighash rides the request, the BIP-340 signature comes back with
+    /// the npub prepended, exactly the §2.2 `SIGN` shape.
+    #[test]
+    fn us1662_sign_round_trips_the_32_byte_sighash() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("sign", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_SIGN,
+        };
+
+        let sighash: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x40));
+
+        // Pass 1: INIT.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        // Pass 2: GENERATE_KEY so the identity exists.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        // Pass 3: SIGN the sighash.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_SIGN,
+            &encode_request(0, &sighash),
+        ));
+        block_on(
+            "US-1662: the SIGN pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        let (sw, npub) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(npub.len(), 32);
+
+        let (sw, signed) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000, "the touch is host-acked and the sighash signs");
+        assert_eq!(signed.len(), 96, "npub(32) ‖ sig(64) — the §2.2 SIGN shape");
+        assert_eq!(&signed[..32], npub, "the signing identity is echoed");
+        // The signature is 64 bytes of Schnorr over the sighash; its exact
+        // bytes are the apps/nostr vector suite's business — here the shape
+        // and the identity binding are what the transport pins.
+    }
+
+    /// US-1662: `nip44_encrypt`/`decrypt` round-trip — the arguments exceed
+    /// one APDU length byte (the 1,792-byte plaintext plus the 32-byte peer
+    /// key), so the extended-Lc APDU build is what gets exercised, and the
+    /// ciphertext comes back through the 2 KiB wire buffer whole.
+    #[test]
+    fn us1662_nip44_round_trips_the_extended_length_argument() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("nip44", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_NIP44_DECRYPT,
+            NOSTR_CMD_NIP44_ENCRYPT,
+        };
+
+        // Pass 1: INIT; Pass 2: GENERATE_KEY — the identity's own npub is
+        // then the peer key: a real x-only point.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, npub) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+
+        // Pass 3: ENCRYPT — peer(32) ‖ plaintext(1792), 1,824 bytes of
+        // argument, far beyond one Lc byte.
+        let plaintext: [u8; 1792] = core::array::from_fn(|i| (i as u16) as u8);
+        let mut arg = HeaplessVec::<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }>::new();
+        arg.extend_from_slice(npub).unwrap();
+        arg.extend_from_slice(&plaintext).unwrap();
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_NIP44_ENCRYPT,
+            &encode_request(0, &arg),
+        ));
+        // The 1.9 KB command rides ~30 HID reports and a pass reads one, so
+        // drive the loop until the reply lands — the assembler reassembles
+        // across passes, exactly as it would on the wire.
+        block_on("US-1662: the NIP-44 ENCRYPT passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 3 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 200, "the ENCRYPT reply never landed");
+            }
+        });
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, ct) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000, "the 1.8 KB ciphertext crosses the 2 KiB wire buffer whole");
+        assert!(ct.len() > 1700, "the NIP-44 payload shape (version ‖ nonce ‖ ct ‖ mac)");
+        assert!(ct.len() < 2048 - 16, "it fits the NOSTR_RESP_MAX budget with framing");
+
+        // Pass 4: DECRYPT — sender(32) ‖ payload, again beyond one Lc byte —
+        // and the plaintext comes back exactly as it went in.
+        let mut arg = HeaplessVec::<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }>::new();
+        arg.extend_from_slice(npub).unwrap();
+        arg.extend_from_slice(ct).unwrap();
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_NIP44_DECRYPT,
+            &encode_request(0, &arg),
+        ));
+        block_on("US-1662: the NIP-44 DECRYPT passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 4 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 200, "the DECRYPT reply never landed");
+            }
+        });
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, back) = decode_response(&nostr_sent[3].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(back, &plaintext[..], "the decrypted plaintext matches byte for byte");
+    }
+
+    /// US-1662: an unsupported method is answered **in band** on its own
+    /// channel — the D20 `error unsupported-method` semantics as the
+    /// vocabulary's `0x6D00` — not as a CTAPHID framing error, and never
+    /// reaching the FIDO app.
+    #[test]
+    fn us1662_unsupported_method_answers_in_band() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("unsupported", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, encode_request};
+
+        // Pass 1: INIT; Pass 2: a command in the reserved vendor range that
+        // names no method this device serves (a client expecting NIP-04
+        // shared-secret semantics would land here).
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x50, &encode_request(0, &[])));
+        block_on(
+            "US-1662: the unsupported-method pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        assert_eq!(nostr_sent[1].cmd, 0x50, "answered on the method's own byte");
+        assert_ne!(nostr_sent[1].cmd, CTAP_HID_ERROR, "the framing is fine — the method is what is refused");
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6D00, "SW_INS_NOT_SUPPORTED — the unsupported-method word");
+        assert!(data.is_empty());
+        assert!(app.up_calls.is_empty());
+    }
+
+    /// US-1662: a malformed request envelope is `6A80` in band — a client
+    /// that sent garbage still gets a readable answer, not silence and not a
+    /// framing fault.
+    #[test]
+    fn us1662_malformed_request_is_a_vocabulary_field() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("malformed", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, NOSTR_CMD_GET_PUBKEY};
+
+        // Pass 1: INIT; Pass 2: a one-byte, non-CBOR payload.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(ch, NOSTR_CMD_GET_PUBKEY, &[0xFF]));
+        block_on(
+            "US-1662: the malformed-request pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6A80);
+        assert!(data.is_empty());
+    }
+
+    /// US-1662: the touch refusal crosses the transport as the vocabulary —
+    /// `6985`, "press the button" — the row of §2.2.0 a browser client meets
+    /// first (US-1663 wires the window and keepalives on top of it).
+    #[test]
+    fn us1662_touch_refusal_crosses_the_vocabulary() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("touch-refused", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Pass 1: INIT; Pass 2: GENERATE_KEY with the grant refusing.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1662: the touch-refusal pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6985, "the touch-required word crossed the transport");
+        assert!(data.is_empty());
     }
 }

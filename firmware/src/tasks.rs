@@ -740,12 +740,16 @@ pub async fn hid_task(
         crate::boot::init_static_slot_with(core::ptr::addr_of_mut!(NOSTR_SERVE), || {
             fapico2_firmware::hid_serve::NostrServe::new(now_ms, nostr_out)
         });
+    // US-1662: the Nostr arm's dispatch — the shared applet behind the
+    // US-1658 mutex, reached per command through the vendor wire dialect.
+    let mut nostr_app = fapico2_firmware::nostr_shared::NostrViaMutex;
     fapico2_firmware::hid_serve::serve_loop_dual(
         srv,
         &mut io,
         &mut app,
         slot,
         srv_nostr,
+        &mut nostr_app,
         &mut io_nostr,
         nostr_slot,
     )

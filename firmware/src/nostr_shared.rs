@@ -18,7 +18,7 @@
 //! device and emulation builds enable.
 
 use fapico2_nostr::NostrApp;
-use fapico2_platform::dispatch::MAX_RESPONSE;
+use fapico2_platform::dispatch::{App as _, MAX_RESPONSE};
 
 // US-1642: the Nostr applet — not a write-once `MaybeUninit` slot, because
 // US-1658 changes its ownership story: **both** transports must reach the
@@ -118,6 +118,55 @@ impl fapico2_platform::dispatch::App for NostrViaMutex {
         resp: &mut heapless::Vec<u8, MAX_RESPONSE>,
     ) -> fapico2_platform::dispatch::Sw {
         with_nostr(|app| app.select_apdu(internal, apdu, resp))
+    }
+}
+
+// US-1662: the vendor arm's scratch. Both are the HID Nostr arm's
+// write-once-in-use buffers — the same single-owner discipline as
+// `boot::NOSTR_RESP`, here because the impl that uses them is a lib module
+// (and the device bin is arm-only). The CCID arm has its own buffers; the
+// applet itself is what the shared mutex guards, and these are filled and
+// drained inside one synchronous `process_vendor` body, never across an
+// `.await`.
+//
+// Request: the CBOR request decoded and re-framed as the applet APDU
+// (`[00, INS, idx, 00, Lc, arg…]`) — `nostr_wire::NOSTR_APDU_REQ_MAX` sizes
+// the worst legal `NIP44_DECRYPT` argument plus the header. Response: the
+// applet's `App::process` signature demands `MAX_RESPONSE` (4,096), and the
+// legal vendor replies (≤ ~1.9 KB) are cut from it into `NOSTR_RESP` after.
+/// The request APDU scratch.
+pub static mut NOSTR_APDU_REQ: heapless::Vec<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }> =
+    heapless::Vec::new();
+/// The applet response scratch (`MAX_RESPONSE`, the `App::process` shape).
+pub static mut NOSTR_APDU_RESP: heapless::Vec<u8, MAX_RESPONSE> = heapless::Vec::new();
+
+/// SAFETY (both statics): written and read only by `hid_task`'s Nostr arm,
+/// inside the synchronous `process_vendor` body below — one owner, no
+/// re-entry (the applet never calls back into the vendor arm), nothing
+/// aliasing across the mutex boundary. `NostrApp::process` reads `apdu` as a
+/// borrowed slice from `NOSTR_APDU_REQ` while writing `NOSTR_APDU_RESP` — two
+/// distinct statics, so no overlap.
+impl crate::hid_serve::NostrDispatch for NostrViaMutex {
+    fn process_vendor(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+        out: &mut heapless::Vec<u8, { crate::hid_serve::NOSTR_RESP_MAX }>,
+    ) -> usize {
+        // SAFETY: single owner (see the statics' docs above).
+        let req: &mut heapless::Vec<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }> =
+            unsafe { &mut *core::ptr::addr_of_mut!(NOSTR_APDU_REQ) };
+        // SAFETY: single owner (see the statics' docs above).
+        let resp: &mut heapless::Vec<u8, MAX_RESPONSE> =
+            unsafe { &mut *core::ptr::addr_of_mut!(NOSTR_APDU_RESP) };
+        crate::nostr_wire::process_vendor_through(
+            cmd,
+            payload,
+            req,
+            resp,
+            |apdu, resp| with_nostr(|app| app.process(apdu, resp)),
+            out,
+        )
     }
 }
 

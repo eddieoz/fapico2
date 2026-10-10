@@ -31,10 +31,10 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 176 |
-/// | `hid_task` | 4,704 |
+/// | `hid_task` | 4,720 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **14,328** |
+/// | **total** | **14,344** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
 /// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.49x** this demand (floor
@@ -83,13 +83,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 14_328;
+pub const TASK_ARENA_DEMAND_B: usize = 14_344;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "e2405609ccb86aa33c819e769cd7ea4125a9f0cbf71a06e91c40b37aca461041";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "43766ceece599670230df80cbee0039eec11a68ffe26f306f1daf787f2530829";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -137,6 +137,13 @@ pub mod hid_serve;
 /// host-testable — the device bin is arm-only and has no host test target.
 #[cfg(any(feature = "device", feature = "emulation"))]
 pub mod nostr_shared;
+/// US-1662: the vendor CTAPHID wire dialect — the command-byte map over
+/// `0x40–0x7F` with NIP-46 method semantics (D20) and the CBOR envelopes that
+/// carry D13's status vocabulary across the transport. A lib module so both
+/// dispatch impls (the device one behind the shared mutex and the tests'
+/// host one) compose the same encoding core.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod nostr_wire;
 /// US-1524: the **emulation binary's** half of the CTAP-HID seam — the
 /// `HidLink`/`HidIo` transport adapter and one iteration of the shared serve
 /// loop — so `emul_main.rs` no longer carries its own assembler, reply framer,
