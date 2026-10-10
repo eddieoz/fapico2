@@ -2,14 +2,17 @@
 //! by allocator discipline.
 //!
 //! The partition itself is a fact of `keyregion::mod` (OATH `[0, 68)`,
-//! scratchpad `[68, 72)`, FIDO `[72, 928)`, index the tail) and both
-//! allocators honour it. But `FidoRecordStore::{delete, update, compact}` take
-//! a caller-supplied [`Slot`], and before the partition move FIDO sat at the
-//! region's head — so the guard only tested the upper bound. After the move
+//! scratchpad `[68, 72)`, FIDO `[72, 920)`, Nostr `[920, 928)` — the eight
+//! slots US-1639 carved from the top of FIDO's range — and the index the tail).
+//! Both allocators honour it. But `FidoRecordStore::{delete, update, compact}`
+//! take a caller-supplied [`Slot`], and before the partition move FIDO sat at
+//! the region's head — so the guard only tested the upper bound. After the move
 //! that guard admitted every OATH slot and the whole scratchpad: a FIDO
 //! tombstone committed over an OATH credential erases OATH's sector and
 //! destroys the credential. This file pins the two-sided refusal so the
-//! predicate cannot drift back the way its own comment did.
+//! predicate cannot drift back the way its own comment did, and — since
+//! US-1640 — the shrunken post-carve range, so the vacated slots cannot drift
+//! back into FIDO's either.
 
 use std::path::{Path, PathBuf};
 
@@ -186,6 +189,75 @@ fn the_guard_refuses_only_across_the_partition() {
     store
         .delete(&payload_key(), report.slot, &nonce(2))
         .expect("a FIDO delete inside FIDO's own range succeeds");
+}
+
+// ---------------------------------------------------------------------------
+// US-1640 — the Nostr carve is enforced, not described
+// ---------------------------------------------------------------------------
+
+/// **The first FIDO record's address is unchanged by the Nostr carve.**
+///
+/// US-1639 carves eight slots from the **top** of FIDO's range precisely so
+/// that `FidoAllocator::alloc` growing from `FIDO_FIRST_SLOT` upward never
+/// moves an existing record. The honest form of "unchanged by the carve" is a
+/// literal frozen against the address the region had *before* the carve —
+/// asserting the module's own derivation against itself would stay green
+/// through a carve-from-the-bottom that shifted every deployed board's
+/// credentials.
+#[test]
+fn the_first_fido_record_address_is_unchanged_by_the_carve() {
+    use fapico2_platform::flashmap::KEY_REGION_OFFSET;
+    use fapico2_platform::keyregion::FIDO_SLOT_BYTES;
+
+    // Pre-carve: FIDO began at slot 72 (68 OATH + 4 scratchpad) and stride
+    // 1024 — the address the first FIDO record has always had since US-1543.
+    // Nostr's carve takes its slots from the *other* end of the range.
+    const FIRST_FIDO_SLOT_PRE_CARVE: u32 = 68 + 4;
+    const FIRST_FIDO_OFFSET_PRE_CARVE: u32 =
+        KEY_REGION_OFFSET + FIRST_FIDO_SLOT_PRE_CARVE * 1024;
+
+    let s = slot(FIDO_FIRST_SLOT);
+    let offset = KEY_REGION_OFFSET + s.index() as u32 * FIDO_SLOT_BYTES;
+    assert_eq!(
+        offset, FIRST_FIDO_OFFSET_PRE_CARVE,
+        "the first FIDO record's address moved — the carve shifted every credential above it"
+    );
+    assert_eq!(FIDO_FIRST_SLOT, FIRST_FIDO_SLOT_PRE_CARVE);
+}
+
+/// **A FIDO write to a carved slot is refused.** The vacated top slots are now
+/// a Nostr-writable overwrite target: once `is_fido_slot` stops covering them
+/// (it must — they are Nostr's), the guard shrinking with `FIDO_CAPACITY` is
+/// what keeps a FIDO tombstone out of Nostr's range the same way it keeps one
+/// out of OATH's. `put` cannot name a slot, so the write-shaped guard
+/// (`update`) is the path under test, exactly as for OATH above.
+#[test]
+fn a_fido_write_to_a_carved_nostr_slot_is_refused() {
+    use fapico2_platform::keyregion::{is_nostr_slot, FIDO_SLOT_LIMIT, NOSTR_FIRST_SLOT};
+
+    assert_eq!(FIDO_SLOT_LIMIT, NOSTR_FIRST_SLOT);
+    let carved = slot(NOSTR_FIRST_SLOT);
+    assert!(
+        is_nostr_slot(carved),
+        "the slot under test must be inside Nostr's range — this test is about the carve"
+    );
+    assert!(
+        !is_fido_slot(carved),
+        "the carved slot is still FIDO-writable — the shrunken range is described, not enforced"
+    );
+
+    let tmp = TempRegion::new("update-nostr");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let mut store = FidoRecordStore::new(&mut region);
+    let err = store
+        .update(&payload_key(), &index_key(), carved, &nonce(1), &rp_hash(), &body(1))
+        .expect_err("a FIDO write into a carved slot must be refused, not overwrite Nostr's");
+    assert!(matches!(err, FidoStoreError::RegionUnreadable(_)), "got {err:?}");
+
+    // And the last slot below the carve is still FIDO's, so the guard shrank
+    // from the top and did not lose its own tail.
+    let last_fido = slot(FIDO_SLOT_LIMIT - 1);
+    assert!(is_fido_slot(last_fido) && !is_nostr_slot(last_fido));
 }
 
 // ---------------------------------------------------------------------------

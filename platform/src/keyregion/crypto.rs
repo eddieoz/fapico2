@@ -158,6 +158,26 @@ pub const INDEX_KEY_INFO: &[u8] = b"fapico2/keyregion/index/v1";
 /// review and apart on the wire.
 pub const PAYLOAD_KEY_INFO: &[u8] = b"fapico2/keyregion/payload/v1";
 
+/// The **Nostr** payload secret: `fapico2/nostr-region/secret/v1` padded to 32
+/// bytes (US-1638).
+///
+/// The third input to `derive_payload_key` for the Nostr domain, in the same
+/// three-input shape OATH hands its `OATH_PAYLOAD_SECRET`
+/// (`oath_store.rs:233`) — the constant is length-32 so it passes straight
+/// through the `pin_secret` parameter, which is 32 bytes of already-derived
+/// material and deliberately knows nothing about what a caller put in it.
+///
+/// **Device-bound, not user-bound, and that is the decision `ADR 0004` records**
+/// (`docs/adr/0004-nostr-key-storage.md`, design §2.4.1): nothing
+/// `authenticatorReset` or management `RESET` can destroy is an input to the
+/// Nostr payload key, so a publishing identity survives both, and the forgotten-PIN
+/// journey ends in recovery rather than in records that are sealed forever under
+/// state that no longer exists. The AAD's domain tag — [`KeyDomain::Nostr`] — is
+/// what separates a Nostr record from a FIDO or OATH record sealed under the same
+/// `PAYLOAD_KEY_INFO` label; the label separates the region's keys from the rest
+/// of the tree, not the region's domains from each other.
+pub const NOSTR_PAYLOAD_SECRET: [u8; KEY_LEN] = *b"fapico2/nostr-region/secret/v1\0\0";
+
 /// Bytes in a derived region key — AES-256.
 ///
 /// Not a new constant for its own sake: it is stated once here so the two key
@@ -214,6 +234,8 @@ pub enum KeyDomain {
     Fido = 1,
     /// OATH / TOTP credentials (`apps/oath`).
     Oath = 2,
+    /// Nostr identities (`apps/nostr`, US-1638).
+    Nostr = 3,
 }
 
 impl KeyDomain {
@@ -236,6 +258,7 @@ impl KeyDomain {
         match tag {
             1 => Some(KeyDomain::Fido),
             2 => Some(KeyDomain::Oath),
+            3 => Some(KeyDomain::Nostr),
             _ => None,
         }
     }

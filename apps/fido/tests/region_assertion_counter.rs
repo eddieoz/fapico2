@@ -20,7 +20,7 @@
 //! credential is not in that array, so the lookup answered `None` and **every**
 //! `getAssertion` on a region-backed device was refused with
 //! `CTAP2_ERR_NO_CREDENTIALS` (0x2E) — after the credential had been opened and
-//! its private key wiped. The device held 856 passkeys and could authenticate
+//! its private key wiped. The device held 848 passkeys and could authenticate
 //! with none of them.
 //!
 //! # Every test here drives the **device** twin

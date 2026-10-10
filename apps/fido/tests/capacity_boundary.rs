@@ -40,7 +40,7 @@
 //!
 //! The run is O(n²) in slot reads: `FidoAllocator::alloc` is a linear scan by
 //! design (`slotmap.rs`, "Lowest free slot is a linear scan"), so enrolling *n*
-//! credentials costs ~n²/2 header reads. At 856 that is ~366,000 1 KiB reads
+//! credentials costs ~n²/2 header reads. At 848 that is ~360,000 1 KiB reads
 //! against a `FileKeyRegion` — seconds, not minutes, on a host tmpfs. Ignoring it
 //! would defeat the point: **the number is the deliverable**, and an unrun
 //! measurement is an assertion.
@@ -501,8 +501,9 @@ fn the_derivation_sums_to_the_measured_boundary() {
         TOTAL_SLOTS
             - fapico2_platform::keyregion::OATH_CAPACITY
             - fapico2_platform::keyregion::SCRATCHPAD_SLOTS
-            - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT,
-        "the capacity is four terms, and they must claim every slot exactly once"
+            - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
+            - fapico2_platform::keyregion::NOSTR_CAPACITY,
+        "the capacity is five terms — Nostr's carve (US-1639) is the fifth — and they must          claim every slot exactly once"
     );
     // The range FIDO actually writes is the capacity, at the derived offset —
     // the two numbers a caller could confuse, pinned together.

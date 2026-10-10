@@ -89,7 +89,7 @@ The layout and every assertion about it are in
 | OATH **reservation** | 68 slots | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the applet's RAM array, and `keyregion::OATH_CAPACITY` charges the same 68 slots to the region because a store that accepted more would refuse on a RAM bound it never mentions |
 | commit scratchpad | 4 | one whole NOR sector, staged through (US-1544) |
 | index reservation | 32 | `index::INDEX_SLOT_COUNT` — one entry per slot in the region, rounded up to whole sectors |
-| **FIDO resident credentials** | **856** | 960 − 68 − 4 − 32, and **measured** below |
+| **FIDO resident credentials** | **848** | 960 − 68 − 4 − 32 − 8 (the Nostr reservation, US-1639), and **measured** below |
 
 Raising either reservation requires a region that fits it; the compile-time
 assertions in `keyregion/mod.rs` stop the build otherwise. That is the whole
@@ -139,10 +139,13 @@ to hold both generations of a double-buffered rewrite, which is exactly the
 cost this design removes. Capacity runs 3.3× the acceptance floor instead, and
 acceptance criterion 2's "≥500 KB spare" is therefore **not met, deliberately**.
 
-## The 856 is measured, not asserted (US-1563)
+## The 848 is measured, not asserted (US-1563; re-derivation US-1639)
 
-The table above is a **derivation**. It says the region is 960 slots and the
-four reservations tile it — and the compile-time assertions in
+US-1639 carved eight Nostr slots from the top of FIDO's range, so the derived
+number moved 856 → 848; the boundary run below is the US-1563 measurement at
+the pre-carve geometry and its re-run against 848 is US-1675's. The table
+above is a **derivation**. It says the region is 960 slots and the
+five reservations tile it — and the compile-time assertions in
 `keyregion/mod.rs` check that the tiling is exact. What it does *not* say is
 that one enrolment really consumes one slot: a commit could strand a slot, a
 delete could leak one, an index write could fail and orphan a record.
@@ -153,12 +156,12 @@ enrols credentials until the first refusal and checks four things:
 
 | claim | check |
 |---|---|
-| the device enrols 856 | each one is written **and read back byte-identically**, with its private key and RP compared |
+| the device enrols 848 | each one is written **and read back byte-identically**, with its private key and RP compared |
 | the 857th is refused | `RegionCredentialError::Full` → CTAP2 `0x28` (`KEY_STORE_FULL`) |
-| the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the four terms sum to `TOTAL_SLOTS` |
-| nothing partial is left | exactly 856 slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
+| the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the five terms sum to `TOTAL_SLOTS` |
+| nothing partial is left | exactly 848 slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
 
-**Measured: 856.** Every record in that run is a real `DeviceCredential`
+**Measured: 856 at the pre-carve geometry (US-1563); 848 derived after US-1639's carve, re-measure US-1675.** Every record in that run is a real `DeviceCredential`
 encoded by the applet's own codec at its maximum field sizes (63-byte RP ID,
 58-byte `user.name`, 43-byte `displayName`, 64-byte `user.id`, 32-byte
 `credBlob`, `largeBlobKey`, `hmac-secret`) — 596 bytes sealed, against the

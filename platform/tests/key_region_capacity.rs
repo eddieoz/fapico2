@@ -43,11 +43,14 @@ const fn derive_fido_capacity() -> u32 {
     // the commit scratchpad. The scratchpad term is the one that is easy to
     // leave out — it is not a domain, so a reader looking for "how many
     // credentials" does not expect to see it — and leaving it out is how a
-    // capacity becomes one sector optimistic.
+    // capacity becomes one sector optimistic. The Nostr term (US-1639) is the
+    // same class of easy-to-leave-out: eight slots carved from the top of
+    // FIDO's range.
     (KEY_REGION_BYTES / kr::FIDO_SLOT_BYTES)
         - kr::OATH_CAPACITY
         - kr::SCRATCHPAD_SLOTS
         - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
+        - kr::NOSTR_CAPACITY
 }
 
 #[test]
@@ -61,9 +64,49 @@ fn the_capacities_are_the_region_arithmetic() {
         kr::FIDO_CAPACITY
             + kr::OATH_CAPACITY
             + kr::SCRATCHPAD_SLOTS
-            + fapico2_platform::keyregion::index::INDEX_SLOT_COUNT,
+            + fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
+            + kr::NOSTR_CAPACITY,
         kr::TOTAL_SLOTS
     );
+}
+
+#[test]
+fn nostr_is_carved_from_the_top_of_fidos_range() {
+    // US-1639: the carve must leave every existing FIDO record's address
+    // unchanged. `FidoAllocator::alloc` grows from `FIDO_FIRST_SLOT` upward
+    // (fido_store.rs:467), so the property that matters is *where FIDO's range
+    // begins and ends* — the beginning must be exactly where it was before the
+    // carve (immediately above the scratchpad), and the vacated slots must be
+    // the eight at the top, contiguous with the index, not scattered.
+    assert_eq!(
+        kr::FIDO_FIRST_SLOT,
+        kr::OATH_CAPACITY + kr::SCRATCHPAD_SLOTS,
+        "FIDO's range no longer begins right above the scratchpad — existing records' \
+         addresses would move"
+    );
+    assert_eq!(kr::FIDO_CAPACITY, 848, "FIDO falls 856 -> 848: the eight slots are Nostr's");
+    assert_eq!(
+        kr::NOSTR_FIRST_SLOT,
+        kr::FIDO_FIRST_SLOT + kr::FIDO_CAPACITY,
+        "Nostr's range does not begin where FIDO's ends"
+    );
+    assert_eq!(
+        fapico2_platform::keyregion::index::INDEX_FIRST_SLOT,
+        kr::NOSTR_SLOT_LIMIT,
+        "Nostr's carve does not end flush against the index"
+    );
+    assert_eq!(kr::NOSTR_CAPACITY, 8);
+    // The predicates the guards consult must agree with the constants they
+    // derive from — a carve the predicates cannot ask about is a carve write
+    // paths can ignore.
+    let first = kr::Slot::new(kr::NOSTR_FIRST_SLOT as u16).expect("Nostr's first slot");
+    let last = kr::Slot::new((kr::NOSTR_SLOT_LIMIT - 1) as u16).expect("Nostr's last slot");
+    let below = kr::Slot::new((kr::NOSTR_FIRST_SLOT - 1) as u16).expect("FIDO's last slot");
+    let index_first =
+        kr::Slot::new(fapico2_platform::keyregion::index::INDEX_FIRST_SLOT as u16).expect("index");
+    assert!(kr::is_nostr_slot(first) && kr::is_nostr_slot(last));
+    assert!(!kr::is_nostr_slot(below), "the slot below the carve is still FIDO's");
+    assert!(!kr::is_nostr_slot(index_first), "the index is not Nostr's");
 }
 
 #[test]
@@ -105,7 +148,8 @@ fn the_region_holds_far_more_than_the_reported_ceiling() {
     let claimed = fits
         - kr::OATH_CAPACITY
         - kr::SCRATCHPAD_SLOTS
-        - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT;
+        - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
+        - kr::NOSTR_CAPACITY;
     assert!(
         claimed >= 256,
         "FIDO capacity is {claimed}, below the 256 floor the acceptance criteria name"

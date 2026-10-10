@@ -927,7 +927,7 @@ impl FidoApp {
     /// 720 B; the old path returned a `&` into a resident array of twelve, which
     /// is 8,640 B of `.bss` and a ceiling of twelve. Returning one by value costs
     /// 720 B of *stack* for the duration of one call and nothing at all between
-    /// calls, which is what makes 856 credentials fit in 532 KB of RAM.
+    /// calls, which is what makes 848 credentials fit in 532 KB of RAM.
     fn region_credential(
         &mut self,
         keys: Option<&crate::device_keystore::RegionKeys>,
@@ -1558,7 +1558,7 @@ impl FidoApp {
         // nonce) and the store will not either; `draw_random` is the applet's
         // bounded pool draw, which can fail and is therefore mapped rather than
         // assumed. Twelve bytes is a counter's worth of entropy against a
-        // birthday bound nobody will reach in 856 writes.
+        // birthday bound nobody will reach in 848 writes.
         let stored: Result<(), ()> = if rkeys.is_some() {
             let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
             self.draw_random(&mut nonce);
@@ -1706,7 +1706,7 @@ impl FidoApp {
                 // This is the RAM win's whole point: the old shape held every
                 // resident credential in a `HeaplessVec<DeviceCredential, 12>`
                 // so that this loop could walk it, and that array cannot be
-                // resized to the derived capacity (856 × 720 B = 616 KB against
+                // resized to the derived capacity (848 × 720 B = 610 KB against
                 // 532 KB of RAM). Here the index names the RP's slots — **no
                 // payload key is involved, so no record is decrypted to build
                 // the candidate list** — and each candidate is then opened one
@@ -1855,7 +1855,7 @@ impl FidoApp {
         // sealed record opened, copied into a local `DeviceCredential`, and
         // dropped — against the old shape, where the credential had to be
         // resident for the assertion to find it at all. That is why the region
-        // can hold 856: the 856 are in flash and this one is on the stack.
+        // can hold 848: the 848 are in flash and this one is on the stack.
         //
         // US-1562: the **slot** comes out of the same load. The signature
         // counter lives in the record and is addressed by slot, so before this
@@ -3522,8 +3522,8 @@ impl FidoApp {
                 //
                 // US-1563: on the region path these come from the region's
                 // index, and **they are the number the measured boundary is
-                // made of** — `docs/capacity.md` reports 856 because this reply
-                // would answer 856, not because a constant says so.
+                // made of** — `docs/capacity.md` reports 848 because this reply
+                // would answer 848, not because a constant says so.
                 //
                 // The two arms are not the same question. `existing` counts
                 // index entries; `remaining` is `FIDO_CAPACITY` less that. A
@@ -3564,7 +3564,7 @@ impl FidoApp {
                 let region_backed_here = rkeys.is_some();
                 if region_backed_here {
                     // US-1555: enumerate **from the index**, which is what makes
-                    // this walk work at 856 rather than at twelve.
+                    // this walk work at 848 rather than at twelve.
                     //
                     // The index stores a truncated MAC of the `rp_id_hash` and
                     // nothing else — no RP name, no RP ID (`index.rs`, "That is
