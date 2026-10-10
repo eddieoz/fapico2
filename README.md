@@ -24,9 +24,23 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | `A0 00 00 05 27 21 01` | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP | CCID | `A0 00 00 05 27 20 01` | ykman otp |
 | Management | device config, rescue surface | CCID | `A0 00 00 05 27 47 11 17` | ykman, PicoForge |
+| Nostr | BIP-340 event signing and NIP-44 encryption for Nostr identities | third HID interface (usage page `0xFF00`, vendor commands `0x40`–`0x7F`) | `F0 00 00 00 02` | host emulator suites; hardware acceptance pending |
 | PIV | smartcard login | — | `A0 00 00 03 08` | **deferred — post-v1.0.0** |
 
 Hardware acceptance was run against all three headline command sets (FIDO2/U2F, OpenPGP 3.4, OATH); the full matrix — USB IDs, algorithms, per-device results — is [`docs/hardware-matrix.md`](docs/hardware-matrix.md).
+
+## Nostr applet
+
+The Nostr applet holds up to 8 BIP-340 Nostr identities and answers a **third HID interface** — usage page `0xFF00`, vendor commands `0x40`–`0x7F` — alongside FIDO's CTAP-HID and the OTP feature reports. `GET_PUBKEY` and `LIST_KEYS` read the public half and need no touch (an npub is public); every command that uses or changes the private key set — `SIGN`, `NIP44_ENCRYPT`, `NIP44_DECRYPT`, `GENERATE_KEY`, `IMPORT_KEY`, `EXPORT_KEY`, `DELETE_KEY`, `SET_LABEL` — requires a physical touch, and there is no config bit that turns the touch on `SIGN` off. The browser surface is the [OpenXrypt](https://github.com/eddieoz/openxrypt) extension, which speaks this vendor protocol over WebHID and exposes `window.nostr` to pages.
+
+**Onboarding — which path is which:**
+
+- **Recommended: generate the key in software, write the nsec down, then `IMPORT_KEY` it to the device.** The paper copy exists before the board is involved at all, so losing, bricking or wiping the device does not cost the identity.
+- **`GENERATE_KEY` on the device is for a user who has decided the device is the only copy.** `EXPORT_KEY` exists as the escape hatch — it is touch-gated and permanent, and it hands the nsec to the host, downgrading the threat model to include the browser. It is offered because a key nobody can back up is not a security property, it is a single point of failure; take it only if you accept that trade.
+
+**Retiring a compromised key — the order is load-bearing:** publish the NIP-09 / kind-0 retirement event **signed by the old key first**, then `EXPORT_KEY` if you still need anything from it, then `DELETE_KEY`. Delete first and the retirement event can never be signed by anyone — the identity is stranded, not revoked. There is no on-device alternative (NIP-46 is rejected by design; the device has no networking stack).
+
+The last step is a real client, not a debugging global: point a Nostr client — anything that consumes `window.nostr` and publishes events to relays — at the extension, and sign real events with the touch in the loop. The vendor command surface itself is a means; publishing a signed event to a relay is the act the user actually came for.
 
 ## Capacity
 
