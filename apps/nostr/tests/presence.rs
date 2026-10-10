@@ -101,11 +101,21 @@ fn sign_refused_without_presence_grant() {
 
 /// The §2.6 required edit, asserted against the firmware source itself:
 /// `App::process` carries no presence parameter, so the ONLY way presence
-/// reaches the device applet is the builder call in `main.rs` — and if it is
-/// forgotten, the fallback (`default_user_present()`, `false` on device)
-/// bricks every private operation with no failing test to point at. This
-/// gate fails loudly the moment the call disappears or degrades to the
-/// join-or-open `window_grant` (§2.3.1's forbidden path).
+/// reaches the device applet is the provider installation in `main.rs` —
+/// and if it is forgotten, the fallback (`default_user_present()`, `false`
+/// on device) bricks every private operation with no failing test to point
+/// at. Since US-1658 the applet is constructed once in `nostr_shared.rs`
+/// behind the shared Mutex (`NostrApp::new()` lives there now, not in
+/// `main.rs`), and the boot path wires presence through
+/// `install_nostr_providers(...)` — so THIS gate asserts the property at
+/// the place it now lives: the call exists in `main.rs`, its grant
+/// argument is `fapico2_firmware::presence::nostr_grant` (the
+/// domain-discriminating strict path — bit-30 CCID tags fall through to
+/// `request_grant`, and the HID vendor arm's tags resolve inside the
+/// window that arm itself opened), and the call site never names the
+/// join-or-open `window_grant` (§2.3.1's forbidden path — the negative
+/// assertion is the half that catches the join-or-open regression this
+/// gate exists for).
 #[test]
 fn main_rs_wires_nostr_presence_through_the_strict_builder() {
     let main_rs = std::fs::read_to_string(concat!(
@@ -115,19 +125,16 @@ fn main_rs_wires_nostr_presence_through_the_strict_builder() {
     .expect("firmware/src/main.rs is readable from the nostr test crate");
 
     let nostr_chain = main_rs
-        .split("NostrApp::new()")
+        .split("install_nostr_providers(")
         .nth(1)
-        .expect("main.rs constructs the nostr applet");
+        .expect("main.rs installs the nostr providers");
     let nostr_chain = &nostr_chain[..nostr_chain
         .find(";")
-        .expect("the nostr construction statement terminates")];
+        .expect("the install_nostr_providers statement terminates")];
 
-    assert!(
-        nostr_chain.contains(".with_presence_grant("),
-        "the §2.6 required edit is missing: main.rs's nostr applet is built \
-         without .with_presence_grant(...) — presence would fall back to \
-         default_user_present() and fail silently"
-    );
+    // The negative assertion comes FIRST so a wiring that degraded to the
+    // forbidden path fails naming the join-or-open hazard, not the missing
+    // strict path.
     assert!(
         !nostr_chain.contains("window_grant"),
         "the nostr applet must never be wired to the join-or-open \
@@ -135,9 +142,10 @@ fn main_rs_wires_nostr_presence_through_the_strict_builder() {
          open window and inherit its press"
     );
     assert!(
-        nostr_chain.contains("presence::request_grant"),
-        "the nostr applet must be wired to the strict one-shot path \
-         (fapico2_firmware::presence::request_grant), not a windowed variant"
+        nostr_chain.contains("fapico2_firmware::presence::nostr_grant"),
+        "the §2.6 required edit is missing: main.rs's install_nostr_providers \
+         call is not wired to presence::nostr_grant — presence would fall back \
+         to default_user_present() and fail silently"
     );
 
     // US-1646's second half: the emulator needs the deny hook, or the

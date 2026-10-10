@@ -112,3 +112,58 @@ boot.rs edit (`measure_task_arena.py`, nightly): 21,952 B against ARENA
 - Emulator suites `test_nostr_select.py` (6) + `test_nostr_keymgmt.py` (7)
   green through `run_tests.sh` with no runner edit.
 - `check_boot_chain` / `check_flash_budget` / `check_rng_path` PASS.
+
+---
+
+# US-1680 — the §2.6 gate re-anchored: red-then-green, re-recorded (2026-10-10)
+
+US-1658 moved the applet's construction out of `main.rs` (`NostrApp::new()`
+now lives at `nostr_shared.rs:56`, behind the shared Mutex), which left this
+gate's stale anchor: it split `main.rs` on the literal `NostrApp::new()`,
+found nothing, and failed at the `expect` — a red caused by the *anchor*,
+not by any wiring fault. The gate now asserts the property where it lives:
+the `install_nostr_providers(...)` call in `main.rs`, its grant argument
+`fapico2_firmware::presence::nostr_grant`, and the call site never naming
+`window_grant` (the negative assertion is checked first, so a degraded
+wiring fails naming the join-or-open hazard).
+
+## Red 1 — the stale anchor (observed at the pre-US-1680 tip, `c0fffec`)
+
+```
+$ cargo test -p fapico2-nostr --target x86_64-unknown-linux-gnu --test presence
+
+test main_rs_wires_nostr_presence_through_the_strict_builder ... FAILED
+
+thread 'main_rs_wires_nostr_presence_through_the_strict_builder' panicked at apps/nostr/tests/presence.rs:120:10:
+main.rs constructs the nostr applet
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out
+```
+
+The failure names the stale anchor (`main.rs constructs the nostr applet`),
+not a wiring fault — the review's P1-2 exactly.
+
+## Red 2 — the wiring degraded to `window_grant` (revert on the re-anchored gate)
+
+`main.rs`'s third `install_nostr_providers` argument changed from
+`fapico2_firmware::presence::nostr_grant` to
+`fapico2_firmware::presence::window_grant`, then the gate re-run:
+
+```
+thread 'main_rs_wires_nostr_presence_through_the_strict_builder' panicked at apps/nostr/tests/presence.rs:
+the nostr applet must never be wired to the join-or-open window_grant (§2.3.1):
+a same-tag SIGN would join another SIGN's open window and inherit its press
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out
+```
+
+The gate fails for the right reason — naming the join-or-open hazard — not
+by `expect`ing on a string that no longer exists. `git checkout --` restored
+the strict wiring; no red survives in the tree.
+
+## Green
+
+```
+$ cargo test -p fapico2-nostr --target x86_64-unknown-linux-gnu
+keymgmt 18, wire 9, presence 5, nostr_shared's US-1658 module 13, store
+suites 9+9 — 0 failed across every `-p fapico2-nostr` target.
