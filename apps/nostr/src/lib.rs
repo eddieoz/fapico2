@@ -1124,7 +1124,13 @@ impl App for NostrApp {
         let ins = apdu[1];
         let p1 = apdu[2];
         let p2 = apdu[3];
-        let data = parse_data(apdu);
+        let data = match parse_data(apdu) {
+            Ok(data) => data,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
         match ins {
             INS_GET_INFO => self.get_info(p1, p2, data, resp),
             INS_LIST_KEYS => self.list_keys(p1, p2, data, resp),
@@ -1144,15 +1150,31 @@ impl App for NostrApp {
 
 /// The APDU data field: short (`Lc` in `apdu[4]`) or extended (`00 Hi Lo`)
 /// form — the `apps/mgmt` convention the C-harness encodings share.
-fn parse_data(apdu: &[u8]) -> &[u8] {    if apdu.len() >= 7 && apdu[4] == 0x00 {
+///
+/// US-1685: a malformed form is a refusal, not silent empty data. An
+/// extended form whose declared length exceeds the bytes present is
+/// [`SW_WRONG_LENGTH`] (the review's P2: a truncated extended form used to
+/// answer as if the data field were empty, so `refuse_payload` passed where
+/// `6A80`-class honesty was owed); a short-form command with bytes past its
+/// `Lc` window is [`SW_WRONG_DATA`]. The empty and well-formed cases behave
+/// exactly as before — the change is observable only to a malformed APDU.
+fn parse_data(apdu: &[u8]) -> Result<&[u8], Sw> {
+    if apdu.len() >= 7 && apdu[4] == 0x00 {
         let lc = u16::from_be_bytes([apdu[5], apdu[6]]) as usize;
-        return apdu.get(7..7 + lc).unwrap_or(&[]);
+        return if apdu.len() >= 7 + lc {
+            Ok(&apdu[7..7 + lc])
+        } else {
+            Err(SW_WRONG_LENGTH)
+        };
     }
     if apdu.len() < 5 {
-        return &[];
+        return Ok(&[]);
     }
     let lc = apdu[4] as usize;
-    apdu.get(5..5 + lc).unwrap_or(&[])
+    if apdu.len() != 5 + lc {
+        return Err(SW_WRONG_DATA);
+    }
+    Ok(&apdu[5..5 + lc])
 }
 
 fn write_sw(resp: &mut HeaplessVec<u8, MAX_RESPONSE>, sw: Sw) {

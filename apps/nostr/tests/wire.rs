@@ -417,3 +417,37 @@ fn the_nip44_pair_is_no_longer_the_skeleton_refusal() {
     }
     std::fs::remove_file(path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1685 — parse_data refuses malformed Lc forms
+// ---------------------------------------------------------------------------
+
+/// A truncated extended-Lc form is a malformed APDU, not "no data": the
+/// header declares 65,535 bytes and carries none, and the honest answer is a
+/// status word — not `GET_INFO`'s success shape (review P2: `parse_data`
+/// treated the truncation as an empty data field, so `refuse_payload`
+/// passed and the command executed).
+#[test]
+fn a_truncated_extended_lc_form_is_refused() {
+    let (mut app, path) = booted_app("truncated-ext");
+    // `00 10 00 00 00 FF FF` — extended form, declares 0xFFFF, carries 0.
+    let bad: HeaplessVec<u8, 300> = [0x00u8, 0x10, 0x00, 0x00, 0x00, 0xFF, 0xFF]
+        .into_iter()
+        .collect();
+    let (_, sw) = call(&mut app, &bad);
+    assert_ne!(sw, SW_OK, "a declared length the frame does not carry must not succeed");
+    assert_ne!(sw, 0x6D00, "the arm exists; this is a malformed-frame refusal");
+    // And a short-form Lc=0 command with trailing bytes is wrong data too —
+    // the bytes after the Lc window belong to no legal form.
+    let trailing: HeaplessVec<u8, 300> = [0x00u8, 0x10, 0x00, 0x00, 0x00, 0xDE, 0xAD]
+        .into_iter()
+        .collect();
+    let (_, sw) = call(&mut app, &trailing);
+    assert_ne!(sw, SW_OK, "bytes past a short-form Lc=0 window are wrong data");
+    // The empty case is untouched: a well-formed Lc=0 GET_INFO still answers
+    // its success shape.
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert!(!data.is_empty(), "GET_INFO's success shape survives");
+    std::fs::remove_file(path).ok();
+}
