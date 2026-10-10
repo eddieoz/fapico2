@@ -204,15 +204,21 @@ pub const APPLET_VERSION: [u8; 2] = [0x00, 0x01];
 
 /// The largest NIP-44 plaintext the applet will accept or return (§2.2.1).
 ///
-/// **Derived, not chosen**: `MAX_WIRE = 2074` (`firmware/src/ccid_reasm.rs`)
-/// caps both directions of the CCID transport, and the two heavy rows leave
-/// ≈1995 (encrypt response) and ≈1962 (decrypt request) — 1900 sits under
-/// both with headroom. Advertising the host's 4096 dispatch-buffer scale
-/// would be a wire claim the device does not honour: an over-long response
-/// is dropped by `handle_ccid_message` with *no frame and no status word*.
-/// `tests/wire.rs::wire_fits_max_wire` asserts the arithmetic against the
-/// device constant.
-pub const MAX_PLAINTEXT: u16 = 1900;
+/// **Derived, not chosen — and derived from the *chunk-rounded* padding,
+/// not the naive `ct ≥ plaintext + 2`.** The encrypt response is
+/// `33 + (2 + calc_padded_len(n)) + 32` bytes against
+/// `MAX_WIRE = 2074` (`firmware/src/ccid_reasm.rs`, both directions of the
+/// CCID transport), so `calc_padded_len(n) ≤ 2072 − 67 = 2005`. Padding is
+/// chunk-rounded, not linear: `calc_padded_len` jumps 1792 → 2048 at
+/// n = 1793, so a 1900-byte cap would produce a 2,115-byte response the
+/// device drops with *no frame and no status word* while `GET_INFO` still
+/// advertises it — the exact wire claim the device does not honour that
+/// AGENTS §4 exists to prevent. 1792 is the largest n whose padded length
+/// fits. Advertising the host's 4096 dispatch-buffer scale would be the
+/// same failure at a different scale. `tests/wire.rs::wire_fits_max_wire`
+/// asserts the arithmetic against the device constant with the same
+/// chunk-rounded function, so the two cannot drift.
+pub const MAX_PLAINTEXT: u16 = 1792;
 
 /// caps bit 0: key management and `SIGN` (`0x13`–`0x15`) are served. Set in
 /// the same edit as US-1644/1645 — an advertised command that refuses is
@@ -221,12 +227,13 @@ pub const CAP_KEY_MGMT: u16 = 0x0001;
 /// caps bit 1: the NIP-44 pair (`0x16`/`0x17`) is served. Set with US-1653.
 pub const CAP_NIP44: u16 = 0x0002;
 
-/// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] — the key-management trio
-/// (`0x13`–`0x15`) is served, set in the same edit as the commands
-/// themselves (US-1644/US-1645; `tests/wire.rs` re-derives the cap rows when
-/// the NIP-44 story adds the next bit). An advertised command that refuses
-/// is the §4 failure mode (`apps/fido` getInfo history).
-pub const CAPS: u16 = CAP_KEY_MGMT;
+/// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] (the key-management trio
+/// `0x13`–`0x15`, US-1644/US-1645) plus [`CAP_NIP44`] (the NIP-44 pair
+/// `0x16`/`0x17`, US-1653). An advertised command that refuses is the §4
+/// failure mode (`apps/fido` getInfo history), so this constant changes in
+/// the same commit as the arms it covers — `tests/wire.rs` re-derives the
+/// cap rows and the harness suite asserts the wire value.
+pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44;
 
 /// Reserved `flags` byte of `GET_INFO` — zero until a story defines a bit.
 pub const INFO_FLAGS: u8 = 0x00;
@@ -715,6 +722,183 @@ impl NostrApp {
         }
     }
 
+    /// `NIP44_ENCRYPT` — P1 = idx, data = `peer_x(32) ‖ plaintext(n)`; the
+    /// response is the NIP-44 v2 payload `0x02 ‖ nonce(32) ‖ ct(m) ‖
+    /// mac(32)` (§2.2), built in place inside `resp` — the ~2 KiB payload
+    /// never crosses a stack buffer on its way out. The nonce is
+    /// **generated on-device** from the RNG source: the host cannot supply
+    /// it, so no host bug can reuse one (§2.2.0a).
+    ///
+    /// Refusal order: shape (`P2`, the 32-byte key, the plaintext above
+    /// `MAX_PLAINTEXT` — the §2.2.1 cap, `6A80`), the peer key (`6B00` ECC
+    /// form / `6A87` not a curve point — both are properties of the request
+    /// bytes, so they are settled before the state and the touch), state
+    /// (`6A82`), the touch (`6985`).
+    fn nip44_encrypt(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() < 33 {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        let (peer_x, plaintext) = data.split_at(32);
+        if plaintext.len() > MAX_PLAINTEXT as usize {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        if let Some(sw) = validate_peer_key(peer_x) {
+            write_sw(resp, sw);
+            return;
+        }
+        let Self { region, provider, rng, presence_grant } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        if !user_present(*presence_grant, p1 as u16) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        let mut nonce = [0u8; 32];
+        if draw_random(*rng, &mut nonce).is_none() {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+        let ck = match nip44::conversation_key(&id.scalar, &peer_key_bytes(peer_x)) {
+            // The scalar is stored valid and the peer key is lifted above,
+            // so the only failure left is the identity itself.
+            Ok(ck) => ck,
+            Err(_) => {
+                write_sw(resp, SW_STORE_FAULT);
+                return;
+            }
+        };
+        // The payload is sized exactly (33 + ct + 32; ct = 2 + padded) and
+        // `encrypt_with_ck` fills `[0..total]` in place — no second buffer.
+        let padded = match nip44::calc_padded_len(plaintext.len() as u64) {
+            Some(padded) => padded as usize,
+            None => {
+                write_sw(resp, SW_WRONG_DATA);
+                return;
+            }
+        };
+        let total = 33 + 2 + padded + 32;
+        if resp.resize(total, 0).is_err() {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+        match nip44::encrypt_with_ck(&ck, &nonce, plaintext, &mut resp[..total]) {
+            Ok(len) => {
+                debug_assert_eq!(len, total);
+                write_sw(resp, SW_OK);
+            }
+            // Unreachable under the caps above; a fault beats a wrong answer.
+            Err(_) => {
+                resp.clear();
+                write_sw(resp, SW_STORE_FAULT);
+            }
+        }
+    }
+
+    /// `NIP44_DECRYPT` — P1 = idx, data = `sender_x(32) ‖ payload(65+m)`;
+    /// the response is the raw plaintext (§2.2). The payload's bytes are
+    /// attacker-influenced after one touch, so the parse order is the one
+    /// §2.2.2 states: shape, then MAC (**constant-time**, `verify_slice`)
+    /// before any length/padding parsing; the decrypted prefix is validated
+    /// (`unpadded_len == 0`, the sub-99-byte floor, the exact padded length)
+    /// **before** any slicing.
+    ///
+    /// Every malformed payload is `6A80` — wrong data — with one deliberate
+    /// exception: the NIP-44 v1 "ECC key" form (`f9308a…`) is `6B00`, the
+    /// word that tells a user their counterparty's key type is unsupported
+    /// rather than that their bytes are corrupt. The sender key check is a
+    /// property of the request bytes, so it precedes the state and the
+    /// touch (the `6A87`/`6B00` refusals a user can act on without
+    /// pressing first).
+    fn nip44_decrypt(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p2 != 0 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() < 32 + nip44::MIN_PAYLOAD {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        let (sender_x, payload) = data.split_at(32);
+        // A legal payload cannot exceed the largest one `MAX_PLAINTEXT`
+        // could produce: version+nonce (33) + ct (2 + 2048) + mac (32). The
+        // §2.2.1 cap is what makes the 6-byte (u32) prefix form unreachable.
+        let max_legal = 33 + 2 + nip44::calc_padded_len(MAX_PLAINTEXT as u64).unwrap_or(0) as usize
+            + 32;
+        if payload.len() > max_legal {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        if let Some(sw) = validate_peer_key(sender_x) {
+            write_sw(resp, sw);
+            return;
+        }
+        if payload.starts_with(&ECC_KEY_PREFIX) {
+            write_sw(resp, SW_ECC_UNSUPPORTED);
+            return;
+        }
+        let Self { region, provider, presence_grant, .. } = self;
+        let Some(mut store) = attach_store(region, provider, resp) else { return };
+        let id = match read_identity(&mut store, p1 as u16) {
+            Ok(id) => id,
+            Err(sw) => {
+                write_sw(resp, sw);
+                return;
+            }
+        };
+        if !user_present(*presence_grant, p1 as u16) {
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
+        let ck = match nip44::conversation_key(&id.scalar, &peer_key_bytes(sender_x)) {
+            Ok(ck) => ck,
+            Err(_) => {
+                write_sw(resp, SW_STORE_FAULT);
+                return;
+            }
+        };
+        let ct_len = payload.len() - 65;
+        if resp.resize(ct_len, 0).is_err() {
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+        match nip44::decrypt_with_ck(&ck, payload, &mut resp[..ct_len]) {
+            Ok(unpadded_len) => {
+                // The plaintext now sits at `[0..unpadded_len]`; the
+                // remainder of the scratch region is padded garbage.
+                resp.truncate(unpadded_len);
+                write_sw(resp, SW_OK);
+            }
+            Err(_) => {
+                resp.clear();
+                write_sw(resp, SW_WRONG_DATA);
+            }
+        }
+    }
+
     /// `SET_LABEL` — P1 = idx, data = UTF-8 label ≤ 32 bytes; no response
     /// data. Touch-gated. Refusal order: shape (P2, payload), label validity
     /// (`6A80` — a label that is not a string is not a label, the same
@@ -914,10 +1098,11 @@ impl App for NostrApp {
             INS_GENERATE_KEY => self.generate_key(p1, p2, data, resp),
             INS_IMPORT_KEY => self.import_key(p1, p2, data, resp),
             INS_SIGN => self.sign(p1, p2, data, resp),
+            INS_NIP44_ENCRYPT => self.nip44_encrypt(p1, p2, data, resp),
+            INS_NIP44_DECRYPT => self.nip44_decrypt(p1, p2, data, resp),
             INS_SET_LABEL => self.set_label(p1, p2, data, resp),
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
             INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
-            // US-1653 the NIP-44 pair replaces its arms here.
             _ => write_sw(resp, SW_INS_NOT_SUPPORTED),
         }
     }
@@ -938,6 +1123,33 @@ fn parse_data(apdu: &[u8]) -> &[u8] {    if apdu.len() >= 7 && apdu[4] == 0x00 {
 
 fn write_sw(resp: &mut HeaplessVec<u8, MAX_RESPONSE>, sw: Sw) {
     resp.extend_from_slice(&sw.to_be_bytes()).ok();
+}
+
+/// The NIP-44 v1 "ECC key" marker (design §2.2.0): the key form that needs
+/// x25519, which §5 rejects. `6B00` — "that key type is not supported yet"
+/// — is a *user* problem, distinct from `6A87`'s "not a valid key".
+const ECC_KEY_PREFIX: [u8; 3] = [0xF9, 0x30, 0x8A];
+
+/// Copy a key slice into the 32-byte form the primitive lifts.
+fn peer_key_bytes(x: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&x[..32]);
+    out
+}
+
+/// US-1656: the peer/sender key check that runs **before any scalar
+/// multiplication**. The ECC form is `6B00`; zero and non-curve x are
+/// `6A87`. secp256k1 is cofactor 1, so between "on the curve" and "the
+/// identity" there are no low-order points — the lifting check is the whole
+/// validation.
+fn validate_peer_key(x: &[u8]) -> Option<Sw> {
+    if x.starts_with(&ECC_KEY_PREFIX) {
+        return Some(SW_ECC_UNSUPPORTED);
+    }
+    match nip44::lift_xonly(&peer_key_bytes(x)) {
+        Some(_) => None,
+        None => Some(SW_INVALID_PEER_KEY),
+    }
 }
 
 /// The commands take no payload in this story; a payload is wrong data.

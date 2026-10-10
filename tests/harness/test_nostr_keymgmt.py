@@ -49,8 +49,11 @@ def test_get_info_layout_over_ccid(emu):
     assert len(data) == 8
     assert data[0:2] == b"\x00\x01"  # APPLET_VERSION
     caps = int.from_bytes(data[2:4], "big")
-    assert caps & 0x0001 and not caps & 0x0002  # key mgmt served, NIP-44 not
-    assert int.from_bytes(data[4:6], "big") == 1900  # max_plaintext
+    assert caps == 0x0003  # key mgmt (0x0001) + NIP-44 (0x0002), both served
+    # The wire-cap value: the largest plaintext whose chunk-rounded padding
+    # still fits MAX_WIRE (2074) — 1792 pads to itself, 1793 pads to 2048 and
+    # would push the encrypt response off the wire.
+    assert int.from_bytes(data[4:6], "big") == 1792  # max_plaintext
     assert data[6] == 0  # empty store
 
 

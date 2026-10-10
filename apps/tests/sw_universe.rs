@@ -2027,9 +2027,21 @@ const NOSTR: &[Claim] = &[
     ),
     Claim::applet(
         0x6D00,
-        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — the arms no story has \
-         implemented yet (NIP44_ENCRYPT/DECRYPT 0x16/0x17 — US-1653) plus unknown \
-         INS bytes; US-1649's trio (0x18/0x19/0x1A) left this row",
+        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — unknown INS bytes only: \
+         US-1643's reads, US-1644/45's key trio, US-1649's §2.2.0a trio and \
+         US-1653's NIP-44 pair (0x16/0x17) have all left this row",
+    ),
+    Claim::applet(
+        0x6B00,
+        "US-1653: ECC key form unsupported — the NIP-44 peer/sender key carries the \
+         NIP-44 v1 'ECC key' prefix (f9308a…); x25519 is §5-rejected, so the answer \
+         names the key *type*, not the key bytes (apps/nostr/src/lib.rs SW_ECC_UNSUPPORTED)",
+    ),
+    Claim::applet(
+        0x6A87,
+        "US-1653: peer/sender key is not a valid secp256k1 curve point — the x-only \
+         coordinate fails lift_xonly (zero, non-curve, or ≥ p). Settled before state \
+         and touch: it is a property of the request bytes alone",
     ),
     Claim::applet(
         0x6985,
@@ -2095,7 +2107,8 @@ const NOSTR_SPACE: Space = Space {
 fn nostr_cases() -> Vec<Case> {
     vec![
         // GET_INFO (INS 0x10, design §2.2), short framing: succeeds over the
-        // empty sweep region and advertises max_plaintext 1900.
+        // empty sweep region and advertises max_plaintext 1792 (US-1653's
+        // wire-cap correction).
         case("GET_INFO-shaped header", short(0x10, 0x00, 0x00, &[]), 0x9000),
         // The same header as case-2 (an Le, no Lc) — the framing GET_INFO
         // will actually arrive in.
@@ -2117,6 +2130,18 @@ fn nostr_cases() -> Vec<Case> {
         case("IMPORT_KEY zero scalar", short(0x14, 0x02, 0x00, &[0u8; 32]), 0x6A80),
         case("SIGN empty slot", short(0x15, 0x02, 0x00, &[0x5A; 32]), 0x6A82),
         case("SIGN out-of-range idx", short(0x15, 0xFF, 0x00, &[0x5A; 32]), 0x6A80),
+        // US-1653: the NIP-44 pair validates the peer key before state and
+        // touch, so a non-curve peer_x is 6A87 whatever the slot holds —
+        // a zero coordinate lifts at nothing. The data is the minimum
+        // shape (peer_x(32) ‖ plaintext(1)).
+        case("NIP44_ENCRYPT zero peer", short(0x16, 0x00, 0x00, &[0u8; 33]), 0x6A87),
+        // ...and an x25519-shaped key: the f9308a prefix is 6B00, naming the
+        // key *type* rather than the bytes (the §2.2.0a user/client split).
+        case(
+            "NIP44_ENCRYPT ECC peer",
+            short(0x16, 0x00, 0x00, &[0xF9, 0x30, 0x8A, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D]),
+            0x6B00,
+        ),
         // US-1643 enforces CLA 0x00 — `0x80` (Rescue's class) is refused with
         // 6E00. US-1648 decides whether that stays.
         case("CLA 0x80", vec![0x80, 0x10, 0x00, 0x00], 0x6E00),

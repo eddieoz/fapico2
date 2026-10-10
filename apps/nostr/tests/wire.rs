@@ -16,6 +16,7 @@
 //! silently disappears is exactly the failure this test exists to keep off
 //! the wire.
 
+use fapico2_nostr::nip44::calc_padded_len;
 use fapico2_nostr::{
     bech32_npub, NostrApp, APPLET_VERSION, CAPS, INS_GET_INFO, INS_GET_PUBKEY, INS_LIST_KEYS,
     MAX_PLAINTEXT,
@@ -120,10 +121,14 @@ fn wire_fits_max_wire() {
     let max_pt = MAX_PLAINTEXT as usize;
 
     // NIP44_ENCRYPT response: 0x02 ‖ nonce(32) ‖ ct ‖ mac(32) + SW(2),
-    // where the ciphertext of a plaintext is at least plaintext + 2
-    // (one padding byte + the 32-byte MAC share the body; §2.2.1 counts
-    // `ct ≥ plaintext + 2` conservatively).
-    let encrypt_resp = 1 + 32 + (max_pt + 2) + 32 + 2;
+    // where the ciphertext is 1 + padded and `padded` is the
+    // **chunk-rounded** `calc_padded_len` the primitive layer actually
+    // applies — the naive `ct ≥ plaintext + 2` bound points the wrong
+    // way, because padding jumps 1792 → 2048 at n = 1793 and a "conservative"
+    // row built on it advertises plaintexts whose response is off the wire
+    // (no frame, no status word — the silent-disappearance failure).
+    let padded = calc_padded_len(max_pt as u64).expect("MAX_PLAINTEXT itself pads") as usize;
+    let encrypt_resp = 1 + 32 + (2 + 1 + padded) + 32 + 2;
     assert!(
         4 + encrypt_resp <= MAX_WIRE,
         "NIP44_ENCRYPT's largest response ({encrypt_resp} bytes) must fit the CCID wire \
@@ -135,7 +140,7 @@ fn wire_fits_max_wire() {
     // ciphertext of the padded plaintext. The reassembler refuses the
     // whole message past MAX_WIRE, so an over-long *request* never even
     // reaches the applet.
-    let ct = padded_len(max_pt) + 1;
+    let ct = 1 + calc_padded_len(max_pt as u64).expect("MAX_PLAINTEXT itself pads") as usize;
     let decrypt_req = 4 + 32 + 65 + ct;
     assert!(
         4 + decrypt_req <= MAX_WIRE,
@@ -161,35 +166,40 @@ fn wire(payload: usize) -> usize {
     4 + payload
 }
 
-/// The §2.2.1 cap is a *derived* number, not a preference: 1900 is what the
-/// two heavy rows leave, with headroom. If a future change wants a different
+/// The §2.2.1 cap is a *derived* number, not a preference. The response row
+/// is `4 + (1 + 32 + 2 + 1 + calc_padded_len(n) + 32 + 2) ≤ MAX_WIRE`, and
+/// `calc_padded_len` is chunk-rounded (multiples of 256 above 256 bytes), so
+/// the largest n whose padded length still fits is **1792**: 1792 pads to
+/// itself (response 1,859 bytes), while 1793 pads to 2048 (response 2,115
+/// bytes) — off the wire at 2,074, dropped with no frame and no status word
+/// while GET_INFO still advertises it. If a future change wants a different
 /// value it must re-derive both rows and change this test with them.
 #[test]
 fn max_plaintext_is_the_design_value() {
-    assert_eq!(MAX_PLAINTEXT, 1900);
+    assert_eq!(MAX_PLAINTEXT, 1792);
+
+    // The neighbouring value betrays the jump: one byte more plaintext
+    // rounds the padding up a whole chunk and pushes the response past the
+    // wire. Stated as an assert so the arithmetic is re-checked, not
+    // trusted.
+    let padded_next = calc_padded_len(1793).expect("legal spec length") as usize;
+    let next_resp = 4 + (1 + 32 + (2 + 1 + padded_next) + 32 + 2);
+    assert!(next_resp > MAX_WIRE, "1793 must be off the wire — that is the cliff the cap sits behind");
+    assert_eq!(
+        calc_padded_len((MAX_PLAINTEXT - 1) as u64),
+        calc_padded_len(MAX_PLAINTEXT as u64),
+        "MAX_PLAINTEXT must sit at the top of a padding chunk"
+    );
 
     // The trap the cap closes: at the host's dispatch-buffer scale the
     // encrypt response would already be off the wire. Stated as an assert
     // so the test fails loudly the day someone "fixes" the constant to
     // MAX_RESPONSE instead of re-deriving the rows.
-    let host_scale = 1 + 32 + (4096 + 2) + 32 + 2;
+    let host_scale = 4 + 1 + 32 + 2 + 1 + calc_padded_len(4096).expect("legal") as usize + 32 + 2;
     assert!(
-        4 + host_scale > MAX_WIRE,
+        host_scale > MAX_WIRE,
         "the 4096-scale response must NOT fit the wire — that is the bug the cap exists for"
     );
-}
-
-/// NIP-44 v2 padding: `calc_padded_len`. The device does the padding, so the
-/// cap arithmetic needs it here; local because only the cap needs it.
-fn padded_len(len: usize) -> usize {
-    if len <= 32 {
-        return 32;
-    }
-    let mut x = (len / 32) * 32;
-    if x < len {
-        x += 32;
-    }
-    x
 }
 
 // ---------------------------------------------------------------------------
@@ -390,16 +400,20 @@ fn a_storeless_applet_refuses_the_reads() {
 // The touch-gated commands are still the skeleton's refusals
 // ---------------------------------------------------------------------------
 
-/// US-1643 ships only the three reads; everything else stays `6D00` until
-/// its own story replaces the arm.
+/// US-1643 shipped only the three reads; US-1644/45 implemented `0x13`–`0x15`,
+/// US-1649 the §2.2.0a trio (`0x18`–`0x1A`), and US-1653 the NIP-44 pair
+/// (`0x16`/`0x17`). Nothing between `0x10` and `0x1A` remains refused with
+/// `6D00` — the pin is that the pair has *left* this test's scope: an
+/// accidental dispatch edit would surface as `6D00` here before any client
+/// found it.
 #[test]
-fn unimplemented_commands_stay_refused() {
+fn the_nip44_pair_is_no_longer_the_skeleton_refusal() {
     let (mut app, path) = booted_app("skeleton-rest");
-    // US-1644/US-1645 implemented 0x13–0x15 and US-1649 the §2.2.0a trio
-    // (0x18–0x1A); the NIP-44 pair is still Phase 2's.
     for ins in [0x16u8, 0x17] {
+        // Wrong shape (no peer key / payload) refuses as wrong shape, not as
+        // unknown-insn — the point is that the arm exists at all.
         let (_, sw) = call(&mut app, &apdu(ins, 0, 0, &[]));
-        assert_eq!(sw, 0x6D00, "INS {ins:#04x} is not this story's");
+        assert_ne!(sw, 0x6D00, "INS {ins:#04x} must be dispatched");
     }
     std::fs::remove_file(path).ok();
 }
