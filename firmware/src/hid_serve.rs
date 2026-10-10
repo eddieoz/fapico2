@@ -62,7 +62,9 @@ use crate::ctap_hid::{
     CTAPHID_KEEPALIVE_UPNEEDED, HID_ERR_INVALID_CMD, HID_ERR_INVALID_LEN,
 };
 use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
-use crate::presence::{self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, TouchWindow};
+use crate::presence::{
+    self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, NOSTR_TOUCH_WINDOW_MS, TouchWindow,
+};
 
 /// `CTAP_READ_CONFIG` (`0x42`) — yubikit's `CTAP_VENDOR_FIRST + 2`.
 ///
@@ -122,31 +124,47 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 ///
 /// ## The arithmetic
 ///
-/// Three CTAPHID reply writes plus the one keepalive period the outbound read
-/// is bounded by. Walking one [`serve_once`] pass, in order, while a window is
-/// live:
+/// Five CTAPHID reply writes plus the one keepalive period the outbound read
+/// is bounded by. Walking one [`serve_once_dual`] pass, in order, while a
+/// window is live on **either** interface:
 ///
-/// 1. **the bounded read.** A frame that arrives on the OUT endpoint is
+/// 1. **the bounded read.** A frame that arrives on either OUT endpoint is
 ///    picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (now **250 ms**),
-///    because [`read_one`] is bounded by it. This is the term US-1506
+///    because `read_either` is bounded by it. This is the term US-1506
 ///    moved, and it moved *with* the emitted cadence, because the same
 ///    constant is both — see the note there on why they must not be
 ///    split.
-/// 2. **the live window's keepalive** — [`redrive_window`], one reply, at
+/// 2. **the FIDO window's keepalive** — [`redrive_window`], one reply, at
 ///    most [`HID_REPLY_WRITE_TIMEOUT_MS`] (500 ms) if the host has stopped
 ///    reading the IN endpoint (US-1504).
-/// 3. **a `check_timeout` error** — [`serve_once`] step 2, and only if a
+/// 3. **the Nostr window's keepalive** — [`redrive_vendor_window`]
+///    (US-1663), one reply, same bound. The second arm is US-1660's
+///    structural change and the reason this sum grew by one term: both
+///    windows are re-driven on the same clock, each at most one reply per
+///    pass, so a pass that carries two live keepalives carries two writes.
+/// 4. **a `check_timeout` error on the FIDO interface** — and only if a
 ///    fragmented transaction really is stale. One more reply, same bound.
-/// 4. **the dispatched answer** — the frame read in step 1 is dispatched
+/// 5. **a `check_timeout` error on the Nostr interface** — same bound. Each
+///    interface has its own assembler, so both can hold a stale transaction
+///    in the same pass.
+/// 6. **the dispatched answer** — the frame read in step 1 is dispatched
 ///    and answered with exactly **one** reply, same bound.
 ///
-/// So **1750 ms worst case** (3 x 500 + 250) against a host that has
+/// So **2750 ms worst case** (5 x 500 + 250) against a host that has
 /// stopped reading the IN endpoint, and **one keepalive period (250 ms)**
 /// against a host that is actually reading it — the case the blackout is
-/// about, where the three replies complete immediately rather than costing
+/// about, where the five replies complete immediately rather than costing
 /// their deadlines.
 ///
-/// ## Why the term count went *down*
+/// US-1660's note on the cadence, restated now that the Nostr arm has a
+/// window too: with two windows live, each pass re-drives **both**, so a
+/// flash persist or a slow re-drive on one interface delays the *other
+/// interface's* keepalive by however long that pass ran — the one-clock
+/// bound §A.8.3 #7 accepted. The cadence is bounded by the pass period,
+/// not guaranteed to 250 ms sharp, and both arms' keepalives are advisory
+/// frames clients tolerate jitter on.
+///
+/// ## Why the term count went *down* (and then back up)
 ///
 /// The published 2100 ms counted **four** replies: the live window's
 /// keepalive, the assembler's timeout error, **the dispatched command's
@@ -170,8 +188,10 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 /// **enumerate the pass frame by frame, add only what is still there, and
 /// publish a bound no wider than what the deadlines actually cover.** A term
 /// that is not a deadline is not a term; a case the sum does not describe is
-/// not a case the sum may claim.
-pub const SERVE_BOUND_MS: u64 = 3 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
+/// not a case the sum may claim. US-1663 applies the same rule in the other
+/// direction: the Nostr arm's window added two real terms (its keepalive,
+/// its own stale-transaction check), and the sum grew by exactly those two.
+pub const SERVE_BOUND_MS: u64 = 5 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
 
 /// Something the serve loop wants the transport to say in its log. The loop
 /// itself has no logger: `defmt` is a device concern, and US-1504 moved the
@@ -537,9 +557,10 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
         // The U2F arm keeps its recorded refusal: CTAP1 has no cancel code,
         // and `6985` / `0700` is the one shape that is both true and
         // parseable.
-        let mut refusal = [0u8; 2];
-        let mut n = slot.refusal().len().min(refusal.len());
-        refusal[..n].copy_from_slice(&slot.refusal()[..n]);
+        let stored = slot.refusal();
+        let mut refusal = [0u8; 16];
+        let mut n = stored.len().min(refusal.len());
+        refusal[..n].copy_from_slice(&stored[..n]);
         let kind = slot.parked().map(|p| p.ticket.kind).unwrap_or(PendingKind::Ctap2);
         if kind == PendingKind::Ctap2 {
             refusal[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
@@ -550,7 +571,7 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
             reply(
                 io,
                 &ticket.channel,
-                frame_cmd(ticket.kind),
+                frame_cmd(&ticket),
                 &refusal[..n],
             )
             .await;
@@ -588,6 +609,13 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
             let len = app.process_u2f(parked.payload, ctap_out);
             (presence::u2f_up_refusal(&ctap_out[..len]), len)
         }
+        // A vendor ticket is only ever parked by the vendor arm into the
+        // Nostr interface's own slot (its own PendingUp instance); this loop
+        // re-drives the FIDO slot, so it can only be reached through a FIDO
+        // or U2F park. A Vendor here is a wiring bug, not a recoverable
+        // state — fail loud (the boot-fatal discipline) rather than answering
+        // a host with a fabricated sentence.
+        PendingKind::Vendor => unreachable!("Vendor ticket in the FIDO re-drive slot"),
     };
 
     if still_owed {
@@ -615,18 +643,109 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
     // window is over and this is the final reply.
     close_window(slot);
     if app.persist() {
-        reply(io, &channel, frame_cmd(kind), &ctap_out[..len]).await;
+        // The FIDO re-drive's final answer: this arm only ever parks
+        // `Ctap2`/`U2f` (the vendor arm has its own re-drive below), so the
+        // frame command is the plain kind mapping.
+        let frame = match kind {
+            PendingKind::Ctap2 => CTAP_HID_CBOR,
+            PendingKind::U2f => CTAP_HID_MSG,
+            PendingKind::Vendor => unreachable!("the FIDO re-drive never parks a vendor command"),
+        };
+        reply(io, &channel, frame, &ctap_out[..len]).await;
     } else {
         io.note(HidNote::PersistFailed);
         reply(io, &channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
     }
 }
 
-/// The CTAP-HID frame command a window's answer goes out on.
-const fn frame_cmd(kind: PendingKind) -> u8 {
-    match kind {
+/// US-1663: the Nostr arm's window re-drive — the vendor twin of
+/// [`redrive_window`], on the same clock and the same pass order (re-assert
+/// the prompt, re-run the command, emit at most one rate-limited keepalive).
+///
+/// The differences are the wire shapes, nothing else: the parked payload is
+/// the CBOR request envelope, the re-drive calls `process_vendor` with the
+/// command's own byte, and "still owed" is decoded from the envelope's `sw`
+/// field (`0x6985` — the same word that opened the window) rather than a
+/// one-byte CTAP2 status. The final answer — grant consumed, or any other
+/// status the applet produced — goes out on the parked command's own byte
+/// with the full envelope, and the window closes.
+///
+/// On expiry the stored refusal goes out unrewritten: the vendor vocabulary
+/// has no `KEEPALIVE_CANCEL` (US-1506's word is CTAP2's), and `0x6985` is
+/// the terminal sentence the window was already speaking. A press landing
+/// on the closing tick cannot retroactively authorise what the window
+/// refused — the command is deliberately NOT re-driven one last time (the
+/// US-921 rule in the time dimension).
+async fn redrive_vendor_window<S: HidIo, N: NostrDispatch>(
+    now_ms: fn() -> u64,
+    out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    io: &mut S,
+    app: &mut N,
+    slot: &mut PendingUp<2048>,
+) {
+    if !slot.is_occupied() {
+        return;
+    }
+    let now = now_ms();
+
+    if slot.is_expired(now) {
+        // Copied out before `close_window` takes the slot — the recorded
+        // refusal dies with it, and it IS the answer.
+        let stored = slot.refusal();
+        let mut refusal = [0u8; 16];
+        let n = stored.len().min(refusal.len());
+        refusal[..n].copy_from_slice(&stored[..n]);
+        let ticket = close_window(slot);
+        reply(io, &ticket.channel, frame_cmd(&ticket), &refusal[..n]).await;
+        return;
+    }
+
+    let Some(parked) = slot.parked() else { return };
+    let channel = parked.ticket.channel;
+    let cmd = parked.ticket.ctap_cmd;
+
+    // Re-assert the prompt: the heartbeat flickers it off between passes
+    // (the shared-pin contract, and the same reason the FIDO re-drive
+    // re-asserts it after every keepalive).
+    presence::touch_prompt(true);
+
+    // US-1663: the applet is transport-blind — it asks its gate with the
+    // CCID-form tag on every transport — so the arm marks the synchronous
+    // stretch of this call and `presence::nostr_grant` routes the ask to the
+    // window this loop parked. Cleared before anything else can run: the
+    // executor is cooperative and nothing awaits between the two.
+    presence::enter_nostr_hid_grant_context();
+    let n = app.process_vendor(cmd, parked.payload, out);
+    presence::exit_nostr_hid_grant_context();
+    let owed =
+        n >= 2 && u16::from_be_bytes([out[n - 2], out[n - 1]]) == crate::nostr_wire::SW_TOUCH_REQUIRED;
+    if owed {
+        slot.note_refusal(&out[..n]);
+        // Rate-limited to [`CTAP_KEEPALIVE_PERIOD_MS`], `0x02` UP NEEDED —
+        // which is true now, and only now (the same US-1506 discipline the
+        // FIDO re-drive states in full).
+        if slot.keepalive_due(now_ms()) {
+            slot.note_keepalive(now_ms());
+            reply(io, &channel, CTAP_HID_KEEPALIVE, &[CTAPHID_KEEPALIVE_UPNEEDED]).await;
+        }
+        return;
+    }
+
+    // The grant was consumed (or the command answered a non-touch status):
+    // the window is over and this is the final reply.
+    let ticket = close_window(slot);
+    reply(io, &ticket.channel, frame_cmd(&ticket), &out[..n]).await;
+}
+
+/// The CTAP-HID frame command a window's answer goes out on. The vendor
+/// arm (US-1663) answers on its own command byte — the reply frame of a
+/// parked `SIGN` is a `SIGN` frame, the same rule US-1662 pinned for the
+/// immediate path.
+fn frame_cmd(ticket: &WindowTicket) -> u8 {
+    match ticket.kind {
         PendingKind::Ctap2 => CTAP_HID_CBOR,
         PendingKind::U2f => CTAP_HID_MSG,
+        PendingKind::Vendor => ticket.ctap_cmd,
     }
 }
 
@@ -1030,10 +1149,13 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         // is also why this arm can be ordered with the native commands.
         if slot.is_occupied() {
             // Copied out before `close_window` takes the slot: `take()`
-            // clears the recorded refusal, and the U2F arm's answer is that
-            // refusal. Reading it afterwards would answer a U2F cancel with a
-            // zero-length APDU response.
-            let mut answer = [0u8; 2];
+            // clears the recorded refusal, and the U2F and vendor arms'
+            // answers are that refusal. Reading it afterwards would answer
+            // a U2F cancel with a zero-length APDU response or a vendor
+            // cancel with an empty envelope. 16 bytes holds the widest
+            // recorded refusal on any pending kind (the vendor sw-only
+            // envelope is 5).
+            let mut answer = [0u8; 16];
             let n = slot.refusal().len().min(answer.len());
             answer[..n].copy_from_slice(&slot.refusal()[..n]);
             let ticket = close_window(slot);
@@ -1063,8 +1185,16 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
                         n
                     }
                 }
+                // US-1663: the vendor sentence the cancel ends with is the
+                // recorded refusal itself — the parked command's CBOR
+                // envelope, unrewritten. The vendor vocabulary has no
+                // KEEPALIVE_CANCEL byte to substitute: `6985` inside the
+                // envelope IS the terminal answer, so re-drive and cancel
+                // end on the same word. (The envelope is never empty here —
+                // the park recorded it before the window opened.)
+                PendingKind::Vendor => n,
             };
-            reply(io, &ticket.channel, frame_cmd(ticket.kind), &answer[..len]).await;
+            reply(io, &ticket.channel, frame_cmd(&ticket), &answer[..len]).await;
         }
     } else if cmd == 0x41 && !payload.is_empty() && payload[0] == 0x05 {
         // Vendor vault function (pico-fido2 vendor protocol).
@@ -1378,6 +1508,10 @@ pub async fn serve_once_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
     let now_n = *now_n;
 
     redrive_window(now_f, ctap_out, io_f, app, slot_f).await;
+    // US-1663: the Nostr arm's window is re-driven on the same pass — the
+    // two windows share one clock, which is the §A.8.3 #7 arithmetic this
+    // file publishes in [`SERVE_BOUND_MS`].
+    redrive_vendor_window(now_n, nostr_out, io_n, nostr_app, slot_n).await;
 
     if let Some((channel, code)) = asm_f.check_timeout() {
         reply(io_f, &channel, CTAP_HID_ERROR, &[code]).await;
@@ -1520,6 +1654,20 @@ async fn read_either<S: HidIo>(
 /// US-1662/US-1663; until then a browser client can handshake and ping and
 /// nothing more, and the refusal is loud rather than silent.
 #[allow(clippy::too_many_arguments)]
+/// US-1663: the Nostr interface's presence-tag domain — `0x6000_0000 | CID`
+/// (§A.8.3 #1, the cross-interface tag-collision fix). The FIDO interface
+/// derives `0x8000_0000 | CID` and the Nostr-CCID path `0x4000_0000 | idx`;
+/// the three are disjoint by construction, and the vendor arm's CID
+/// allocator is range-clamped (`NOSTR_CID_LIMIT`) so the OR-fold stays
+/// injective (§A.8.3a #2).
+pub fn nostr_tag_from_channel(channel: [u8; 4]) -> u32 {
+    0x6000_0000 | u32::from_be_bytes(channel)
+}
+
+// The width mirrors [`dispatch`] argument for argument — the two arms of one
+// serve pass are symmetric on purpose (US-1663): every argument here has its
+// FIDO-side twin, and reshaping one arm alone would hide that symmetry.
+#[allow(clippy::too_many_arguments)]
 async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
     cid_alloc: &mut CidAllocator,
     out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
@@ -1531,8 +1679,6 @@ async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
     cmd: u8,
     payload: &[u8],
 ) {
-    let _ = now_ms;
-    let _ = slot;
     if cmd == CTAP_HID_INIT {
         let nonce = if payload.len() >= 8 {
             &payload[..8]
@@ -1553,9 +1699,14 @@ async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
         // the arm is here now so a client can always CANCEL and the close
         // path exists before a window can exist to close).
         if slot.is_occupied() {
-            let mut answer = [0u8; 2];
-            let n = slot.refusal().len().min(answer.len());
-            answer[..n].copy_from_slice(&slot.refusal()[..n]);
+            // Copied out before `close_window` takes the slot (the recorded
+            // refusal dies with it), and widened for the vendor arm: the
+            // answer there is the **whole stored envelope** — the CBOR
+            // `map {1: sw}` shape, up to 5 bytes — not a status word.
+            let stored = slot.refusal();
+            let mut answer = [0u8; 16];
+            let n = stored.len().min(answer.len());
+            answer[..n].copy_from_slice(&stored[..n]);
             let ticket = close_window(slot);
             let len = match ticket.kind {
                 PendingKind::Ctap2 => {
@@ -1570,18 +1721,105 @@ async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
                         n
                     }
                 }
+                // US-1663: the vendor vocabulary has no cancel word — the
+                // envelope's `0x6985` IS the terminal sentence ("the touch
+                // you were asked for did not happen"), so the stored
+                // refusal goes out unrewritten, on the parked command's
+                // own byte.
+                PendingKind::Vendor => n,
             };
-            reply(io, &ticket.channel, frame_cmd(ticket.kind), &answer[..len]).await;
+            reply(io, &ticket.channel, frame_cmd(&ticket), &answer[..len]).await;
         }
         // No window: silence, as [`dispatch`]'s CANCEL arm does (CTAPHID
         // spec; a CANCEL is never acknowledged).
     } else if crate::nostr_wire::is_vendor_command(cmd) {
+        // US-1663: the consent semantics on this arm are the FIDO arm's,
+        // inherited rather than rebuilt — park on the touch refusal, stream
+        // keepalives, answer a second request **refused, never queued**
+        // (US-1510). The refusal-before-app rule carries over too: with the
+        // slot occupied, every vendor command is refused without running
+        // the applet, because running it could only produce another touch
+        // request (the strict gate would refuse it) or, worse, let a
+        // second command reach for the same button the first is waiting on.
+        // The client-side contract is one transaction per interface
+        // (§A.8.3 #9), so this is the conservative side and it is bounded
+        // by the 15 s window.
+        if slot.is_occupied() {
+            let n = crate::nostr_wire::encode_response(
+                crate::nostr_wire::SW_TOUCH_REQUIRED,
+                &[],
+                out,
+            );
+            reply(io, channel, cmd, &out[..n]).await;
+            return;
+        }
+        let tag = nostr_tag_from_channel(*channel);
         // US-1662: the vendor range carries the Nostr command set. The
         // dispatch impl is synchronous — its scratch (the request APDU and
         // the applet's `MAX_RESPONSE` answer) never crosses this `.await` —
         // and the reply goes out on the method's own channel with the same
         // command byte, the CBOR response in the payload.
+        // US-1663: same context discipline as the re-drive above — the first
+        // app call happens before any window exists, so the gate refuses
+        // (that refusal is what CREATES the window), and every later call
+        // runs inside the parked window's transaction bound.
+        presence::enter_nostr_hid_grant_context();
         let n = nostr_app.process_vendor(cmd, payload, out);
+        presence::exit_nostr_hid_grant_context();
+        // A touch refusal parks: the same US-921/US-1509 move the FIDO arm
+        // makes. The window is the strict path's transaction bound — 15 s
+        // (`NOSTR_TOUCH_WINDOW_MS`, §A.8.3a #4), not a join-or-open window;
+        // the press is consumed on the re-drive, one command per window.
+        let owed = n >= 2
+            && u16::from_be_bytes([out[n - 2], out[n - 1]]) == crate::nostr_wire::SW_TOUCH_REQUIRED;
+        if owed {
+            let ticket = WindowTicket {
+                kind: PendingKind::Vendor,
+                channel: *channel,
+                tag,
+                ctap_cmd: cmd,
+                deadline_ms: TouchWindow::open_for(tag, now_ms(), NOSTR_TOUCH_WINDOW_MS)
+                    .deadline_ms,
+            };
+            match slot.park(ticket, payload) {
+                Ok(()) => {
+                    // The envelope is the recorded refusal: the CANCEL answer
+                    // and the expiry answer both come from it, and either can
+                    // arrive before the first re-drive (the FIDO arm records
+                    // its first refusal at the park for the same reason).
+                    slot.note_refusal(&out[..n]);
+                    if presence::begin_window(tag, NOSTR_TOUCH_WINDOW_MS) {
+                        presence::touch_prompt(true);
+                        // The window's first keepalive, `0x01` PROCESSING —
+                        // the same US-1506 discipline as the FIDO arm: sent
+                        // once, the moment the window really is open.
+                        slot.note_keepalive(now_ms());
+                        reply(
+                            io,
+                            channel,
+                            CTAP_HID_KEEPALIVE,
+                            &[CTAPHID_KEEPALIVE_PROCESSING],
+                        )
+                        .await;
+                        return;
+                    }
+                    // The platform presence slot is busy — a CCID window or
+                    // a FIDO ceremony owns it (US-1663's contention bound).
+                    // Un-park and fall through to the plain touch refusal:
+                    // no `end_window` and no prompt clear, because this
+                    // window never began and clearing the prompt would put
+                    // out a light the *other* window lit.
+                    slot.take();
+                }
+                Err(_) => {
+                    // `PayloadTooLarge`: a request the slot cannot hold
+                    // keeps its synchronous refusal and never converts
+                    // into a window (and so never into a 15 s wait). No
+                    // re-answer needed — the envelope in `out` is exactly
+                    // that refusal.
+                }
+            }
+        }
         reply(io, channel, cmd, &out[..n]).await;
     } else {
         reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
@@ -4337,8 +4575,448 @@ pub(crate) mod tests {
 
         let nostr_sent = bus_n.lock().unwrap().sent.clone();
         assert_eq!(nostr_sent.len(), 2);
-        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        // US-1663: a touch refusal no longer answers synchronously — the
+        // command is parked and the window announces itself with the `0x01`
+        // PROCESSING keepalive. The word still crossed the transport (the
+        // envelope holds it), but it reaches the host on the close path, so
+        // that is what this test now drives: CANCEL, and the recorded
+        // refusal comes back unrewritten on the parked command's own byte.
+        assert_eq!(nostr_sent[1].cmd, CTAP_HID_KEEPALIVE);
+        assert_eq!(nostr_sent[1].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1662: the CANCEL close",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        assert_eq!(nostr_sent[2].cmd, NOSTR_CMD_GENERATE_KEY, "the refusal answers on the parked command's own byte");
+        let (sw, data) = decode_response(&nostr_sent[2].payload).unwrap();
         assert_eq!(sw, 0x6985, "the touch-required word crossed the transport");
         assert!(data.is_empty());
+    }
+
+    // ── US-1663: the consent machinery, inherited ────────────────────────────
+
+    /// A controllable clock for the US-1663 tests. Keepalive rate limiting and
+    /// window expiry are functions of the serve loop's `now_ms`, and these
+    /// tests move it in ≥250 ms steps between passes — the device clock never
+    /// stops, and neither may a test's. Every US-1663 test takes the serve
+    /// guard first, so this static is contended the same way the presence
+    /// slot is: one test at a time.
+    static VNOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn vnow() -> u64 {
+        VNOW.load(Ordering::SeqCst)
+    }
+
+    fn vset(ms: u64) {
+        VNOW.store(ms, Ordering::SeqCst);
+    }
+
+    /// The expiry fixture's gate: counts how often the applet asked for a
+    /// touch, and never grants. The count is how the test sees "the expiry
+    /// path did not re-ask for a touch".
+    static EXPIRY_GRANT_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn expiry_no_grant(_tag: u32) -> bool {
+        EXPIRY_GRANT_CALLS.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    /// The parked command's own channel, without reaching into the slot type.
+    fn parked_channel<const N: usize>(slot: &PendingUp<N>) -> [u8; 4] {
+        slot.parked().expect("the window must still be parked").ticket.channel
+    }
+
+    /// US-1663, the whole consent story on the vendor arm: a touch refusal
+    /// **parks** (the FIDO arm's US-921/US-1509 move), the window announces
+    /// itself with `0x01` PROCESSING, refused re-drives stream rate-limited
+    /// `0x02` UP NEEDED, and a press inside the window is consumed by the
+    /// parked command's own re-drive — answered on the parked command's byte,
+    /// window closed. The applet's gate is `presence::nostr_grant` itself,
+    /// the same fn `main.rs` wires: the press is consumed through the
+    /// tag-bound, join-only window path, not a fixture shortcut.
+    #[test]
+    fn us1663_touch_refusal_parks_streams_and_the_grant_lands() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-park", presence::nostr_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // The touch refusal parks, and the window announces itself.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].cmd, CTAP_HID_KEEPALIVE);
+        assert_eq!(sent[0].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch);
+
+        // Two refused re-drives: `0x02` UP NEEDED, rate-limited to the
+        // keepalive period — at +300 ms one arrives, and the *next* one only
+        // at +600 ms, so the cadence is asserted, not assumed.
+        for (ms, prior_len) in [(300u64, 1usize), (600, 2)] {
+            vset(ms);
+            block_on(
+                "US-1663: a refused re-drive pass",
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+            );
+            let sent = bus_n.lock().unwrap().sent.clone();
+            assert_eq!(sent.len(), prior_len + 1);
+            assert_eq!(
+                sent.last().unwrap().cmd, CTAP_HID_KEEPALIVE,
+                "a refused re-drive streams, it does not answer"
+            );
+            assert_eq!(sent.last().unwrap().payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+        }
+
+        // A press inside the window is consumed by the parked command's own
+        // re-drive, and the answer goes out on the parked command's byte.
+        presence::emul_inject_press();
+        vset(900);
+        block_on(
+            "US-1663: the granted re-drive pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[3].cmd, NOSTR_CMD_GENERATE_KEY, "the answer is on the parked command's own byte");
+        let (sw, data) = decode_response(&sent[3].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(data.len(), 32, "GENERATE_KEY answered with the identity");
+        assert!(!slot_n.is_occupied(), "the window closed with the answer");
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "the Nostr window never touched the FIDO interface");
+    }
+
+    /// US-1663 + US-1510: a second vendor request while a window is parked is
+    /// **refused, never queued** — the same rule the FIDO slot holds, and
+    /// refused *before the app runs* (running it could only reach for the
+    /// same button). The parked command keeps the slot: the refusal does not
+    /// replace it, and the re-drive keeps streaming for the first requester.
+    #[test]
+    fn us1663_second_vendor_request_while_parked_is_refused_not_queued() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-busy", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch1 = [0x00, 0x00, 0x00, 0x02];
+        let ch2 = [0x00, 0x00, 0x00, 0x03];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Park the first requester.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch1,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // A second requester, on its own channel, in the same window: the
+        // refusal is synchronous and immediate — and this pass also carries
+        // the parked command's own rate-limited `0x02`, so the two sentences
+        // go out together, each on its own channel.
+        vset(300);
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch2,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the busy pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 3, "park's 0x01, this pass's 0x02, and the refusal");
+        assert_eq!(sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED], "the parked command still owns the stream");
+        assert_eq!(sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+        assert_eq!(sent[2].cmd, NOSTR_CMD_GENERATE_KEY, "the refusal is on the second requester's own byte");
+        let (sw, data) = decode_response(&sent[2].payload).unwrap();
+        assert_eq!(sw, 0x6985, "the busy refusal is the touch-required word");
+        assert!(data.is_empty());
+
+        // Not queued: the slot still holds the FIRST requester.
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch1);
+
+        // Cleanup through the shipped close path — which also pins that the
+        // parked command (not the refusal) is what the close answers.
+        bus_n.lock().unwrap().inbound.extend(frame(ch1, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        let last = sent.last().unwrap();
+        assert_eq!(last.cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, _) = decode_response(&last.payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(!slot_n.is_occupied());
+    }
+
+    /// US-1663's contention bound, direction one: the Nostr window holds the
+    /// platform's single presence slot, so a FIDO `makeCredential` arriving
+    /// mid-window cannot open its own. The command falls through to its plain
+    /// `UpRequired` answer — the same state the pre-fix code reached and kept —
+    /// and the Nostr window is untouched: it keeps the slot and the parked
+    /// command keeps its ticket.
+    #[test]
+    fn us1663_nostr_window_open_refuses_a_fido_ceremony() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-nostr-first", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        let ca = [0x00, 0x00, 0x00, 0x09];
+        use crate::nostr_wire::{encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Park the Nostr command: its window owns the presence slot.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the nostr park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_n.is_occupied());
+
+        // A FIDO makeCredential while that window is open: the app answers
+        // UpRequired, the park is attempted, and `begin_window` fails — so
+        // the FIDO arm un-parks and falls through to the plain `[0x3B]`
+        // answer. No FIDO keepalive: no FIDO window exists to announce.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CBOR, &[0x01, 0x01]));
+        block_on(
+            "US-1663: the contending makeCredential pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 1, "exactly the fall-through answer, no keepalive");
+        assert_eq!(fido_sent[0].cmd, CTAP_HID_CBOR);
+        assert_eq!(fido_sent[0].payload, vec![0x3B]);
+        assert!(!slot_f.is_occupied(), "the FIDO window never opened");
+
+        // The Nostr window is untouched by the attempt.
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch);
+
+        // Cleanup: the parked Nostr window closes through the shipped path.
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(!slot_n.is_occupied());
+    }
+
+    /// US-1663's contention bound, direction two: a FIDO window holds the
+    /// slot, so a vendor command cannot park. It still runs — the applet's
+    /// gate refuses under the FIDO window's tag, join-only — and the touch
+    /// refusal that comes back cannot convert into a window: the arm un-parks
+    /// and answers the envelope synchronously. The FIDO window is untouched.
+    #[test]
+    fn us1663_fido_window_open_refuses_a_vendor_command() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-fido-first", presence::nostr_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        let ca = [0x00, 0x00, 0x00, 0x09];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Open the FIDO window: makeCredential parks and announces.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CBOR, &[0x01, 0x01]));
+        block_on(
+            "US-1663: the fido park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_f.is_occupied());
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent[0].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+
+        // A vendor command while that window is open: the applet's gate is
+        // tag-bound (`nostr_grant`), refuses under the FIDO tag, and the
+        // touch refusal that results cannot park — `begin_window` fails, the
+        // slot is un-parked, and the envelope answers synchronously.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the contending vendor pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 1, "the refusal, synchronously — no keepalive of its own");
+        assert_eq!(nostr_sent[0].cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, data) = decode_response(&nostr_sent[0].payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(data.is_empty());
+        assert!(!slot_n.is_occupied(), "the vendor window never opened");
+
+        // The FIDO window is untouched and still streaming.
+        assert!(slot_f.is_occupied());
+        vset(300);
+        block_on(
+            "US-1663: the fido redrive pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 2);
+        assert_eq!(fido_sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+
+        // Cleanup: the FIDO window closes through the shipped path.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(!slot_f.is_occupied());
+    }
+
+    /// US-1663's expiry sentence: a window that runs out answers with the
+    /// **recorded refusal** — exactly the bytes the command last produced —
+    /// and does **not** re-ask the app for a touch. Re-driving at expiry
+    /// would be a fourth grant request for a command the client may have
+    /// already given up on; the envelope is the terminal sentence, and
+    /// nothing grants after it.
+    #[test]
+    fn us1663_expiry_answers_the_recorded_refusal_without_a_late_grant() {
+        let _g = serve_test_guard();
+        vset(0);
+        EXPIRY_GRANT_CALLS.store(0, Ordering::SeqCst);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-expiry", expiry_no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_n.is_occupied());
+        assert_eq!(
+            EXPIRY_GRANT_CALLS.load(Ordering::SeqCst), 1,
+            "the park asked once"
+        );
+
+        // Past the 15 s deadline: the recorded refusal is the answer, on the
+        // parked command's own byte, and the app is NOT asked again.
+        vset(15_001);
+        block_on(
+            "US-1663: the expiry pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 2, "the park's 0x01 and the expiry answer, nothing between");
+        assert_eq!(sent[1].cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, data) = decode_response(&sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(data.is_empty());
+        assert!(!slot_n.is_occupied(), "the window closed with the expiry");
+        assert_eq!(
+            EXPIRY_GRANT_CALLS.load(Ordering::SeqCst), 1,
+            "the expiry path must not re-ask for a touch"
+        );
+
+        // And after the close, the dead window sends nothing: the slot is
+        // empty, so a later pass is idle on this interface.
+        vset(16_000);
+        block_on(
+            "US-1663: the idle pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert_eq!(bus_n.lock().unwrap().sent.len(), 2);
     }
 }

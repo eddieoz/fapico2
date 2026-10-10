@@ -1180,13 +1180,20 @@ async fn main(spawner: Spawner) -> ! {
     // would join another SIGN's open window and inherit its press: a
     // signature over attacker-chosen bytes authorised by a touch for
     // different bytes.
+    // US-1663: the grant is the domain-discriminating `nostr_grant`, not the
+    // bare strict path — the CCID arm still gets strict one-shot semantics
+    // (bit-30 tags fall through to `request_grant`), while the HID vendor
+    // arm's tags (`0x6000_0000 | cid`) resolve to tag-bound consumption
+    // inside the window that arm itself opened when it parked the request.
+    // `nostr_grant` never *opens* a window; it only consumes inside the one
+    // the transport owns, under that command's own tag.
     // US-1658: the applet now lives behind `nostr_shared::NOSTR_APP`'s shared Mutex
     // (both transports reach it), so the boot path installs the providers
     // through the lock instead of consuming a builder by value.
     fapico2_firmware::nostr_shared::install_nostr_providers(
         nostr_region,
         nostr_random,
-        fapico2_firmware::presence::request_grant,
+        fapico2_firmware::presence::nostr_grant,
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the

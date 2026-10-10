@@ -71,6 +71,12 @@ pub const SW_WRONG_DATA: Sw = 0x6A80;
 /// device is broken" word. Also the degradation for an applet answer that
 /// arrived without a status word (unreachable for this applet).
 pub const SW_STORE_FAULT: Sw = 0x6F00;
+/// The touch-required word (`apps/nostr::SW_TOUCH_REQUIRED`) — the one the
+/// HID arm parks on (US-1663) and the one the re-drive reads to know the
+/// touch is still owed. The same word is the second-request refusal while
+/// a window is parked: the consent slot (the condition of use) is not
+/// free, and the D13 vocabulary has no busier sentence than this.
+pub const SW_TOUCH_REQUIRED: Sw = 0x6985;
 
 /// Is `cmd` in the spec-reserved vendor range (§A.8.2)?
 pub fn is_vendor_command(cmd: u8) -> bool {

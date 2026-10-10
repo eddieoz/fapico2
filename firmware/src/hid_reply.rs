@@ -454,7 +454,7 @@ mod tests {
     /// `CCID_REPLY_WRITE_TIMEOUT_MS` (`firmware/src/tasks.rs:200`), the CTAP
     /// twin this path was modelled on — and, more sharply, because
     /// [`crate::hid_serve::SERVE_BOUND_MS`] is *derived* from it as
-    /// `3 x HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS` and
+    /// `5 x HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS` and
     /// published as a number a host is told to wait. Silently shrinking the
     /// deadline to 50 ms would republish a 400 ms bound with no test anywhere
     /// objecting. So the value is asserted directly, and so is the derivation,
@@ -466,17 +466,19 @@ mod tests {
             "the CTAPHID reply-write deadline is matched to CCID_REPLY_WRITE_TIMEOUT_MS \
              (firmware/src/tasks.rs), and SERVE_BOUND_MS is derived from it"
         );
-        // The published bound, restated from its own term list (three replies
-        // + one keepalive period). If either input moves, the number hosts are
+        // The published bound, restated from its own term list (US-1663:
+        // five replies — FIDO re-drive keepalive, Nostr re-drive keepalive,
+        // two check-timeout errors, one dispatched answer — plus one
+        // keepalive period). If either input moves, the number hosts are
         // told to wait moves with it — which is why the sum is asserted and
         // not just the result.
         assert_eq!(
             crate::hid_serve::SERVE_BOUND_MS,
-            3 * HID_REPLY_WRITE_TIMEOUT_MS + crate::presence::CTAP_KEEPALIVE_PERIOD_MS
+            5 * HID_REPLY_WRITE_TIMEOUT_MS + crate::presence::CTAP_KEEPALIVE_PERIOD_MS
         );
         assert_eq!(
-            crate::hid_serve::SERVE_BOUND_MS, 1_750,
-            "500 + 500 + 500 + 250: the published serve bound"
+            crate::hid_serve::SERVE_BOUND_MS, 2_750,
+            "5 x 500 + 250: the published serve bound"
         );
     }
 

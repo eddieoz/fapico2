@@ -795,6 +795,76 @@ pub fn request_grant(tag: u32) -> bool {
     unsafe { runtime().request_grant(tag) }
 }
 
+/// US-1663: which transport is driving the Nostr applet right now. The
+/// applet is **transport-blind** — it asks its gate with the CCID-form tag
+/// (`apps/nostr::presence_tag(idx)`, the §2.3.1 bit-30 domain) whatever the
+/// transport — so the transport context cannot ride in the tag. It rides
+/// here instead: the HID arm sets it around its synchronous app call and
+/// [`nostr_grant`] reads it inside that same call. The cooperative
+/// single-task executor makes a static exact rather than racy — nothing
+/// can interleave between the arm's set and the applet's gate call — and
+/// the shared-applet mutex ([`crate::nostr_shared::NOSTR_APP`]) serialises
+/// the two transports the same way.
+static NOSTR_HID_GRANT_CONTEXT: AtomicBool = AtomicBool::new(false);
+
+/// Mark the synchronous stretch in which the shared applet is running on
+/// the HID vendor arm (US-1663). Set by the arm immediately before
+/// `process_vendor` and cleared immediately after — the applet's gate call
+/// happens strictly inside.
+pub fn enter_nostr_hid_grant_context() {
+    NOSTR_HID_GRANT_CONTEXT.store(true, Ordering::SeqCst);
+}
+
+/// Clear the HID-arm context (the paired unset of
+/// [`enter_nostr_hid_grant_context`]).
+pub fn exit_nostr_hid_grant_context() {
+    NOSTR_HID_GRANT_CONTEXT.store(false, Ordering::SeqCst);
+}
+
+/// The tag of the window currently holding the pending slot, if any.
+/// Read by [`nostr_grant`]'s HID arm; a `None` means no window is open.
+pub fn pending_window_tag() -> Option<u32> {
+    // SAFETY: device bin — `init` ran at boot before any task; no .await
+    // inside this op, so the cooperative executor serializes access.
+    unsafe { runtime().svc.pending_tag() }
+}
+
+/// US-1663: the Nostr applet's grant — the one provider both transports
+/// share, discriminated by the transport context rather than by the tag,
+/// because the applet's tag is transport-blind.
+///
+/// * **CCID arm** (context clear): the strict one-shot path —
+///   `begin_request` / poll / `request` / `end_request` under the applet's
+///   own tag. This is D3's rule: a same-tag SIGN must never join another
+///   SIGN's window and inherit its press.
+/// * **HID vendor arm** (context set): the transaction bound is the window
+///   the arm parked — one command per window (park-not-queue, US-1510) — so
+///   the gate consumes join-only, via [`request_grant_in_window`], under
+///   **the open window's own tag** (`0x6000_0000 | cid`, §A.8.3 #1). The
+///   applet's CCID-form tag is not the bound here and is not consulted: the
+///   press is armed only while that window is open, and it is spent on the
+///   command the arm re-drove. Fail-closed in both degenerate shapes: no
+///   window open (the first, pre-park app call — the refusal that CREATES
+///   the window) or a window under a non-HID domain (a FIDO or CCID window
+///   owns the slot — the US-1663 contention bound). Either way the applet
+///   hears `6985` and the press, if any, stays with its own window.
+///
+/// What this does **not** weaken: `request_grant_in_window` never opens a
+/// window and never burns a grant on a tag mismatch; a press armed for the
+/// Nostr HID window is still unconsumable by FIDO (disjoint tag domains),
+/// and a CCID SIGN concurrent with a HID window still takes the strict path
+/// and finds the slot busy.
+pub fn nostr_grant(tag: u32) -> bool {
+    if NOSTR_HID_GRANT_CONTEXT.load(Ordering::SeqCst) {
+        match pending_window_tag() {
+            Some(t) if t & 0x6000_0000 == 0x6000_0000 => request_grant_in_window(t),
+            _ => false,
+        }
+    } else {
+        request_grant(tag)
+    }
+}
+
 /// US-914: the device touch-to-sign wait (injected into the OpenPGP app
 /// via `with_presence_grant` in `main.rs`). The shared runtime holds the
 /// pending slot under `tag` for `timeout_ms` while `sample` supplies the
