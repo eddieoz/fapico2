@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:e2cd5994-04e0-4cee-a9d7-3ef7fe06f93e",
+  "serialNumber": "urn:uuid:83e12ad1-a59b-4f47-986a-69b0a2ef891a",
   "metadata": {
-    "timestamp": "2026-09-30T13:28:20.359416058Z",
+    "timestamp": "2026-10-10T08:52:17.321082168Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -115,6 +115,19 @@
         }
       ],
       "purl": "pkg:cargo/fapico2-mgmt@0.1.0?download_url=file://../apps/mgmt"
+    },
+    {
+      "type": "library",
+      "bom-ref": "path+file://./apps/nostr#fapico2-nostr@0.1.0",
+      "name": "fapico2-nostr",
+      "version": "0.1.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/fapico2-nostr@0.1.0?download_url=file://../apps/nostr"
     },
     {
       "type": "library",
@@ -240,7 +253,7 @@
       "bom-ref": "path+file://./vendor/trussed-brainpool#0.1.0",
       "name": "trussed-brainpool",
       "version": "0.1.0",
-      "description": "Software Brainpool trussed backend (ECDSA + ECDH over the bp256 crate, allocation-free \u2014 US-944; P-384r1 deferred by US-966). ",
+      "description": "Software Brainpool trussed backend (ECDSA + ECDH over the bp256 crate, allocation-free — US-944; P-384r1 deferred by US-966). ",
       "scope": "required",
       "licenses": [
         {
@@ -254,7 +267,7 @@
       "bom-ref": "path+file://./vendor/trussed-secp256k1#0.1.0",
       "name": "trussed-secp256k1",
       "version": "0.1.0",
-      "description": "Software secp256k1 trussed backend (ECDSA + ECDH over the k256 crate, allocation-free \u2014 S-724). ",
+      "description": "Software secp256k1 trussed backend (ECDSA + ECDH over the k256 crate, allocation-free — S-724). ",
       "scope": "required",
       "licenses": [
         {
@@ -818,7 +831,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#bindgen@0.70.1",
-      "author": "Jyun-Yan You <jyyou.tw@gmail.com>, Emilio Cobos \u00c1lvarez <emilio@crisal.io>, Nick Fitzgerald <fitzgen@gmail.com>, The Servo project developers",
+      "author": "Jyun-Yan You <jyyou.tw@gmail.com>, Emilio Cobos Álvarez <emilio@crisal.io>, Nick Fitzgerald <fitzgen@gmail.com>, The Servo project developers",
       "name": "bindgen",
       "version": "0.70.1",
       "description": "Automatically generates Rust FFI bindings to C and C++ libraries.",
@@ -923,7 +936,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#bitfield-macros@0.19.5",
-      "author": "Lo\u00efc Damien <loic.damien@dzamlo.ch>",
+      "author": "Loïc Damien <loic.damien@dzamlo.ch>",
       "name": "bitfield-macros",
       "version": "0.19.5",
       "description": "Internal crate for the bitfield crate.",
@@ -954,7 +967,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#bitfield@0.13.2",
-      "author": "Lo\u00efc Damien <loic.damien@dzamlo.ch>",
+      "author": "Loïc Damien <loic.damien@dzamlo.ch>",
       "name": "bitfield",
       "version": "0.13.2",
       "description": "This crate provides macros to generate bitfield-like struct.",
@@ -985,7 +998,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#bitfield@0.19.5",
-      "author": "Lo\u00efc Damien <loic.damien@dzamlo.ch>",
+      "author": "Loïc Damien <loic.damien@dzamlo.ch>",
       "name": "bitfield",
       "version": "0.19.5",
       "description": "This crate provides macros to generate bitfield-like struct.",
@@ -4065,7 +4078,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#encode_unicode@0.3.6",
-      "author": "Torbj\u00f8rn Birch Moltu <t.b.moltu@lyse.net>",
+      "author": "Torbjørn Birch Moltu <t.b.moltu@lyse.net>",
       "name": "encode_unicode",
       "version": "0.3.6",
       "description": "UTF-8 and UTF-16 character types, iterators and related methods for char, u8 and u16. ",
@@ -4462,7 +4475,7 @@
       "author": "Alex Crichton <alex@alexcrichton.com>",
       "name": "fnv",
       "version": "1.0.7",
-      "description": "Fowler\u2013Noll\u2013Vo hash function",
+      "description": "Fowler–Noll–Vo hash function",
       "scope": "required",
       "hashes": [
         {
@@ -4585,7 +4598,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7",
-      "author": "Bart\u0142omiej Kami\u0144ski <fizyk20@gmail.com>, Aaron Trent <novacrazy@gmail.com>",
+      "author": "Bartłomiej Kamiński <fizyk20@gmail.com>, Aaron Trent <novacrazy@gmail.com>",
       "name": "generic-array",
       "version": "0.14.7",
       "description": "Generic types implementing functionality of arrays",
@@ -5779,7 +5792,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#lazy_static@1.5.0",
-      "author": "Marvin L\u00f6bel <loebel.marvin@gmail.com>",
+      "author": "Marvin Löbel <loebel.marvin@gmail.com>",
       "name": "lazy_static",
       "version": "1.5.0",
       "description": "A macro for declaring lazily evaluated statics in Rust.",
@@ -7472,7 +7485,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#precomputed-hash@0.1.1",
-      "author": "Emilio Cobos \u00c1lvarez <emilio@crisal.io>",
+      "author": "Emilio Cobos Álvarez <emilio@crisal.io>",
       "name": "precomputed-hash",
       "version": "0.1.1",
       "description": "A library intending to be a base dependency to expose a precomputed hash",
@@ -8185,7 +8198,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#rgb@0.8.53",
-      "author": "Kornel Lesi\u0144ski <kornel@geekhood.net>, James Forster <james.forsterer@gmail.com>",
+      "author": "Kornel Lesiński <kornel@geekhood.net>, James Forster <james.forsterer@gmail.com>",
       "name": "rgb",
       "version": "0.8.53",
       "description": "`struct RGB/RGBA/etc.` for sharing pixels between crates + convenience methods for color manipulation. Allows no-copy high-level interoperability. Also adds common convenience methods and implements standard Rust traits to make `RGB`/`RGBA` pixels and slices first-class Rust objects.",
@@ -8331,7 +8344,7 @@
     {
       "type": "library",
       "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#rustc_version@0.2.3",
-      "author": "Marvin L\u00f6bel <loebel.marvin@gmail.com>",
+      "author": "Marvin Löbel <loebel.marvin@gmail.com>",
       "name": "rustc_version",
       "version": "0.2.3",
       "description": "A library for querying the version of a installed rustc compiler",
@@ -8607,6 +8620,75 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#secp256kfun@0.12.1",
+      "author": "LLFourn <lloyd.fourn@gmail.com>",
+      "name": "secp256kfun",
+      "version": "0.12.1",
+      "description": "A mid-level secp256k1 library optimized for fun!",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ca6e7ba8c21335d29d0c9b8f46c3fbd1127b03b0e0b7dc5ebbe3ef28ef820ec6"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "0BSD"
+        }
+      ],
+      "purl": "pkg:cargo/secp256kfun@0.12.1",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/secp256kfun"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/LLFourn/secp256kfun"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/LLFourn/secp256kfun"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#secp256kfun_arithmetic_macros@0.2.0",
+      "name": "secp256kfun_arithmetic_macros",
+      "version": "0.2.0",
+      "description": "Helper macros for secp256kfun's aritmetic macros",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "5d48abcff68cafcdb4469dc1204542c336a748f365a224c6acacea66f98185ff"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "0BSD"
+        }
+      ],
+      "purl": "pkg:cargo/secp256kfun_arithmetic_macros@0.2.0",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/secp256kfun_arithmetic_macros"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/LLFourn/secp256kfun/tree/master/ecdsa_fun"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/LLFourn/secp256kfun"
         }
       ]
     },
@@ -9701,7 +9783,7 @@
       "author": "Danny Guo <danny@dannyguo.com>, maxbachmann <oss@maxbachmann.de>",
       "name": "strsim",
       "version": "0.11.1",
-      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein, OSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and S\u00f8rensen-Dice. ",
+      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein, OSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and Sørensen-Dice. ",
       "scope": "required",
       "hashes": [
         {
@@ -9727,6 +9809,41 @@
         {
           "type": "vcs",
           "url": "https://github.com/rapidfuzz/strsim-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#subtle-ng@2.5.0",
+      "author": "Isis Lovecruft <isis@patternsinthevoid.net>, Henry de Valence <hdevalence@hdevalence.ca>",
+      "name": "subtle-ng",
+      "version": "2.5.0",
+      "description": "Pure-Rust traits and utilities for constant-time cryptographic implementations.",
+      "scope": "required",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "734676eb262c623cec13c3155096e08d1f8f29adce39ba17948b18dad1e54142"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:cargo/subtle-ng@2.5.0",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/subtle"
+        },
+        {
+          "type": "website",
+          "url": "https://dalek.rs/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/dalek-cryptography/subtle"
         }
       ]
     },
@@ -11471,6 +11588,7 @@
       "ref": "path+file://./apps#fapico2-apps@0.1.0",
       "dependsOn": [
         "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
+        "path+file://./apps/nostr#fapico2-nostr@0.1.0",
         "path+file://./apps/oath#fapico2-oath@0.1.0",
         "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
         "path+file://./platform#fapico2-platform@0.1.0",
@@ -11499,7 +11617,8 @@
         "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.6.4",
         "registry+https://github.com/rust-lang/crates.io-index#sha1@0.10.7",
         "registry+https://github.com/rust-lang/crates.io-index#sha2@0.10.9",
-        "path+file://./vendor/x448#0.6.0"
+        "path+file://./vendor/x448#0.6.0",
+        "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.0"
       ]
     },
     {
@@ -11507,6 +11626,17 @@
       "dependsOn": [
         "path+file://./platform#fapico2-platform@0.1.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0"
+      ]
+    },
+    {
+      "ref": "path+file://./apps/nostr#fapico2-nostr@0.1.0",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#chacha20@0.9.1",
+        "path+file://./platform#fapico2-platform@0.1.0",
+        "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
+        "registry+https://github.com/rust-lang/crates.io-index#hmac@0.12.1",
+        "registry+https://github.com/rust-lang/crates.io-index#secp256kfun@0.12.1",
+        "registry+https://github.com/rust-lang/crates.io-index#sha2@0.10.9"
       ]
     },
     {
@@ -11578,6 +11708,7 @@
         "path+file://./apps#fapico2-apps@0.1.0",
         "path+file://./apps/fido#fapico2-fido@0.1.0",
         "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
+        "path+file://./apps/nostr#fapico2-nostr@0.1.0",
         "path+file://./apps/oath#fapico2-oath@0.1.0",
         "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
         "path+file://./apps/piv#fapico2-piv@0.1.0",
@@ -13552,6 +13683,22 @@
       ]
     },
     {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#secp256kfun@0.12.1",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#digest@0.10.7",
+        "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.6.4",
+        "registry+https://github.com/rust-lang/crates.io-index#secp256kfun_arithmetic_macros@0.2.0",
+        "registry+https://github.com/rust-lang/crates.io-index#subtle-ng@2.5.0"
+      ]
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#secp256kfun_arithmetic_macros@0.2.0",
+      "dependsOn": [
+        "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+        "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47"
+      ]
+    },
+    {
       "ref": "registry+https://github.com/rust-lang/crates.io-index#semver-parser@0.7.0"
     },
     {
@@ -13770,6 +13917,9 @@
     },
     {
       "ref": "registry+https://github.com/rust-lang/crates.io-index#strsim@0.11.1"
+    },
+    {
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#subtle-ng@2.5.0"
     },
     {
       "ref": "registry+https://github.com/rust-lang/crates.io-index#subtle@2.6.1"

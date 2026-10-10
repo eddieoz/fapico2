@@ -1398,8 +1398,12 @@ dependencies = [
 name = "fapico2-nostr"
 version = "0.1.0"
 dependencies = [
+ "chacha20",
  "fapico2-platform",
  "heapless 0.8.0",
+ "hmac 0.12.1",
+ "secp256kfun",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2943,6 +2947,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "secp256kfun"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca6e7ba8c21335d29d0c9b8f46c3fbd1127b03b0e0b7dc5ebbe3ef28ef820ec6"
+dependencies = [
+ "digest 0.10.7",
+ "rand_core 0.6.4",
+ "secp256kfun_arithmetic_macros",
+ "subtle-ng",
+]
+
+[[package]]
+name = "secp256kfun_arithmetic_macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d48abcff68cafcdb4469dc1204542c336a748f365a224c6acacea66f98185ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "semver"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3275,6 +3301,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "subtle-ng"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "734676eb262c623cec13c3155096e08d1f8f29adce39ba17948b18dad1e54142"
 
 [[package]]
 name = "syn"
