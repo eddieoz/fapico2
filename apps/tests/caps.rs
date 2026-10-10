@@ -14,14 +14,14 @@
 //! The invariant under test, in both directions:
 //!
 //! * every AID in `CCID_AIDS` has an entry in [`AID_CAP_BITS`] — adding a
-//!   sixth registered app without pairing it here fails;
+//!   seventh registered app without pairing it here fails;
 //! * every capability bit **set** in `caps()` belongs to a registered AID (or
 //!   to the HID transport, which is not AID-dispatched) — re-adding
 //!   [`CAP_PIV`] while PIV is unregistered fails here.
 //!
 //! An entry's bit may be **0**, and that is a statement, not a gap: it means
 //! the applet is deliberately *not* advertised through the capability word.
-//! Three applets take that slot, for three different reasons:
+//! Four applets take that slot, for four different reasons:
 //!
 //! * `AID_MANAGEMENT` — it is the applet *doing* the reporting.
 //! * `AID_VENDOR_LED` (US-160, PICOForge-COMPAT) — the client defines exactly
@@ -39,10 +39,15 @@
 //!   is unauthenticated (threat model §1), so the capability word must not be
 //!   what turns it on. It is reachable by SELECT, which is how the client
 //!   reaches it.
+//! * `AID_NOSTR` (US-1642, EPIC design §2.1) — the same six `USB_CAP_*` bits
+//!   apply and none of them names a Nostr applet, for the same reason: the
+//!   client (OpenXrypt) reaches it by SELECT over its own transport (US-1657+),
+//!   not through a management toggle, so advertising it in the capability word
+//!   would be a host-settable bit with no meaning behind it.
 //!
-//! Device-vs-emulation. The device path registers six apps
+//! Device-vs-emulation. The device path registers seven apps
 //! (`register_ccid_apps`) and must not advertise PIV. The host emulation binary
-//! registers **seven**, `PivApp` included (`firmware/src/emul_main.rs`), so it
+//! registers **eight**, `PivApp` included (`firmware/src/emul_main.rs`), so it
 //! *does* advertise it. `caps()` is shared by both, so the PIV bit is behind
 //! the `piv` Cargo feature: on by default nowhere, enabled by the firmware's
 //! `emulation` feature only. This test is built with the `apps` default
@@ -50,7 +55,8 @@
 //! `cargo test -p fapico2-apps --features piv` to assert the emulation word.
 
 use fapico2_apps::registry::{
-    AID_MANAGEMENT, AID_OATH, AID_OPENPGP, AID_OTP, AID_RESCUE, AID_VENDOR_LED, CCID_AIDS,
+    AID_MANAGEMENT, AID_NOSTR, AID_OATH, AID_OPENPGP, AID_OTP, AID_RESCUE, AID_VENDOR_LED,
+    CCID_AIDS,
 };
 use fapico2_mgmt::{caps, CAP_FIDO2, CAP_OATH, CAP_OPENPGP, CAP_OTP, CAP_PIV, CAP_U2F};
 
@@ -60,7 +66,7 @@ use fapico2_mgmt::{caps, CAP_FIDO2, CAP_OATH, CAP_OPENPGP, CAP_OTP, CAP_PIV, CAP
 ///
 /// The bits are imported from `fapico2_mgmt` rather than re-spelled as literals,
 /// so this map cannot drift from the constants `caps()` builds its word from.
-const AID_CAP_BITS: [(&[u8], u16); 6] = [
+const AID_CAP_BITS: [(&[u8], u16); 7] = [
     (AID_MANAGEMENT, 0),
     (AID_OATH, CAP_OATH),
     (AID_OTP, CAP_OTP),
@@ -71,6 +77,9 @@ const AID_CAP_BITS: [(&[u8], u16); 6] = [
     // this applet is unauthenticated, so nothing in the capability word should
     // be what enables it.
     (AID_RESCUE, 0),
+    // No `CAP_NOSTR` either (US-1642): the client decodes no such bit, and the
+    // applet is reachable by SELECT, not by a management toggle.
+    (AID_NOSTR, 0),
 ];
 
 /// FIDO2/U2F ride the HID transport, not the AID dispatcher, so they have no
@@ -133,7 +142,7 @@ fn caps_bits_match_registered_apps() {
     assert_eq!(
         caps() & CAP_PIV,
         0,
-        "PIV is not in CCID_AIDS (the device registers six apps) but CAP_PIV \
+        "PIV is not in CCID_AIDS (the device registers seven apps) but CAP_PIV \
          (0x10) is advertised — the host would offer a PIV screen the device \
          cannot serve"
     );

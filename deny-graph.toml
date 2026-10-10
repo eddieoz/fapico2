@@ -52,6 +52,11 @@ applet_edges_allow = [
   "fapico2-apps -> fapico2-openpgp",
   "fapico2-apps -> fapico2-rescue",
   "fapico2-apps -> fapico2-vendor-led",
+  # US-1642: the registry holds the Nostr applet's AID, so the aggregator
+  # edge is listed like the five above. The `fapico2-nostr` crate itself
+  # holds no applet->applet edge (§2.4.1c: its device-bound store key needs
+  # none) — this entry names a registry edge, not an applet one.
+  "fapico2-apps -> fapico2-nostr",
 ]
 
 # ---------------------------------------------------------------------------

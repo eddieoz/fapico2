@@ -49,6 +49,9 @@ fapico2-vendor-led = { path = "../apps/vendor_led", optional = true, default-fea
 # host process. See `docs/tasks/rescue-threat-model.md` for what shipping it
 # costs and why that is accepted.
 fapico2-rescue = { path = "../apps/rescue", optional = true, default-features = false }
+# US-1642 (Nostr): the seventh CCID app (AID F0 00 00 00 02), a normal
+# optional dep like the other applets.
+fapico2-nostr = { path = "../apps/nostr", optional = true, default-features = false }
 # Host-only (emulation binary); must stay outside the arm scope.
 env_logger = { version = "0.11", optional = true }
 
@@ -197,6 +200,8 @@ device = [
     "dep:fapico2-vendor-led", "fapico2-vendor-led/device",
     # US-161/162/163: the sixth CCID app (Rescue, AID A0 58 3F ... 4F 21).
     "dep:fapico2-rescue", "fapico2-rescue/device",
+    # US-1642: the seventh CCID app (Nostr, AID F0 00 00 00 02).
+    "dep:fapico2-nostr", "fapico2-nostr/device",
 ]
 emulation = [
     "dep:env_logger",
@@ -230,4 +235,7 @@ emulation = [
     # US-161/162/163: the emulation serves the Rescue applet too, so
     # `tests/harness/test_rescue_*.py` drive the real applet over CCID.
     "dep:fapico2-rescue", "fapico2-rescue/host",
+    # US-1642: the emulation serves the Nostr applet too, so Phase 1 suites
+    # drive the real applet over CCID.
+    "dep:fapico2-nostr", "fapico2-nostr/host",
 ]

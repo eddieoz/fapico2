@@ -23,6 +23,8 @@ use fapico2_vendor_led::VendorLedApp;
 use fapico2_rescue::{
     PhySnapshot, PhyUpdate, RebootMode, RescueApp, RescueConfigHandler, RescueDeviceHandler,
 };
+// US-1642: the Nostr applet (AID F0 00 00 00 02), `no_std` like the others.
+use fapico2_nostr::NostrApp;
 // S-721-2: the OpenPGP app owns the trussed platform client by value
 // (taken out of the backend static with `trusted_backend::take_client`).
 use fapico2_platform::trusted_backend::{Client, DevicePlatform, OpcardDispatch};
@@ -1923,18 +1925,24 @@ pub static mut VENDOR_LED_APP: core::mem::MaybeUninit<VendorLedApp> =
 // `Option<&'static mut dyn>` handles), so the slot costs nothing measurable.
 pub static mut RESCUE_APP: core::mem::MaybeUninit<RescueApp> =
     core::mem::MaybeUninit::uninit();
+// US-1642: the Nostr applet, static memory for the same reason as the six
+// above — `CCID_DISPATCHER` lives in static memory and borrows every app for
+// `'static`. The skeleton is stateless (zero-sized), so the slot costs
+// nothing until Phase 1 stories give the applet its store handle.
+pub static mut NOSTR_APP: core::mem::MaybeUninit<NostrApp> =
+    core::mem::MaybeUninit::uninit();
 
-// The CCID dispatcher holds the five apps by reference. Built + registered on
+// The CCID dispatcher holds the seven apps by reference. Built + registered on
 // the boot path and stored in its own write-once static slot so it never
 // lives on the task frame either; `ccid_task` only borrows a `&'static mut`
 // to it.
 //
-// US-160: `4 → 5`; US-161/162/163: `5 → 6`. This const generic,
-// `register_ccid_apps`' `Dispatcher<'a, 6>` parameter and the six `register`
-// calls move together — the dispatcher's registration capacity *is* this
-// number, so a stale `5` would make the sixth `register` fail on a full `Vec`
-// and the device would refuse to boot rather than half-wire.
-pub static mut CCID_DISPATCHER: core::mem::MaybeUninit<Dispatcher<'static, 6>> =
+// US-160: `4 → 5`; US-161/162/163: `5 → 6`; US-1642: `6 → 7`. This const
+// generic, `register_ccid_apps`' `Dispatcher<'a, 7>` parameter and the seven
+// `register` calls move together — the dispatcher's registration capacity *is*
+// this number, so a stale `6` would make the seventh `register` fail on a full
+// `Vec` and the device would refuse to boot rather than half-wire.
+pub static mut CCID_DISPATCHER: core::mem::MaybeUninit<Dispatcher<'static, 7>> =
     core::mem::MaybeUninit::uninit();
 
 /// Construct `value` into a write-once `static mut` slot and hand back the

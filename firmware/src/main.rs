@@ -53,6 +53,8 @@ use fapico2_vendor_led::VendorLedApp;
 // US-161/162/163 (PICOForge-COMPAT Phase H): the Rescue applet's two owners
 // are wired in `boot.rs`; only the applet itself is constructed here.
 use fapico2_rescue::RescueApp;
+// US-1642: the Nostr applet (AID F0 00 00 00 02).
+use fapico2_nostr::NostrApp;
 
 // Diagnostic event logging (`dbg-log` feature, off by default): in a
 // diagnostic build the macro records `(task, event, a, b)` into the RAM
@@ -1099,6 +1101,16 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
+    // US-1642: the Nostr applet (AID `F0 00 00 00 02`). A stateless skeleton
+    // in this revision — no store handle yet, so there is nothing to boot
+    // from and no injection to attach; Phase 1 stories add both
+    // (`platform/src/keyregion/nostr_store.rs` is the store that will back
+    // it). Static memory for the same reason as the six above.
+    let nostr_app = boot::init_static_slot(
+        core::ptr::addr_of_mut!(boot::NOSTR_APP),
+        NostrApp::new(),
+    );
+
     // Build + register the dispatcher on the boot path so it too stays off the
     // task frame. Registration is a hard boot error (duplicate AID / capacity):
     // an assert parks here — equivalent to the old in-task parking guard.
@@ -1112,6 +1124,7 @@ async fn main(spawner: Spawner) -> ! {
             openpgp_app,
             vendor_led_app,
             rescue_app,
+            nostr_app,
         ),
         "ccid app registration failed (duplicate AID or capacity)"
     );

@@ -1314,6 +1314,7 @@ name = "fapico2-apps"
 version = "0.1.0"
 dependencies = [
  "fapico2-mgmt",
+ "fapico2-nostr",
  "fapico2-oath",
  "fapico2-openpgp",
  "fapico2-piv",
@@ -1369,6 +1370,7 @@ dependencies = [
  "fapico2-apps",
  "fapico2-fido",
  "fapico2-mgmt",
+ "fapico2-nostr",
  "fapico2-oath",
  "fapico2-openpgp",
  "fapico2-piv",
@@ -1390,6 +1392,14 @@ dependencies = [
  "hmac 0.12.1",
  "pbkdf2",
  "sha1",
+]
+
+[[package]]
+name = "fapico2-nostr"
+version = "0.1.0"
+dependencies = [
+ "fapico2-platform",
+ "heapless 0.8.0",
 ]
 
 [[package]]

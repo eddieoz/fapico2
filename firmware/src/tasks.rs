@@ -66,10 +66,10 @@ pub async fn ccid_task(
     ccid_in: Endpoint<'static, USB, In>,
     ccid_out: Endpoint<'static, USB, Out>,
     mut store: DeviceStore,
-    dispatcher: &'static mut Dispatcher<'static, 6>,
+    dispatcher: &'static mut Dispatcher<'static, 7>,
     flash: &'static mut DevFlash,
 ) {
-    defmt::info!("ccid serve loop up: 6 apps registered (standard CCID)");
+    defmt::info!("ccid serve loop up: 7 apps registered (standard CCID)");
 
     let mut ccid_in = ccid_in;
     let mut ccid_out = ccid_out;
@@ -277,7 +277,7 @@ async fn ccid_fail_reply(
 #[allow(clippy::too_many_arguments)]
 async fn handle_ccid_message(
     ccid_in: &mut Endpoint<'static, USB, In>,
-    dispatcher: &mut Dispatcher<'_, 6>,
+    dispatcher: &mut Dispatcher<'_, 7>,
     store: &mut DeviceStore,
     flash: &mut DevFlash,
     resp: &mut HeaplessVec<u8, MAX_RESPONSE>,

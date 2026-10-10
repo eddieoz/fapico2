@@ -13,6 +13,8 @@ use fapico2_openpgp::OpenPgpApp;
 use fapico2_platform::trusted_backend::with_host_backend;
 use fapico2_piv::PivApp;
 use fapico2_vendor_led::VendorLedApp;
+// US-1642: the Nostr applet (AID F0 00 00 00 02).
+use fapico2_nostr::NostrApp;
 use fapico2_rescue::{
     FlashStats, PhySnapshot, PhyUpdate, RebootMode, RescueApp, RescueConfigHandler,
     RescueDeviceHandler,
@@ -657,6 +659,10 @@ fn main() {
         .with_device_handler(unsafe {
             &mut *core::ptr::addr_of_mut!(EMUL_RESCUE_DEVICE_HANDLER)
         });
+    // US-1642: the Nostr applet, constructed in the emulator too so the Phase
+    // 1 suites drive the real applet over CCID. Stateless in this revision,
+    // so there is no store stand-in to boot from.
+    let mut nostr_app = NostrApp::new();
     // Registered apps must outlive the dispatcher, so it is declared last.
     // S-721-2 (D-D): the OpenPGP client is the S-721-1 no_std "call thyself"
     // `SyscallRunner` client on the host backend (option A — the same
@@ -665,13 +671,13 @@ fn main() {
     // `with_host_backend`.
     with_host_backend("fapico2-openpgp", |client| {
         let mut openpgp_app = OpenPgpApp::new(client);
-        // Seven registrations (management, OATH, OTP, OpenPGP, PIV, vendor
-        // LED, Rescue) into a capacity-7 dispatcher — exactly full, so an
-        // eighth registration would fail the `push` and be reported rather than
-        // silently dropped. US-161/162/163 took this from six to seven; the
-        // device path registers six (`apps::registry::CCID_AIDS`) because it
-        // does not carry PIV.
-        let mut dispatcher: Dispatcher<7> = Dispatcher::new();
+        // Eight registrations (management, OATH, OTP, OpenPGP, PIV, vendor
+        // LED, Rescue, Nostr) into a capacity-8 dispatcher — exactly full, so a
+        // ninth registration would fail the `push` and be reported rather than
+        // silently dropped. US-161/162/163 took this from six to seven and
+        // US-1642 took it to eight; the device path registers seven
+        // (`apps::registry::CCID_AIDS`) because it does not carry PIV.
+        let mut dispatcher: Dispatcher<8> = Dispatcher::new();
         dispatcher.register(&mut management_app);
         dispatcher.register(&mut oath_app);
         dispatcher.register(&mut otp_app);
@@ -679,6 +685,7 @@ fn main() {
         dispatcher.register(&mut piv_app);
         dispatcher.register(&mut vendor_led_app);
         dispatcher.register(&mut rescue_app);
+        dispatcher.register(&mut nostr_app);
         serve_loop(
             &mut transport,
             &mut fido_app,
@@ -924,7 +931,7 @@ fn copy_answer(resp: &[u8], out: &mut HeaplessVec<u8, CTAP2_MAX_MSG>) -> usize {
 fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     transport: &mut EmulationTransport,
     fido_app: &mut FidoApp<K>,
-    dispatcher: &mut Dispatcher<7>,
+    dispatcher: &mut Dispatcher<8>,
     store: &mut HostSecureStore,
     partition_path: &std::path::Path,
 ) {

@@ -30,6 +30,12 @@ fapico2-vendor-led = { path = "vendor_led", default-features = false }
 # registered AID set differ between builds. `default-features = false` (no
 # `host`) keeps it `no_std` for this crate, which is `#![no_std]` itself.
 fapico2-rescue = { path = "rescue", default-features = false }
+# US-1642 (Nostr): the seventh CCID app (AID F0 00 00 00 02), same shape as
+# the vendor LED and Rescue applets above and for the same reason —
+# `CCID_AIDS` is a non-gated `const` that names its AID, so a feature-gated
+# entry would make the registered AID set differ between builds.
+# `default-features = false` (no `host`) keeps it `no_std` for this crate.
+fapico2-nostr = { path = "nostr", default-features = false }
 
 [features]
 default = ["host"]

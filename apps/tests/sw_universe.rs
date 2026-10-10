@@ -2007,6 +2007,72 @@ fn reachability_rescue() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Nostr applet (US-1642 skeleton)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The Nostr applet's status words (`apps/nostr/src/lib.rs`).
+///
+/// The skeleton implements no commands, so the table is three rows wide and
+/// every command-shaped APDU lands in the same one. US-1648 rebuilds this
+/// table against the applet's real vocabulary; until then the closed-world
+/// invariant is exactly what holds the skeleton honest — the moment an arm
+/// starts answering anything other than `6D00`, the table below is the thing
+/// that refuses to pass until the new word is named.
+const NOSTR: &[Claim] = &[
+    Claim::applet(
+        0x9000,
+        "platform::dispatch::SW_OK (dispatch.rs:22), on the SELECT arm only (apps/nostr/src/lib.rs)",
+    ),
+    Claim::applet(
+        0x6D00,
+        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24), returned for every command — the US-1642 skeleton implements none",
+    ),
+    Claim::dispatcher(
+        0x6A82,
+        "platform SW_FILE_NOT_FOUND (dispatch.rs:23) — never by the applet",
+    ),
+];
+
+/// The INS range design §2.2 names for the applet (`GET_INFO 0x10` through
+/// the NIP-44 pair, plus unhandled bytes), with the CLA classes the other
+/// applets discriminate. The skeleton branches on none of them, so the space
+/// is what the *client* will send, not what the source matches today.
+const NOSTR_SPACE: Space = Space {
+    clas: &[0x00, 0x10, 0x80, 0xFF],
+    ins: &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1A, 0x1B, 0x00, 0xFF],
+    p1: &[0x00, 0x01, 0x02, 0xFF],
+    p2: &[0x00, 0x01, 0x02, 0xFF],
+};
+
+/// The skeleton has no state and no framing opinions, so the named cases are
+/// about *the shape of the refusal*: every command framing answers the same
+/// bare `6D00`, and the two CLA classes are not yet discriminated.
+fn nostr_cases() -> Vec<Case> {
+    vec![
+        // GET_INFO's eventual header (INS 0x10, design §2.2), short framing.
+        case("GET_INFO-shaped header", short(0x10, 0x00, 0x00, &[]), 0x6D00),
+        // The same header as case-2 (an Le, no Lc) — the framing GET_INFO
+        // will actually arrive in.
+        case("GET_INFO-shaped, case-2", case2(0x10, 0x00, 0x00), 0x6D00),
+        // SIGN's eventual header (INS 0x15, design §2.2): touch-gated later
+        // (US-1646), refused flat now.
+        case("SIGN-shaped header", short(0x15, 0x00, 0x00, &[0u8; 32]), 0x6D00),
+        // The skeleton does not branch on CLA yet — `0x80` (Rescue's class)
+        // is refused with the same word. US-1648 decides whether that stays.
+        case("CLA 0x80", vec![0x80, 0x10, 0x00, 0x00], 0x6D00),
+        case("unknown INS", short(0x00, 0x00, 0x00, &[]), 0x6D00),
+    ]
+}
+
+#[test]
+fn reachability_nostr() {
+    let mut app = fapico2_nostr::NostrApp::new();
+    let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
+    d.sweep(&nostr_cases(), &NOSTR_SPACE);
+    d.into_report().finish("nostr", NOSTR);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The platform itself
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2177,6 +2243,7 @@ fn all_tables() -> Vec<(&'static str, &'static [Claim])> {
         ("piv", PIV),
         ("vendor_led", VENDOR_LED),
         ("rescue", RESCUE),
+        ("nostr", NOSTR),
         ("platform", PLATFORM),
     ]
 }
@@ -2217,6 +2284,13 @@ fn epic_word_list_misses_words_four_applets_use() {
     }
     for (who, table) in all_tables() {
         if matches!(who, "mgmt" | "vendor_led" | "platform") {
+            continue;
+        }
+        // The Nostr skeleton implements no commands and so refuses nothing
+        // with `6A86` — it does not branch on P1/P2 yet. US-1643 gives it
+        // real commands; when it does, add it back to the required set (and
+        // to the table) in the same edit, so the two cannot drift.
+        if matches!(who, "nostr") {
             continue;
         }
         assert!(
