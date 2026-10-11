@@ -140,3 +140,43 @@ matters. If the freeze is a reset-property bug, the policy is likewise unchanged
 because the decision is about an unreadable key row rather than about how the
 board got there. This is deliberate: the decision does not wait on the
 measurement, and does not pretend to have preceded it.
+
+---
+
+## Amendment 2026-10-11 — the refusal is deadline-bounded, not single-shot
+
+**Unchanged:** the decision. No fallback key, no lock/absence distinction, the
+signature, the park, the watchdog refusal.
+
+**New measurement** (2026-10-11, board with a pico-fido2 history — full record
+in `docs/pico-fido2-to-fapico2-migration.md`): OTP reads fail *intermittently*
+in the first seconds of a power episode, and the failing read migrated later
+into boot across attempts — the key row one session (signature id 1), the
+chipid the next (id 2, at the rung-6 window) — which is what a slowly settling
+read-voltage rail looks like from a series of fixed read sites (errata E16's
+shape). The bootrom read the same rows cleanly later in the same power
+episode; and 10 s of power-off did not reliably clear it, so the earlier
+dwell guidance is not a dependable operator fix on this board.
+
+**Refinement:** every boot-path OTP read (`read_otp_key_1`, `read_chipid`) is
+retried on a 250 ms step within a 20 s budget (`firmware/src/otp_retry.rs`)
+before its caller degrades or emits its signature. This is option 1 with a
+later giving-up point, not a new option: the device still refuses on a
+genuinely unreadable row, still emits the same signature, still never serves
+with an unverified identity — and §22's escalated-lock mode does not recover
+by retry any more than by dwell, so it still parks, ~20 s later.
+
+**Costs accepted:** up to ~20 s of silent boot before a refusal on a board
+whose row is truly unreadable (documented in `docs/boot-freeze.md`); a
+degrading site (the OATH region, the migration skips) spends its own budget
+before degrading. A healthy board pays nothing — the first attempt succeeds.
+
+**Structural alternative, recorded not chosen:** RS-Key (same A2 stepping)
+never reads its key row at boot — `read_mkek` is handed to the applets and
+called per operation ("Reading it late", `firmware/src/otp_keys.rs:36-47`) —
+and tolerates a failed chipid read (`get_chipid().unwrap_or(0)`,
+`firmware/src/main.rs:541`), so it structurally cannot hit these parks.
+Moving fapico2's boot-time store-key derivation to that shape is a larger
+architectural change than this fix needs; if the retry budget ever proves
+insufficient on real boards, that is the direction, and this ADR should be
+superseded for it.

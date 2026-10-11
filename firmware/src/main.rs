@@ -831,9 +831,9 @@ async fn main(spawner: Spawner) -> ! {
     // in its static: `boot::take_drbg` hands the generator to the trussed
     // backend below and resets the slot, so after that point there is no
     // `&mut` left to boot an app from.
-    let device_chipid = match embassy_rp::otp::get_chipid() {
-        Ok(c) => c,
-        Err(_) => boot::fatal_boot("device chipid unavailable", fapico2_firmware::fatal_sig::Reason::ChipId),
+    let device_chipid = match boot::read_chipid() {
+        Some(c) => c,
+        None => boot::fatal_boot("device chipid unavailable", fapico2_firmware::fatal_sig::Reason::ChipId),
     };
     // US-354 (S-711-2): OATH boots from the secure store, the same discipline
     // as FIDO (US-387) and OTP (US-388) — a corrupt keystore stream is fatal;

@@ -371,8 +371,8 @@ pub fn migration_authority() -> Option<&'static dyn fapico2_platform::trusted_ba
     if !migration::has_openpgp_capture(store) { return None; }
     let otp = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
-    let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
+    let uid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // US-939: the authority (~98 KiB, it owns the migration scratch) is
     // constructed field-by-field directly into its `PIN_AUTHORITY` static
     // slot — letting the value transit this function's stack frame (then
@@ -543,7 +543,7 @@ pub fn take_oath_key_region() -> Option<KeyRegionHandle> {
 #[inline(never)]
 pub fn derive_oath_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
     let otp_key_1 = read_otp_key_1()?;
-    let chipid = embassy_rp::otp::get_chipid().ok()?;
+    let chipid = read_chipid()?;
     fapico2_platform::keyregion::crypto::derive_payload_key(
         &otp_key_1,
         &chipid.to_be_bytes(),
@@ -880,8 +880,8 @@ pub unsafe fn init_drbg(
 > {
     let otp = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)", fatal_sig::Reason::OtpKeyRow));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("drbg: chipid unavailable (cannot seed)", fatal_sig::Reason::ChipId));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("drbg: chipid unavailable (cannot seed)", fatal_sig::Reason::ChipId));
 
     let otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
     let uid: &'static mut [u8; 8] =
@@ -969,7 +969,7 @@ impl fapico2_mgmt::MigrationHandler for DeviceMigrationHandler {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
-        let Ok(chipid) = embassy_rp::otp::get_chipid() else {
+        let Some(chipid) = read_chipid() else {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
@@ -1037,7 +1037,7 @@ impl DeviceMigrationHandler {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
-        let Ok(chipid) = embassy_rp::otp::get_chipid() else {
+        let Some(chipid) = read_chipid() else {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
@@ -1460,15 +1460,51 @@ pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
 /// not survive reset, so this row carries no durable write-lock until an OTP
 /// lock page is burned — US-918/D-14; read-protection is a CryptoCell
 /// cutover item, US-924).
+///
+/// Each attempt is a full 16-word read; a row that reads intermittently
+/// (errata E16's settling read-voltage rail — see
+/// `fapico2_firmware::otp_retry`) is retried within the boot budget before
+/// this returns `None` and the caller degrades or parks.
 fn read_otp_key_1() -> Option<[u8; 32]> {
-    let mut key = [0u8; 32];
-    for i in 0..16u8 {
-        match embassy_rp::otp::read_ecc_word(0xE90 + i as usize) {
-            Ok(w) => key[(i as usize) * 2..(i as usize) * 2 + 2].copy_from_slice(&w.to_le_bytes()),
-            Err(_) => return None,
-        }
+    fapico2_firmware::otp_retry::retry(
+        || {
+            let mut key = [0u8; 32];
+            for i in 0..16u8 {
+                match embassy_rp::otp::read_ecc_word(0xE90 + i as usize) {
+                    Ok(w) => key[(i as usize) * 2..(i as usize) * 2 + 2]
+                        .copy_from_slice(&w.to_le_bytes()),
+                    Err(_) => return None,
+                }
+            }
+            Some(key)
+        },
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+}
+
+/// The public device identity (`CHIPID0..3` + `RANDID0..3`, OTP rows
+/// `0x000`–`0x007`), with the same boot retry budget as [`read_otp_key_1`].
+/// Every boot-path consumer of the chipid goes through this — the failing
+/// read on the 2026-10-11 board was this one, at the rung-6 window
+/// (signature id 2), after the key-row read had already passed.
+pub fn read_chipid() -> Option<u64> {
+    fapico2_firmware::otp_retry::retry(
+        || embassy_rp::otp::get_chipid().ok(),
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+}
+
+/// Blocking sleep on the boot path, before any task exists to yield to.
+/// Reuses the module's TIMERAWL [`busy_wait_us`] (the same reason it exists:
+/// no timers are running this early), one call per millisecond.
+fn busy_sleep_ms(ms: u64) {
+    for _ in 0..ms {
+        busy_wait_us(1000);
     }
-    Some(key)
 }
 
 /// US-915: the boot store key — [`fapico2_platform::store_v3::derive_store_key`]
@@ -1490,8 +1526,8 @@ fn read_otp_key_1() -> Option<[u8; 32]> {
 pub fn derive_boot_store_key() -> [u8; 32] {
     let otp_key_1 = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("secure partition: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("secure partition: chipid unavailable", fatal_sig::Reason::ChipId));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("secure partition: chipid unavailable", fatal_sig::Reason::ChipId));
     fapico2_platform::store_v3::derive_store_key(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1510,8 +1546,8 @@ pub fn derive_boot_store_key() -> [u8; 32] {
 pub fn derive_oath_seal() -> OathSeal {
     let otp_key_1 = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("oath seal: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("oath seal: chipid unavailable", fatal_sig::Reason::ChipId));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("oath seal: chipid unavailable", fatal_sig::Reason::ChipId));
     OathSeal::derive(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1903,8 +1939,8 @@ pub fn restore_openpgp_at_boot(
     }
     let otp = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
-    let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
+    let uid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // Boot-only exclusive access; runtime has not started.
     let bufs = unsafe { &mut *core::ptr::addr_of_mut!(MIG_BUFS) };
     if app.restore_at_boot(store, &otp, &uid.to_be_bytes(), bufs).is_err() {
@@ -1925,12 +1961,9 @@ pub fn run_first_boot_migration(store: &mut DeviceStore) {
         defmt::info!("migration: OTP key row unreadable; skipping");
         return;
     };
-    let chipid = match embassy_rp::otp::get_chipid() {
-        Ok(id) => id,
-        Err(_) => {
-            defmt::info!("migration: chipid unreadable; skipping");
-            return;
-        }
+    let Some(chipid) = read_chipid() else {
+        defmt::info!("migration: chipid unreadable; skipping");
+        return;
     };
     let part = cflash::data_partition();
     let bounds = PoolBounds::from_partition(part);

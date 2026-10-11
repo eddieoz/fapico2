@@ -40,10 +40,10 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 795,192 | `0x10000200` | no (flash) |
-| `.rodata` | 20,304 | `0x100c2438` | no (flash) |
+| `.text` | 795,328 | `0x10000200` | no (flash) |
+| `.rodata` | 20,304 | `0x100c24c0` | no (flash) |
 | `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100ca960` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100caa00` | non-alloc, not in Berkeley `text` |
 | `.bss` | 374,792 | `0x200035d8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x2005ede0` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -65,7 +65,7 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 862,340 B** · **`.data` = 13,780 B** · **`.bss` = 375,816 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 862,476 B** · **`.data` = 13,780 B** · **`.bss` = 375,816 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 389,596 B** (389,600 B address-to-address: `__sheap` `0x2005f1e0` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2005f1e0` → **main stack zone = 142,880 B** of 532,480 B of SRAM.
 

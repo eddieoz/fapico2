@@ -93,24 +93,45 @@ booted normally throughout.
 
 **Mechanism — recorded at its actual confidence:** the strongest hypothesis is
 the OTP power-rail transient of RP2350 errata **E16** (the OTP read voltage
-comes from an internal regulator whose power-good "isn't sampled outside of the
-initial power-on reset startup sequence"). A post-flash reboot is not a
+comes from an internal regulator whose power-good "isn't sampled outside of
+the initial power-on reset startup sequence"). A post-flash reboot is not a
 power-on reset — the bootrom marks `FLASH_UPDATE` in the watchdog scratch — so
-every flash lands in the risk window. The sibling investigation measured, with
-no probe attached (2026-10-01,
-`fapico2-bootfreeze/docs/boot-freeze.md`), that recovery depends on the
-power-off dwell: replug fast → still frozen; wait 4–5 s → boots. On
-2026-10-11 this board recovered on every attempt, including fast replugs, so
-the transient is marginal and not reliably reproducible on demand. What is
-certain from both sessions: **the recovery is always a power cycle, never a
-nuke, never a reflash.**
+every flash lands in the risk window. What the 2026-10-11 session added:
 
-**Reading the LED on the shipping image** (polarity per the pending US-1303:
-GPIO25 is active-high): lit from reset; one brief dark pulse per boot rung;
-solid-on = parked pre-USB. Rung map (`main.rs` mark sites): 1 HAL → 2 TRNG →
-3 OTP/store-key → 4 store mount → 5 DRBG → 6 migration → 7 apps → 8 USB →
-9 serving. A park after pulse *n* names the window between rung *n* and *n+1*;
-a park after pulse 3 is the OTP/store-key window this page is about.
+- The failure is **intermittent, not dwell-driven**: 10 s of power-off did not
+  reliably clear it, so the earlier "wait 4–5 s" guidance (measured on another
+  board on 2026-10-01) is not a dependable fix on this silicon.
+- The failing read **migrates later into boot** across attempts — the key row
+  one session (signature id 1), the chipid the next (id 2, at the rung-6
+  window) — which is what a slowly settling rail looks like from a series of
+  fixed read sites.
+- **In the failing episode, the bootrom read the same rows cleanly** (BOOTSEL,
+  `picotool otp get -r 0x0 0x8`, taken right after a hang): the OTP is healthy
+  tens of seconds into a power episode; firmware's early reads simply fire
+  inside the unsettled window.
+
+**Firmware response (2026-10-11):** every boot-path OTP read — the key row and
+the chipid — is now retried on a 250 ms step within a 20 s budget
+(`firmware/src/otp_retry.rs`, ADR
+[`adr/0002-fatal-boot-recovery-policy.md`](adr/0002-fatal-boot-recovery-policy.md)
+amendment) before the caller degrades or emits its signature. A healthy board
+pays nothing; a board with a genuinely unreadable row still refuses, with the
+same signature, ~20 s later. RS-Key (same A2 stepping) avoids the problem
+structurally — it never reads its key row at boot and tolerates a failed
+chipid read — recorded in the ADR as the direction if the budget ever proves
+insufficient.
+
+**Reading the LED on the merged image** (post-`feat/boot-freeze-post-flash`):
+dark at reset; one brief lit pulse per boot rung (9 total); then either the
+1 Hz heartbeat (boot completed) or — on a refusal — the **fatal signature**:
+one 1200 ms flash, a pause, then 4 reason bits (200 ms flashes), where the gap
+after each bit encodes it — **long gap ≈ 0.6 s = 0, short gap ≈ 0.2 s = 1**,
+most-significant first (this is the encoder's order, `fatal_sig.rs:97-101`;
+an earlier revision of `boot-freeze.md` printed the example inverted — it was
+corrected after decoding a live board). id 1 = key row, id 2 = chipid — on
+this board both are the transient, and both recover on a power cycle; the
+firmware now also retries both before giving up. A silent boot pause of up to
+~20 s is the retry budget, not a hang.
 
 ## House rules that apply on these boards
 

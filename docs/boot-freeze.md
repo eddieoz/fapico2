@@ -163,18 +163,25 @@ probe; a probe causes the failure. So the device now says why on the LED
 A signature is **one long flash, a pause, then four short flashes**:
 
 ```text
-    ████████████░░░░░     preamble: one 1200 ms pulse, 600 ms gap
-    ██░░░  ██░░░  ██░░░  ████░░░░░  4 bits, most-significant first
-    short  short  short  long          = 0b0001 = 1
+    ████████████░░░░░░     preamble: one 1200 ms pulse, 600 ms gap
+    ██░░░░░░  ██░░░░░░  ██░░░░░░  ██░░░  4 bits, most-significant first
+    long    long    long    short     = 0b0001 = 1
 ```
 
-Long gap = `1`, short gap = `0`. The whole signature takes ~4.6 s and is emitted
+**Long gap = `0`, short gap = `1`** (`fatal_sig.rs`: `ZERO_GAP_US` 600 ms,
+`ONE_GAP_US` 200 ms). The whole signature takes ~4.6 s and is emitted
 **once** before the device parks.
+
+> **Correction (2026-10-11, from a live board):** this section originally
+> carried the example with the gaps inverted ("long gap = `1`"), which decoded
+> a real board's `long, long, short, long` to an undefined id 13 instead of
+> id 2. The encoder constants above are the authority; the example now matches
+> them.
 
 | id | Cause | Fix |
 |---:|---|---|
 | 1 | **OTP key row unreadable** | **Power cycle** — the only thing that clears it |
-| 2 | Chip identity row unreadable | Investigate provisioning |
+| 2 | Chip identity row unreadable | **Power cycle** — same transient as id 1, measured 2026-10-11: the rail sag catches whichever OTP read is in flight, and the chipid read (`get_chipid`, OTP rows `0x000`–`0x003`) sits later in boot than the key row |
 | 3 | TRNG refused / no entropy | Investigate silicon |
 | 4 | DRBG could not be seeded | Investigate; usually follows 1 or 2 |
 | 5 | Secure-partition image failed authentication | Investigate; may be a foreign image |
