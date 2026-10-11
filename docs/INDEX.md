@@ -29,6 +29,10 @@ deliberately **not in git**.
 - [secure-storage-comparison.md](secure-storage-comparison.md) — adversarial comparison of key-at-rest against pico-fido/pico-openpgp/pico-hsm/RS-Key.
 - [secure-storage-story-matrix.md](secure-storage-story-matrix.md) — tracked evidence index for the secure-storage epic.
 - [adr/](adr/README.md) — architecture decision records (PIV/RSA, provisioning policy, TrustZone).
+- [nostr-presence-audit.md](nostr-presence-audit.md) — the Nostr presence-gate adversarial audit
+  (2026-10-12): the CANCEL-repark orphaned-grant replay (Critical, PoC-confirmed), the folded-FIDO-tag
+  mask check, the proxy-swallowed mgmt-RESET wipe, the CCID arm that can never grant — arbitration,
+  decision log D1–D10, and the red-then-green fix plan.
 
 The three red-team security assessments live in
 [`archive/`](archive/README.md): [round 2](archive/SECURITY-ASSESSMENT-ROUND2.md)
