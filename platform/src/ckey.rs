@@ -76,7 +76,7 @@
 //!   row by construction — C records cannot be re-keyed.
 //! * There is no runtime OTP software lock: the `sw_lock` write US-918
 //!   once attempted was removed on 2026-10-11 (it correlated with page-0
-//!   read failures; ADR 0002 amendment), so the row is not
+//!   read failures; ADR 0004 amendment), so the row is not
 //!   write-locked for the boot's lifetime either (D-14). A durable lock
 //!   needs an irreversible SBPI lock-page burn, which is not in this
 //!   tree. Read-protect

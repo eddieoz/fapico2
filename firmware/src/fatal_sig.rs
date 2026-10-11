@@ -450,9 +450,9 @@ mod tests {
         assert_eq!(Reason::OtpKeyRow.id(), 1);
     }
 
-    /// US-1310 (implementing ADR 0002 option 1): the OTP refusal emits its
+    /// US-1310 (implementing ADR 0004 option 1): the OTP refusal emits its
     /// signature and the device does not serve. Asserted against the *decision*
-    /// rather than the encoder — the property ADR 0002 chose is that the
+    /// rather than the encoder — the property ADR 0004 chose is that the
     /// refusal is both **legible** and **enforced**, so the test checks both
     /// halves and would fail if someone "fixed" a freeze by making the key row
     /// optional.

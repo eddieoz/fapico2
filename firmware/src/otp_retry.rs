@@ -21,7 +21,7 @@
 //! does the caller do what it did before (degrade, or `fatal_boot` with the
 //! same signature it would have emitted immediately). This changes nothing
 //! about the fail-closed posture — ADR
-//! [`docs/adr/0002-fatal-boot-recovery-policy.md`](../docs/adr/0002-fatal-boot-recovery-policy.md):
+//! [`docs/adr/0004-fatal-boot-recovery-policy.md`](../docs/adr/0004-fatal-boot-recovery-policy.md):
 //! an escalated or genuinely dead row still parks the device, just ~20 s
 //! later, and §22's escalated-lock mode does not recover by retry any more
 //! than by dwell.

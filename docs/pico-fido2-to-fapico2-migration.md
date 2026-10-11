@@ -105,7 +105,7 @@ derivation.
 **A/B (2026-10-11):** shipping image (write in) parked reproducibly with
 signature id 2; a build with the write removed — 15 power cycles across
 timings, normal FIDO use in between — zero parks. **The write is removed**
-(ADR [`adr/0002-fatal-boot-recovery-policy.md`](adr/0002-fatal-boot-recovery-policy.md),
+(ADR [`adr/0004-fatal-boot-recovery-policy.md`](adr/0004-fatal-boot-recovery-policy.md),
 amendment 2). It was the runtime-only half of a lock whose durable half never
 shipped (D-14), so what it protected was already the recorded residual; the
 durable mitigation remains US-924. Two honest loose ends stay recorded in the

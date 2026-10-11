@@ -89,7 +89,7 @@ The device now says which failure it is on the LED, so you do not have to
 attach a probe to find out — and on this hardware **attaching a probe is itself
 enough to cause the failure**. See [`docs/boot-freeze.md`](boot-freeze.md) for
 how to read the LED and what each signature means. The policy decision is
-[ADR 0002](adr/0002-fatal-boot-recovery-policy.md): the device refuses to serve
+[ADR 0004](adr/0004-fatal-boot-recovery-policy.md): the device refuses to serve
 when it cannot read its hardware identity, and says so rather than serving with
 an unverified one.
 

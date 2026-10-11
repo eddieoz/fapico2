@@ -1,4 +1,4 @@
-# ADR 0002 — The recovery policy for a fatal boot: refuse, and say so
+# ADR 0004 — The recovery policy for a fatal boot: refuse, and say so
 
 - **Status:** Decided
 - **Date:** 2026-10-01

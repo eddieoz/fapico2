@@ -1457,7 +1457,7 @@ pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
 /// firmware does (readable from any code — no read-protect; the runtime
 /// `sw_lock` write-lock this tree once attempted was removed on 2026-10-11 —
-/// it correlated with page-0 read failures, see the ADR 0002 amendment — so
+/// it correlated with page-0 read failures, see the ADR 0004 amendment — so
 /// this row carries no durable write-lock until an OTP lock page is burned —
 /// US-918/D-14; read-protection is a CryptoCell cutover item, US-924).
 ///

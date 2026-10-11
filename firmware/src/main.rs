@@ -670,7 +670,7 @@ async fn main(spawner: Spawner) -> ! {
     // residual risk it carried (key row writable by same-session code) is the
     // status quo that D-14 already records; the durable mitigation remains
     // US-924. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the
-    // ADR 0002 amendment.
+    // ADR 0004 amendment.
     unsafe {
         (&*core::ptr::addr_of!(boot::STORE))
             .borrow_mut()

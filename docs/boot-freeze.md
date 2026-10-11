@@ -307,19 +307,19 @@ be reconciled by whoever reads them next is how the fourth account happened:
 | Account | Status |
 |---|---|
 | §20 "the device is not frozen" | **Left open.** §20.6 declined to link §20 and §22; this epic does not link them either, and no measurement was available to settle it. |
-| §22 (R2-26) "attaching a debugger bricks it" | **Left open as the trigger**, but its *recovery* finding — power cycle, not reset — is carried into this document and ADR 0002 as established. |
+| §22 (R2-26) "attaching a debugger bricks it" | **Left open as the trigger**, but its *recovery* finding — power cycle, not reset — is carried into this document and ADR 0004 as established. |
 | D-12 "came up dark", mechanism disputed | **Left open**, for the same reason. |
 
 None is confirmed or refuted, because the measurement that would do that
 (US-1301) has not been taken. What *is* settled is the instrumentation that will
 make that measurement possible without a probe.
 
-## The recovery policy (ADR 0002)
+## The recovery policy (ADR 0004)
 
 The firmware refuses to serve when it cannot read its hardware identity, and
 says so. There is no fallback key and no lock/absence distinction — both
 rejected with their trade-offs recorded in
-[`docs/adr/0002-fatal-boot-recovery-policy.md`](adr/0002-fatal-boot-recovery-policy.md).
+[`docs/adr/0004-fatal-boot-recovery-policy.md`](adr/0004-fatal-boot-recovery-policy.md).
 
 ## Operator procedure
 
