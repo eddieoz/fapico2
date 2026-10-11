@@ -20,7 +20,7 @@
 //! ([`fapico2_firmware`'s `boot-timeline` capture](crate)) needs enumeration
 //! to drain, which is the thing that failed.
 //!
-//! The board LED (GPIO25, active-low) is the only channel that survives a
+//! The board LED (GPIO25, active-high) is the only channel that survives a
 //! board that never enumerates. **It is always there**: no feature, no rebuild,
 //! no second image.
 //!

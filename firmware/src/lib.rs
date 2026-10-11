@@ -89,7 +89,7 @@ pub const TASK_ARENA_DEMAND_B: usize = 21_944;
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "fbf2ea72f7a7358d931aca9e2fb3763a954e129fddbe4c472fbe606a074a897f";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "84abdfde73d7947b95369d90c75e472fb8f946771f8a926379fc8a0b72bf2f5a";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -102,6 +102,11 @@ pub mod ccid_reasm;
 /// (`boot_led.rs`); this module owns the encoding, the ordering contract and
 /// the release/pin-handover rule, all of which are testable without hardware.
 pub mod bootphase;
+/// US-1304: the boot-phase blink ladder's level sequence (pure, host-tested;
+/// the device bin drives the pin over it).
+pub mod boot_ladder;
+/// US-1306: fatal-boot reason ids and their LED signatures (pure, host-tested).
+pub mod fatal_sig;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;

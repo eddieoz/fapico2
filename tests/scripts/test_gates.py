@@ -347,7 +347,7 @@ _B_BOOT_CHAIN = Break(
 
 _B_SIZE_REPORT = Break(
     "docs/size-report.md",
-    # Re-nominated SIX times, and the recurrence is the finding:
+    # Re-nominated SEVEN times, and the recurrence is the finding:
     #   1. 2026-09-29 (US-1080) — the anchor tracked a measured figure and had
     #      rotted through earlier re-measurements.
     #   2. 2026-09-29 (I-1/I-4/US-1008/US-1083 fix pass) — it rotted AGAIN,
@@ -355,8 +355,14 @@ _B_SIZE_REPORT = Break(
     #   3. 2026-09-29 (US-1010, the MAX_PARTS fix) — re-measured again.
     #   4. 2026-09-29 (US-1010, the RAM-gating pass) — the anchor MOVED: the
     #      headline text line it pointed at was replaced by a generated block.
-    #   5. 2026-10-02 (falsifiability audit F3) — rotted again for reason 1.
-    #   6. 2026-10-07 — rotted a fifth time (doc `.text` row 766,400 -> 794,772)
+    #   5. 2026-10-01 (BOOT-FREEZE-POST-FLASH, US-1302…US-1306) — the same
+    #      recurrence again, from the same cause: the epic added code, so the
+    #      report was re-measured (text 813,568 → 813,912 B) and the anchor
+    #      tracked the old number. The note above predicts exactly this, and
+    #      the prediction is why the cost is re-nomination rather than a
+    #      silently-passing gate.
+    #   6. 2026-10-02 (falsifiability audit F3) — rotted again for reason 1.
+    #   7. 2026-10-07 — rotted again (doc `.text` row 766,400 -> 794,772)
     #      after two re-baselines in two days, which is what finally made the
     #      recurrence intolerable rather than merely annoying.
     #
@@ -579,6 +585,22 @@ _B_ACCEPTANCE_EXIT = Break(
     "\"an unexecuted case reported SUCCESS\".",
 )
 
+_B_LED_POLARITY = Break(
+    "platform/src/trusted_backend/device.rs",
+    "    fn set_status(&mut self, status: trussed::types::ui::Status) {",
+    "    fn set_status(&mut self, status: trussed::types::ui::Status) {\n"
+    "        let _ = led; // US-1041 nominated break: an active-low LED claim returns\n"
+    "        // GPIO25 is active-low (active-low).",
+    "an LED site re-asserts the polarity the Pico 2's GPIO25 does not have, so "
+    "the 'working' indicator shows the LED OFF while the device is busy "
+    "(US-1303/US-1305). Re-nominated after US-1305: the original break pointed "
+    "at the Processing arm itself, which US-1305 then fixed, so it could only "
+    "ever have been demonstrated against a red baseline. The break now INSERTS "
+    "a wrong claim at a stable anchor, which is both the defect class a reader "
+    "is most likely to reintroduce and a break that stays demonstrable while "
+    "the tree is green — the state a gate has to be trustworthy in",
+)
+
 GATES: tuple[Gate, ...] = (
     Gate(
         "check_persist_gate.py",
@@ -603,6 +625,12 @@ GATES: tuple[Gate, ...] = (
         "check_flash_budget.py",
         breaks=(_B_FLASH_BUDGET,),
         note="cross-file constant agreement, then budget-vs-region geometry",
+    ),
+    Gate(
+        "check_led_polarity.py",
+        breaks=(_B_LED_POLARITY,),
+        note="claim-forbiddance archetype (LED polarity), one allowlisted "
+             "true claim keyed on path + subject",
     ),
     Gate(
         "check_readme.py",

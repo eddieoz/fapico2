@@ -102,10 +102,35 @@ macro_rules! dlog_throttle {
 // Kept as its own macro rather than a `dbg::phase()` fn so the call site can
 // name a bare `P_*` constant; a fn would need `mod dbg` to exist, which is
 // not true in a production build.
+//
+// US-1304: it also drives the LED ladder, and that is a fix rather than a
+// detail. Until now this macro only wrote the CTAP-HID ring, so
+// `dbg::phase_blinks` had **no call site anywhere in the tree** — the ladder
+// the whole boot-freeze epic is built around was documented and implemented
+// but never emitted. The ring is the precise instrument and it is useless
+// here: it lives in RAM, and a device that never enumerates cannot serve it.
+// So the very failure this epic investigates had no LED output to read, which
+// is why three prior accounts of it had nothing to count. `phase_blinks`
+// no-ops until `mark_led_ready()`, which is what keeps `P_MAIN_ENTERED` safe
+// to call at the top of `main` — before the `LED_OUT` slot exists.
+//
+// The cfg split below is `dlog!`'s, deliberately: in a production build
+// neither arm mentions `crate::dbg::`, so `mod dbg` need not exist and the
+// shipping image carries no reference to the ladder at all — not merely an
+// unreached one. That matters more than usual for the ladder than for the
+// ring, because the ladder is not free: it costs 80 ms × Σ(phase ids) on a
+// boot that has it enabled (US-1304's timing correction — 15.2 s to reach
+// phase 19, not 1.5 s).
+#[cfg(any(feature = "dbg-log", feature = "boot-timeline"))]
 macro_rules! bphase {
     ($id:expr) => {
-        dlog!(crate::dbg::T_MAIN, crate::dbg::E_PHASE, $id, 0)
+        dlog!(crate::dbg::T_MAIN, crate::dbg::E_PHASE, $id, 0);
+        crate::dbg::phase_blinks($id as u8)
     };
+}
+#[cfg(not(any(feature = "dbg-log", feature = "boot-timeline")))]
+macro_rules! bphase {
+    ($id:expr) => {};
 }
 
 // Boot-phase **LED** marker (the `bootphase` ladder — ON in the default
@@ -155,10 +180,18 @@ static SOAK_PANIC_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Panic handler: defmt-encoded over RTT so probe-rs / defmt-print can decode
 /// a crash without a UART sink. Increments the US-385 soak panic counter and
 /// emits it, so a soak driver reading RTT can count panics (zero = pass).
+///
+/// US-1306: a panic emits its own LED signature before parking. It gets a
+/// distinct reason from every policy refusal above because it is a different
+/// kind of event — a bug, not a decision the firmware made — and telling those
+/// apart from a board is the point of the story. `defmt` here has the same
+/// limitation as `fatal_boot`: the only sink is a probe, and attaching one is
+/// what this epic investigates as a trigger.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     let n = SOAK_PANIC_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     defmt::error!("SOAK-PANIC #{}", n);
+    boot::fatal_boot_sig("panic", fapico2_firmware::fatal_sig::Reason::Panic);
     loop {}
 }
 
@@ -191,7 +224,7 @@ fn boot_fido<T: Trng>(
         FidoApp::boot_in_place(core::ptr::addr_of_mut!(boot::FIDO_APP), trng, &mut *store)
     } {
         Ok(app) => app,
-        Err(_) => boot::fatal_boot("fido: keystore boot failed"),
+        Err(_) => boot::fatal_boot("fido: keystore boot failed", fapico2_firmware::fatal_sig::Reason::KeystoreFailed),
     }
 }
 
@@ -271,7 +304,7 @@ fn boot_oath<T: Trng>(
         )
     } {
         Ok(app) => app,
-        Err(_) => boot::fatal_boot("oath: keystore boot failed"),
+        Err(_) => boot::fatal_boot("oath: keystore boot failed", fapico2_firmware::fatal_sig::Reason::KeystoreFailed),
     }
 }
 
@@ -287,7 +320,16 @@ async fn main(spawner: Spawner) -> ! {
     // Board LED (GPIO25) for the heartbeat task + the trussed backend UI
     // (S-721-2, shared pin — see `led_heartbeat_task`): the write-once
     // slot must be initialized before either driver touches it.
-    boot::init_static_slot(core::ptr::addr_of_mut!(boot::LED_OUT), Output::new(p.PIN_25, Level::High));
+    //
+    // US-1305: this is `Level::Low`, where it was `Level::High`. GPIO25 on
+    // the Pico 2 is ACTIVE-HIGH (US-1303), so `High` meant **lit** — and
+    // nothing touched the pin again until the heartbeat task spawned hundreds
+    // of lines below. A healthy boot therefore presented a *solid LED* for its
+    // first several seconds, and so did a frozen one. "Solid LED, no USB" is
+    // the documented appearance of *not yet*, and it was also the appearance
+    // of a board dead in `fatal_boot` before USB was ever constructed.
+    // Initialising to the unlit level is what makes the boot phases legible.
+    boot::init_static_slot(core::ptr::addr_of_mut!(boot::LED_OUT), Output::new(p.PIN_25, Level::Low));
 
     // The board LED is now usable by the boot-phase markers: the write-once
     // slot above is initialized, so the flag that gates them can be set.
@@ -302,6 +344,10 @@ async fn main(spawner: Spawner) -> ! {
     // answer it. One pulse per boundary from here on; see `boot_led.rs`.
     crate::boot_led::ready();
     mark!(fapico2_firmware::bootphase::RUNG_HAL);
+
+    // US-1306: `fatal_boot` may now drive the LED for its reason signature.
+    // Gated on the same write-once slot as the boot ladder above.
+    boot::mark_fatal_led_ready();
 
     // US-929 boot ladder, stage 1 (dbg-log builds only): main entered /
     // `.bss` cleared, the embassy HAL initialized, and the board LED
@@ -420,7 +466,7 @@ async fn main(spawner: Spawner) -> ! {
     // boot path before USB enumerates is the hang US-1001 exists to remove.
     let clock = match Rp2350Timer::require_advancing() {
         Ok(clock) => clock,
-        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the entropy wait has no deadline"),
+        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the entropy wait has no deadline", fapico2_firmware::fatal_sig::Reason::TrngRefused),
     };
     // US-1005 fix: the third argument is the configuration the probe
     // re-applies after an autocorrelation error. It is the same value
@@ -575,7 +621,7 @@ async fn main(spawner: Spawner) -> ! {
     // reads, not something worth caching a proof for.
     let mig_clock = match Rp2350Timer::require_advancing() {
         Ok(clock) => clock,
-        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the migration entropy wait has no deadline"),
+        Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the migration entropy wait has no deadline", fapico2_firmware::fatal_sig::Reason::TrngRefused),
     };
     boot::init_static_slot(
         core::ptr::addr_of_mut!(boot::MIG_PROBE),
@@ -787,7 +833,7 @@ async fn main(spawner: Spawner) -> ! {
     // `&mut` left to boot an app from.
     let device_chipid = match embassy_rp::otp::get_chipid() {
         Ok(c) => c,
-        Err(_) => boot::fatal_boot("device chipid unavailable"),
+        Err(_) => boot::fatal_boot("device chipid unavailable", fapico2_firmware::fatal_sig::Reason::ChipId),
     };
     // US-354 (S-711-2): OATH boots from the secure store, the same discipline
     // as FIDO (US-387) and OTP (US-388) — a corrupt keystore stream is fatal;
@@ -931,7 +977,7 @@ async fn main(spawner: Spawner) -> ! {
             )
         },
     ).is_none() {
-        boot::fatal_boot("migration: capture persistence failed; backend not mounted");
+        boot::fatal_boot("migration: capture persistence failed; backend not mounted", fapico2_firmware::fatal_sig::Reason::BackendNotMounted);
     }
     bphase!(crate::dbg::P_BACKEND);
     // E6 (S-391-10): construct each CCID app once into its static slot and take
@@ -1142,7 +1188,7 @@ async fn main(spawner: Spawner) -> ! {
     dlog!(crate::dbg::T_MAIN, crate::dbg::E_PSD, 0, persist_start.elapsed().as_micros() as u32);
     bphase!(crate::dbg::P_GATE2_POST);
     if !boot_persist {
-        boot::fatal_boot("secure partition: boot persist failed; serving suppressed");
+        boot::fatal_boot("secure partition: boot persist failed; serving suppressed", fapico2_firmware::fatal_sig::Reason::PersistFailed);
     }
 
     // The stored physical configuration becomes the boot-time USB identity.
@@ -1322,9 +1368,9 @@ async fn led_heartbeat_task() {
     let led: &'static mut Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(boot::LED_OUT)).assume_init_mut() };
     loop {
-        led.set_low(); // ON (active-low)
+        led.set_high(); // ON (active-high)
         Timer::after_millis(500).await;
-        led.set_high(); // OFF
+        led.set_low(); // OFF
         Timer::after_millis(500).await;
     }
 }

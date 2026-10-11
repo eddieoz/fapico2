@@ -1,5 +1,5 @@
 //! The **LED half** of the boot-phase ladder: drives the board LED
-//! (GPIO25, active-low) with one short pulse per boot boundary crossed, so a
+//! (GPIO25, active-high) with one short pulse per boot boundary crossed, so a
 //! board that flashed cleanly and then never re-enumerates can be diagnosed by
 //! power-cycling it and watching one LED — no debugger, no rebuild, no special
 //! image.
@@ -126,14 +126,14 @@ mod on {
             (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut()
         };
         for _ in 0..pulses {
-            led.set_low(); // ON (active-low)
+            led.set_high(); // ON (GPIO25 is active-high on the Pico 2)
             busy_wait_us(bootphase::PULSE_ON_US);
-            led.set_high(); // OFF
+            led.set_low(); // OFF
             busy_wait_us(bootphase::PULSE_OFF_US);
         }
         // Park it dark: an LED left lit after a boot-phase marker would be
         // read as an open user-presence window.
-        led.set_high();
+        led.set_low();
     }
 
     /// Hand GPIO25 to the runtime drivers. Idempotent, and after it `mark` is
@@ -151,7 +151,7 @@ mod on {
             let led: &mut Output<'static> = unsafe {
                 (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut()
             };
-            led.set_high(); // OFF — the ladder never ends holding the pin
+            led.set_low(); // dark — the ladder never ends holding the pin
         }
     }
 
