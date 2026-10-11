@@ -92,13 +92,13 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 820,356 | `0x10000200` | no (flash) |
-| `.rodata` | 20,700 | `0x100c8688` | no (flash) |
+| `.text` | 820,892 | `0x10000200` | no (flash) |
+| `.rodata` | 20,708 | `0x100c88a0` | no (flash) |
 | `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100d0d40` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100d0f60` | non-alloc, not in Berkeley `text` |
 | `.bss` | 400,988 | `0x200035d8` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x20065434` | yes |
-| `.defmt` | 41 | `0x00000000` | non-alloc, not in Berkeley `text` |
+| `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
 <!-- END measured ELF sections -->
@@ -117,7 +117,7 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 887,900 B** · **`.data` = 13,780 B** · **`.bss` = 402,012 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 888,444 B** · **`.data` = 13,780 B** · **`.bss` = 402,012 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 415,792 B** (415,796 B address-to-address: `__sheap` `0x20065834` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20065834` → **main stack zone = 116,684 B** of 532,480 B of SRAM.
 
