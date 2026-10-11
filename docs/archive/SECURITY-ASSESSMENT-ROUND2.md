@@ -1431,6 +1431,16 @@ Unchanged by the revision reading, and worth restating plainly:
 
 ## 20. The "permanent freeze" — RESOLVED: a TRNG start/wait ordering defect
 
+> **STATUS LINE (BOOT-FREEZE-POST-FLASH, 2026-10-01): LEFT OPEN.** The
+> instrumentation this epic needed now exists — a countable LED ladder and a
+> per-cause fatal signature, neither of which was reachable before — but the
+> measurement that would confirm or refute this section's "the device is not
+> frozen" claim has **not been taken**, because no RP2350 board was attached
+> (US-1301 is BLOCKED). §20.6's refusal to link §20 and §22 is the model here:
+> this line does not link them either. See
+> [`docs/boot-freeze.md`](boot-freeze.md#what-is-not-known). Nothing above is
+> withdrawn.
+
 **Status: root cause FOUND and FIXED. It was a TRNG wedge, as suspected below —
 and it is now proven rather than merely the best-supported cause.** Fixed on
 `feat/rskey-adopt` in commits `7e6ffd1` (the red test) and `4d9746b` (the fix).
@@ -1811,6 +1821,18 @@ trap.
 ---
 
 ## 22. R2-26 (HIGH) — attaching a debugger bricks the token until it is power-cycled
+
+> **STATUS LINE (BOOT-FREEZE-POST-FLASH, 2026-10-01): the TRIGGER IS LEFT OPEN;
+> the RECOVERY IS CARRIED FORWARD AS ESTABLISHED.** This section's measurement —
+> `SW_LOCK` escalation surviving a system reset and clearing only on a power
+> cycle — is treated as hardware fact throughout
+> [`docs/boot-freeze.md`](boot-freeze.md) and
+> [`ADR 0002`](adr/0002-fatal-boot-recovery-policy.md), both of which were
+> written on top of it. Whether this is the *trigger* of the reported
+> post-flash freeze remains unmeasured: US-1301 (reproduce with zero SWD
+> involvement) is BLOCKED. This section's own scope statement — "at least for
+> every case observed with a debugger attached" — is unchanged and is the
+> reason no broader claim is made.
 
 **Status: reproduced on hardware, 2026-09-28, and measured end to end.** Brief
 physical SWD access leaves the device unbootable — solid LED, no USB, no

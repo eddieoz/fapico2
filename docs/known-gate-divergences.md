@@ -3340,6 +3340,20 @@ argument, and it is recorded as one.
 
 ## D-12 — the entropy wait's wall clock: the precondition is now checked, but TIMER0-on-silicon is still an assumption (2026-09-29)
 
+> **STATUS LINE (BOOT-FREEZE-POST-FLASH, 2026-10-01): LEFT OPEN — and now
+> decidable without a probe.** This entry's disputed root cause is the same
+> "came up dark" signature investigated by
+> [`docs/tasks/EPIC-boot-freeze-post-flash.md`](tasks/EPIC-boot-freeze-post-flash.md).
+> It is **neither confirmed nor refuted**: the measurement that would settle it
+> (US-1301, reproduce the freeze with zero SWD involvement) is BLOCKED — no
+> RP2350 board was attached when that epic was executed. What did change is that
+> the question is no longer unanswerable in practice: the boot-phase ladder and
+> the per-cause fatal signature now exist, both readable off a frozen board
+> with no tools, so a future run can name the phase and the cause without
+> attaching a probe — which is itself a suspected trigger. If a run reads
+> signature id 3 (`TrngRefused`), *this entry is refuted* and the dark boot had
+> a different cause. See [`docs/boot-freeze.md`](boot-freeze.md#what-is-not-known).
+
 **Date:** 2026-09-29. **Story:** the 2026-09-29 dark-boot defect fix
 (`c9975e4` and the two commits that follow it). **Class:** recorded
 assumption about a device runtime property, unverified on silicon — plus a
@@ -3589,6 +3603,14 @@ wrong, which is the one thing the epic's "blocks" relationship is for.
 ---
 
 ## D-14 — the key row's "write-lock" is a runtime-only register and does not survive reset (US-918)
+
+> **Status update 2026-10-11:** the runtime write this entry analyses was
+> **removed** on A/B evidence — with it in place, a later boot-path chipid read
+> (OTP page 0) intermittently failed ~80 consecutive times and parked the board
+> (fatal signature id 2); with it out, 15 power cycles produced zero parks. The
+> residual risk this entry records (no durable write-lock of the key row) is
+> unchanged and still pending US-924. Decision record: the ADR 0004 amendment;
+> full record: `docs/pico-fido2-to-fapico2-migration.md`.
 
 **Story:** US-918, which claims a hardware write-lock of the C key row
 (OTP 0xE90). **Class:** a claim in shipped code and comments that the part's

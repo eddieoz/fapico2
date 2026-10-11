@@ -11,6 +11,8 @@
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Output};
 use embassy_rp::peripherals::FLASH;
+// US-1306: the fatal-reason ids whose LED signatures `fatal_boot` emits.
+use fapico2_firmware::fatal_sig;
 use fapico2_fido::FidoApp;
 use fapico2_mgmt::ManagementApp;
 use fapico2_oath::{OathApp, OathSeal, OtpApp};
@@ -194,7 +196,7 @@ pub fn boot_slot_decision(key: &[u8; 32]) -> BootSlot {
             BootSlot::Fresh
         }
         SealedBootDecision::Refuse => {
-            fatal_boot("secure partition: untrusted image content; refusing to boot (US-915)")
+            fatal_boot("secure partition: untrusted image content; refusing to boot (US-915)", fatal_sig::Reason::UntrustedImage)
         }
     }
 }
@@ -247,10 +249,96 @@ impl SlotFlash for DevSlotFlash<'_> {
 
 /// Park the boot sequence: a fatal condition the device must not continue
 /// past (the serve loops never start, so nothing is served).
+///
+/// US-1306: `reason` is emitted as a countable LED signature before the park,
+/// so a person standing at a frozen board with no tools can name the cause.
+/// That matters more than it sounds: `defmt` needs an RTT sink, which needs a
+/// probe attached, and per `AGENTS.md`:98-112 a connected SWD debugger is
+/// *sufficient on its own* to make this firmware dark-boot on a board whose OTP
+/// is perfectly healthy. The only way to find out why the board died was the
+/// act that kills the board.
+///
+/// The signature is emitted **once**, then the board parks. There is no
+/// watchdog (US-1311), so this is the last thing the device will ever show —
+/// which is why it must be short enough to read at a glance and distinct from
+/// every other pattern on the pin (asserted in `fatal_sig`'s tests).
+///
+/// `msg` is still logged: the signature names the cause, the message says
+/// which call site raised it.
 #[allow(clippy::empty_loop)]
-pub fn fatal_boot(msg: &str) -> ! {
+pub fn fatal_boot(msg: &str, reason: fatal_sig::Reason) -> ! {
     defmt::error!("{}", msg);
+    emit_fatal_signature(reason);
     loop {}
+}
+
+/// Whether the LED slot has been mounted, so `fatal_boot` may drive it.
+///
+/// Declared here rather than reached for in `dbg`: `fatal_boot` is called from
+/// paths that run before `mark_led_ready()`, and from `apdu-trace` builds where
+/// `mod dbg` is compiled but `LED_READY` was never set. Reading the slot
+/// uninitialised would write through a dangling pointer, which is a worse
+/// failure than an unsignalled one — so an early fatal boot stays silent on the
+/// LED and parks with the pin in whatever state the last driver left.
+static FATAL_LED_MOUNTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Emit `reason`'s LED signature without parking — the panic handler's entry
+/// point, which has its own `loop {}` and cannot call a `-> !` helper from
+/// inside a `#[panic_handler]`.
+///
+/// Split out from [`fatal_boot`] so the panic path carries the same signature
+/// as every policy refusal, and differs from them only in the reason id.
+pub fn fatal_boot_sig(msg: &str, reason: fatal_sig::Reason) {
+    defmt::error!("{}", msg);
+    emit_fatal_signature(reason);
+}
+
+/// Drive one fatal signature on the board LED, synchronously.
+///
+/// The same pre-task discipline as `dbg::phase_blinks`: the async executor and
+/// its timers are not running this early, so a `Timer::after` would never
+/// wake. Same write-once slot, same safety argument.
+fn emit_fatal_signature(reason: fatal_sig::Reason) {
+    use fapico2_firmware::fatal_sig::{self, LIT};
+
+    if !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: the `LED_OUT` slot is written exactly once at the top of `main`
+    // before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`; this is the
+    // pre-task boot path, single-core, so no heartbeat or trussed-UI driver
+    // shares the pin.
+    let led: &mut Output<'static> =
+        unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
+    for pulse in fatal_sig::signature(reason) {
+        // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303).
+        if pulse.on == LIT {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
+        busy_wait_us(pulse.us);
+    }
+}
+
+/// µs busy-wait on the RP2350's 1 MHz `TIMERAWL` counter — the same
+/// wrap-correct wait the boot ladder uses, for the same reason: no timers are
+/// running this early. Duplicated rather than shared because `dbg` is a
+/// diagnostic-feature module and `fatal_boot` must work in every build.
+fn busy_wait_us(us: u32) {
+    let target = rp_pac::TIMER0.timerawl().read().wrapping_add(us);
+    while ((rp_pac::TIMER0.timerawl().read().wrapping_sub(target)) as i32) < 0 {}
+}
+
+/// Flip `fatal_boot`'s LED gate on, once `LED_OUT` is mounted.
+///
+/// Called from `main` immediately after the write-once slot is filled, beside
+/// `dbg::mark_led_ready()`. Until this runs, a fatal boot has no LED to speak
+/// through and parks silently — which is correct, because the alternative is
+/// writing through an uninitialised pin.
+pub fn mark_fatal_led_ready() {
+    FATAL_LED_MOUNTED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 // The secure store lives outside the async main() future (in static memory,
@@ -283,9 +371,9 @@ pub fn migration_authority() -> Option<&'static dyn fapico2_platform::trusted_ba
     let store = init_static_slot(core::ptr::addr_of_mut!(AUTH_STORE), store_handle());
     if !migration::has_openpgp_capture(store) { return None; }
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable"));
-    let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable"));
+        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
+    let uid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // US-939: the authority (~98 KiB, it owns the migration scratch) is
     // constructed field-by-field directly into its `PIN_AUTHORITY` static
     // slot — letting the value transit this function's stack frame (then
@@ -300,7 +388,7 @@ pub fn migration_authority() -> Option<&'static dyn fapico2_platform::trusted_ba
             &otp,
             &uid.to_be_bytes(),
         )
-    }.unwrap_or_else(|_| fatal_boot("migration: authority initialization failed")))
+    }.unwrap_or_else(|_| fatal_boot("migration: authority initialization failed", fatal_sig::Reason::MigrationFailed)))
 }
 
 /// US-413 S-413-5: migration working buffers (~96 KiB, bss — never on the
@@ -456,7 +544,7 @@ pub fn take_oath_key_region() -> Option<KeyRegionHandle> {
 #[inline(never)]
 pub fn derive_oath_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
     let otp_key_1 = read_otp_key_1()?;
-    let chipid = embassy_rp::otp::get_chipid().ok()?;
+    let chipid = read_chipid()?;
     fapico2_platform::keyregion::crypto::derive_payload_key(
         &otp_key_1,
         &chipid.to_be_bytes(),
@@ -862,9 +950,9 @@ pub unsafe fn init_drbg(
     >,
 > {
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)"));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("drbg: chipid unavailable (cannot seed)"));
+        .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)", fatal_sig::Reason::OtpKeyRow));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("drbg: chipid unavailable (cannot seed)", fatal_sig::Reason::ChipId));
 
     let otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
     let uid: &'static mut [u8; 8] =
@@ -878,7 +966,7 @@ pub unsafe fn init_drbg(
     // Fail-closed: no constructor hands back an unseeded generator, and a
     // refusal is fatal at boot (see the doc comment above).
     let drbg = fapico2_platform::trng::DrbgTrng::try_new(source)
-        .unwrap_or_else(|_| fatal_boot("drbg: seed refused (see SeedError) — no generator"));
+        .unwrap_or_else(|_| fatal_boot("drbg: seed refused (see SeedError) — no generator", fatal_sig::Reason::DrbgRefused));
     init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg)
 }
 
@@ -952,7 +1040,7 @@ impl fapico2_mgmt::MigrationHandler for DeviceMigrationHandler {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
-        let Ok(chipid) = embassy_rp::otp::get_chipid() else {
+        let Some(chipid) = read_chipid() else {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
@@ -1020,7 +1108,7 @@ impl DeviceMigrationHandler {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
-        let Ok(chipid) = embassy_rp::otp::get_chipid() else {
+        let Some(chipid) = read_chipid() else {
             out.push(ClassStatus::Error.to_byte()).ok();
             return fapico2_platform::dispatch::SW_OK;
         };
@@ -1487,20 +1575,56 @@ pub static mut NOSTR_SERVE: core::mem::MaybeUninit<
 
 /// US-413 S-413-4: the C key row (`OTP_MKEK_ROW 0xE90`, 32 bytes = 16 ECC
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
-/// firmware does (readable from any code — no read-protect; the boot-path
-/// software lock in [`otp_hw_write_lock_key_row`] is RUNTIME-ONLY and does
-/// not survive reset, so this row carries no durable write-lock until an OTP
-/// lock page is burned — US-918/D-14; read-protection is a CryptoCell
-/// cutover item, US-924).
+/// firmware does (readable from any code — no read-protect; the runtime
+/// `sw_lock` write-lock this tree once attempted was removed on 2026-10-11 —
+/// it correlated with page-0 read failures, see the ADR 0004 amendment — so
+/// this row carries no durable write-lock until an OTP lock page is burned —
+/// US-918/D-14; read-protection is a CryptoCell cutover item, US-924).
+///
+/// Each attempt is a full 16-word read; a row that reads intermittently
+/// (errata E16's settling read-voltage rail — see
+/// `fapico2_firmware::otp_retry`) is retried within the boot budget before
+/// this returns `None` and the caller degrades or parks.
 fn read_otp_key_1() -> Option<[u8; 32]> {
-    let mut key = [0u8; 32];
-    for i in 0..16u8 {
-        match embassy_rp::otp::read_ecc_word(0xE90 + i as usize) {
-            Ok(w) => key[(i as usize) * 2..(i as usize) * 2 + 2].copy_from_slice(&w.to_le_bytes()),
-            Err(_) => return None,
-        }
+    fapico2_firmware::otp_retry::retry(
+        || {
+            let mut key = [0u8; 32];
+            for i in 0..16u8 {
+                match embassy_rp::otp::read_ecc_word(0xE90 + i as usize) {
+                    Ok(w) => key[(i as usize) * 2..(i as usize) * 2 + 2]
+                        .copy_from_slice(&w.to_le_bytes()),
+                    Err(_) => return None,
+                }
+            }
+            Some(key)
+        },
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+}
+
+/// The public device identity (`CHIPID0..3` + `RANDID0..3`, OTP rows
+/// `0x000`–`0x007`), with the same boot retry budget as [`read_otp_key_1`].
+/// Every boot-path consumer of the chipid goes through this — the failing
+/// read on the 2026-10-11 board was this one, at the rung-6 window
+/// (signature id 2), after the key-row read had already passed.
+pub fn read_chipid() -> Option<u64> {
+    fapico2_firmware::otp_retry::retry(
+        || embassy_rp::otp::get_chipid().ok(),
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+}
+
+/// Blocking sleep on the boot path, before any task exists to yield to.
+/// Reuses the module's TIMERAWL [`busy_wait_us`] (the same reason it exists:
+/// no timers are running this early), one call per millisecond.
+fn busy_sleep_ms(ms: u64) {
+    for _ in 0..ms {
+        busy_wait_us(1000);
     }
-    Some(key)
 }
 
 /// US-915: the boot store key — [`fapico2_platform::store_v3::derive_store_key`]
@@ -1521,9 +1645,9 @@ fn read_otp_key_1() -> Option<[u8; 32]> {
 #[inline(never)]
 pub fn derive_boot_store_key() -> [u8; 32] {
     let otp_key_1 = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("secure partition: OTP key row unavailable"));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("secure partition: chipid unavailable"));
+        .unwrap_or_else(|| fatal_boot("secure partition: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("secure partition: chipid unavailable", fatal_sig::Reason::ChipId));
     fapico2_platform::store_v3::derive_store_key(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1541,9 +1665,9 @@ pub fn derive_boot_store_key() -> [u8; 32] {
 #[inline(never)]
 pub fn derive_oath_seal() -> OathSeal {
     let otp_key_1 = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("oath seal: OTP key row unavailable"));
-    let chipid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("oath seal: chipid unavailable"));
+        .unwrap_or_else(|| fatal_boot("oath seal: OTP key row unavailable", fatal_sig::Reason::OtpKeyRow));
+    let chipid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("oath seal: chipid unavailable", fatal_sig::Reason::ChipId));
     OathSeal::derive(&otp_key_1, &chipid.to_be_bytes())
 }
 
@@ -1608,7 +1732,7 @@ pub fn ensure_boot_entropy(
         }
     }
     if fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).is_err() {
-        fatal_boot("boot entropy: TRNG refused inside the budget; nothing to guarantee the slot with");
+        fatal_boot("boot entropy: TRNG refused inside the budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
@@ -1856,71 +1980,25 @@ pub fn ensure_fw_manifest(store: &mut DeviceStore) -> fw_manifest::ForeignImageD
     }
 }
 
-/// US-918: best-effort software lock of the C key row's page (OTP 0xE90) for
-/// the remainder of THIS BOOT. It is **not** a durable write-lock — see
-/// "runtime-only" below.
+/// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
+/// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
+/// chipid read (rung 6, a page-0 read that had already passed at rung 3)
+/// intermittently failed ~80 consecutive times and parked the board with
+/// fatal signature id 2; with the write out, 15 power cycles across timings
+/// produced zero parks. The write was D-14's runtime-only half of a lock
+/// whose durable half never shipped, so what it mitigated was the D-14
+/// residual (same-session write access to the key row) that D-14 already
+/// records as unshipped; the durable mitigation remains US-924's lock-page
+/// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
+/// 0002 amendment.
 ///
-/// OTP page 233 (`0xE90 / 16`) covers exactly rows 0xE90..=0xE9F, so the
-/// lock on this page covers the key row and its page-neighbors without
-/// touching anything else. From non-secure boot only the NSEC field is
-/// writable (`SEC` is read-only to NS code), and `READ_ONLY` (write-lock) is
-/// chosen over `INACCESSIBLE` because the firmware reads the row every boot
-/// (store key + bound root) — an inaccessible row would brick the device.
-/// Writes are OR'd, so the lock is monotonic/idempotent; a page group
-/// already locked earlier in this boot is skipped.
-///
-/// # This lock is RUNTIME-ONLY (US-918, corrected 2026-09-29)
-///
-/// `SW_LOCK` is initialised from the **OTP lock pages at reset**; the
-/// register "can be written to further advance the lock state of each page
-/// (*until next reset*)" — rp-pac 7.0.0, `src/rp235x/otp.rs:17`. A power
-/// cycle therefore presents whatever the lock PAGES hold, and the write
-/// below is forgotten. It does not stop later software on a rebooted unit.
-///
-/// A real lock is an irreversible OTP lock-page burn via SBPI — the other
-/// half of the C reference's `otp_lock_page()`
-/// (`pico-keys-sdk/src/otp/otp_rp2350.c:88-95`), which burns the lock row
-/// through `rom_func_otp_access` and *then* does this same register write.
-/// Only the runtime half is implemented here. A permanently write-locked key
-/// row additionally needs a provisioning decision about who may burn a unit
-/// and when. Recorded as D-14 in `docs/known-gate-divergences.md`.
-///
-/// The call is KEPT on purpose: it is harmless, non-fatal, and it makes a
-/// unit whose lock pages are already burnt behave correctly at runtime.
-/// Whether to keep it is a separate decision; what was wrong was the
-/// claim, and that is what this comment corrects.
-///
-/// NEVER fatal: a failed lock only restores the pre-US-918 exposure (the
-/// row stays software-unlocked), while wedging boot over a lock register
-/// would cost more than the residual risk itself. Read-protection (the
-/// stronger half) is the CryptoCell cutover, story US-924.
-// US-939: `#[inline(never)]` -- async-main frame discipline.
-#[inline(never)]
-pub fn otp_hw_write_lock_key_row() {
-    use rp_pac::otp::vals::SwLockNsec;
-    // The RP2350 OTP spans 256 pages of 16 ECC rows (row 0xE90 = page
-    // 233) and the 64 SWLOCK registers each cover a group of 4 pages, so
-    // the key row's lock register is 233 / 4 = 58 (`sw_lock` asserts
-    // n < 64 — the per-page form would panic at boot). The lock also
-    // covers the row's 3 page-neighbors, which this firmware never
-    // writes — write-locking them is harmless. RUNTIME-ONLY: reset reloads
-    // the lock state from the OTP lock pages, not from this register.
-    const KEY_ROW_PAGE: usize = 0xE90 / 16; // 233
-    const OTP_PAGES: usize = 256;
-    const SWLOCK_REGS: usize = 64;
-    const SWLOCK_REG: usize = KEY_ROW_PAGE / (OTP_PAGES / SWLOCK_REGS); // 58
-    let swlock = rp_pac::OTP.sw_lock(SWLOCK_REG);
-    if swlock.read().nsec() == SwLockNsec::READ_ONLY {
-        return; // already write-locked (boot is idempotent)
-    }
-    swlock.modify(|v| v.set_nsec(SwLockNsec::READ_ONLY));
-    if swlock.read().nsec() != SwLockNsec::READ_ONLY {
-        defmt::warn!(
-            "otp: SWLOCK reg {} write-lock did not take; key row remains writable (residual risk, US-924)",
-            SWLOCK_REG
-        );
-    }
-}
+/// If a runtime lock is ever reinstated, note that the register model in the
+/// removed implementation ("256 pages of 16 rows, one register per 4 pages")
+/// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
+/// of 64 rows, one register per page) — they only coincide on the *number*
+/// 58. Whatever the correct model is, the measured fact stands: the write
+/// correlated with page-0 read failures, and the burden of proof is on any
+/// reinstatement.
 
 /// Restore captured OpenPGP state after backend mount and before registration.
 /// Missing hardware identity is acceptable only when there is no capture.
@@ -1934,13 +2012,13 @@ pub fn restore_openpgp_at_boot(
         return;
     }
     let otp = read_otp_key_1()
-        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable"));
-    let uid = embassy_rp::otp::get_chipid()
-        .unwrap_or_else(|_| fatal_boot("migration: captured identity chipid unavailable"));
+        .unwrap_or_else(|| fatal_boot("migration: captured identity OTP unavailable", fatal_sig::Reason::OtpKeyRow));
+    let uid = read_chipid()
+        .unwrap_or_else(|| fatal_boot("migration: captured identity chipid unavailable", fatal_sig::Reason::ChipId));
     // Boot-only exclusive access; runtime has not started.
     let bufs = unsafe { &mut *core::ptr::addr_of_mut!(MIG_BUFS) };
     if app.restore_at_boot(store, &otp, &uid.to_be_bytes(), bufs).is_err() {
-        fatal_boot("migration: OpenPGP restore failed");
+        fatal_boot("migration: OpenPGP restore failed", fatal_sig::Reason::MigrationFailed);
     }
 }
 
@@ -1957,12 +2035,9 @@ pub fn run_first_boot_migration(store: &mut DeviceStore) {
         defmt::info!("migration: OTP key row unreadable; skipping");
         return;
     };
-    let chipid = match embassy_rp::otp::get_chipid() {
-        Ok(id) => id,
-        Err(_) => {
-            defmt::info!("migration: chipid unreadable; skipping");
-            return;
-        }
+    let Some(chipid) = read_chipid() else {
+        defmt::info!("migration: chipid unreadable; skipping");
+        return;
     };
     let part = cflash::data_partition();
     let bounds = PoolBounds::from_partition(part);
@@ -1997,7 +2072,7 @@ pub fn run_first_boot_migration(store: &mut DeviceStore) {
             };
             defmt::info!("migration skipped: {}", what)
         }
-        Err(_) => fatal_boot("migration failed; refusing destructive backend boot"),
+        Err(_) => fatal_boot("migration failed; refusing destructive backend boot", fatal_sig::Reason::MigrationFailed),
     }
 }
 
@@ -2091,7 +2166,7 @@ pub fn init_static_slot_with<T>(
     }
 }
 
-// Board LED (GPIO25, active-low on the Pico 2), owned by the 1 Hz heartbeat
+// Board LED (GPIO25, active-high on the Pico 2), owned by the 1 Hz heartbeat
 // task once it spawns. Initialized on the boot path via the write-once slot
 // discipline shared with the app statics.
 pub static mut LED_OUT: core::mem::MaybeUninit<Output<'static>> =

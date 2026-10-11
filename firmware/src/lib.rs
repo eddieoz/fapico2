@@ -89,7 +89,7 @@ pub const TASK_ARENA_DEMAND_B: usize = 14_344;
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "ed3a6f466e305b99b3d757673617685d7a4ee41438e6a3c5c28fd6e31862ff2f";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "7eaf364b32cbcc1b2d38dd8c3129c193b826a6e488bd6724df3e68927a0c7634";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -102,6 +102,15 @@ pub mod ccid_reasm;
 /// (`boot_led.rs`); this module owns the encoding, the ordering contract and
 /// the release/pin-handover rule, all of which are testable without hardware.
 pub mod bootphase;
+/// US-1304: the boot-phase blink ladder's level sequence (pure, host-tested;
+/// the device bin drives the pin over it).
+pub mod boot_ladder;
+/// US-1306: fatal-boot reason ids and their LED signatures (pure, host-tested).
+pub mod fatal_sig;
+/// Bounded retry for the boot path's OTP reads (the E16-class settling rail;
+/// pure, host-tested — the device wrapper in `boot.rs` supplies the real read
+/// and the busy-wait).
+pub mod otp_retry;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;

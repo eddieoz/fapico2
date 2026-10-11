@@ -2,7 +2,7 @@
 //! every public primitive is reachable, so the linked `text` is the honest
 //! flash cost of carrying this second secp256k1 implementation on the board.
 //! Built detached from the firmware's own graph on purpose — the number this
-//! produces is the *marginal* cost of the crate, recorded in ADR 0004.
+//! produces is the *marginal* cost of the crate, recorded in ADR 0005.
 #![no_std]
 #![no_main]
 

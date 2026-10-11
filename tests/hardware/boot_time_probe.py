@@ -17,6 +17,15 @@ So this reports every attach/detach of the target VID:PID over the window,
 not just the first arrival. A device that shows up, drops, and shows up
 again is reported as such.
 
+And it names a frozen boot
+--------------------------
+
+"DEAD" is a verdict about the *transport*: the device never enumerated. It
+says nothing about *where* it stopped, and on this board that has
+historically looked identical from the outside for two entirely different
+failures — a hang somewhere after USB came up, and a park before USB was
+ever constructed. See [`classify_ladder`].
+
 Modes
 -----
   --after-eject     (default) wait for the BOOTSEL MSC volume to disappear,
@@ -46,6 +55,71 @@ TARGET_PID = "0002"
 # chips differ again, so match on a set rather than one string.
 BOOTSEL_MARKERS = ("RP2BOOT", "RPI-RP2", "RP2350", "BOOTSEL")
 POLL_S = 0.01  # 10 ms — an enumeration that takes ~1 s is not a rounding error
+
+# US-1302: the top of the boot-phase ladder (`dbg.rs`'s `P_SERVING`).
+MAX_PHASE = 19
+# How many blink cycles phase N contributes: `phase_blinks(id)` runs its loop
+# `id` times, so the phase ids are also the per-phase cycle counts.
+PHASE_CYCLES = tuple(range(0, MAX_PHASE + 1))
+# Cumulative cycle count after each phase has been emitted. `CUMULATIVE[n]` is
+# how many cycles phase `n` has produced in total, so it doubles as the map
+# from a total-cycle reading back to the phase that produced it.
+CUMULATIVE: dict[int, int] = {}
+_running = 0
+for _phase, _cycles in enumerate(PHASE_CYCLES):
+    _running += _cycles
+    CUMULATIVE[_running] = _phase
+
+
+def classify_ladder(levels: list[bool] | None) -> str:
+    """Name the boot phase a frozen board stopped at, from its blink sequence.
+
+    `levels` is the pin's level at each sample — the raw observation, in the
+    order it was seen. `None` means nobody was counting, which is not the same
+    as a count of zero and is reported as `UNKNOWN`.
+
+    Returns one of:
+
+      `NO_BLINK`     the pin never changed level — froze inside or before
+                     `embassy_rp::init`, before the LED slot could be driven;
+      `PHASE_<n>`    phases 1..n all completed, and phase n+1 did not;
+      `UNKNOWN`      the reading does not correspond to any complete phase —
+                     see below for the three cases that produce it.
+
+    **This counts transitions, not lit levels, and that is the whole design
+    claim.** `dbg.rs` builds its ladder so the count survives a board revision
+    that inverts the pin — the module doc puts it as "N blinks-then-frozen
+    names the phase whichever way the pin is wired". A classifier that counted
+    lit samples instead would read every inverted-pin board as a different
+    phase, which is precisely the failure the ladder was built to avoid. The
+    property is asserted in `test_boot_ladder.py` by classifying each sequence
+    twice, once polarity-flipped, and requiring the same answer.
+
+    `SLOW` is not a member of this function's return set on purpose: reaching
+    the last phase means the device booted, and the caller already reports that
+    case as `enumerated_ms is not None`. A board that shows the full ladder
+    *and* never enumerates is a genuine finding, and it is reported as
+    `PHASE_19` rather than as `SLOW` so the two facts stay separable.
+
+    `UNKNOWN` is returned, rather than a guess, for three readings:
+
+      * an **odd** transition count — `phase_blinks` leaves the pin balanced
+        after every cycle, so any complete ladder reads even. An odd count
+        came from something this ladder did not produce (a `fatal_boot`
+        signature, US-1306, or the 1 Hz heartbeat);
+      * a count **beyond** `MAX_PHASE` — past the end of the phase table there
+        is no phase to name;
+      * a **missing** sequence — no instrument was watching.
+    """
+    if levels is None:
+        return "UNKNOWN"
+    transitions = sum(1 for a, b in zip(levels, levels[1:]) if a != b)
+    if transitions % 2:
+        return "UNKNOWN"
+    cycles = transitions // 2
+    if cycles == 0:
+        return "NO_BLINK"
+    return f"PHASE_{CUMULATIVE[cycles]}" if cycles in CUMULATIVE else "UNKNOWN"
 
 
 def _listdir(d: Path) -> list[Path]:
@@ -117,6 +191,32 @@ def _target_present(devices: dict[tuple[str, str], str]) -> bool:
     return (TARGET_VID, TARGET_PID) in devices
 
 
+def read_blinks(path: Path) -> list[bool]:
+    """Load a recorded LED sequence: one level per line or token.
+
+    `1`/`on`/`true` and `0`/`off`/`false` (case-insensitive) are the levels.
+    The file is a *recording*, not a live sample — reading a blink rate off a
+    board needs either a person counting or a camera, and this tool is not
+    either. It exists so the recording a person or a rig produced can be turned
+    into a [`classify_ladder`] verdict by the same code path a live run uses,
+    instead of by whoever is reading the transcript.
+    """
+    truthy = {"1", "on", "true"}
+    falsy = {"0", "off", "false"}
+    out: list[bool] = []
+    for raw in path.read_text(encoding="utf-8").split():
+        token = raw.strip().lower()
+        if token in truthy:
+            out.append(True)
+        elif token in falsy:
+            out.append(False)
+        else:
+            raise SystemExit(
+                f"{path}: {raw!r} is not a level — use 1/on/true or 0/off/false."
+            )
+    return out
+
+
 def wait_for_eject(timeout: float, log) -> float:
     """Block until BOOTSEL's MSC disappears. Returns seconds waited."""
     t0 = time.monotonic()
@@ -145,6 +245,12 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=180.0,
                     help="give up after N seconds (default 180)")
     ap.add_argument("--out", type=Path, help="also write the result as JSON here")
+    ap.add_argument("--blinks", type=Path,
+                    help="classify a recorded LED sequence (1/on/true, 0/off/false "
+                         "per token) with classify_ladder, and report the phase it "
+                         "names. Independent of the USB timing: supply it on a run "
+                         "that dead-booted, where enumerated_ms is null and the "
+                         "ladder is the only channel left.")
     args = ap.parse_args()
 
     if args.after_enter == args.after_eject:
@@ -210,6 +316,8 @@ def main() -> int:
         "events": events,
         "dropped_after_enumeration": len(dropped_after),
     }
+    if args.blinks is not None:
+        result["ladder"] = classify_ladder(read_blinks(args.blinks))
     if enumerated_ms is None:
         result["verdict"] = "DID NOT ENUMERATE — this is the dark-boot failure, not a slow boot"
     elif dropped_after:

@@ -63,7 +63,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     defmt::info!("secure store in static");
 
     // Stage 0 marker: LED on for ~2s then blink. If this shows, embassy init works.
-    let mut led = Output::new(p.PIN_25, Level::Low); // ON (active-low)
+    let mut led = Output::new(p.PIN_25, Level::High); // ON (active-high)
     Timer::after_millis(2000).await;
 
     // US-103: the real OTP chipid. These are bring-up binaries, but they run

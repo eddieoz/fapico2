@@ -16,7 +16,7 @@ check and the `NOSTR_REQ_ARG_MAX` constant), the fallible builders
 (`build_apdu`/`encode_request` gaining their `Option` overflow arms and the
 `6A80` mapping), and the strict Lc refusal in `apps/nostr::parse_data`
 (US-1685 — the `Result` plumbing at the dispatch site). US-1686 added no
-code: the scalar-lifetime decision is the ADR 0004 amendment, not a
+code: the scalar-lifetime decision is the ADR 0005 amendment, not a
 mechanism. The +20 B is 0.007% of the flash ceiling; no capacity boundary
 moves, and `docs/capacity.md` carries no number this delta touches.)
 
@@ -1698,6 +1698,34 @@ the two tables against each other rather than take the sum on trust.
 **RAM statics = 389,252 B** (389,256 B address-to-address: `__sheap` `0x2005f088` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2005f088` → **main stack zone = 143,224 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
+
+### BOOT-FREEZE-POST-FLASH (US-1302…US-1306), 2026-10-01
+
+**Measured: `text` 813,568 → 813,912 B (+344 B); Berkeley `bss` 420,692 →
+420,704 B (+12 B); RAM statics 420,888 → 420,900 B (+12 B); main stack zone
+111,588 → 111,576 B (−12 B); UF2 3,053 → 3,055 blocks (3055 blocks, 1 absolute preamble + 3054
+ARM_S payload). Shipping sha256 `0f08de2a8f4b…`.**
+
+The +344 B of `text` and the +12 B of `bss` are the boot-freeze epic's
+instrumentation, and both are worth naming rather than rounding:
+
+- **`fatal_sig` (US-1306)** is the bulk of the `text`: a ten-variant reason
+  enum, an encoder, and a decoder, all of them reachable from the shipping
+  image because `fatal_boot` calls the encoder on every pre-USB refusal. The
+  decoder is device-side dead weight in the strict sense — nothing on the
+  device reads its own signature back — and it is carried anyway so the format
+  and the reader cannot drift apart. That is a deliberate trade: it is the same
+  trade `ctap_hid` already makes, and the cost is 344 B against a 3,670,016 B
+  ceiling.
+- **The +12 B of `bss` is `FATAL_LED_MOUNTED`**, one `AtomicBool` that gates
+  `fatal_boot`'s LED output until the `LED_OUT` slot is mounted. It is the
+  guard that stops a pre-slot refusal writing through an uninitialised pin.
+- **`boot_ladder` (US-1304) costs no static RAM at all** — its level sequence is
+  an iterator, evaluated in registers while the pin is driven. Worth stating
+  because "a new boot-ladder module" is exactly the kind of change that would
+  otherwise be assumed to cost a table.
+
+Task-arena demand is **unchanged** at 17,760 B: nothing here spawns a task.
 
 ### What this fix cost, against the US-1011/US-1012 tip
 

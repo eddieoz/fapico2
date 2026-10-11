@@ -87,7 +87,7 @@ flashmap.rs, ends at or below every data region; headroom intact to
 FIRMWARE_GROWTH_END 0x200000
 ```
 
-US-1630's ADR 0004 raise (1621 → 1664 KiB) absorbs the applet's core: the
+US-1630's ADR 0005 raise (1621 → 1664 KiB) absorbs the applet's core: the
 budget gate passes unmodified at the Phase 1 tip.
 
 ## Worst call chain: green

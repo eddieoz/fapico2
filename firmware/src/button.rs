@@ -135,9 +135,9 @@ pub fn set_touch_prompt_led(on: bool) {
     let led: &mut embassy_rp::gpio::Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut() };
     if on {
-        led.set_low(); // ON (active-low)
+        led.set_high(); // ON (active-high)
     } else {
-        led.set_high(); // OFF
+        led.set_low(); // OFF
     }
 }
 
@@ -167,9 +167,9 @@ pub fn pso_wait_grant(tag: u32) -> bool {
     // wait is one synchronous section inside the serve task).
     let led: &mut embassy_rp::gpio::Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut() };
-    led.set_low(); // ON (active-low) — the touch prompt
+    led.set_high(); // ON (active-high) — the touch prompt
     let granted = fapico2_firmware::presence::wait_grant(tag, PSO_TOUCH_WINDOW_MS, paced_bootsel);
-    led.set_high(); // OFF — the heartbeat resumes at the next await
+    led.set_low(); // OFF — the heartbeat resumes at the next await
     if granted {
         defmt::info!("US-914: presence granted (op {=u32:x})", tag);
     } else {

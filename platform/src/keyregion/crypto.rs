@@ -167,8 +167,8 @@ pub const PAYLOAD_KEY_INFO: &[u8] = b"fapico2/keyregion/payload/v1";
 /// through the `pin_secret` parameter, which is 32 bytes of already-derived
 /// material and deliberately knows nothing about what a caller put in it.
 ///
-/// **Device-bound, not user-bound, and that is the decision `ADR 0004` records**
-/// (`docs/adr/0004-nostr-key-storage.md`, design §2.4.1): nothing
+/// **Device-bound, not user-bound, and that is the decision `ADR 0005` records**
+/// (`docs/adr/0005-nostr-key-storage.md`, design §2.4.1): nothing
 /// `authenticatorReset` or management `RESET` can destroy is an input to the
 /// Nostr payload key, so a publishing identity survives both, and the forgotten-PIN
 /// journey ends in recovery rather than in records that are sealed forever under

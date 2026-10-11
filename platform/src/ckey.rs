@@ -74,12 +74,12 @@
 //!   alias). The bound root protects Rust-derived secrets, but the
 //!   C-compat material above remains reconstructable from a leaked OTP
 //!   row by construction — C records cannot be re-keyed.
-//! * The OTP software lock set at boot
-//!   (`firmware/src/boot.rs::otp_hw_write_lock_key_row`) covers the
-//!   non-secure view only (`SWLOCK.NSEC`) **and is runtime-only** — reset
-//!   reloads the lock state from the OTP lock pages, so it is not a durable
-//!   write-lock (D-14). A durable lock needs an irreversible SBPI lock-page
-//!   burn, which is not in this tree. Read-protect
+//! * There is no runtime OTP software lock: the `sw_lock` write US-918
+//!   once attempted was removed on 2026-10-11 (it correlated with page-0
+//!   read failures; ADR 0004 amendment), so the row is not
+//!   write-locked for the boot's lifetime either (D-14). A durable lock
+//!   needs an irreversible SBPI lock-page burn, which is not in this
+//!   tree. Read-protect
 //!   (`INACCESSIBLE` / the secure-view field) is pending the CryptoCell
 //!   secure-partition gating. US-924 runs the hardware verification.
 

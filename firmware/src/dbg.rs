@@ -291,7 +291,7 @@ pub async fn handle_dbg(
 // The LED is driven SYNCHRONOUSLY here (direct `Output` writes + a busy-wait
 // on the 1 MHz RP2350 TIMER counter) — at the early stages the async
 // executor/timers are not running yet, so a `Timer::after` would never wake.
-// The single board LED (GPIO25, active-low) is the shared heartbeat /
+// The single board LED (GPIO25, active-high) is the shared heartbeat /
 // trussed-UI pin (`boot::LED_OUT`); during the boot stages the heartbeat task
 // has not been polled yet, so the synchronous blinks own the pin.
 //
@@ -352,13 +352,26 @@ pub fn mark_led_ready() {
 ///
 /// # The cost, and how to read a timing anyway
 ///
-/// 40 ms on / 40 ms off per blink, so phase N costs 80·N ms and the whole
-/// ladder adds **at most 1.5 s** to a boot that reaches phase 19. That is
-/// not free, and a timing pulled from a `boot-timeline` build includes it.
-/// Subtract `80 ms × (sum of the phase ids seen)`; the CTAP-HID ring's own
-/// `t_us` values do **not** include it, because the ring record is written
-/// *before* the blinks — which is why the ring is authoritative when it is
-/// reachable and this is the fallback for when it is not.
+/// 40 ms on / 40 ms off per blink, so phase N costs 80·N ms. **US-1304
+/// correction:** this doc previously said the whole ladder adds "at most
+/// 1.5 s" to a boot that reaches phase 19, which is off by a factor of ten.
+/// Phase 19 *on its own* costs 1.52 s; the ladder is cumulative, so a full
+/// boot pays 80 ms × (1 + 2 + … + 19) = **15.2 s**. The doc's own correction
+/// formula — subtract 80 ms × (the sum of the phase ids seen) — was the
+/// correct one all along, and the two statements contradicted each other. The
+/// arithmetic is now asserted in [`fapico2_firmware::boot_ladder`]'s tests so
+/// it cannot drift back.
+///
+/// That is a large tax on a `boot-timeline` capture build and it is not free;
+/// the CTAP-HID ring's `t_us` values do **not** include it, because the ring
+/// record is written *before* the blinks — which is why the ring is
+/// authoritative when it is reachable and this is the fallback for when it is
+/// not.
+///
+/// US-1304: the level sequence itself lives in
+/// [`fapico2_firmware::boot_ladder`], which is pure and host-tested. This
+/// function is now only the pin-driving shell around it; the shape it emits is
+/// checked without a board.
 #[allow(dead_code)]
 pub fn phase_blinks(id: u8) {
     if !LED_READY.load(Ordering::Acquire) {
@@ -371,11 +384,24 @@ pub fn phase_blinks(id: u8) {
     let led: &mut Output<'static> = unsafe {
         (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut()
     };
-    for _ in 0..id {
-        led.set_low(); // ON (active-low)
-        busy_wait_us(40_000);
-        led.set_high(); // OFF
-        busy_wait_us(40_000);
+    use fapico2_firmware::boot_ladder::{self, Level, LADDER_OFF_US, LADDER_ON_US};
+    for level in boot_ladder::phase_levels(id) {
+        // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303: the oracle is
+        // pico-keys-sdk/src/led/led_pico.c:50, `gpio_put(gpio, progress >= 0.5)`
+        // with no PICO_DEFAULT_LED_PIN_INVERTED). `Level::On` is the lit level
+        // by name; this is the one place allowed to say which pin level that
+        // is, so no other site has to reason about polarity to be correct.
+        let dwell = match level {
+            Level::On => {
+                led.set_high();
+                LADDER_ON_US
+            }
+            Level::Off => {
+                led.set_low();
+                LADDER_OFF_US
+            }
+        };
+        busy_wait_us(dwell);
     }
 }
 
@@ -404,9 +430,9 @@ fn stage_blinks(stage: u8) {
         (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut()
     };
     for _ in 0..=stage {
-        led.set_low(); // ON (active-low)
+        led.set_high(); // ON (active-high)
         busy_wait_us(120_000);
-        led.set_high(); // OFF
+        led.set_low(); // OFF
         busy_wait_us(120_000);
     }
     busy_wait_us(500_000);

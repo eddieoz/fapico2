@@ -1,4 +1,4 @@
-# ADR 0004: Nostr key storage — device-bound keyregion domain, and the second secp256k1 implementation
+# ADR 0005: Nostr key storage — device-bound keyregion domain, and the second secp256k1 implementation
 
 **Status:** Accepted (2026-10-10)
 **Supersedes:** nothing
@@ -151,7 +151,7 @@ headroom with ~19 KB to spare, and the alternative — routing Nostr's BIP-340 s
 and NIP-44 ECDH through the trussed `Client` — drags in `DevicePlatform`, the heap
 and a backend crate this applet may not name, for a handful of scalar
 multiplications. `deny-graph.toml`'s comment already sanctions ordinary RustCrypto
-library uses; ADR 0004 makes the second curve deliberate so a later reader meets
+library uses; ADR 0005 makes the second curve deliberate so a later reader meets
 the decision, not the accident.
 
 **Provisional on two re-measures**, both owned by later stories:
