@@ -1455,11 +1455,11 @@ pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
 
 /// US-413 S-413-4: the C key row (`OTP_MKEK_ROW 0xE90`, 32 bytes = 16 ECC
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
-/// firmware does (readable from any code — no read-protect; the boot-path
-/// software lock in [`otp_hw_write_lock_key_row`] is RUNTIME-ONLY and does
-/// not survive reset, so this row carries no durable write-lock until an OTP
-/// lock page is burned — US-918/D-14; read-protection is a CryptoCell
-/// cutover item, US-924).
+/// firmware does (readable from any code — no read-protect; the runtime
+/// `sw_lock` write-lock this tree once attempted was removed on 2026-10-11 —
+/// it correlated with page-0 read failures, see the ADR 0002 amendment — so
+/// this row carries no durable write-lock until an OTP lock page is burned —
+/// US-918/D-14; read-protection is a CryptoCell cutover item, US-924).
 ///
 /// Each attempt is a full 16-word read; a row that reads intermittently
 /// (errata E16's settling read-voltage rail — see
@@ -1860,71 +1860,25 @@ pub fn ensure_fw_manifest(store: &mut DeviceStore) -> fw_manifest::ForeignImageD
     }
 }
 
-/// US-918: best-effort software lock of the C key row's page (OTP 0xE90) for
-/// the remainder of THIS BOOT. It is **not** a durable write-lock — see
-/// "runtime-only" below.
+/// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
+/// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
+/// chipid read (rung 6, a page-0 read that had already passed at rung 3)
+/// intermittently failed ~80 consecutive times and parked the board with
+/// fatal signature id 2; with the write out, 15 power cycles across timings
+/// produced zero parks. The write was D-14's runtime-only half of a lock
+/// whose durable half never shipped, so what it mitigated was the D-14
+/// residual (same-session write access to the key row) that D-14 already
+/// records as unshipped; the durable mitigation remains US-924's lock-page
+/// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
+/// 0002 amendment.
 ///
-/// OTP page 233 (`0xE90 / 16`) covers exactly rows 0xE90..=0xE9F, so the
-/// lock on this page covers the key row and its page-neighbors without
-/// touching anything else. From non-secure boot only the NSEC field is
-/// writable (`SEC` is read-only to NS code), and `READ_ONLY` (write-lock) is
-/// chosen over `INACCESSIBLE` because the firmware reads the row every boot
-/// (store key + bound root) — an inaccessible row would brick the device.
-/// Writes are OR'd, so the lock is monotonic/idempotent; a page group
-/// already locked earlier in this boot is skipped.
-///
-/// # This lock is RUNTIME-ONLY (US-918, corrected 2026-09-29)
-///
-/// `SW_LOCK` is initialised from the **OTP lock pages at reset**; the
-/// register "can be written to further advance the lock state of each page
-/// (*until next reset*)" — rp-pac 7.0.0, `src/rp235x/otp.rs:17`. A power
-/// cycle therefore presents whatever the lock PAGES hold, and the write
-/// below is forgotten. It does not stop later software on a rebooted unit.
-///
-/// A real lock is an irreversible OTP lock-page burn via SBPI — the other
-/// half of the C reference's `otp_lock_page()`
-/// (`pico-keys-sdk/src/otp/otp_rp2350.c:88-95`), which burns the lock row
-/// through `rom_func_otp_access` and *then* does this same register write.
-/// Only the runtime half is implemented here. A permanently write-locked key
-/// row additionally needs a provisioning decision about who may burn a unit
-/// and when. Recorded as D-14 in `docs/known-gate-divergences.md`.
-///
-/// The call is KEPT on purpose: it is harmless, non-fatal, and it makes a
-/// unit whose lock pages are already burnt behave correctly at runtime.
-/// Whether to keep it is a separate decision; what was wrong was the
-/// claim, and that is what this comment corrects.
-///
-/// NEVER fatal: a failed lock only restores the pre-US-918 exposure (the
-/// row stays software-unlocked), while wedging boot over a lock register
-/// would cost more than the residual risk itself. Read-protection (the
-/// stronger half) is the CryptoCell cutover, story US-924.
-// US-939: `#[inline(never)]` -- async-main frame discipline.
-#[inline(never)]
-pub fn otp_hw_write_lock_key_row() {
-    use rp_pac::otp::vals::SwLockNsec;
-    // The RP2350 OTP spans 256 pages of 16 ECC rows (row 0xE90 = page
-    // 233) and the 64 SWLOCK registers each cover a group of 4 pages, so
-    // the key row's lock register is 233 / 4 = 58 (`sw_lock` asserts
-    // n < 64 — the per-page form would panic at boot). The lock also
-    // covers the row's 3 page-neighbors, which this firmware never
-    // writes — write-locking them is harmless. RUNTIME-ONLY: reset reloads
-    // the lock state from the OTP lock pages, not from this register.
-    const KEY_ROW_PAGE: usize = 0xE90 / 16; // 233
-    const OTP_PAGES: usize = 256;
-    const SWLOCK_REGS: usize = 64;
-    const SWLOCK_REG: usize = KEY_ROW_PAGE / (OTP_PAGES / SWLOCK_REGS); // 58
-    let swlock = rp_pac::OTP.sw_lock(SWLOCK_REG);
-    if swlock.read().nsec() == SwLockNsec::READ_ONLY {
-        return; // already write-locked (boot is idempotent)
-    }
-    swlock.modify(|v| v.set_nsec(SwLockNsec::READ_ONLY));
-    if swlock.read().nsec() != SwLockNsec::READ_ONLY {
-        defmt::warn!(
-            "otp: SWLOCK reg {} write-lock did not take; key row remains writable (residual risk, US-924)",
-            SWLOCK_REG
-        );
-    }
-}
+/// If a runtime lock is ever reinstated, note that the register model in the
+/// removed implementation ("256 pages of 16 rows, one register per 4 pages")
+/// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
+/// of 64 rows, one register per page) — they only coincide on the *number*
+/// 58. Whatever the correct model is, the measured fact stands: the write
+/// correlated with page-0 read failures, and the burden of proof is on any
+/// reinstatement.
 
 /// Restore captured OpenPGP state after backend mount and before registration.
 /// Missing hardware identity is acceptable only when there is no capture.

@@ -3604,6 +3604,14 @@ wrong, which is the one thing the epic's "blocks" relationship is for.
 
 ## D-14 — the key row's "write-lock" is a runtime-only register and does not survive reset (US-918)
 
+> **Status update 2026-10-11:** the runtime write this entry analyses was
+> **removed** on A/B evidence — with it in place, a later boot-path chipid read
+> (OTP page 0) intermittently failed ~80 consecutive times and parked the board
+> (fatal signature id 2); with it out, 15 power cycles produced zero parks. The
+> residual risk this entry records (no durable write-lock of the key row) is
+> unchanged and still pending US-924. Decision record: the ADR 0002 amendment;
+> full record: `docs/pico-fido2-to-fapico2-migration.md`.
+
 **Story:** US-918, which claims a hardware write-lock of the C key row
 (OTP 0xE90). **Class:** a claim in shipped code and comments that the part's
 own documentation contradicts. Found 2026-09-29 while investigating an

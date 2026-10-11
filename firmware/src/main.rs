@@ -660,10 +660,17 @@ async fn main(spawner: Spawner) -> ! {
     mark!(fapico2_firmware::bootphase::RUNG_OTP);
     let store_key = boot::derive_boot_store_key();
     bphase!(crate::dbg::P_STORE_KEY);
-    // US-918: best-effort software lock of the C key row's page (OTP 0xE90)
-    // — idempotent, never fatal. RUNTIME-ONLY: it does not survive reset, so
-    // it is not a durable write-lock (D-14); see `boot::otp_hw_write_lock_key_row`.
-    boot::otp_hw_write_lock_key_row();
+    // US-918's best-effort runtime `sw_lock` write (`otp_hw_write_lock_key_row`)
+    // was REMOVED on 2026-10-11, on A/B evidence: with the call in, the rung-6
+    // chipid read intermittently failed ~80 consecutive reads (fatal signature
+    // id 2) on a board where the same read had passed at rung 3; with the call
+    // out — the only OTP-controller register write in that window — 15 power
+    // cycles across timings produced zero parks. The write was D-14's
+    // runtime-only half of a lock whose durable half never shipped, so the
+    // residual risk it carried (key row writable by same-session code) is the
+    // status quo that D-14 already records; the durable mitigation remains
+    // US-924. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the
+    // ADR 0002 amendment.
     unsafe {
         (&*core::ptr::addr_of!(boot::STORE))
             .borrow_mut()

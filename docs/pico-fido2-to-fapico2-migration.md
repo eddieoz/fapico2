@@ -91,35 +91,37 @@ booted normally throughout.
   all-ones read deterministically (consistent garbage keys) — a firmware
   difference in failure posture, not a difference in what the hardware returned.
 
-**Mechanism — recorded at its actual confidence:** the strongest hypothesis is
-the OTP power-rail transient of RP2350 errata **E16** (the OTP read voltage
-comes from an internal regulator whose power-good "isn't sampled outside of
-the initial power-on reset startup sequence"). A post-flash reboot is not a
-power-on reset — the bootrom marks `FLASH_UPDATE` in the watchdog scratch — so
-every flash lands in the risk window. What the 2026-10-11 session added:
+**Root cause — found the same day, by A/B.** The mechanism narrative below the
+first dash was the best hypothesis of its afternoon and is **retracted**: a
+settling rail cannot fail a *later* read after an *earlier* one succeeded in
+the same boot, and the decisive observation was exactly that — with the retry
+installed, a boot passed its rung-3 chipid read and then failed the rung-6
+chipid read ~80 consecutive times (20 s budget). Something between rungs 3 and
+6 broke page-0 reads dynamically, and the only OTP-controller register write
+in that window was this tree's own `otp_hw_write_lock_key_row()` — the
+US-918/D-14 runtime `sw_lock` write, firing immediately after the store-key
+derivation.
 
-- The failure is **intermittent, not dwell-driven**: 10 s of power-off did not
-  reliably clear it, so the earlier "wait 4–5 s" guidance (measured on another
-  board on 2026-10-01) is not a dependable fix on this silicon.
-- The failing read **migrates later into boot** across attempts — the key row
-  one session (signature id 1), the chipid the next (id 2, at the rung-6
-  window) — which is what a slowly settling rail looks like from a series of
-  fixed read sites.
-- **In the failing episode, the bootrom read the same rows cleanly** (BOOTSEL,
-  `picotool otp get -r 0x0 0x8`, taken right after a hang): the OTP is healthy
-  tens of seconds into a power episode; firmware's early reads simply fire
-  inside the unsettled window.
+**A/B (2026-10-11):** shipping image (write in) parked reproducibly with
+signature id 2; a build with the write removed — 15 power cycles across
+timings, normal FIDO use in between — zero parks. **The write is removed**
+(ADR [`adr/0002-fatal-boot-recovery-policy.md`](adr/0002-fatal-boot-recovery-policy.md),
+amendment 2). It was the runtime-only half of a lock whose durable half never
+shipped (D-14), so what it protected was already the recorded residual; the
+durable mitigation remains US-924. Two honest loose ends stay recorded in the
+ADR: the single id-1 episode (one observation, at rung 3, *before* the write
+window — unexplained, covered only by the retry), and the register-model
+disagreement ("256 pages of 16 rows" here vs 64 × 64 everywhere else) that any
+reinstatement must reconcile.
 
-**Firmware response (2026-10-11):** every boot-path OTP read — the key row and
-the chipid — is now retried on a 250 ms step within a 20 s budget
-(`firmware/src/otp_retry.rs`, ADR
-[`adr/0002-fatal-boot-recovery-policy.md`](adr/0002-fatal-boot-recovery-policy.md)
-amendment) before the caller degrades or emits its signature. A healthy board
-pays nothing; a board with a genuinely unreadable row still refuses, with the
-same signature, ~20 s later. RS-Key (same A2 stepping) avoids the problem
+**Also kept from that afternoon:** every boot-path OTP read — the key row and
+the chipid — is retried on a 250 ms step within a 20 s budget
+(`firmware/src/otp_retry.rs`) before the caller degrades or emits its
+signature. It rode out nothing that day, but it is the belt under whichever
+read next proves marginal. RS-Key (same A2 stepping) avoids the whole class
 structurally — it never reads its key row at boot and tolerates a failed
-chipid read — recorded in the ADR as the direction if the budget ever proves
-insufficient.
+chipid read — and remains the recorded direction if fapico2 ever moves its
+store-key derivation off the boot path.
 
 **Reading the LED on the merged image** (post-`feat/boot-freeze-post-flash`):
 dark at reset; one brief lit pulse per boot rung (9 total); then either the

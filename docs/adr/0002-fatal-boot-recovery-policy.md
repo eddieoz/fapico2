@@ -180,3 +180,36 @@ Moving fapico2's boot-time store-key derivation to that shape is a larger
 architectural change than this fix needs; if the retry budget ever proves
 insufficient on real boards, that is the direction, and this ADR should be
 superseded for it.
+
+## Amendment 2, 2026-10-11 — root cause of the intermittent id-1/id-2 parks: removed, not retried
+
+The same-day retry amendment stood on a mechanism hypothesis that the evening's
+A/B disproved and replaced:
+
+- **With the retry alone**, the board parked again: the rung-6 chipid read
+  failed ~80 consecutive times (20 s budget exhausted) in a boot whose rung-3
+  chipid read had passed — so the failure was never a settling rail; something
+  between rungs 3 and 6 broke page-0 reads dynamically.
+- **The only OTP-controller register write in that window was this tree's own**
+  `otp_hw_write_lock_key_row()` (the US-918/D-14 runtime `sw_lock` write at
+  `main.rs`, immediately after the store-key derivation).
+- **A/B, 2026-10-11:** shipping image (write in) parked reproducibly with
+  signature id 2; `fapico2-nolockwrite.uf2` (write out) — 15 power cycles
+  across timings, zero parks, and the operator's normal FIDO use in between.
+- **The write is removed.** It was D-14's runtime-only half of a lock whose
+  durable half never shipped; the residual it mitigated is the D-14 status
+  quo, and the durable mitigation remains US-924. The retry
+  (`firmware/src/otp_retry.rs`) stays: it is the belt under whichever read
+  next proves marginal, and the earlier id-1 episode (one observation, at
+  rung 3, *before* the write window) remains a single unexplained data point
+  that only the retry covers.
+
+Honest bookkeeping: the E16 "settling rail" narrative in this file's first
+amendment and in `docs/pico-fido2-to-fapico2-migration.md` was the
+best-supported hypothesis of its afternoon and is now **retracted** as the
+cause of the recurring parks; the settling-read *observation* (bootrom reads
+healthy later in the same episode) stands as data, unexplained. The
+`otp_hw_write_lock_key_row` register model ("256 pages of 16 rows, one
+register per 4 pages") also disagrees with both `pico-keys-sdk` and the RP2350
+register map (64 pages of 64 rows, one register per page) — a reconciliation
+that is now academic but belongs in any future reinstatement review.
