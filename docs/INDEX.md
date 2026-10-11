@@ -8,6 +8,7 @@ deliberately **not in git**.
 ## Start here (first-time setup and the things that look like dead hardware)
 
 - [bootsel.md](bootsel.md) — flashing over BOOTSEL, recovery paths, why re-enumeration can take a minute.
+- [pico-fido2-to-fapico2-migration.md](pico-fido2-to-fapico2-migration.md) — the durable OTP state a board carries after pico-fido2 1.0 (page-58 lock, picotool `permission failure`), and the post-flash park that looks like a brick but recovers on a 5-second power cycle.
 - [identity.md](identity.md) — USB identity (AAGUID, VID:PID), the **PC/SC allowlist step Linux/macOS need before OpenPGP/OATH work**, and the runtime VID/PID silent-lockout hazard.
 - [capacity.md](capacity.md) — hardware-verified ceilings: 856 FIDO2 resident credentials (measured to refusal), 68 OATH slots (reservation), and which constants are *not* capacities.
 - [client-compatibility.md](client-compatibility.md) — client-side quirks no firmware change can fix.
