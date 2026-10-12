@@ -210,6 +210,12 @@ pub enum NostrStoreError {
     OccupiedForeign {
         slot: Slot,
     },
+    /// The occupant still opens as ours under this device's key:
+    /// [`NostrStore::force_tombstone`] refuses — `delete` owns live
+    /// records, and it names what it destroyed.
+    LiveRecord {
+        slot: Slot,
+    },
     /// The AEAD refused a seal or an open it should never refuse.
     Aead,
     /// The slot's generation counter is exhausted.
@@ -231,6 +237,11 @@ impl fmt::Display for NostrStoreError {
                 f,
                 "slot {} holds a record this store cannot identify as its own; the write was \
                  refused rather than overwrite it",
+                slot.index()
+            ),
+            NostrStoreError::LiveRecord { slot } => write!(
+                f,
+                "slot {} holds a live record: delete it through the named path, not a force",
                 slot.index()
             ),
             NostrStoreError::Aead => write!(f, "the AEAD refused the record"),
@@ -406,6 +417,43 @@ impl<'r> NostrStore<'r> {
     /// Tombstone `index`: a durable delete that keeps the slot reusable.
     pub fn delete(&mut self, index: u16) -> Result<CommitReport, NostrStoreError> {
         self.commit_body(index, TOMBSTONE)
+    }
+
+    /// Tombstone `index` bypassing the occupancy guard — the repair path
+    /// for a slot whose record carries our domain tag but will not open
+    /// (`Entry::Undecodable`, F-A5 in `docs/nostr-presence-audit.md`). The
+    /// guard protects *live* records: one that opens is refused here
+    /// ([`NostrStoreError::LiveRecord`] — delete it through
+    /// [`NostrStore::delete`], which names what it destroyed); one that
+    /// cannot open is by definition not live, and refusing to touch it
+    /// stranded the slot behind `6A84` forever. The generation comes from
+    /// the standing header when it can be read; a header too damaged to
+    /// decode leaves nothing to advance past and the tombstone commits at
+    /// generation 1. A fault-class decode (the region itself is failing)
+    /// is refused, never papered over.
+    pub fn force_tombstone(&mut self, index: u16) -> Result<CommitReport, NostrStoreError> {
+        let slot = self.slot_for(index)?;
+        let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
+        let raw = self.region.read_slot(slot).map_err(NostrStoreError::Fault)?;
+        let generation = match record::decode(slot, &raw) {
+            SlotRead::Present(d) => {
+                if matches!(
+                    record::open(d.header(), self.key.as_bytes(), d.body()),
+                    SlotRead::Present(_)
+                ) {
+                    return Err(NostrStoreError::LiveRecord { slot });
+                }
+                d.header()
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(NostrStoreError::GenerationExhausted { slot })?
+            }
+            SlotRead::Absent => 1,
+            SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
+        };
+        let sealed = self.seal(slot, generation, TOMBSTONE)?;
+        let plan = CommitPlan::new(scratchpad, slot, Domain::Nostr, generation);
+        commit::commit(self.region, plan, &sealed).map_err(NostrStoreError::Commit)
     }
 
     /// The shared commit path: guard, seal, commit.

@@ -580,3 +580,96 @@ fn factory_wipe_empties_the_key_set() {
     }
     std::fs::remove_file(path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// F-A5 (docs/nostr-presence-audit.md) — the undecodable slot's remedy
+// ---------------------------------------------------------------------------
+
+/// A slot that carries our tag but will not open: the identity is sealed
+/// under chip A's payload key and the applet is booted on chip B's — the
+/// header still names Nostr/our slot, the body no longer opens
+/// (`Entry::Undecodable`), the same shape the platform store test builds
+/// with an other-device record.
+fn app_with_corrupt_slot(tag: &str) -> (NostrApp, std::path::PathBuf) {
+    let path = region_path(tag);
+    std::fs::remove_file(&path).ok();
+    let region = FileKeyRegion::create(&path, TOTAL_SLOTS).expect("a fixture region");
+    {
+        let mut region = fixture_key(region);
+        let mut store = region.store();
+        let scalar: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+        store
+            .write(1, &NostrIdentity::new(scalar, npub, b"", 0).expect("a valid identity"))
+            .expect("fill slot 1 under chip A's key");
+    }
+    let reopened = FileKeyRegion::open(&path).expect("reopen the fixture region");
+    let other_otp: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x12));
+    let other_chip: [u8; 8] = 0x0000_BADC_0FFE_EE01_0204_u64.to_be_bytes();
+    let other_key = derive_payload_key(&other_otp, &other_chip, &NOSTR_PAYLOAD_SECRET)
+        .expect("a non-zero OTP row");
+    let app = NostrApp::boot(NostrRegion::new(Box::new(reopened), other_key));
+    (app, path)
+}
+
+/// Deleting the unreadable slot still costs a touch — the corrupt class is
+/// not a touch-free escape hatch.
+#[test]
+fn an_undecodable_delete_still_requires_the_touch() {
+    let (app, path) = app_with_corrupt_slot("corrupt-deny");
+    let mut app = app.with_presence_grant(|_| false);
+    let (_, sw) = call(&mut app, &apdu(fapico2_nostr::INS_DELETE_KEY, 1, 0, &[]));
+    assert_eq!(
+        sw,
+        fapico2_nostr::SW_TOUCH_REQUIRED,
+        "6985 before anything is destroyed"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A payload is wrong data for every delete — the corrupt class included
+/// (a name cannot be verified on a record that will not open).
+#[test]
+fn an_undecodable_delete_takes_no_payload() {
+    let (app, path) = app_with_corrupt_slot("corrupt-named");
+    let mut app = app.with_presence_grant(|_| true);
+    let (_, sw) = call(&mut app, &apdu(fapico2_nostr::INS_DELETE_KEY, 1, 0, &[0xAA; 32]));
+    assert_eq!(sw, fapico2_nostr::SW_WRONG_DATA, "6A80 — the name cannot be checked");
+    std::fs::remove_file(&path).ok();
+}
+
+/// With the touch granted, the corrupt slot is destroyed and reusable —
+/// the remedy the old code refused before the touch.
+#[test]
+fn an_undecodable_slot_is_deletable_with_a_touch() {
+    let (app, path) = app_with_corrupt_slot("corrupt-del");
+    let mut app = app.with_presence_grant(|_| true);
+    let (data, sw) = call(&mut app, &apdu(fapico2_nostr::INS_DELETE_KEY, 1, 0, &[]));
+    assert_eq!(sw, 0x9000, "the corrupt slot is destroyed");
+    assert!(data.is_empty(), "no npub exists to name — the answer carries no body");
+    // The slot is now a tombstone: a second delete answers "no identity".
+    let (_, sw2) = call(&mut app, &apdu(fapico2_nostr::INS_DELETE_KEY, 1, 0, &[]));
+    assert_eq!(sw2, fapico2_nostr::SW_NO_SUCH_IDENTITY, "the slot reads empty");
+    std::fs::remove_file(&path).ok();
+}
+
+/// D6/F-A5 together: the factory wipe clears the corrupt class too —
+/// after the wipe every slot is reusable, as US-1650's acceptance says.
+#[test]
+fn factory_wipe_clears_an_undecodable_slot() {
+    let (app, path) = app_with_corrupt_slot("corrupt-wipe");
+    use fapico2_platform::dispatch::App as _;
+    let mut app = app.with_presence_grant(|_| true);
+    app.factory_wipe();
+    // Re-attach a fresh applet on the same region, same key: the slot is
+    // gone.
+    let other_otp: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x12));
+    let other_chip: [u8; 8] = 0x0000_BADC_0FFE_EE01_0204_u64.to_be_bytes();
+    let other_key = derive_payload_key(&other_otp, &other_chip, &NOSTR_PAYLOAD_SECRET)
+        .expect("a non-zero OTP row");
+    let region = FileKeyRegion::open(&path).expect("reopen");
+    let mut fresh = NostrApp::boot(NostrRegion::new(Box::new(region), other_key));
+    let (_, sw) = call(&mut fresh, &apdu(fapico2_nostr::INS_DELETE_KEY, 1, 0, &[]));
+    assert_eq!(sw, fapico2_nostr::SW_NO_SUCH_IDENTITY, "after the wipe the slot holds no identity");
+    std::fs::remove_file(&path).ok();
+}

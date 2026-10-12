@@ -290,3 +290,48 @@ fn every_carved_slot_takes_its_first_write() {
         "the ninth identity must be refused by the geometry, not wrap onto slot 0"
     );
 }
+
+/// F-A5 (docs/nostr-presence-audit.md): a slot our own tag marks but whose
+/// body will not open is deletable. The occupancy guard protects *live*
+/// records; a record that cannot open is by definition not one — refusing
+/// the remedy stranded the slot behind 6A84 forever. force_tombstone
+/// commits at the standing header's next generation and leaves the slot
+/// reusable by the writers.
+#[test]
+fn an_undecodable_slot_is_force_tombstoned_and_reusable() {
+    let tmp = TempRegion::new("force-tombstone");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let stale = slot_of(0);
+    let other_chip = [0x99u8; 8];
+    let other_key =
+        crypto::derive_payload_key(&otp_row(), &other_chip, &crypto::NOSTR_PAYLOAD_SECRET)
+            .expect("the other board's Nostr key");
+    program_record(&mut region, stale, &foreign_record(Domain::Nostr, &other_key, stale, 1));
+
+    let key = nostr_payload_key();
+    let mut store = NostrStore::new(&mut region, &key);
+    assert!(matches!(store.read(0), Ok(Entry::Undecodable)));
+    store.force_tombstone(0).expect("the corrupt occupant is force-tombstoned");
+    assert!(
+        matches!(store.read(0), Ok(Entry::Tombstone)),
+        "the slot reads as a tombstone, not a fault"
+    );
+    store.write(0, &identity(6)).expect("the slot is reusable by the writers");
+}
+
+/// F-A5's safety rail: force_tombstone is not a guard bypass for *live*
+/// records — a slot that opens as ours must go through `delete` (which
+/// names what it destroyed, D12); force refuses it and leaves it standing.
+#[test]
+fn force_tombstone_refuses_a_live_record() {
+    let tmp = TempRegion::new("force-live");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let key = nostr_payload_key();
+    let mut store = NostrStore::new(&mut region, &key);
+    store.write(0, &identity(3)).expect("write a live identity");
+    let err = store
+        .force_tombstone(0)
+        .expect_err("a live record is delete's business, not a force's");
+    assert!(matches!(err, NostrStoreError::LiveRecord { .. }), "got {err:?}");
+    assert!(matches!(store.read(0), Ok(Entry::Live(_))), "the live record is untouched");
+}

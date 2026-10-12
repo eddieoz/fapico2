@@ -125,7 +125,9 @@ pub const INS_NIP44_ENCRYPT: u8 = 0x16;
 pub const INS_NIP44_DECRYPT: u8 = 0x17;
 /// `SET_LABEL` — `utf8(≤32 bytes)`. Touch-gated. US-1649.
 pub const INS_SET_LABEL: u8 = 0x18;
-/// `DELETE_KEY` — `npub(32)` naming what was destroyed. Touch-gated. US-1649.
+/// `DELETE_KEY` — a live slot answers the destroyed identity's `npub(32)`
+/// (D12); an undecodable slot answers with no body. The request carries
+/// no payload. Touch-gated. US-1649.
 pub const INS_DELETE_KEY: u8 = 0x19;
 /// `EXPORT_KEY` — `scalar(32)`, touch-gated and permanent (§2.2.0a).
 /// US-1649.
@@ -1002,6 +1004,15 @@ impl NostrApp {
     /// `DELETE_KEY` — P1 = idx; answers `npub(32)` naming what was
     /// destroyed (§2.2: the host and the user learn *which* identity is
     /// gone). Touch-gated; the slot becomes reusable (our own tombstone).
+    /// `DELETE_KEY` — P1 = idx; a live slot answers the destroyed
+    /// identity's `npub(32)` naming what was destroyed (D12), an
+    /// undecodable slot answers with no body. The request carries no
+    /// payload. Touch-gated. A slot that carries our tag but will not
+    /// open (`Entry::Undecodable`, F-A5) has no name to verify and no
+    /// body to answer with — but it takes the same touch any other
+    /// delete costs: the occupancy guard protects live records, and
+    /// refusing the remedy stranded the slot behind `6A84`/`6F00`
+    /// forever.
     fn delete_key(
         &mut self,
         p1: u8,
@@ -1018,22 +1029,38 @@ impl NostrApp {
         }
         let Self { region, provider, rng: _, presence_grant } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
-        let id = match read_identity(&mut store, p1 as u16) {
-            Ok(id) => id,
-            Err(sw) => {
-                write_sw(resp, sw);
-                return;
+        // Classify after the form check: a corrupt slot (our tag, a body
+        // that will not open) destroys through force_tombstone with no
+        // npub to answer; a live slot keeps the D12 contract.
+        use fapico2_platform::keyregion::nostr_store::Entry;
+        let corrupt = matches!(store.read(p1 as u16), Ok(Entry::Undecodable));
+        let id = if corrupt {
+            None
+        } else {
+            match read_identity(&mut store, p1 as u16) {
+                Ok(id) => Some(id),
+                Err(sw) => {
+                    write_sw(resp, sw);
+                    return;
+                }
             }
         };
         if !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
-        if store.delete(p1 as u16).is_err() {
+        let deleted = if corrupt {
+            store.force_tombstone(p1 as u16).is_ok()
+        } else {
+            store.delete(p1 as u16).is_ok()
+        };
+        if !deleted {
             write_sw(resp, SW_STORE_FAULT);
             return;
         }
-        resp.extend_from_slice(&id.npub).ok();
+        if let Some(id) = id {
+            resp.extend_from_slice(&id.npub).ok();
+        }
         write_sw(resp, SW_OK);
     }
 
@@ -1101,12 +1128,25 @@ impl App for NostrApp {
         let Self { region, provider, .. } = self;
         let mut resp = HeaplessVec::new();
         if let Some(mut store) = attach_store(region, provider, &mut resp) {
+            use fapico2_platform::keyregion::nostr_store::Entry;
             for index in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
                 // Best effort per slot — `factory_wipe` has no status-word
                 // channel, and a slot that will not commit is reported by
                 // the next read's honest answer, not by a fault here.
-                if read_identity(&mut store, index).is_ok() {
-                    let _ = store.delete(index);
+                // Live records delete (named, committed); a slot our tag
+                // marks but that will not open (F-A5) force-tombstones —
+                // after the wipe every slot is reusable, as US-1650's
+                // acceptance says. Empty, tombstone and foreign slots are
+                // skipped: the guard would refuse them anyway, and a
+                // foreign record is not ours to destroy.
+                match store.read(index) {
+                    Ok(Entry::Live(_)) => {
+                        let _ = store.delete(index);
+                    }
+                    Ok(Entry::Undecodable) => {
+                        let _ = store.force_tombstone(index);
+                    }
+                    _ => {}
                 }
             }
         }
