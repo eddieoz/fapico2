@@ -129,8 +129,10 @@ currently bypassed by omission.
 - **F-A8 (G-F4):** refuse `idx > 0xFF` in `nostr_wire::decode_request_inner` (in-band `6A80`)
   + test — the envelope honours only what the device honours.
 - **F-A9 (S-F6):** stale capacity prose in `fido_store.rs:245, 449` (856 → the carved 848).
-- **F-A10 (G-F5):** `docs/erase-budget.md` §3.1a/§4c.5 name the Nostr store as a budget
+- **F-A10 (G-F5):** `docs/erase-budget.md` §4c.5 names the Nostr store as a budget
   consumer (2 of 3 erases per Nostr commit land on the shared scratchpad sector).
+  Scope corrected in execution: §3.1a is the *secure-partition* persist budget and
+  Nostr is not a consumer there — only §4c.5 (the keyregion) gets the line.
 
 ### Recorded, no code (accepted risks / out of scope)
 
