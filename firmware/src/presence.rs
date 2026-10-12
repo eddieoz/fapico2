@@ -854,10 +854,21 @@ pub fn pending_window_tag() -> Option<u32> {
 /// Nostr HID window is still unconsumable by FIDO (disjoint tag domains),
 /// and a CCID SIGN concurrent with a HID window still takes the strict path
 /// and finds the slot busy.
+/// The Nostr HID window-tag domain, exactly: bits 30 and 29 set, bit 31
+/// clear — the range `0x6000_0000 | cid` with the Nostr CID allocator's
+/// clamp (`cid < 0x2000_0000`, `ctap_hid.rs`) guarantees. A mask on bit 30
+/// alone would also admit a *folded FIDO* tag `0xE000_xxxx` (FIDO tags are
+/// `0x8000_0000 | cid` and the FIDO allocator wraps at `0x8000_0000`
+/// unclamped), and a FIDO press would authorize a Nostr command
+/// (`docs/nostr-presence-audit.md` F-A2).
+fn is_nostr_window_tag(tag: u32) -> bool {
+    tag & 0xE000_0000 == 0x6000_0000
+}
+
 pub fn nostr_grant(tag: u32) -> bool {
     if NOSTR_HID_GRANT_CONTEXT.load(Ordering::SeqCst) {
         match pending_window_tag() {
-            Some(t) if t & 0x6000_0000 == 0x6000_0000 => request_grant_in_window(t),
+            Some(t) if is_nostr_window_tag(t) => request_grant_in_window(t),
             _ => false,
         }
     } else {
