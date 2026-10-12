@@ -119,6 +119,17 @@ impl fapico2_platform::dispatch::App for NostrViaMutex {
     ) -> fapico2_platform::dispatch::Sw {
         with_nostr(|app| app.select_apdu(internal, apdu, resp))
     }
+
+    /// D6 (docs/nostr-presence-audit.md F-A3): the dispatcher's
+    /// `factory_wipe_apps` reaches the applet only through this proxy —
+    /// the trait's default no-op would silently spare Nostr from
+    /// management RESET while the emulator (which registers the inner
+    /// app) wiped it. Forward: mgmt RESET means every identity is gone,
+    /// Nostr included (user-confirmed D6; CTAP2 `authenticatorReset`
+    /// stays Nostr-preserving — it wipes only FIDO's range).
+    fn factory_wipe(&mut self) {
+        with_nostr(|app| app.factory_wipe());
+    }
 }
 
 // US-1662: the vendor arm's scratch. Both are the HID Nostr arm's

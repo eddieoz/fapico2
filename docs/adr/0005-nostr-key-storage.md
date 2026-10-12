@@ -169,8 +169,11 @@ the decision, not the accident.
   measured, not asserted" line moves with the carve (US-1675), as do
   `apps/fido/tests/capacity_boundary.rs:43` and the ten prose sites in
   `apps/fido/src/device_keystore.rs`.
-- The forgotten-PIN journey ends in resets that no longer destroy Nostr identities
-  — worth saying in user-facing docs, because it is a *feature* of this decision.
+- The forgotten-PIN journey ends in a management RESET that destroys Nostr
+  identities with everything else (D6, `docs/nostr-presence-audit.md` F-A3);
+  what the device-bound derivation guarantees is that a *scoped* reset — CTAP2
+  `authenticatorReset`, which erases only FIDO's range — leaves Nostr records
+  sealed and recoverable, not orphaned.
 - A future story that wants Nostr keys to survive into a multi-vault future must
   re-open §2.4.1 rule 3 (whole-region re-keying) before touching this shape.
 - The spike stays a detached workspace until US-1636 brings the real dependency

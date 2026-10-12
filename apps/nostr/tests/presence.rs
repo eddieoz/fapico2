@@ -254,3 +254,32 @@ fn nostr_tag_never_collides_with_another_domain() {
         }
     }
 }
+
+/// D6 (docs/nostr-presence-audit.md F-A3): the device registers the
+/// `NostrViaMutex` proxy, not the applet, and `App::factory_wipe`'s trait
+/// default is a silent no-op — management RESET would wipe every applet
+/// except Nostr while the emulator (which registers the inner app) wiped
+/// it: the AGENTS §1 twin trap. The proxy must forward the wipe.
+#[test]
+fn the_ccid_proxy_forwards_factory_wipe() {
+    let shared = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/nostr_shared.rs"
+    ))
+    .expect("firmware/src/nostr_shared.rs is readable from the nostr test crate");
+    let tail = shared
+        .split("impl fapico2_platform::dispatch::App for NostrViaMutex")
+        .nth(1)
+        .expect("the proxy implements App");
+    assert!(
+        tail.contains("fn factory_wipe(&mut self)"),
+        "the CCID proxy must override factory_wipe — the trait default is a \
+         silent no-op, and management RESET would spare Nostr while wiping \
+         every other applet (F-A3)"
+    );
+    assert!(
+        tail.contains("with_nostr(|app| app.factory_wipe())"),
+        "the proxy's factory_wipe must forward through the shared mutex, \
+         not re-implement (or worse, no-op)"
+    );
+}
