@@ -148,6 +148,28 @@ currently bypassed by omission.
 - **F-A14:** prior-assessment items left open there and not contradicted here: `nostr_init_reply`
   capFlags honesty (US-1661) not re-derived; FIDO-allocator flood-cost figure unmeasured.
 
+### Found by the hardware pass (2026-10-12)
+
+- **F-A15 — FIXED (`be886fc`):** `paced_bootsel`'s per-poll "re-assert" drove the
+  active-high touch prompt LOW, holding it dark for the whole blocking wait — observed
+  live ("led was solid dark for this last touch", the user, during a Nostr CCID wait),
+  on the OpenPGP PSO wait too. Re-assert HIGH; the source gate pins the polarity.
+- **F-A16 — RECORDED, not fixed:** the **windowed** CCID prompt (mgmt/OATH) is dark on
+  this board — it lights only at window-open, then trussed's Processing→Idle bracketing
+  per pcscd poll flips it off (the documented 2026-09-23 class; its fix covered only
+  the blocking wait). The user pressed blind and the RESET completed. Fix shape: the
+  button task's tick re-asserts the prompt HIGH while `pending_tag()` is `Some` —
+  broader than F-A15 (every CCID window's heartbeat interplay), its own decision.
+
+### Hardware acceptance (the D2 leg — `docs/evidence/nostr-presence-audit/hardware.md`)
+
+Verified on the post-audit tip with the user's finger: D7 (the CCID blocking wait
+grants — `9000` + npub after a 5.1 s press; the untouched control refused `6985` after
+the full 10.0 s window), the delete flow (the destroyed npub named, then `6A82`), F-A1
+(six rounds of the park/CANCEL hammer with many presses — **zero** orphan consumptions,
+no command ever ran without a matching fresh press), and D6 (mgmt RESET: first leg
+`6985` instantly, the retry consumed the press at t+8 s, `LIST_KEYS` answered **n=0**).
+
 ### Verified clean (re-derived at this tip, not inherited)
 
 Carve enforced at all guard sites (`fido_store.rs:506, 1103, 1340, 1454`; allocator scan
