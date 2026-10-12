@@ -123,11 +123,23 @@ impl PresenceService {
     /// Frees the slot (so the next command can begin) and returns whether
     /// a window actually closed. A deadline-less pending request (the
     /// plain `begin_request` path) never expires here.
+    ///
+    /// The expired window's armed grant dies with it: a press in the
+    /// window's final moments must not arm the next window opened under
+    /// the same tag (the CANCEL-repark replay's race-free variant,
+    /// `docs/nostr-presence-audit.md` F-A1 — the expiry path already
+    /// refuses to re-drive; the grant must leak no further either).
     pub fn expire_pending(&mut self, now_ms: u64) -> bool {
         match self.pending_deadline {
             Some(deadline) if now_ms >= deadline => {
+                let tag = self.pending;
                 self.pending = None;
                 self.pending_deadline = None;
+                if let Some(Armed { tag: a, deadline_ms: _ }) = self.armed {
+                    if Some(a) == tag {
+                        self.armed = None;
+                    }
+                }
                 true
             }
             _ => false,
@@ -138,10 +150,21 @@ impl PresenceService {
     /// Clears any window deadline too (a window opened by
     /// [`begin_request_window`] is closed only by its owner, its expiry,
     /// or this call).
+    ///
+    /// The grant dies with its request: an armed-but-unconsumed press must
+    /// not outlive the command it was armed for (the CANCEL-repark replay,
+    /// `docs/nostr-presence-audit.md` F-A1). A grant bound to a different
+    /// tag cannot exist while `tag` owns the slot — arming requires that
+    /// tag to be pending — so this drop can never strand a foreign grant.
     pub fn end_request(&mut self, tag: u32) {
         if self.pending == Some(tag) {
             self.pending = None;
             self.pending_deadline = None;
+            if let Some(Armed { tag: a, deadline_ms: _ }) = self.armed {
+                if a == tag {
+                    self.armed = None;
+                }
+            }
         }
     }
 

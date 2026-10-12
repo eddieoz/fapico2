@@ -219,3 +219,43 @@ fn plain_begin_request_has_no_deadline_and_end_request_clears_it() {
     assert!(!svc.expire_pending(u64::MAX));
     assert!(svc.begin_request(0x22), "the slot freed");
 }
+
+/// F-A1 (docs/nostr-presence-audit.md) — the CANCEL-repark replay: an armed
+/// grant must not outlive the request it was armed for. A press that armed
+/// while command A was pending must be dead once A's request ends, even
+/// though a later command can re-open a window under the same tag.
+#[test]
+fn end_request_drops_the_armed_grant_for_that_tag() {
+    let mut svc = PresenceService::new();
+    assert!(svc.begin_request(0x6000_0042));
+    svc.observe_press(1_000);
+    // The command ends without consuming — the CANCEL path.
+    svc.end_request(0x6000_0042);
+    // A later command re-opens a window under the same tag…
+    assert!(svc.begin_request_window(0x6000_0042, 20_000));
+    // …and must find nothing armed: the press died with the old request.
+    assert_eq!(
+        svc.request(0x6000_0042, 2_000),
+        None,
+        "an armed grant must not outlive the request it was armed for"
+    );
+}
+
+/// F-A1's race-free variant: a press in a window's final moments arms, the
+/// window expires unconsumed, and the grant must not leak into the next
+/// window opened under the same tag (the expiry path already refuses to
+/// re-drive — US-1663's no-late-grant rule — the grant must leak no
+/// further either).
+#[test]
+fn an_expired_window_takes_its_armed_grant_with_it() {
+    let mut svc = PresenceService::new();
+    assert!(svc.begin_request_window(0x6000_0042, 10_000));
+    svc.observe_press(9_900); // arms, inside the window
+    assert!(svc.expire_pending(10_000), "the window expires");
+    assert!(svc.begin_request_window(0x6000_0042, 30_000));
+    assert_eq!(
+        svc.request(0x6000_0042, 10_500),
+        None,
+        "a press in a window's final moments must not arm a later window"
+    );
+}
