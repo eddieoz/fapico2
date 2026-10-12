@@ -409,6 +409,16 @@ async fn main(spawner: Spawner) -> ! {
         fapico2_firmware::presence::set_touch_prompt_hook(Some(button::set_touch_prompt_led)),
         "touch-prompt hook double-install"
     );
+    // D7 (docs/nostr-presence-audit.md F-A4): the Nostr CCID arm's
+    // blocking touch wait — the OpenPGP US-914 pattern under the Nostr
+    // command's own request-bound tag. The hook lives in the lib; the
+    // wait's LED and pad sampler are this bin's (`button.rs`). Without
+    // the install the arm fails closed (no grant, ever), so a forgotten
+    // boot line shows up as dead CCID key management, not as a bypass.
+    assert!(
+        fapico2_firmware::presence::set_nostr_ccid_wait_hook(Some(button::nostr_wait_grant)),
+        "nostr CCID wait hook double-install"
+    );
     // Boot-phase rung 2: everything from here to the store mount is TRNG /
     // clock bring-up (`Rp2350Trng::from_peri`, the `TIMER0` proof, the boot
     // sanity draw) — the first boundary that can catch a peripheral-level

@@ -142,23 +142,45 @@ pub fn set_touch_prompt_led(on: bool) {
 }
 
 /// US-914: touch-to-sign wait for the OpenPGP app — the device-build
-/// presence gate for PSO:SIGN / PSO:DECIPHER / INT-AUTH. Blocks the CCID
-/// serve task for at most [`PSO_TOUCH_WINDOW_MS`] while the shared
-/// presence runtime holds the pending slot under the operation tag; a
-/// BOOTSEL press *edge* inside the window arms and consumes exactly one
-/// grant. The pad is sampled here directly (paced) because the button
-/// poll task is starved while the serve task blocks; the steady ON light
-/// for the whole window is the touch prompt (the heartbeat is starved
-/// too, so this is the only driver during the wait).
+/// presence gate for PSO:SIGN / PSO:DECIPHER / INT-AUTH. See
+/// [`blocking_touch_wait`] for the mechanism; this is the OpenPGP tag's
+/// entry point.
 ///
 /// No key material is ever logged — the operation tag only.
 pub fn pso_wait_grant(tag: u32) -> bool {
-    // US-906 window parity: 10 s, the same grant-expiry budget the
-    // platform presence service uses (`PRESENCE_WINDOW_MS`). It must stay
-    // under the host's T=1 transaction-abort ceiling (observed ~14.5 s
-    // over libccid — US-920's WTX work owns longer waits) so the refusal
-    // is observable as SW=6982 rather than a host-side transport abort.
-    const PSO_TOUCH_WINDOW_MS: u64 = 10_000;
+    blocking_touch_wait(tag, PSO_TOUCH_WINDOW_MS)
+}
+
+/// US-914's window: 10 s, the same grant-expiry budget the platform
+/// presence service uses (`PRESENCE_WINDOW_MS`). It must stay under the
+/// host's T=1 transaction-abort ceiling (observed ~14.5 s over libccid —
+/// US-920's WTX work owns longer waits) so the refusal is observable as a
+/// status word rather than a host-side transport abort.
+const PSO_TOUCH_WINDOW_MS: u64 = 10_000;
+
+/// D7 (docs/nostr-presence-audit.md F-A4): the Nostr CCID arm's device
+/// gate — the OpenPGP wait pattern under the Nostr command's own
+/// request-bound tag. The strict one-shot `request_grant` can never grant
+/// on hardware: the CCID dispatch is synchronous and non-preemptive, and
+/// the button task latches and drains a press inside one 10 ms tick, so
+/// the one-shot poll always finds the latch empty and every touch-gated
+/// Nostr command over PC/SC answered `6985` forever. The wait holds the
+/// pending slot for the attempt and samples the pad in-line (paced), so a
+/// press during the wait arms and consumes exactly one grant — for
+/// exactly this command. The window is [`PSO_TOUCH_WINDOW_MS`]'s 10 s for
+/// the same T=1-ceiling reason.
+pub fn nostr_wait_grant(tag: u32) -> bool {
+    blocking_touch_wait(tag, PSO_TOUCH_WINDOW_MS)
+}
+
+/// The shared touch-wait body (US-914's mechanism): light the touch
+/// prompt, block the serve task for at most `window_ms` waiting for a
+/// BOOTSEL press *edge* under `tag`, clear the prompt. The pad is sampled
+/// directly (paced) because the button poll task is starved while the
+/// serve task blocks; the steady ON light for the whole window is the
+/// touch prompt (the heartbeat is starved too, so this is the only driver
+/// during the wait).
+fn blocking_touch_wait(tag: u32, window_ms: u64) -> bool {
     // SAFETY: the `LED_OUT` slot is initialized exactly once at the top of
     // `main`; this access is serialized against the heartbeat task and the
     // trussed UI by the shared-pin contract (single core, cooperative
@@ -168,12 +190,12 @@ pub fn pso_wait_grant(tag: u32) -> bool {
     let led: &mut embassy_rp::gpio::Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut() };
     led.set_high(); // ON (active-high) — the touch prompt
-    let granted = fapico2_firmware::presence::wait_grant(tag, PSO_TOUCH_WINDOW_MS, paced_bootsel);
+    let granted = fapico2_firmware::presence::wait_grant(tag, window_ms, paced_bootsel);
     led.set_low(); // OFF — the heartbeat resumes at the next await
     if granted {
-        defmt::info!("US-914: presence granted (op {=u32:x})", tag);
+        defmt::info!("presence granted (op {=u32:x})", tag);
     } else {
-        defmt::warn!("US-914: touch-to-sign refused, no press (op {=u32:x})", tag);
+        defmt::warn!("touch wait expired without a press (op {=u32:x})", tag);
     }
     granted
 }

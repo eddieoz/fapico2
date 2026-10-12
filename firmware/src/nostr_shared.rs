@@ -80,10 +80,14 @@ pub fn with_nostr<R>(f: impl FnOnce(&mut NostrApp) -> R) -> R {
 /// stable `&mut` to the applet behind it, so the CCID arm reaches the applet
 /// through this zero-sized proxy, which locks per call. Every lock is held
 /// only inside the synchronous [`App::process`] body (no `.await` inside the
-/// gate, no touch wait under the lock — the strict presence path parks and
-/// returns), so the two transports' critical sections stay word-scale and
-/// the cooperative executor cannot deadlock. The touch wait happens outside
-/// the lock by construction; snapshots and flash commits stay under it.
+/// gate — the HID arm's strict presence path parks and returns). The CCID
+/// arm blocks inside `process` in the OpenPGP wait shape (D7,
+/// `docs/nostr-presence-audit.md` F-A4) — on this single-core cooperative
+/// executor the wait stalls the executor regardless of the mutex, so the
+/// lock adds no ordering the executor does not already force. The two
+/// transports' critical sections stay word-scale for the HID arm, and the
+/// cooperative executor cannot deadlock. The HID touch wait happens outside
+/// the lock by construction.
 pub struct NostrViaMutex;
 
 /// Write-once slot for the proxy (the dispatcher borrows it for `'static`).

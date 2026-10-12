@@ -829,31 +829,6 @@ pub fn pending_window_tag() -> Option<u32> {
     unsafe { runtime().svc.pending_tag() }
 }
 
-/// US-1663: the Nostr applet's grant — the one provider both transports
-/// share, discriminated by the transport context rather than by the tag,
-/// because the applet's tag is transport-blind.
-///
-/// * **CCID arm** (context clear): the strict one-shot path —
-///   `begin_request` / poll / `request` / `end_request` under the applet's
-///   own tag. This is D3's rule: a same-tag SIGN must never join another
-///   SIGN's window and inherit its press.
-/// * **HID vendor arm** (context set): the transaction bound is the window
-///   the arm parked — one command per window (park-not-queue, US-1510) — so
-///   the gate consumes join-only, via [`request_grant_in_window`], under
-///   **the open window's own tag** (`0x6000_0000 | cid`, §A.8.3 #1). The
-///   applet's CCID-form tag is not the bound here and is not consulted: the
-///   press is armed only while that window is open, and it is spent on the
-///   command the arm re-drove. Fail-closed in both degenerate shapes: no
-///   window open (the first, pre-park app call — the refusal that CREATES
-///   the window) or a window under a non-HID domain (a FIDO or CCID window
-///   owns the slot — the US-1663 contention bound). Either way the applet
-///   hears `6985` and the press, if any, stays with its own window.
-///
-/// What this does **not** weaken: `request_grant_in_window` never opens a
-/// window and never burns a grant on a tag mismatch; a press armed for the
-/// Nostr HID window is still unconsumable by FIDO (disjoint tag domains),
-/// and a CCID SIGN concurrent with a HID window still takes the strict path
-/// and finds the slot busy.
 /// The Nostr HID window-tag domain, exactly: bits 30 and 29 set, bit 31
 /// clear — the range `0x6000_0000 | cid` with the Nostr CID allocator's
 /// clamp (`cid < 0x2000_0000`, `ctap_hid.rs`) guarantees. A mask on bit 30
@@ -865,6 +840,76 @@ fn is_nostr_window_tag(tag: u32) -> bool {
     tag & 0xE000_0000 == 0x6000_0000
 }
 
+/// D7 (`docs/nostr-presence-audit.md` F-A4): the Nostr CCID arm's wait
+/// hook. `nostr_grant` lives in this lib, but the blocking touch wait
+/// drives the device bin's LED and pad sampler (`button.rs`, bin-only) —
+/// the same layering the touch-prompt hook below solves. The device bin
+/// installs `button::nostr_wait_grant` at boot (next to the touch-prompt
+/// install); host builds install nothing. Write-once, exactly like
+/// [`set_touch_prompt_hook`] — the first install wins, a second returns
+/// `false` so a boot-ordering mistake is loud rather than silent.
+static NOSTR_CCID_WAIT_SET: AtomicBool = AtomicBool::new(false);
+static mut NOSTR_CCID_WAIT_FN: Option<fn(u32) -> bool> = None;
+
+/// Install the Nostr CCID arm's blocking touch wait (device wiring:
+/// `main` registers `button::nostr_wait_grant` at boot, next to the
+/// touch-prompt hook). Returns `false` on a second call.
+pub fn set_nostr_ccid_wait_hook(hook: Option<fn(u32) -> bool>) -> bool {
+    if NOSTR_CCID_WAIT_SET.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    unsafe {
+        // SAFETY: write-once before any task runs (boot discipline, the
+        // RUNTIME_SLOT pattern) — no aliasing exists yet.
+        core::ptr::addr_of_mut!(NOSTR_CCID_WAIT_FN).write(hook);
+    }
+    true
+}
+
+/// The installed CCID wait hook, if any.
+fn nostr_ccid_wait_hook() -> Option<fn(u32) -> bool> {
+    if NOSTR_CCID_WAIT_SET.load(Ordering::SeqCst) {
+        // SAFETY: read of the write-once slot, sequenced after the flag.
+        unsafe { core::ptr::addr_of!(NOSTR_CCID_WAIT_FN).read() }
+    } else {
+        None
+    }
+}
+
+/// US-1663: the Nostr applet's grant — the one provider both transports
+/// share, discriminated by the transport context rather than by the tag,
+/// because the applet's tag is transport-blind.
+///
+/// * **CCID arm** (context clear): the blocking touch wait — the OpenPGP
+///   US-914 pattern, via the boot-installed wait hook
+///   ([`set_nostr_ccid_wait_hook`]; the device bin installs
+///   `button::nostr_wait_grant`) under the
+///   command's own request-bound tag. D7 (`docs/nostr-presence-audit.md`
+///   F-A4): the strict one-shot poll this arm used before can never grant
+///   on hardware — the dispatch is synchronous and the button task drains
+///   a press within one tick — so it held the slot for microseconds and
+///   answered `6985` forever. The wait holds the slot for the attempt; a
+///   same-tag SIGN still never joins another SIGN's grant, because the
+///   grant is bound to this command's pending slot alone and dies with it
+///   (F-A1's rule).
+/// * **HID vendor arm** (context set): the transaction bound is the window
+///   the arm parked — one command per window (park-not-queue, US-1510) — so
+///   the gate consumes join-only, via [`request_grant_in_window`], under
+///   **the open window's own tag** (`0x6000_0000 | cid`, §A.8.3 #1). The
+///   applet's CCID-form tag is not the bound here and is not consulted: the
+///   press is armed only while that window is open, and it is spent on the
+///   command the arm re-drove. Fail-closed in both degenerate shapes: no
+///   window open (the first, pre-park app call — the refusal that CREATES
+///   the window) or a window under a non-HID domain (a FIDO or CCID window
+///   owns the slot — the US-1663 contention bound, exact per F-A2). Either
+///   way the applet hears `6985` and the press, if any, stays with its own
+///   window.
+///
+/// What this does **not** weaken: `request_grant_in_window` never opens a
+/// window and never burns a grant on a tag mismatch; a press armed for the
+/// Nostr HID window is still unconsumable by FIDO (disjoint tag domains),
+/// and a CCID command concurrent with a HID window still takes the wait
+/// path and finds the slot busy.
 pub fn nostr_grant(tag: u32) -> bool {
     if NOSTR_HID_GRANT_CONTEXT.load(Ordering::SeqCst) {
         match pending_window_tag() {
@@ -872,7 +917,20 @@ pub fn nostr_grant(tag: u32) -> bool {
             _ => false,
         }
     } else {
-        request_grant(tag)
+        // D7 (docs/nostr-presence-audit.md F-A4): the CCID arm blocks in
+        // the OpenPGP wait shape under this command's own request-bound
+        // tag — the strict one-shot poll can never observe a press on
+        // hardware (the dispatch is synchronous; the button task drains
+        // within one tick). The hook is the device bin's
+        // `button::nostr_wait_grant`, installed at boot; absent it fails
+        // CLOSED — a missing install must not silently degrade to a path
+        // that cannot grant. With F-A1's fix the grant cannot outlive the
+        // wait, and the single pending slot means no other command can
+        // join it.
+        match nostr_ccid_wait_hook() {
+            Some(wait) => wait(tag),
+            None => false,
+        }
     }
 }
 

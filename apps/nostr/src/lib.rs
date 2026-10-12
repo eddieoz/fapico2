@@ -42,7 +42,11 @@
 //!   never produce.
 //! * **presence** (`with_presence_grant`) — US-1646's wiring. Absent, the
 //!   applet falls back to a device-denies / host-acks default, the rescue
-//!   applet's fail-closed shape.
+//!   applet's fail-closed shape. The device injects `nostr_grant`
+//!   (US-1663): the HID arm consumes join-only inside the window that arm
+//!   itself opened; the CCID arm blocks in the OpenPGP touch-wait shape
+//!   under the command's own request-bound tag (D7,
+//!   `docs/nostr-presence-audit.md`).
 //!
 //! SELECT answers `9000` with no FCI template: the client reads the applet's
 //! identity through [`INS_GET_INFO`], not through the SELECT response, so
@@ -1358,11 +1362,13 @@ pub fn hid_presence_tag(cid: [u8; 4]) -> u32 {
 
 fn user_present(grant: Option<fn(u32) -> bool>, idx: u16) -> bool {
     match grant {
-        // The device injects the strict one-shot path
-        // (`fapico2_firmware::presence::request_grant`): begin_request /
-        // poll / request / end_request under this tag — never the
-        // join-or-open `window_grant`, which would let a same-tag SIGN
-        // join another SIGN's open window (§2.3.1 requirement 1).
+        // The device injects the domain-discriminating `nostr_grant`
+        // (US-1663): the HID arm consumes join-only inside the window that
+        // arm itself opened — never the join-or-open `window_grant`, which
+        // would let a same-tag SIGN join another SIGN's open window
+        // (§2.3.1 requirement 1) — and the CCID arm blocks in the OpenPGP
+        // touch-wait shape under this command's own request-bound tag
+        // (D7, docs/nostr-presence-audit.md F-A4).
         Some(g) => g(presence_tag(idx)),
         None => default_user_present(),
     }

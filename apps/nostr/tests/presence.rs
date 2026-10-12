@@ -110,9 +110,10 @@ fn sign_refused_without_presence_grant() {
 /// `install_nostr_providers(...)` — so THIS gate asserts the property at
 /// the place it now lives: the call exists in `main.rs`, its grant
 /// argument is `fapico2_firmware::presence::nostr_grant` (the
-/// domain-discriminating strict path — bit-30 CCID tags fall through to
-/// `request_grant`, and the HID vendor arm's tags resolve inside the
-/// window that arm itself opened), and the call site never names the
+/// domain-discriminating gate — the HID vendor arm's tags resolve inside
+/// the window that arm itself opened, and the CCID arm blocks in the
+/// OpenPGP touch-wait shape under the command's own request-bound tag,
+/// D7), and the call site never names the
 /// join-or-open `window_grant` (§2.3.1's forbidden path — the negative
 /// assertion is the half that catches the join-or-open regression this
 /// gate exists for).
@@ -281,5 +282,58 @@ fn the_ccid_proxy_forwards_factory_wipe() {
         tail.contains("with_nostr(|app| app.factory_wipe())"),
         "the proxy's factory_wipe must forward through the shared mutex, \
          not re-implement (or worse, no-op)"
+    );
+}
+
+/// D7 (docs/nostr-presence-audit.md F-A4): the CCID arm's grant must be
+/// the OpenPGP wait shape — the strict one-shot poll can never grant on
+/// hardware, so a CCID-built `nostr_grant` that still routes to
+/// `request_grant` would answer `6985` forever with no prompt. The wait
+/// body is the device bin's (`button.rs` is bin-only), so the lib takes it
+/// through a boot-installed hook — the touch-prompt hook's own pattern —
+/// and the gate pins both halves against the firmware source: the lib's
+/// hook consultation and the bin's install.
+#[test]
+fn the_ccid_arm_uses_the_wait_shape_not_the_one_shot() {
+    let presence_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/presence.rs"
+    ))
+    .expect("firmware/src/presence.rs is readable from the nostr test crate");
+    let nostr_grant_body = presence_rs
+        .split("pub fn nostr_grant")
+        .nth(1)
+        .expect("nostr_grant exists");
+    assert!(
+        nostr_grant_body.contains("nostr_ccid_wait_hook()"),
+        "nostr_grant's non-HID branch must consult the boot-installed wait \
+         hook (D7) — a one-shot poll can never grant on hardware, and a \
+         missing hook must fail closed, not degrade to request_grant"
+    );
+    assert!(
+        presence_rs.contains("pub fn set_nostr_ccid_wait_hook"),
+        "presence.rs must publish the write-once CCID wait hook (the \
+         touch-prompt hook's pattern)"
+    );
+    let main_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/main.rs"
+    ))
+    .expect("firmware/src/main.rs is readable from the nostr test crate");
+    assert!(
+        main_rs.contains("set_nostr_ccid_wait_hook(Some(button::nostr_wait_grant))"),
+        "main.rs must install button::nostr_wait_grant as the CCID wait \
+         hook at boot — without the install the arm fails closed (dead CCID \
+         key management), the same silence the §2.6 gate exists to catch"
+    );
+    let button_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/button.rs"
+    ))
+    .expect("firmware/src/button.rs is readable from the nostr test crate");
+    assert!(
+        button_rs.contains("pub fn nostr_wait_grant"),
+        "button.rs must publish nostr_wait_grant (the OpenPGP pattern's \
+         Nostr entry point)"
     );
 }
