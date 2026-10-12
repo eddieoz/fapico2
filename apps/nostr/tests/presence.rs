@@ -336,4 +336,24 @@ fn the_ccid_arm_uses_the_wait_shape_not_the_one_shot() {
         "button.rs must publish nostr_wait_grant (the OpenPGP pattern's \
          Nostr entry point)"
     );
+    // F-A15 (docs/nostr-presence-audit.md, hardware pass 2026-10-12): the
+    // wait's own sampler is what keeps the prompt lit — the LED is
+    // active-high, so the per-poll re-assert must be HIGH. An earlier
+    // draft set it LOW every poll and held the prompt dark for the whole
+    // wait, on the Nostr CCID arm and the OpenPGP PSO wait alike.
+    let paced = button_rs
+        .split("fn paced_bootsel")
+        .nth(1)
+        .expect("paced_bootsel exists");
+    assert!(
+        paced.contains(".set_high();"),
+        "paced_bootsel must re-assert the touch prompt HIGH on every poll \
+         (F-A15) — the LED is active-high, and a LOW re-assert holds the \
+         prompt dark for the whole wait"
+    );
+    assert!(
+        !paced.contains(".set_low();"),
+        "paced_bootsel must never drive the prompt LOW mid-wait (F-A15: \
+         the user's only signal is this LED)"
+    );
 }

@@ -216,9 +216,15 @@ fn paced_bootsel() -> bool {
     // (pcscd's GetSlotStatus polling) pass through trussed, whose
     // Processing→Idle bracketing flips the LED OFF mid-wait — the
     // hardware BDD caught the prompt showing as solid OFF (2026-09-23).
+    // The LED is active-high (`set_touch_prompt_led`: set_high = ON), so
+    // the re-assert is HIGH — an earlier draft set it LOW here, holding
+    // the prompt dark for the whole wait (the audit's hardware pass
+    // caught it live, 2026-10-12: "led was solid dark for this last
+    // touch" during a Nostr CCID wait; the PSO wait inherited the same
+    // dark prompt since US-914).
     // SAFETY: as `pso_wait_grant` — the shared `LED_OUT` slot, serialized
     // single-core; this runs inside the serve task's synchronous wait.
     unsafe { (&mut *core::ptr::addr_of_mut!(crate::boot::LED_OUT)).assume_init_mut() }
-        .set_low();
+        .set_high();
     pressed
 }
