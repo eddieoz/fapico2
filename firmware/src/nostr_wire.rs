@@ -147,8 +147,8 @@ fn decode_request_inner(payload: &[u8]) -> Option<(u16, &[u8])> {
         return None; // array(2), always
     }
     let (idx, rest) = read_uint(rest)?;
-    if idx > 0xFFFF {
-        return None;
+    if idx > 0xFF {
+        return None; // idx rides P1 — one byte (F-A8); a wider "uint" is malformed
     }
     let (arg, rest) = read_bytes(rest)?;
     // The §2.2.1 wire cap (US-1678): the CTAPHID frame can carry up to
@@ -395,6 +395,24 @@ pub fn process_vendor_through(
 mod tests {
     use super::*;
     use fapico2_platform::dispatch::SW_INS_NOT_SUPPORTED;
+
+    /// F-A8 (docs/nostr-presence-audit.md): the envelope honours only what
+    /// the device honours — idx rides P1, one byte. `0x101` must refuse in
+    /// band, not silently truncate onto slot 1.
+    #[test]
+    fn an_idx_above_one_byte_is_refused() {
+        // array(2) [uint 0x101, bytes ""] — a 16-bit head.
+        assert!(
+            decode_request_inner(&[0x82, 0x19, 0x01, 0x01, 0x40]).is_none(),
+            "idx 0x101 must refuse, not truncate onto slot 1"
+        );
+        // array(2) [uint 0xFF, bytes ""] — the ceiling is honoured.
+        assert_eq!(
+            decode_request_inner(&[0x82, 0x18, 0xFF, 0x40]),
+            Some((0xFF, &[][..])),
+            "idx 0xFF is the one-byte ceiling"
+        );
+    }
 
     /// The envelope shapes are the extension's executable spec: request and
     /// response round-trip byte-exactly, and the `sw` field survives as a u16.

@@ -335,3 +335,27 @@ fn force_tombstone_refuses_a_live_record() {
     assert!(matches!(err, NostrStoreError::LiveRecord { .. }), "got {err:?}");
     assert!(matches!(store.read(0), Ok(Entry::Live(_))), "the live record is untouched");
 }
+
+/// F-A7 (docs/nostr-presence-audit.md): "occupied but names another slot"
+/// is a typed refusal, not a reboot. A valid-CRC header programmed into
+/// the wrong slot decodes Absent at the reading slot; admission must
+/// answer OccupiedForeign like any other foreign occupant — the arm used
+/// to be `unreachable!`, and panic = abort = reboot mid-ceremony.
+#[test]
+fn a_misaddressed_record_is_a_typed_refusal_not_a_panic() {
+    let tmp = TempRegion::new("misaddressed");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let placed_at = slot_of(0);
+    let named = slot_of(5);
+    let key = nostr_payload_key();
+    // A well-formed Nostr record for slot 5, sealed under our own key,
+    // programmed into slot 0: the header's CRC is valid, so the slot reads
+    // occupied, but the codec refuses it at slot 0 (the header names 5).
+    let image = foreign_record(Domain::Nostr, &key, named, 1);
+    program_record(&mut region, placed_at, &image);
+    let mut store = NostrStore::new(&mut region, &key);
+    let err = store
+        .write(0, &identity(7))
+        .expect_err("a misaddressed occupant is refused, typed");
+    assert!(matches!(err, NostrStoreError::OccupiedForeign { .. }), "got {err:?}");
+}

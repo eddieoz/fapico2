@@ -368,7 +368,11 @@ impl<'r> NostrStore<'r> {
         //    refused *before* anything touches it.
         let decoded = match record::decode(slot, &raw) {
             SlotRead::Present(d) => d,
-            SlotRead::Absent => unreachable!("occupied slot decoded as absent"),
+            // A header that parses but names another slot is a misaddressed
+            // transplant, not an impossibility (F-A7): it is occupied, it
+            // is not ours to open, and it is refused typed like any other
+            // foreign occupant instead of rebooting the board.
+            SlotRead::Absent => return Err(NostrStoreError::OccupiedForeign { slot }),
             SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
         };
         if decoded.header().domain() != Domain::Nostr {
