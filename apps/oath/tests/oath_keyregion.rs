@@ -721,20 +721,28 @@ fn fido_and_oath_at_capacity_coexist() {
     );
 }
 
-/// The geometry the two adapters have to agree on, asserted as a claim rather
-/// than left to a comment in either file.
+/// The geometry the adapters have to agree on, asserted as a claim rather
+/// than left to a comment in any of the files.
 ///
 /// `oath_store.rs` publishes `FIDO_FIRST_SLOT` precisely so the FIDO adapter
 /// cannot invent a second answer, and the cost of a disagreement is that one
 /// applet's first enrolment destroys the other's credentials. That is too
-/// expensive for two independently-edited files to leave to review, so it is
-/// here.
+/// expensive for independently-edited files to leave to review, so it is
+/// here. The Nostr reservation (US-1639) sits between FIDO's range and the
+/// index, so the tiling now names it — a carve that forgets this test tiles
+/// to 920 against a 928-slot region and the assert says so.
 #[test]
 fn the_two_reservations_tile_the_region_without_touching() {
     assert_eq!(
         FIDO_FIRST_SLOT + FIDO_CAPACITY,
+        fapico2_platform::keyregion::NOSTR_FIRST_SLOT,
+        "Nostr's reservation must start exactly where FIDO's range ends"
+    );
+    assert_eq!(
+        fapico2_platform::keyregion::NOSTR_FIRST_SLOT
+            + fapico2_platform::keyregion::NOSTR_CAPACITY,
         TOTAL_SLOTS - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT,
-        "OATH + scratchpad + FIDO + index must tile the region exactly once"
+        "OATH + scratchpad + FIDO + Nostr + index must tile the region exactly once"
     );
     assert!(
         oath_store::SCRATCHPAD_FIRST_SLOT.is_multiple_of(
