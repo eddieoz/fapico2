@@ -8,13 +8,13 @@ The practical questions first, then every term this site uses, explained.
 For FIDO2, nothing — browsers and libfido2 clients speak CTAP-HID natively. OpenPGP, OATH and OTP go over CCID, and on Linux/macOS that means a one-time libccid allowlist edit before your host sees the smartcard reader (see [Getting Started](../getting-started/index.md)). Tools worth having: `ykman` and PicoForge for management, GnuPG for the OpenPGP card. What each tool can and cannot do, quirks included: [What it works with](../interop/index.md).
 
 **What happens if I forget the PIN?**
-Nothing recovers it — that is the design, not an oversight. A factory reset issued from any FIDO2 client clears the PIN and takes every FIDO credential on the board with it; the OATH, OTP and OpenPGP applets keep their records. If a reset is your recovery plan, the credentials were never backed up anywhere — plan for that before you need it.
+Nothing recovers it — that is the design, not an oversight. A factory reset issued from any FIDO2 client clears the PIN and takes every FIDO credential on the board with it; the OATH, OTP, OpenPGP and Nostr applets keep their records. (The management applet's full RESET is the stronger act — it wipes Nostr too.) If a reset is your recovery plan, the credentials were never backed up anywhere — plan for that before you need it.
 
 **What happens if I lose the board?**
 A resident passkey exists on that one board and nowhere else — there is no cloud copy to fall back on, and no export either: passkeys are non-exportable by design. For accounts you cannot afford to be locked out of, register a second authenticator of any kind and store its recovery codes with your emergency documents. The [seed backup](../how-to/seed-backup.md) does not carry passkeys — it carries the vendor seed behind the soft lock, which is why a lost board means re-enrolling and a lost phrase for an *exported* seed means a key loose in the world.
 
 **Why not just buy a YubiKey?**
-Capacity and source. This holds 856 resident passkeys to a YubiKey 5's 100, and the firmware is AGPLv3 — you can build it, read it and change it instead of trusting a vendor's black box. What you give up is on the [threat model](../threat-model.md) page: no secure element (a lab with the board can do things a lab with a YubiKey cannot), no NFC, no certifications.
+Capacity and source. This holds 848 resident passkeys to a YubiKey 5's 100, and the firmware is AGPLv3 — you can build it, read it and change it instead of trusting a vendor's black box. What you give up is on the [threat model](../threat-model.md) page: no secure element (a lab with the board can do things a lab with a YubiKey cannot), no NFC, no certifications.
 
 **Can I sync my passkeys across devices?**
 No. Passkey sync means a vendor's cloud holds a usable copy of your credential and you hold an account with that vendor. A resident passkey here exists on one board you control — that is the whole trade.

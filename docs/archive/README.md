@@ -22,6 +22,7 @@ One-line verdicts, so nobody has to read 3,000 lines to learn what happened:
 | [`SECURITY-ASSESSMENT-ROUND2.md`](SECURITY-ASSESSMENT-ROUND2.md) | Round-2 red-team security assessment (2026-09-27, published copy, redactions applied) | Historical record of that build; the headline CRITICAL is now fixed — per-finding status at the top of the file and in the [round-3 remediation record](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) |
 | [`SECURITY-ASSESSMENT-ROUND3.md`](SECURITY-ASSESSMENT-ROUND3.md) | Round-3 red-team report (2026-10-05, moved from `redteam/`) | F1/F3 fixed, F2 accepted — per-finding status at the top of the file and in the [round-3 remediation record](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) |
 | [`SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md`](SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) | Round-3 red-team remediation record (F1/F3 fixed, F2 accepted) | F1/F3 fixed with hardware evidence; F2's accepted-risk record is [`../debug-access-risk.md`](../debug-access-risk.md) |
+| [`SECURITY-ASSESSMENT-NOSTR.md`](SECURITY-ASSESSMENT-NOSTR.md) | Nostr-applet red-team pass over the firmware and the extension (2026-10-10, `feat/nostr`) | The arc held — no panic from a USB frame, no forged signature, no touch bypass; the one P0 (US-1678's oversized-argument reboot) is fixed at three layers; residuals F1–F6 are documented and dispositioned in the file |
 
 The two `webauthn-discovery-*.md` files and the security/storage/budget
 records that are still cited from code, CI or other documents were **not**

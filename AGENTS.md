@@ -310,6 +310,93 @@ another, which is why `register` rejects **overlap** rather than mere equality
 `no_device_aid_is_a_prefix_of_another` pins the registered set in
 `apps/tests/registry.rs`.
 
+### 8. The Nostr applet is one applet with two transports, and the touch is the part that bites.
+
+`apps/nostr` (AID `F0 00 00 00 02`, the seventh CCID applet) serves a small
+identity set — 8 BIP-340 identities, `NOSTR_CAPACITY` — over two independent
+transports, and everything the user experiences flows from how they differ:
+
+| transport | framing | where |
+|---|---|---|
+| CCID | plain APDUs, `INS 0x10`–`0x1A`, selected by AID | `apps/nostr/src/lib.rs` |
+| vendor HID (interface 3) | CTAPHID framing on usage page `0xFF00`, command bytes `0x40`–`0x4A`, payload = CBOR `[idx, arg]`, response = CBOR `{1: sw, 2?: data}` | `firmware/src/nostr_wire.rs` + the Nostr arm of `firmware/src/hid_serve.rs` |
+
+Traps this shape has already produced — all fixed, all cheap to re-create:
+
+- **The vendor byte *is* the method.** `vendor_to_ins` (`nostr_wire.rs:101-122`)
+  maps it; an unsupported byte in `0x40–0x7F` answers `6D00` **in band, as the
+  CBOR `sw` field on that channel** — never as a CTAPHID error code, and never
+  by falling through to the FIDO dispatch. The client is the
+  [fapico2-nostr-extension](https://github.com/eddieoz/fapico2-nostr-extension)
+  (WebHID, NIP-07 `window.nostr`); it defines the dialect, the same way
+  python-fido2 defines CTAP2's. Read its `src/core/ctaphid.js` before
+  "correcting" a wire shape toward any spec.
+- **`0x41` means three different things and none of them collide — because the
+  interfaces differ.** Nostr `GET_PUBKEY` over the vendor HID, the RS-Key
+  vendor channel (`vendor41`) over the **FIDO** HID, and CCID APDU INS values
+  all share byte values. The §2 dual-homing argument (signed-message
+  discriminator) lives entirely on the FIDO interface; a frame on the Nostr
+  interface never reaches FIDO's dispatch (`hid_serve.rs` routes by interface,
+  and `us1660_a_nostr_command_is_refused_loudly_and_never_reaches_fido` pins
+  it). Do not "unify" them.
+- **The emulator does not expose the Nostr HID interface.** `emul_main.rs`
+  registers Nostr over CCID only (`FAPICO2_NOSTR_REGION`,
+  `FAPICO2_NOSTR_PRESENCE=deny` are the knobs); the vendor-HID path is
+  exercised by firmware host tests driving `process_vendor_through` and on
+  hardware. A green emulator suite says nothing about the HID arm — the §3
+  asymmetry lesson, again.
+- **The twin trap has a Nostr edition.** On device the applet lives behind the
+  `NostrViaMutex` proxy (`firmware/src/nostr_shared.rs`), the first
+  `embassy_sync::Mutex` in device code; the emulator registers the inner app.
+  A trait method the proxy does not forward is silently a no-op on hardware
+  while every test passes — exactly how management RESET stopped wiping Nostr
+  (`docs/nostr-presence-audit.md` F-A3). **New `App` trait methods must be
+  forwarded through the proxy**, and the touch wait happens *outside* the
+  mutex (the strict path parks and returns; only the CCID arm blocks, in the
+  OpenPGP `wait_grant` shape).
+
+The touch model: three reads are touch-free (`GET_INFO`, `GET_PUBKEY`,
+`LIST_KEYS`) and **every other command presses the button**, with no config
+bit to change that. The press consents to the **identity**, not the opcode —
+the tag is `0x4000_0000 ‖ idx` over CCID and `0x6000_0000 ‖ CID` over HID,
+disjoint from FIDO's `0x8000_0000 ‖ CID` (`apps/nostr/src/lib.rs:1362-1400`).
+Two properties are load-bearing and both came out of the presence audit
+(`docs/nostr-presence-audit.md`): the domain check is **exact**
+(`tag & 0xE000_0000 == 0x6000_0000`, not a bit-30 mask — a folded FIDO tag
+must never pass), and **an armed grant dies with its request** (CANCEL and
+expiry drop it). The HID arm **refuses while parked, it does not queue** — a
+second vendor command answers `6985` immediately without running the applet;
+the extension does the FIFO on its side.
+
+The caps are derived, not chosen, and the derivation is chunk-rounded:
+`MAX_PLAINTEXT = 1792` is the largest NIP-44 plaintext whose *padded*
+ciphertext fits `MAX_WIRE = 2074` (CCID) — padding jumps 1792 → 2048 at
+plaintext 1793, so a naive linear cap yields a response the device drops with
+no frame and no status word (`apps/nostr/src/lib.rs:211-245`,
+`nip44::calc_padded_len`). `MAX_REQUEST_ARG = 1891` is refused in band
+(`6A80`) by `nostr_wire::decode_request` before the applet runs. The
+compile-time twin (`calc_padded_len_const`) and a drift test keep the
+wire cap and the runtime refusal in lockstep.
+
+Storage is the keyregion's third domain, carved **from the top of FIDO's
+range** so existing passkeys keep their addresses (`FIDO_CAPACITY` 856 → 848,
+`platform/src/keyregion/mod.rs:184-249`); every write runs the occupancy
+guard — a non-virgin slot must open as a Nostr record before reuse, so a stale
+FIDO record in the carved range refuses `6A84` rather than dying silently.
+Keys are **device-bound** (`derive_payload_key(otp_key_1, chipid,
+NOSTR_PAYLOAD_SECRET)`, no PIN input) and the second secp256k1 implementation
+(`secp256kfun`) is deliberate, on a measurement — both are ADR 0005's
+decisions, and ADR 0005's amendment records the accepted RAM lifetime of the
+scalar. Reset semantics: management `RESET` wipes Nostr (the proxy forwards
+`factory_wipe`); CTAP2 `authenticatorReset` spares it.
+
+Tests: `apps/nostr/tests/` (wire, keymgmt + BIP-340 vectors, NIP-44 vectors,
+presence), `platform/tests/nostr_store.rs`, the emulator suites
+`tests/harness/test_nostr_select.py` / `test_nostr_keymgmt.py`, the CCID
+hardware probe `scripts/nostr_probe.py`, and the udev rule a Linux extension
+user needs — `platform/udev/70-fapico2-nostr.rules` (scoped to the VID;
+a PID-bound rule would strand every re-identified board).
+
 ---
 
 ## A yellow "Online - FIDO" in PicoForge is usually the USB identity, not a bug in the applet
@@ -370,16 +457,19 @@ reason case 1 survived as long as it did.
 firmware/src/
   main.rs        boot, app construction, USB device, task spawn
   boot.rs        statics (MANAGEMENT_APP, OTP_APP, FIDO_APP…), flash partitions, REBOOT
-  tasks.rs       CCID task, CTAP-HID task (CTAPHID framing, presence windows)
+  tasks.rs       CCID task, the dual-serve HID task (CTAPHID + Nostr vendor interface)
   otp_hid.rs     YubiOTP HID frame handler (runs one INS 0x01 OTP APDU)
   ctap_hid.rs    CTAPHID assembler, CID allocator, HID command constants
+  nostr_wire.rs  the vendor wire dialect: 0x40–0x4A ↔ INS, CBOR [idx, arg], APDU bridge
+  nostr_shared.rs the shared NOSTR_APP mutex, the CCID proxy, the APDU scratch statics
   emul_main.rs   host emulation binary over TCP sockets (`--features emulation`)
   bin/{bringup,bridge,hwtest}.rs
-apps/{fido,oath,openpgp,piv,mgmt,rescue,vendor_led}/
+apps/{fido,oath,openpgp,piv,mgmt,rescue,nostr,vendor_led}/
 platform/src/
   dispatch.rs    the AID dispatcher every applet registers with
   usb.rs         USB device, composite interfaces, identity from PhyConfig
   otp_hid.rs     YubiOTP transport (report descriptors, feature-report state machine)
+  nostr_hid.rs   Nostr vendor-HID class control (usage page 0xFF00 descriptors)
   ccid.rs, cflash.rs, cfs.rs, ckey.rs   flash / partition / key-derivation
 vendor/
   opcard           OpenPGP card 3.4 (the real implementation; apps/openpgp wraps it)
@@ -387,7 +477,8 @@ vendor/
 ```
 
 Applet maturity differs a lot — check before assuming: `fido` (~28.6k lines)
-and `oath` (6.9k) are deep; `openpgp` (887) is a thin wrapper over
+and `oath` (6.9k) are deep; `nostr` (~1.9k, applet + crypto + NIP-44) is new
+and deep on its own stack; `openpgp` (887) is a thin wrapper over
 `vendor/opcard`; `mgmt` (997) and `rescue` (1267) are small by design;
 `vendor_led` (495) is the PicoForge physical-config channel.
 

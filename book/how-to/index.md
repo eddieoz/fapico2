@@ -10,5 +10,6 @@ End-to-end guides for the things people actually do with the device. Every comma
 - [The seed backup](./seed-backup.md) — the one-shot 24-word phrase that carries the vendor seed off the board; your passkeys are not in it.
 - [Changing the USB identity](./usb-identity.md) — swap the VID:PID from PicoForge or the CLI, without stranding the CCID reader.
 - [Signed secure boot](./secure-boot.md) — sign the firmware and burn the fuse, with every irreversible step named first.
+- [Nostr identities](./nostr.md) — hold and sign with BIP-340 Nostr keys through the browser extension: connect, generate or import, sign events, NIP-44 encryption.
 
 More guides land as they are validated on hardware.

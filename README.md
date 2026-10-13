@@ -24,14 +24,16 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | `A0 00 00 05 27 21 01` | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP | CCID | `A0 00 00 05 27 20 01` | ykman otp |
 | Management | device config, rescue surface | CCID | `A0 00 00 05 27 47 11 17` | ykman, PicoForge |
-| Nostr | BIP-340 event signing and NIP-44 encryption for Nostr identities | third HID interface (usage page `0xFF00`, vendor commands `0x40`–`0x7F`) | `F0 00 00 00 02` | host emulator suites; hardware acceptance pending |
+| Nostr | BIP-340 event signing and NIP-44 encryption for Nostr identities | vendor HID, interface 3 (usage page `0xFF00`, commands `0x40`–`0x4A`) + CCID | `F0 00 00 00 02` | fapico2 Nostr extension — end-to-end on hardware; host emulator suites |
 | PIV | smartcard login | — | `A0 00 00 03 08` | **deferred — post-v1.0.0** |
 
 Hardware acceptance was run against all three headline command sets (FIDO2/U2F, OpenPGP 3.4, OATH); the full matrix — USB IDs, algorithms, per-device results — is [`docs/hardware-matrix.md`](docs/hardware-matrix.md).
 
 ## Nostr applet
 
-The Nostr applet holds up to 8 BIP-340 Nostr identities and answers a **third HID interface** — usage page `0xFF00`, vendor commands `0x40`–`0x7F` — alongside FIDO's CTAP-HID and the OTP feature reports. `GET_PUBKEY` and `LIST_KEYS` read the public half and need no touch (an npub is public); every command that uses or changes the private key set — `SIGN`, `NIP44_ENCRYPT`, `NIP44_DECRYPT`, `GENERATE_KEY`, `IMPORT_KEY`, `EXPORT_KEY`, `DELETE_KEY`, `SET_LABEL` — requires a physical touch, and there is no config bit that turns the touch on `SIGN` off. The browser surface is the [OpenXrypt](https://github.com/eddieoz/openxrypt) extension, which speaks this vendor protocol over WebHID and exposes `window.nostr` to pages.
+The Nostr applet holds up to 8 BIP-340 Nostr identities and serves them over **two transports**: a vendor HID interface — interface 3, usage page `0xFF00`, CTAPHID framing with vendor commands `0x40`–`0x4A` — alongside FIDO's CTAP-HID and the OTP feature reports, and the ordinary CCID AID channel (`SELECT F0 00 00 00 02`, plain APDUs) for scripts and PC/SC tools. `GET_PUBKEY` and `LIST_KEYS` read the public half and need no touch (an npub is public); every command that uses or changes the private key set — `SIGN`, `NIP44_ENCRYPT`, `NIP44_DECRYPT`, `GENERATE_KEY`, `IMPORT_KEY`, `EXPORT_KEY`, `DELETE_KEY`, `SET_LABEL` — requires a physical touch, and there is no config bit that turns the touch on `SIGN` off.
+
+The browser surface is the [fapico2-nostr-extension](https://github.com/eddieoz/fapico2-nostr-extension) (Chrome 116+, WebHID), which speaks the vendor protocol and exposes the standard NIP-07 `window.nostr` to pages: `getPublicKey`, `signEvent`, `nip44.encrypt`/`nip44.decrypt`, `listKeys`. It deliberately implements no `nip04` and no `getRelays` — it delivers a signer, not a Nostr client; publish the signed events with any client or relay tool you already use. The event is hashed in the browser and only the 32-byte sighash reaches the board; the NIP-44 nonce is generated on the device. **Linux needs a one-time udev rule** before Chrome's chooser sees the vendor interface (`platform/udev/70-fapico2-nostr.rules` — install instructions in its header; without it the device is absent from the chooser before any extension code runs). The full user walk, with every screen: [book/how-to/nostr.md](book/how-to/nostr.md); the implementation tour: [book/features/nostr.md](book/features/nostr.md).
 
 **Onboarding — which path is which:**
 
@@ -40,12 +42,15 @@ The Nostr applet holds up to 8 BIP-340 Nostr identities and answers a **third HI
 
 **Retiring a compromised key — the order is load-bearing:** publish the NIP-09 / kind-0 retirement event **signed by the old key first**, then `EXPORT_KEY` if you still need anything from it, then `DELETE_KEY`. Delete first and the retirement event can never be signed by anyone — the identity is stranded, not revoked. There is no on-device alternative (NIP-46 is rejected by design; the device has no networking stack).
 
-The last step is a real client, not a debugging global: point a Nostr client — anything that consumes `window.nostr` and publishes events to relays — at the extension, and sign real events with the touch in the loop. The vendor command surface itself is a means; publishing a signed event to a relay is the act the user actually came for.
+The last step is a real client, not a debugging global: point a Nostr client — anything that consumes `window.nostr` and publishes events to relays — at the extension, and sign real events with the touch in the loop. The vendor command surface itself is a means; publishing a signed event to a relay is the act the user actually came for. The extension ↔ applet path has been verified end-to-end on hardware (generate, import, sign, NIP-44, delete); the formal per-device acceptance matrix entry is [`docs/hardware-matrix.md`](docs/hardware-matrix.md).
+
+**Reset semantics:** the management applet's `RESET` destroys all eight Nostr identities with everything else — "reset" means empty. The scoped CTAP2 `authenticatorReset` (what a browser or `ykman fido reset` triggers) wipes only FIDO's range and leaves Nostr records intact. The reasoning is [ADR 0005](docs/adr/0005-nostr-key-storage.md); the adversarial audit of the touch gate is [`docs/nostr-presence-audit.md`](docs/nostr-presence-audit.md).
 
 ## Capacity
 
-- **FIDO2 resident passkeys: 856** — measured to refusal on current builds (a CI test enrols until the store refuses and checks the count against the derived geometry). The `v1.0.0` release image predates the per-record store and holds a handful; capacity is a reason to track main, not a reason to trust the old image.
+- **FIDO2 resident passkeys: 848** — measured to refusal on current builds (a CI test enrols until the store refuses and checks the count against the derived geometry); 8 slots of the original 856 range are the Nostr reservation (`US-1639`, derived in `platform/src/keyregion/mod.rs`). The `v1.0.0` release image predates the per-record store and holds a handful; capacity is a reason to track main, not a reason to trust the old image.
 - **OATH credentials: 68 slots reserved** in the key store. No enrolment has been run to that boundary yet; a build whose region does not mount falls back to the legacy ceiling of 30.
+- **Nostr identities: 8 slots** — see the [Nostr applet](#nostr-applet) above.
 - For scale: a YubiKey 5 holds 100 resident passkeys.
 
 Every ceiling's derivation — and which numbers are measured versus reserved — is in [`docs/capacity.md`](docs/capacity.md).
@@ -74,7 +79,7 @@ Every ceiling's derivation — and which numbers are measured versus reserved �
 
 **2. Flash it.** Hold **BOOTSEL**, plug the board in, copy the UF2 onto the `RP2350` drive that mounts, and wait — re-enumeration can take up to a minute and that is normal. The Rust build supports **physical BOOTSEL** only (hold BOOTSEL while plugging in, or BOOTSEL + tap RESET); the C firmware additionally accepts a programmatic rescue APDU via `scripts/bootsel.py`. Full procedure, both firmwares, recovery paths: [`docs/bootsel.md`](docs/bootsel.md).
 
-**3. Use it.** The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID device. FIDO2 works everywhere, immediately. **Linux/macOS only:** OpenPGP and OATH need a one-time libccid allowlist edit — without it your host sees *no smartcard reader at all*, which looks like broken hardware and is not. See [`docs/identity.md`](docs/identity.md#pcsc-allowlist-libccid).
+**3. Use it.** The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID device. FIDO2 works everywhere, immediately. **Linux/macOS only:** OpenPGP and OATH need a one-time libccid allowlist edit — without it your host sees *no smartcard reader at all*, which looks like broken hardware and is not. See [`docs/identity.md`](docs/identity.md#pcsc-allowlist-libccid). For the Nostr applet, install the browser extension and — on Linux — the [udev rule](#nostr-applet) that lets Chrome's chooser see the vendor HID interface.
 
 ## USB identity (provisional)
 
@@ -127,10 +132,11 @@ The device build links an `arm-none-eabi` ELF gated at `text` ≤ 3.5 MiB (CI-en
 
 [`docs/INDEX.md`](docs/INDEX.md) maps everything, but the short list:
 
-- **Start here:** USB identity and the host allowlist — [identity.md](docs/identity.md) · what fits — [capacity.md](docs/capacity.md) · flashing and recovery — [Getting started](#getting-started) above
-- **Trust it:** [`SECURITY.md`](SECURITY.md) · [`docs/debug-access-risk.md`](docs/debug-access-risk.md) · [`docs/supply-chain.md`](docs/supply-chain.md) · [ADRs](docs/adr/README.md)
+- **Start here:** USB identity and the host allowlist — [identity.md](docs/identity.md) · what fits — [capacity.md](docs/capacity.md) · flashing and recovery — [Getting started](#getting-started) above · the Nostr walk — [book/how-to/nostr.md](book/how-to/nostr.md)
+- **Trust it:** [`SECURITY.md`](SECURITY.md) · [`docs/debug-access-risk.md`](docs/debug-access-risk.md) · [`docs/supply-chain.md`](docs/supply-chain.md) · [ADRs](docs/adr/README.md) (Nostr storage: [ADR 0005](docs/adr/0005-nostr-key-storage.md))
 - **Client behaviour:** [`docs/hardware-matrix.md`](docs/hardware-matrix.md) · [`docs/client-compatibility.md`](docs/client-compatibility.md)
 - **Design records and past investigations:** [`docs/INDEX.md`](docs/INDEX.md) → the archive
+- **The user manual:** [book/](book/) — an mdBook (`./book.sh serve` previews it locally)
 
 ## Buy me a coffee
 

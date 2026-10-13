@@ -7,7 +7,7 @@ The repository's [`docs/`](https://github.com/eddieoz/fapico2/blob/main/docs/IND
 - [**identity.md**](https://github.com/eddieoz/fapico2/blob/main/docs/identity.md) — what the device claims to be: AAGUID `66617069636F3200…0002`, USB `FA20:0002`, and the **PC/SC allowlist step Linux/macOS need before OpenPGP and OATH work**.
 - [**backup-seed.md**](https://github.com/eddieoz/fapico2/blob/main/docs/backup-seed.md) — the vendor seed's full record: scope, wire notes, the CLI's failure statuses, and what the tests prove.
 - [**bootsel.md**](https://github.com/eddieoz/fapico2/blob/main/docs/bootsel.md) — flashing over BOOTSEL, recovery paths, and why re-enumeration can take a minute.
-- [**capacity.md**](https://github.com/eddieoz/fapico2/blob/main/docs/capacity.md) — hardware-verified ceilings: 856 FIDO2 resident credentials **measured to refusal** on hardware, 68 OATH slots reserved.
+- [**capacity.md**](https://github.com/eddieoz/fapico2/blob/main/docs/capacity.md) — hardware-verified ceilings: 848 FIDO2 resident credentials **measured to refusal** on hardware (8 slots of the original range are the Nostr reservation), 68 OATH slots reserved.
 - [**hardware-matrix.md**](https://github.com/eddieoz/fapico2/blob/main/docs/hardware-matrix.md) — the acceptance matrix: USB IDs, algorithms, per-applet results against real clients.
 
 ## Trusting the device

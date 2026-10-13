@@ -21,7 +21,7 @@ Before anything else: `ykman fido access change-pin`, or accept the PIN prompt t
 
 ## Passkeys
 
-Enroll on any WebAuthn site — `webauthn.io` is the usual first test. The site asks for a touch, the LED confirms, and the credential is generated on the board and stays there. There is room for 856 of them. Sites that offer "sync with your phone" are offering a cloud copy; this board is the non-synced answer.
+Enroll on any WebAuthn site — `webauthn.io` is the usual first test. The site asks for a touch, the LED confirms, and the credential is generated on the board and stays there. There is room for 848 of them. Sites that offer "sync with your phone" are offering a cloud copy; this board is the non-synced answer.
 
 ## Managing credentials
 
@@ -49,7 +49,11 @@ Slot and status behavior is configurable from PicoForge. The LED is the only out
 
 ## Factory reset
 
-`ykman fido reset` wipes the FIDO credentials and the FIDO PIN, and nothing else: the OATH, OTP and OpenPGP applets keep their records. After a reset, the OpenPGP card's serial changes and your host's keyring stubs will point at a card that no longer exists — delete the stale stubs (see [what it works with](../interop/index.md)).
+`ykman fido reset` wipes the FIDO credentials and the FIDO PIN, and nothing else: the OATH, OTP, OpenPGP and Nostr applets keep their records. (The management applet's full RESET is the stronger act — it wipes Nostr too.) After a reset, the OpenPGP card's serial changes and your host's keyring stubs will point at a card that no longer exists — delete the stale stubs (see [what it works with](../interop/index.md)).
+
+## Nostr identities
+
+The board holds up to eight BIP-340 Nostr identities and signs with them through the [fapico2 Nostr extension](../how-to/nostr.md) — the browser asks, you approve in a small window, and the physical touch signs. The private keys live in the same sealed store as everything else, and the one command that reveals one (`EXPORT_KEY`) costs a checkbox and a press. The full walk: [Nostr identities](../how-to/nostr.md).
 
 ## No board yet?
 

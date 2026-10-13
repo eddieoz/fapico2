@@ -11,11 +11,12 @@ What the device does, and proof that it does it. Everything listed here is imple
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP, challenge-response | CCID | ykman otp |
 | Management | device config, rescue surface | CCID | ykman, PicoForge |
+| Nostr | BIP-340 event signing, NIP-44 v2 encryption for Nostr identities | vendor HID (usage page `0xFF00`) + CCID | fapico2 Nostr extension, end-to-end on hardware — [the applet](./nostr.md) · [the how-to](../how-to/nostr.md) |
 
 ## FIDO2 / WebAuthn
 
 - Passkeys (WebAuthn) over **CTAP 2.1** — verified with Chrome, python-fido2 2.2.1, ykman and Yubico Authenticator
-- **856 discoverable credentials (resident keys)** — measured to refusal on hardware
+- **848 discoverable credentials (resident keys)** — measured to refusal on hardware (8 slots of the original range are the Nostr reservation)
 - Credential management: enumerate, rename, delete — via ykman or PicoForge
 - Extensions: **hmac-secret, credProtect, credBlob, largeBlobKey, minPinLength**
 - Large blobs (`authenticatorLargeBlobs`)
@@ -49,6 +50,14 @@ What the device does, and proof that it does it. Everything listed here is imple
 - PIN and Admin PIN protection; reset and unblock — via the admin PIN or a dedicated reset code
 - Works with GnuPG, SSH and compatible tools over CCID
 
+## Nostr
+
+- **Up to 8 Nostr identities** — BIP-340 (Schnorr) signing and NIP-44 v2 encryption, computed on the chip; the full tour is [the applet page](./nostr.md), the walk-through is [the how-to](../how-to/nostr.md)
+- **NIP-07 `window.nostr`** for web pages — `getPublicKey`, `signEvent`, `nip44.encrypt`/`decrypt`, `listKeys` — via the [fapico2 Nostr extension](https://github.com/eddieoz/fapico2-nostr-extension) over WebHID (Chrome 116+, usage page `0xFF00`)
+- **Touch on every private-key operation** — sign, encrypt, decrypt, generate, import, label, delete, export; only the public reads are touch-free, and no config bit changes that
+- Keys sealed as AEAD records in the key store under the chip-unique OTP root — the same at-rest story as passkeys ([why device-bound](../../docs/adr/0005-nostr-key-storage.md))
+- The event is hashed in the browser; only the 32-byte sighash reaches the board, and the signature comes back with the npub that produced it
+
 ## Platform
 
 - **Signed secure boot** (opt-in, `./build-signed.sh`): the bootrom refuses unsigned images
@@ -60,7 +69,8 @@ What the device does, and proof that it does it. Everything listed here is imple
 
 | Resource | Capacity | Notes |
 |---|---|---|
-| FIDO2 resident passkeys | 856 | Measured to refusal on hardware |
+| FIDO2 resident passkeys | 848 | Measured to refusal on hardware; 8 slots of the original 856 range are the Nostr reservation |
 | OATH credentials | 68 | Reserved in the key store |
+| Nostr identities | 8 | [The Nostr applet](./nostr.md) |
 
 For scale: a YubiKey 5 holds 100 resident passkeys.
