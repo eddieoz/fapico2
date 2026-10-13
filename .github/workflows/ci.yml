@@ -804,14 +804,16 @@ jobs:
       # broke this step on main on 2026-10-11: "No module named pytest"), so
       # the pytest this step needs is provided here rather than assumed —
       # a tiny venv, ~5 s, and the job's no-toolchain property (about RUST)
-      # is unchanged.
+      # is unchanged. pytest loads tests/conftest.py for any run under
+      # tests/, and that file imports fido2 at module level, so fido2 rides
+      # along (the same >=2,<3 range tests/requirements.txt pins).
       - name: "Gate: the boot-ladder classifier (US-1302)"
         working-directory: fapico2
         run: |
           set -uo pipefail
           echo "--- classify_ladder over recorded blink sequences ---"
           python3 -m venv /tmp/gates-pytest-venv
-          /tmp/gates-pytest-venv/bin/pip install --quiet pytest
+          /tmp/gates-pytest-venv/bin/pip install --quiet pytest "fido2>=2,<3"
           /tmp/gates-pytest-venv/bin/python -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
           echo "ok: boot-ladder classifier green"
 
