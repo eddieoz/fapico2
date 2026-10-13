@@ -5,7 +5,7 @@ arc and the hardware acceptance pass, measured at the audit-fix tip.** `text`
 3,670,016 B flash ceiling; `.bss` at 402,024 of the 434,176 B RAM ceiling
 (**32,152 B headroom**). `check_boot_chain.py` worst call chain **93,764 ≤
 98,304 B**; task arena demand **14,344 B** of 32,772 B (2.28× floor,
-measurement stamp refreshed to `ac35dbe0…`). UF2 **3,349 blocks**, sha256
+measurement stamp refreshed to `40825090fde74339…`). UF2 **3,349 blocks**, sha256
 `3041b0aca193…`. `check_size_report.py` green; no capacity number moves.)
 
 **The +1,448 text is the audit's fix series, and the flash ratchet was raised
