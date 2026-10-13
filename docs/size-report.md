@@ -1,3 +1,27 @@
+**Date:** 2026-10-13 (**the presence-gate fix series — the audit's red-then-green
+arc and the hardware acceptance pass, measured at the audit-fix tip.** `text`
+887,900 → **889,348 B (+1,448)**; Berkeley `.bss` 402,012 → **402,024 B
+(+12)**; `.data` and `.uninit` unchanged. `text` sits at 889,348 of the
+3,670,016 B flash ceiling; `.bss` at 402,024 of the 434,176 B RAM ceiling
+(**32,152 B headroom**). `check_boot_chain.py` worst call chain **93,764 ≤
+98,304 B**; task arena demand **14,344 B** of 32,772 B (2.28× floor,
+measurement stamp refreshed to `ac35dbe0…`). UF2 **3,349 blocks**, sha256
+`3041b0aca193…`. `check_size_report.py` green; no capacity number moves.)
+
+**The +1,448 text is the audit's fix series, and the flash ratchet was raised
+for it on purpose (F-A6: 1664 → 1680 KiB, the reason recorded in `ci.yml`).**
+The pieces, per `docs/nostr-presence-audit.md`: the grant-lifetime rule in
+`platform/src/presence.rs` (F-A1 — `end_request` and `expire_pending` drop an
+armed grant bound to the dying tag, with the pinning tests), the exact-domain
+`nostr_grant` check (F-A2), the `NostrViaMutex` proxy forwarding
+`factory_wipe` (F-A3/D6), the CCID arm's blocking `wait_grant` in the OpenPGP
+shape with the prompt-lit wait (F-A4/D7), the store-level force-tombstone
+reachable from `DELETE_KEY` and the wipe (F-A5/D8), the typed
+`OccupiedForeign` admission error (F-A7), the in-band `idx > 0xFF` refusal in
+`nostr_wire::decode_request` (F-A8), and `paced_bootsel`'s HIGH re-assert
+(F-A15). The +12 bss is the wait-hook plumbing; the arena pools are
+byte-identical, which is why the stamp's demand is unchanged.
+
 **Date:** 2026-10-10 (**US-1687 — the review fixes (EPIC-nostr-review-fixes),
 measured at the post-review tip.** `text` 887,880 → **887,900 B (+20)**;
 Berkeley `.bss` **402,012 B (unchanged)**; `.data` and `.uninit` unchanged.
