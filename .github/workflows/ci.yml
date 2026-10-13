@@ -800,12 +800,19 @@ jobs:
       # LED sequence, so it is host-testable and belongs in the gate job beside
       # the other no-hardware assertions — NOT in the emulator pytest gate,
       # which needs a built emulation binary this job does not have.
+      # The runner image stopped shipping pytest for /usr/bin/python3 (it
+      # broke this step on main on 2026-10-11: "No module named pytest"), so
+      # the pytest this step needs is provided here rather than assumed —
+      # a tiny venv, ~5 s, and the job's no-toolchain property (about RUST)
+      # is unchanged.
       - name: "Gate: the boot-ladder classifier (US-1302)"
         working-directory: fapico2
         run: |
           set -uo pipefail
           echo "--- classify_ladder over recorded blink sequences ---"
-          python3 -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
+          python3 -m venv /tmp/gates-pytest-venv
+          /tmp/gates-pytest-venv/bin/pip install --quiet pytest
+          /tmp/gates-pytest-venv/bin/python -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
           echo "ok: boot-ladder classifier green"
 
   # ---------------------------------------------------------------------------
