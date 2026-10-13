@@ -1980,25 +1980,25 @@ pub fn ensure_fw_manifest(store: &mut DeviceStore) -> fw_manifest::ForeignImageD
     }
 }
 
-/// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
-/// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
-/// chipid read (rung 6, a page-0 read that had already passed at rung 3)
-/// intermittently failed ~80 consecutive times and parked the board with
-/// fatal signature id 2; with the write out, 15 power cycles across timings
-/// produced zero parks. The write was D-14's runtime-only half of a lock
-/// whose durable half never shipped, so what it mitigated was the D-14
-/// residual (same-session write access to the key row) that D-14 already
-/// records as unshipped; the durable mitigation remains US-924's lock-page
-/// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
-/// 0002 amendment.
-///
-/// If a runtime lock is ever reinstated, note that the register model in the
-/// removed implementation ("256 pages of 16 rows, one register per 4 pages")
-/// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
-/// of 64 rows, one register per page) — they only coincide on the *number*
-/// 58. Whatever the correct model is, the measured fact stands: the write
-/// correlated with page-0 read failures, and the burden of proof is on any
-/// reinstatement.
+// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
+// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
+// chipid read (rung 6, a page-0 read that had already passed at rung 3)
+// intermittently failed ~80 consecutive times and parked the board with
+// fatal signature id 2; with the write out, 15 power cycles across timings
+// produced zero parks. The write was D-14's runtime-only half of a lock
+// whose durable half never shipped, so what it mitigated was the D-14
+// residual (same-session write access to the key row) that D-14 already
+// records as unshipped; the durable mitigation remains US-924's lock-page
+// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
+// 0002 amendment.
+//
+// If a runtime lock is ever reinstated, note that the register model in the
+// removed implementation ("256 pages of 16 rows, one register per 4 pages")
+// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
+// of 64 rows, one register per page) — they only coincide on the *number*
+// 58. Whatever the correct model is, the measured fact stands: the write
+// correlated with page-0 read failures, and the burden of proof is on any
+// reinstatement.
 
 /// Restore captured OpenPGP state after backend mount and before registration.
 /// Missing hardware identity is acceptable only when there is no capture.

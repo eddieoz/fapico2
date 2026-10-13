@@ -81,7 +81,7 @@ pub const LIT: bool = true;
 
 /// Preamble: the longest lit pulse the firmware drives, by a wide margin.
 /// Nothing else on this pin holds the LED for anything close.
-pub const PREAMBLE_US: u32 = 1200_000;
+pub const PREAMBLE_US: u32 = 1_200_000;
 
 /// Unlit gap after the preamble, before the first bit.
 ///
