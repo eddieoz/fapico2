@@ -7,9 +7,12 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-14
 
-### Added — the Nostr applet (branch `feat/nostr`)
+Released as [`fapico2-release-alpha-v0.2.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.2.0);
+full notes in [`docs/release-notes-alpha-v0.2.0.md`](docs/release-notes-alpha-v0.2.0.md).
+
+### Added — the Nostr applet (PR #18)
 
 - **Nostr identities on the device**: up to 8 BIP-340 identities with on-chip
   signing and NIP-44 v2 encryption, served over CCID (AID `F0 00 00 00 02`,
