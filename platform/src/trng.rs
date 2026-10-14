@@ -1135,6 +1135,41 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
+/// Stretch a boot-time entropy pool over `out`, re-keying the pool with its
+/// own hash when it runs dry (US-380's FIDO primitive, moved here when the
+/// Nostr applet became its second user: one implementation, not two — AGENTS
+/// §5). The pool's bytes come from the platform TRNG at boot; the stretch is
+/// SHA-256 of the drained remainder, which is only ever a *availability*
+/// measure over already-TRNG-grade bytes, not a second source of entropy.
+///
+/// A free function taking the pool and cursor by `&mut`, not an applet
+/// method, for the same reason `apps/fido/src/device_core.rs` records: two
+/// disjoint field borrows compose where a whole-`self` borrow does not.
+pub fn stretch_pool<const N: usize>(
+    pool: &mut heapless::Vec<u8, N>,
+    cursor: &mut usize,
+    out: &mut [u8],
+) {
+    let mut cur = *cursor;
+    for b in out.iter_mut() {
+        if cur >= pool.len() {
+            // Stretch: re-key the pool with its own hash.
+            let mut mixed = [0u8; 32];
+            {
+                use sha2::Digest;
+                let digest = sha2::Sha256::digest(pool.as_slice());
+                mixed.copy_from_slice(&digest);
+            }
+            pool.clear();
+            let _ = pool.extend_from_slice(&mixed);
+            cur = 0;
+        }
+        *b = pool[cur];
+        cur += 1;
+    }
+    *cursor = cur;
+}
+
 // ---------------------------------------------------------------------------
 // Device (RP2350): hardware TRNG via embassy-rp.
 // ---------------------------------------------------------------------------

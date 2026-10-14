@@ -1,3 +1,79 @@
+**Date:** 2026-10-13 (**the presence-gate fix series — the audit's red-then-green
+arc and the hardware acceptance pass, measured at the audit-fix tip.** `text`
+887,900 → **889,348 B (+1,448)**; Berkeley `.bss` 402,012 → **402,024 B
+(+12)**; `.data` and `.uninit` unchanged. `text` sits at 889,348 of the
+3,670,016 B flash ceiling; `.bss` at 402,024 of the 434,176 B RAM ceiling
+(**32,152 B headroom**). `check_boot_chain.py` worst call chain **93,764 ≤
+98,304 B**; task arena demand **14,344 B** of 32,772 B (2.28× floor,
+measurement stamp refreshed to `40825090fde74339…`). UF2 **3,349 blocks**, sha256
+`3041b0aca193…`. `check_size_report.py` green; no capacity number moves.)
+
+**The +1,448 text is the audit's fix series, and the flash ratchet was raised
+for it on purpose (F-A6: 1664 → 1680 KiB, the reason recorded in `ci.yml`).**
+The pieces, per `docs/nostr-presence-audit.md`: the grant-lifetime rule in
+`platform/src/presence.rs` (F-A1 — `end_request` and `expire_pending` drop an
+armed grant bound to the dying tag, with the pinning tests), the exact-domain
+`nostr_grant` check (F-A2), the `NostrViaMutex` proxy forwarding
+`factory_wipe` (F-A3/D6), the CCID arm's blocking `wait_grant` in the OpenPGP
+shape with the prompt-lit wait (F-A4/D7), the store-level force-tombstone
+reachable from `DELETE_KEY` and the wipe (F-A5/D8), the typed
+`OccupiedForeign` admission error (F-A7), the in-band `idx > 0xFF` refusal in
+`nostr_wire::decode_request` (F-A8), and `paced_bootsel`'s HIGH re-assert
+(F-A15). The +12 bss is the wait-hook plumbing; the arena pools are
+byte-identical, which is why the stamp's demand is unchanged.
+
+**Date:** 2026-10-10 (**US-1687 — the review fixes (EPIC-nostr-review-fixes),
+measured at the post-review tip.** `text` 887,880 → **887,900 B (+20)**;
+Berkeley `.bss` **402,012 B (unchanged)**; `.data` and `.uninit` unchanged.
+`text` sits at 887,900 of the 3,670,016 B flash ceiling; `.bss` at 402,012 of
+the 434,176 B RAM ceiling (**32,164 B headroom, unchanged**).
+`check_boot_chain.py` worst call chain **93,764 ≤ 98,304 B**; task arena
+demand re-measured at **14,344 B** of 32,772 B (2.28× floor — unchanged,
+every task pool byte-identical, measurement stamp refreshed to `ed3a6f46…`).
+UF2 3,344 blocks, sha256 `397d0134…`. `check_size_report.py` green;
+`capacity_boundary.rs` re-run green 6/6 — the FIDO resident-credential
+boundary (848) moved not at all.)
+
+**The +20 text is the review fixes, and bss did not move.** The attribution:
+the parser cap in `nostr_wire::decode_request` (US-1678 — the §2.2.1 cap
+check and the `NOSTR_REQ_ARG_MAX` constant), the fallible builders
+(`build_apdu`/`encode_request` gaining their `Option` overflow arms and the
+`6A80` mapping), and the strict Lc refusal in `apps/nostr::parse_data`
+(US-1685 — the `Result` plumbing at the dispatch site). US-1686 added no
+code: the scalar-lifetime decision is the ADR 0005 amendment, not a
+mechanism. The +20 B is 0.007% of the flash ceiling; no capacity boundary
+moves, and `docs/capacity.md` carries no number this delta touches.)
+
+**Date:** 2026-10-10 (**US-1675 — the Nostr applet arc, re-measured at
+Phase-3 HEAD (b22d750).** `text` 859,372 → **887,880 B (+28,508)**; Berkeley
+`.bss` 375,808 → **402,012 B (+26,204)**; `.data` **0**; `.uninit`
+**1,024 B** (unchanged). `text` sits at 887,880 of the 3,670,016 B flash
+ceiling; `.bss` at 402,012 of the 434,176 B RAM ceiling (**32,164 B
+headroom**); `check_boot_chain.py` worst call chain **93,764 ≤ 98,304 B**;
+task arena demand **14,344 B** of 32,772 B (2.28× floor, measurement stamp
+`adaccd6a…`). UF2 3,344 blocks, sha256 `7e10d501…`. `check_size_report.py`
+green; the 848-credential boundary re-run green (`capacity_boundary.rs`
+6/6, US-1675).)
+
+**The +28,508 text and +26,204 bss is the whole Nostr applet arc, measured
+as one step because the arc landed between ledger entries.** The pieces:
+the `apps/nostr` applet itself (keyring in flash, BIP-340/ECDFS signing and
+NIP-44 v2 ciphering, §2.2 wire vocabulary); the HID vendor arm
+(`nostr_dispatch`, the `PendingUp` refusal widened `2 → 5` bytes for the
+vendor envelope, US-1663's park-and-redrive consent machinery, the
+`NOSTR_HID_GRANT_CONTEXT` transport discriminator); `nostr_wire.rs`'s CBOR
+dialect; and the arena hoist (US-1660) that moved the HID statics out of
+task stack into `.bss` — the reason the bss step and the chain headroom
+(44,584 → 32,164 B against the main stack zone) moved together.
+
+**What the bss bought, bounded:** the `NOSTR_RESP`/frame statics are fixed
+buffers sized by the wire bounds (§2.2's 2,074 B worst request), not by
+call depth — the arena demand measurement (14,344 B, stamped) pins the HID
+task's stack at 4,720 B unchanged from US-1660's measurement. The
+32,164 B RAM headroom is the honest margin; US-1672's hoist moved it
+*down* from 44,584 by design, in exchange for a serve bound (2,750 ms)
+that is asserted rather than hoped.
+
 **Date:** 2026-10-04 (**US-1562 — `getAssertion` over the key region.** `text`
 855,656 → **859,372 B**; Berkeley `.bss` 375,472 → **375,808 B (+336)**;
 `.data` **0**; `.uninit` 1,024 → **1,024 B**. Main stack zone 143,224 →
@@ -40,12 +116,12 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 795,288 | `0x10000200` | no (flash) |
-| `.rodata` | 20,304 | `0x100c2498` | no (flash) |
+| `.text` | 821,796 | `0x10000200` | no (flash) |
+| `.rodata` | 20,708 | `0x100c8c28` | no (flash) |
 | `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100ca9c0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 374,792 | `0x200035d8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x2005ede0` | yes |
+| `.gnu.sgstubs` | 0 | `0x100d12e0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 401,000 | `0x200035d8` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x20065440` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -65,12 +141,21 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 862,436 B** · **`.data` = 13,780 B** · **`.bss` = 375,816 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 889,348 B** · **`.data` = 13,780 B** · **`.bss` = 402,024 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 389,596 B** (389,600 B address-to-address: `__sheap` `0x2005f1e0` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2005f1e0` → **main stack zone = 142,880 B** of 532,480 B of SRAM.
+**RAM statics = 415,804 B** (415,808 B address-to-address: `__sheap` `0x20065840` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20065840` → **main stack zone = 116,672 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
+
+**Date: 2026-10-12 (flash ratchet raised 1664 → 1680 KiB, by `raise_flash_budget.py`).**
+
+Reason recorded with the number: the Nostr applet arc (US-1630-1688): secp256kfun BIP-340 signing, the NIP-44 pair, the keyregion Nostr domain and the HID serve path — the ADR 0005 spike projected ~25 KB of text, the real delta is +28.5 KB (US-1675), consuming the headroom the pre-Nostr baseline left. Audit F-A6 (docs/nostr-presence-audit.md).
+
+Shipping image at the raise: 1713152 B = 3346 blocks = 1673 KiB. Budget 1680 KiB = 1720320 B, which is 7168 B of headroom.
+
+The ratchet is the only *near-term* bound on the shipping image: the 3.5 MiB text ceiling is ~2 MB above the current build and cannot fire on ordinary growth, and the flash-map geometry (`FIRMWARE_GROWTH_END`) is the hard limit past which the image would link over the trussed filesystem. Headroom here is deliberate and finite — the next raise is a decision, not an accident, which is why the reason is recorded next to the number in `.github/workflows/ci.yml` and in `platform/src/flashmap.rs`.
+
 
 **Date: 2026-10-07 (flash ratchet raised 1621 → 1664 KiB — and the mirror that
 was not gated, and the end of the zero-headroom policy).**

@@ -70,6 +70,12 @@ pub const FIDO_RECORD_MAX: u32 = 836;
 /// and properties, sealed.
 pub const OATH_RECORD_MAX: u32 = 210;
 
+/// The largest sealed Nostr record, in bytes (US-1641): the 97-byte plaintext
+/// body `scalar(32) ‖ npub(32) ‖ label(32, zero-padded) ‖ flags(1)` plus the
+/// AEAD's 28 bytes of nonce-and-tag framing. Derived, not asserted — the
+/// identity body is fixed-width, so this is arithmetic and not a measurement.
+pub const NOSTR_RECORD_MAX: u32 = 97 + 28;
+
 /// Header bytes per record: a magic, the domain, the slot, the generation, the
 /// flags, the body length, and a CRC32 over all of it (US-1542).
 ///
@@ -174,7 +180,8 @@ pub const SCRATCHPAD_SLOTS: u32 = SLOTS_PER_SECTOR;
 pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS
     - OATH_CAPACITY
     - SCRATCHPAD_SLOTS
-    - crate::keyregion::index::INDEX_SLOT_COUNT;
+    - crate::keyregion::index::INDEX_SLOT_COUNT
+    - NOSTR_CAPACITY;
 
 /// Resident OATH credentials the region holds.
 ///
@@ -185,6 +192,13 @@ pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS
 /// it never mentions. What changes under US-1553 is not this number but what
 /// it competes for: 68 slots of flash instead of a share of 24.
 pub const OATH_CAPACITY: u32 = 68;
+
+/// Resident Nostr identities the region holds (US-1639).
+///
+/// 8 is a deliberate, small number: a Nostr user has one identity, occasionally
+/// a couple, and §2.2 of the design caps `idx` and `n_identities` at `u8`
+/// anyway. The region cost is 8 KiB of 960 KiB.
+pub const NOSTR_CAPACITY: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // The partition — one owner, because two applets share one region
@@ -217,6 +231,23 @@ pub const FIDO_FIRST_SLOT: u32 = SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS;
 /// The exclusive end of FIDO's range.
 pub const FIDO_SLOT_LIMIT: u32 = FIDO_FIRST_SLOT + FIDO_CAPACITY;
 
+/// First slot of Nostr's range: the **top** of what was FIDO's range (US-1639).
+///
+/// Carved from the top, not the bottom, and that is not a free choice — it is
+/// what keeps every existing FIDO record where it is. `FidoAllocator::alloc`
+/// grows from `FIDO_FIRST_SLOT` upward (`fido_store.rs:467`), so shrinking
+/// FIDO's range from its **end** leaves the address of every record below the
+/// cut unchanged; carving from the bottom would shift every FIDO record above
+/// the cut and strand deployed boards' credentials.
+pub const NOSTR_FIRST_SLOT: u32 = FIDO_SLOT_LIMIT;
+
+/// The exclusive end of Nostr's range.
+///
+/// Nostr's slots sit immediately below the index, in the space FIDO's range
+/// vacated: `INDEX_FIRST_SLOT` is unchanged by the carve, and so is the index
+/// itself.
+pub const NOSTR_SLOT_LIMIT: u32 = NOSTR_FIRST_SLOT + NOSTR_CAPACITY;
+
 /// Is this slot inside OATH's range?
 ///
 /// `saturating_sub(..) < CAPACITY` rather than the two-sided comparison: OATH's
@@ -233,6 +264,19 @@ pub const fn is_oath_slot(slot: Slot) -> bool {
 pub const fn is_fido_slot(slot: Slot) -> bool {
     let i = slot.index() as u32;
     i >= FIDO_FIRST_SLOT && i < FIDO_SLOT_LIMIT
+}
+
+/// Is this slot inside Nostr's range? (US-1639)
+///
+/// Published beside `is_oath_slot`/`is_fido_slot` for the reason
+/// `oath_store.rs:276` states: **a reservation nothing can ask about is a
+/// reservation nothing will respect.** This is the predicate the FIDO guard
+/// sites consult (US-1640) and the Nostr store is bounded by; a carve that
+/// existed only as two constants in this file would be a carve every write
+/// path could ignore.
+pub const fn is_nostr_slot(slot: Slot) -> bool {
+    let i = slot.index() as u32;
+    i >= NOSTR_FIRST_SLOT && i < NOSTR_SLOT_LIMIT
 }
 
 /// Is this slot reserved — the scratchpad or the index?
@@ -276,6 +320,11 @@ const _: () = {
     assert!(
         OATH_SLOT_BYTES >= OATH_RECORD_MAX + RECORD_HEADER_BYTES,
         "the OATH slot stride cannot hold the largest OATH record"
+    );
+    assert!(
+        FIDO_SLOT_BYTES >= NOSTR_RECORD_MAX + RECORD_HEADER_BYTES,
+        "the shared FIDO-slot stride cannot hold the largest Nostr record — Nostr rides the \
+         region's one grid, so its bound is checked here too (US-1641)"
     );
 
     // Strides must be whole flash pages, and the region must divide into whole
@@ -328,22 +377,28 @@ const _: () = {
             == FIDO_CAPACITY
                 + OATH_CAPACITY
                 + SCRATCHPAD_SLOTS
-                + crate::keyregion::index::INDEX_SLOT_COUNT,
-        "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index"
+                + crate::keyregion::index::INDEX_SLOT_COUNT
+                + NOSTR_CAPACITY,
+        "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index + Nostr"
     );
     // …and the ranges must be *contiguous*, in the order the constants above
     // build them. Two applet adapters each described this layout independently
     // while being written in parallel and they disagreed, so the shape is
     // asserted here where the owners are declared rather than in either
-    // consumer.
+    // consumer. Nostr (US-1639) is the fifth reservation, taken from the top of
+    // FIDO's range: FIDO's limit *is* Nostr's first slot, which is why the
+    // carve cannot shift any existing FIDO record's address.
     assert!(
         OATH_FIRST_SLOT == 0
             && SCRATCHPAD_FIRST_SLOT == OATH_FIRST_SLOT + OATH_CAPACITY
             && FIDO_FIRST_SLOT == SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS
             && FIDO_SLOT_LIMIT == FIDO_FIRST_SLOT + FIDO_CAPACITY
-            && crate::keyregion::index::INDEX_FIRST_SLOT == FIDO_SLOT_LIMIT
-            && FIDO_SLOT_LIMIT + crate::keyregion::index::INDEX_SLOT_COUNT == TOTAL_SLOTS,
-        "the four reservations must tile the region contiguously: OATH, scratchpad, FIDO, index"
+            && NOSTR_FIRST_SLOT == FIDO_SLOT_LIMIT
+            && NOSTR_SLOT_LIMIT == NOSTR_FIRST_SLOT + NOSTR_CAPACITY
+            && crate::keyregion::index::INDEX_FIRST_SLOT == NOSTR_SLOT_LIMIT
+            && NOSTR_SLOT_LIMIT + crate::keyregion::index::INDEX_SLOT_COUNT == TOTAL_SLOTS,
+        "the five reservations must tile the region contiguously: OATH, scratchpad, FIDO, Nostr, \
+         index"
     );
     // The scratchpad is a whole sector, and a commit stages into it — a
     // scratchpad that is not sector-aligned is a staging area with no
@@ -556,6 +611,7 @@ pub mod device_region;
 pub mod fido_store;
 pub mod host;
 pub mod index;
+pub mod nostr_store;
 pub mod on_demand;
 pub mod oath_store;
 pub mod record;

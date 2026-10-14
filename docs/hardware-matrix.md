@@ -298,3 +298,47 @@ in the list; see README Requirements).
 Key"` (the C release build `pico_fido2_pico2-1.0.uf2`) — both are verbatim
 `lsusb` observations of different C builds; the release build carries the
 Clay Logic strings.
+
+## Nostr applet hardware acceptance — PENDING (US-1677, 2026-10-10)
+
+The host half of the story is done and recorded elsewhere (US-1665: the
+software/hardware signing ceremony cross-checked against `nostr-tools`
+vectors; the emulator suites exercise every vendor command against the
+firmware twin). What remains is board-level acceptance, which needs the
+flashed board and a browser — **blocked on board access as of 2026-10-10**,
+so this entry documents the acceptance rather than claiming it.
+
+**The image this acceptance must run against (US-1688):** the build at
+US-1687's close — `feat/nostr` git **`10c02dc`**, shipping UF2 sha256
+**`397d0134a5910ca5417fb18b74e4561899f0a569abd2d49e07b045fd0e8fbd62`**
+(recorded in `docs/size-report.md`'s US-1687 ledger entry). This is the
+first tip that carries the review's P0 fix — `feat/nostr` @ `c0fffec` and
+everything before it must NOT be flashed and cannot be accepted: the
+pre-fix image reboots on an oversized vendor argument (US-1678). If the tip
+moves before the board run, rebuild, and record the fresh sha from
+`check_size_report.py` here — a board run against any other image cannot be
+mistaken for US-1677's acceptance.
+
+To be run on the final image, with **no SWD debugger attached**
+(`AGENTS.md`'s warning — validate detached, over BOOTSEL), and recorded
+here as evidence:
+
+1. **WebHID ceremony with the touch in the loop.** A browser over the
+   third HID interface (usage page `0xFF00`) signs an event through the
+   OpenXrypt extension path — `SIGN` with a real presence grant, US-1665
+   repeated on the final image.
+2. **Cross-check against `nostr-tools` on the host** (§2.7: vectors, not
+   self-consistency) — the browser-signed event's sig verifies
+   independently, against the same `id`/pubkey.
+3. **Observability check on BOTH transports** (§2.3 / §A.8.3b #3): the
+   touch prompt must be observable with the **CCID** transport *and* with
+   the **vendor-HID** path. `firmware/src/button.rs:150-158` records
+   pcscd polling flipping the LED off mid-wait, and a browser extension
+   holding a persistent connection is the client most likely to
+   reproduce that — the host must not assume a press is being seen.
+4. The board's answers match the emulator's for every vendor command
+   (Definition of Done #13).
+
+Flash and recovery follow the standing procedure: REBOOT(BOOTSEL) via the
+rescue applet, copy `firmware/fapico2.uf2` through `firmware/uf2gen.py`,
+poll `lsusb` 8–52 s.

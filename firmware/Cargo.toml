@@ -49,6 +49,9 @@ fapico2-vendor-led = { path = "../apps/vendor_led", optional = true, default-fea
 # host process. See `docs/tasks/rescue-threat-model.md` for what shipping it
 # costs and why that is accepted.
 fapico2-rescue = { path = "../apps/rescue", optional = true, default-features = false }
+# US-1642 (Nostr): the seventh CCID app (AID F0 00 00 00 02), a normal
+# optional dep like the other applets.
+fapico2-nostr = { path = "../apps/nostr", optional = true, default-features = false }
 # Host-only (emulation binary); must stay outside the arm scope.
 env_logger = { version = "0.11", optional = true }
 
@@ -56,6 +59,22 @@ env_logger = { version = "0.11", optional = true }
 # embassy/cortex-m stack assumes an ARMv8-M target and must not be compiled
 # for the host (x86_64) unit-test builds of the pure lib (`ctap_hid`). On
 # arm they still link for thumbv8m.main via the `device` feature.
+# US-1658: declared target-independent (not in the arm section) because the
+# shared-mutex module is host-compiled too — the lib tests run it on x86_64.
+# US-1658: the Nostr applet moves behind `static NOSTR_APP:
+# Mutex<CriticalSectionRawMutex, NostrApp>` — the first `embassy_sync::Mutex`
+# in device code in the tree — because both the CCID dispatcher and the Nostr
+# HID interface must reach the one instance. embassy-sync is already in the
+# lock transitively (embassy-rp/embassy-usb pull 0.8.0); promoting it to a
+# direct dep needs NO deny-graph.toml entry: its rule families are applet
+# edges (R1-R3), backend selection, wildcard versions in owned manifests (G4)
+# and duplicate crates (G5) — a new single-version direct dep trips none of
+# them, and the lock gains no duplicate. Checked against
+# `tests/scripts/check_crate_graph.py`'s rules, not assumed.
+embassy-sync = { version = "0.8", optional = true }
+# US-1660: the dual-interface read race (`select` of the two OUT reads).
+# Transitive through embassy-rp already; promoted so the serve loop may name it.
+embassy-futures = { version = "0.1", optional = true }
 [target.'cfg(target_arch = "arm")'.dependencies]
 # `set-msplim`: every hardware-observed artifact in the US-391 boot ladder
 # (E1 baseline disasm onward) was built with cortex-m-rt's MSPLIM setup
@@ -109,6 +128,13 @@ defmt-rtt = { version = "1.0", optional = true }
 # which never calls into `hid_reply`, links it without starting a thread.
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+# US-1658: `CriticalSectionRawMutex` needs a critical-section implementation
+# per target. On arm, embassy-rp's `critical-section-impl` provides it; on
+# the host builds (lib tests, the emulator) the `std` impl is the one that
+# exists — without it the CS symbols do not link. Feature unification turns
+# it on for the whole graph when compiled, so this stays optional and is
+# activated by the same features as `embassy-sync`.
+critical-section = { version = "1", features = ["std"], optional = true }
 
 [features]
 # US-919: the foreign-image wipe is selected by the BUILD PARAMETER
@@ -197,6 +223,10 @@ device = [
     "dep:fapico2-vendor-led", "fapico2-vendor-led/device",
     # US-161/162/163: the sixth CCID app (Rescue, AID A0 58 3F ... 4F 21).
     "dep:fapico2-rescue", "fapico2-rescue/device",
+    # US-1642: the seventh CCID app (Nostr, AID F0 00 00 00 02).
+    "dep:fapico2-nostr", "fapico2-nostr/device",
+    # US-1658: the shared applet mutex (device code lives in boot.rs).
+    "dep:embassy-sync", "dep:critical-section", "dep:embassy-futures",
 ]
 emulation = [
     "dep:env_logger",
@@ -230,4 +260,9 @@ emulation = [
     # US-161/162/163: the emulation serves the Rescue applet too, so
     # `tests/harness/test_rescue_*.py` drive the real applet over CCID.
     "dep:fapico2-rescue", "fapico2-rescue/host",
+    # US-1642: the emulation serves the Nostr applet too, so Phase 1 suites
+    # drive the real applet over CCID.
+    "dep:fapico2-nostr", "fapico2-nostr/host",
+    # US-1658: the emulator runs the same shared-mutex shape as the board.
+    "dep:embassy-sync", "dep:critical-section", "dep:embassy-futures",
 ]

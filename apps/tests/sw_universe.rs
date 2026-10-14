@@ -2007,6 +2007,260 @@ fn reachability_rescue() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Nostr applet (US-1642 skeleton)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The Nostr applet's status words (`apps/nostr/src/lib.rs`).
+///
+/// US-1643 implemented the three touch-free reads over the store; the
+/// mutating arms (`GENERATE_KEY` onwards) are still the US-1642 skeleton
+/// refusal and join this table as their stories land. US-1648 rebuilds the
+/// table against the applet's real vocabulary; until then the closed-world
+/// invariant is what keeps the implemented arms honest — the moment an arm
+/// starts answering anything new, the table below is the thing that refuses
+/// to pass until the word is named.
+const NOSTR: &[Claim] = &[
+    Claim::applet(
+        0x9000,
+        "platform::dispatch::SW_OK (dispatch.rs:22) — SELECT, and the three reads' \
+         happy paths (GET_INFO/LIST_KEYS/GET_PUBKEY over an empty store, US-1643)",
+    ),
+    Claim::applet(
+        0x6D00,
+        "platform SW_INS_NOT_SUPPORTED (dispatch.rs:24) — unknown INS bytes only: \
+         US-1643's reads, US-1644/45's key trio, US-1649's §2.2.0a trio and \
+         US-1653's NIP-44 pair (0x16/0x17) have all left this row",
+    ),
+    Claim::applet(
+        0x6B00,
+        "US-1653: ECC key form unsupported — the NIP-44 peer/sender key carries the \
+         NIP-44 v1 'ECC key' prefix (f9308a…); x25519 is §5-rejected, so the answer \
+         names the key *type*, not the key bytes (apps/nostr/src/lib.rs SW_ECC_UNSUPPORTED)",
+    ),
+    Claim::applet(
+        0x6A87,
+        "US-1653: peer/sender key is not a valid secp256k1 curve point — the x-only \
+         coordinate fails lift_xonly (zero, non-curve, or ≥ p). Settled before state \
+         and touch: it is a property of the request bytes alone",
+    ),
+    Claim::applet(
+        0x6985,
+        "US-1644: touch required / not granted — every mutating command's execution \
+         gate (GENERATE/IMPORT/SIGN, and US-1649's SET_LABEL/DELETE_KEY/EXPORT_KEY); \
+         the host build auto-acks, the device grant is US-1646's strict request path",
+    ),
+    Claim::applet(
+        0x6A84,
+        "US-1644: identity index already occupied — GENERATE_KEY/IMPORT_KEY never \
+         overwrite (design §2.2.0); the occupant need not be a Nostr identity, a \
+         foreign or unopenable record is the same actionable fact",
+    ),
+    Claim::applet(
+        0x6A88,
+        "US-1644: key set full — all eight slots committed, so no index choice \
+         helps; takes precedence over 6A84 because it names the remedy",
+    ),
+    Claim::applet(
+        0x6A86,
+        "US-1643: GET_INFO/LIST_KEYS take P1 = P2 = 0 and GET_PUBKEY takes P2 = 0; \
+         any other shape is refused before the payload is read",
+    ),
+    Claim::applet(
+        0x6A80,
+        "US-1643: bad index — GET_PUBKEY's P1 outside the 8-slot range (design §2.2.0: \
+         an out-of-range idx is a bad *handle*, not a missing identity) — and a payload \
+         on a command that takes none; US-1649 adds SET_LABEL's oversized/non-UTF-8 label",
+    ),
+    Claim::applet(
+        0x6A82,
+        "US-1643: no such identity at idx — an in-range slot holding no live identity \
+         (erased, tombstoned, or a foreign record US-1641's guard protects)",
+    ),
+    Claim::dispatcher(
+        0x6A82,
+        "platform SW_FILE_NOT_FOUND (dispatch.rs:23) — on a SELECT naming an unregistered \
+         AID; the applet itself also answers 6A82 from `process` (the row above), which is \
+         the second applet after PIV to do so",
+    ),
+    Claim::applet(
+        0x6E00,
+        "platform SW_CLA_NOT_SUPPORTED (dispatch.rs:25) — US-1643 enforces CLA_ISO 0x00; \
+         US-1648 owns the final decision",
+    ),
+];
+
+/// The INS range design §2.2 names for the applet (`GET_INFO 0x10` through
+/// the NIP-44 pair, plus unhandled bytes), with the CLA classes the other
+/// applets discriminate. US-1643 branches on CLA, P1 and P2, so the space is
+/// both what the *client* will send and what the source matches today.
+const NOSTR_SPACE: Space = Space {
+    clas: &[0x00, 0x10, 0x80, 0xFF],
+    ins: &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1A, 0x1B, 0x00, 0xFF],
+    p1: &[0x00, 0x01, 0x02, 0xFF],
+    p2: &[0x00, 0x01, 0x02, 0xFF],
+};
+
+/// The reads are implemented (US-1643), so the named cases are the *answers*:
+/// the two GET_INFO framings succeed, the index distinction (§2.2.0's "bad
+/// index" vs "no such identity") shows up as `6A80` vs `6A82`, and the CLA
+/// guard is live.
+fn nostr_cases() -> Vec<Case> {
+    vec![
+        // GET_INFO (INS 0x10, design §2.2), short framing: succeeds over the
+        // empty sweep region and advertises max_plaintext 1792 (US-1653's
+        // wire-cap correction).
+        case("GET_INFO-shaped header", short(0x10, 0x00, 0x00, &[]), 0x9000),
+        // The same header as case-2 (an Le, no Lc) — the framing GET_INFO
+        // will actually arrive in.
+        case("GET_INFO-shaped, case-2", case2(0x10, 0x00, 0x00), 0x9000),
+        // GET_INFO's shape names P1 = P2 = 0; anything else is 6A86.
+        case("GET_INFO wrong P1", short(0x10, 0x01, 0x00, &[]), 0x6A86),
+        // GET_PUBKEY (INS 0x12): in-range empty slot vs out-of-range index —
+        // the two different facts §2.2.0 separates.
+        case("GET_PUBKEY empty slot", short(0x12, 0x01, 0x00, &[]), 0x6A82),
+        case("GET_PUBKEY out-of-range idx", short(0x12, 0xFF, 0x00, &[]), 0x6A80),
+        // US-1644/US-1645 implemented the key-management trio. GENERATE at
+        // a free index succeeds — the sweep runs with the host build's
+        // auto-ack presence and OS-entropy default, so this case commits
+        // idx 0 to the sweep region (later cases do not depend on it
+        // staying empty). IMPORT with a zero scalar is refused flat — no
+        // touch, no write. SIGN at an in-range empty slot is 6A82; at an
+        // out-of-range one, 6A80.
+        case("GENERATE_KEY free idx", short(0x13, 0x01, 0x00, &[]), 0x9000),
+        case("IMPORT_KEY zero scalar", short(0x14, 0x02, 0x00, &[0u8; 32]), 0x6A80),
+        case("SIGN empty slot", short(0x15, 0x02, 0x00, &[0x5A; 32]), 0x6A82),
+        case("SIGN out-of-range idx", short(0x15, 0xFF, 0x00, &[0x5A; 32]), 0x6A80),
+        // US-1653: the NIP-44 pair validates the peer key before state and
+        // touch, so a non-curve peer_x is 6A87 whatever the slot holds —
+        // a zero coordinate lifts at nothing. The data is the minimum
+        // shape (peer_x(32) ‖ plaintext(1)).
+        case("NIP44_ENCRYPT zero peer", short(0x16, 0x00, 0x00, &[0u8; 33]), 0x6A87),
+        // ...and an x25519-shaped key: the f9308a prefix is 6B00, naming the
+        // key *type* rather than the bytes (the §2.2.0a user/client split).
+        case(
+            "NIP44_ENCRYPT ECC peer",
+            short(0x16, 0x00, 0x00, &[0xF9, 0x30, 0x8A, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D]),
+            0x6B00,
+        ),
+        // US-1643 enforces CLA 0x00 — `0x80` (Rescue's class) is refused with
+        // 6E00. US-1648 decides whether that stays.
+        case("CLA 0x80", vec![0x80, 0x10, 0x00, 0x00], 0x6E00),
+        case("unknown INS", short(0x00, 0x00, 0x00, &[]), 0x6D00),
+    ]
+}
+
+/// The sweep's payload key, derived per scenario — `PayloadKey` is not `Copy`
+/// and each `NostrRegion::new` consumes one.
+fn nostr_sweep_key() -> fapico2_platform::keyregion::crypto::PayloadKey {
+    let otp_row: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x11));
+    let chipid: [u8; 8] = 0x0000_BADC_0FFE_EE01_0203_u64.to_be_bytes();
+    fapico2_platform::keyregion::crypto::derive_payload_key(
+        &otp_row,
+        &chipid,
+        &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
+    )
+    .expect("a non-zero OTP row")
+}
+
+#[test]
+fn reachability_nostr() {
+    // The sweep drives a **region-backed** applet — the shape the device and
+    // the emulator register — so the table claims what the real applet
+    // answers, not what a storeless shell would (`6F00` on every read).
+    let path = std::env::temp_dir().join(format!(
+        "fapico2-us1644-nostr-sweep-{}.bin",
+        std::process::id()
+    ));
+    std::fs::remove_file(&path).ok();
+    let mut report = Report::default();
+
+    // Scenario 1 (US-1643) — a fresh, empty fixture: every read command's
+    // happy path is "n = 0" / "no such identity", which is exactly the
+    // answer a swept empty store gives; GENERATE at a free index succeeds
+    // (the host build's auto-ack presence and OS-entropy default).
+    {
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+            &path,
+            fapico2_platform::keyregion::TOTAL_SLOTS,
+        )
+        .expect("a fresh nostr sweep region");
+        let key = nostr_sweep_key();
+        let mut app = fapico2_nostr::NostrApp::boot(
+            fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ),
+        );
+        let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
+        d.sweep(&nostr_cases(), &NOSTR_SPACE);
+        report.absorb(d.into_report());
+    }
+
+    // Scenario 2 (US-1644) — a full set and no presence grant: the three
+    // words a full device answers before it will act. GENERATE is 6A88
+    // (no index choice helps), IMPORT at an occupied index is 6A84 even
+    // with a valid scalar, and SIGN is 6985 — the touch gates the
+    // *execution*, and the state refusals come first because a press the
+    // host could have avoided is a press wasted.
+    {
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+            &path,
+            fapico2_platform::keyregion::TOTAL_SLOTS,
+        )
+        .expect("a full nostr sweep region");
+        {
+            // Fill the set directly — the sweep does not press the button.
+            let key = nostr_sweep_key();
+            let mut region = fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            );
+            let mut store = region.store();
+            for i in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
+                let scalar: [u8; 32] = core::array::from_fn(|b| (i as u8).wrapping_add(b as u8));
+                let npub = fapico2_nostr::crypto::xonly_pubkey(&scalar).expect("a valid scalar");
+                store
+                    .write(i, &fapico2_platform::keyregion::nostr_store::NostrIdentity::new(
+                        scalar, npub, b"", 0,
+                    ).expect("a valid identity"))
+                    .expect("fill the set");
+            }
+        }
+        // Reopen the filled region — the applet must not know the sweep
+        // wrote it directly, any more than a client's session would.
+        let region = fapico2_platform::keyregion::host::FileKeyRegion::open(&path)
+            .expect("the filled nostr sweep region");
+        let key = nostr_sweep_key();
+        let mut app = fapico2_nostr::NostrApp::boot(
+            fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ),
+        )
+        .with_presence_grant(|_| false);
+        let mut d = Driver::new(&mut app, fapico2_nostr::NOSTR_AID);
+        d.run(&[
+            case("GENERATE on a full set", short(0x13, 0x00, 0x00, &[]), 0x6A88),
+            case(
+                "IMPORT at an occupied index",
+                short(0x14, 0x00, 0x00, &{
+                    let mut v = vec![0u8; 32];
+                    v[31] = 0x40;
+                    v
+                }),
+                0x6A84,
+            ),
+            case("SIGN without a grant", short(0x15, 0x00, 0x00, &[0x5A; 32]), 0x6985),
+        ]);
+        d.cross(&NOSTR_SPACE);
+        report.absorb(d.into_report());
+    }
+
+    report.finish("nostr", NOSTR);
+    std::fs::remove_file(&path).ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The platform itself
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2177,6 +2431,7 @@ fn all_tables() -> Vec<(&'static str, &'static [Claim])> {
         ("piv", PIV),
         ("vendor_led", VENDOR_LED),
         ("rescue", RESCUE),
+        ("nostr", NOSTR),
         ("platform", PLATFORM),
     ]
 }
@@ -2219,6 +2474,9 @@ fn epic_word_list_misses_words_four_applets_use() {
         if matches!(who, "mgmt" | "vendor_led" | "platform") {
             continue;
         }
+        // US-1643 gave Nostr real commands with P1/P2 shape checks, so the
+        // skeleton-era skip is gone: Nostr joins the required set here and
+        // carries 6A86 in its own table, in the same edit.
         assert!(
             table_has(table, 0x6A86),
             "{who}: the table must carry 6A86 — the word the EPIC's list omits"
@@ -2282,9 +2540,9 @@ fn every_applet_answers_6a82_only_through_the_dispatcher() {
         }
         assert!(
             as_dispatcher,
-            "{who}: 0x6A82 must be marked Layer::Dispatcher — no applet here returns it from \
-             `process`; the dispatcher does, on a SELECT naming an unregistered AID \
-             (platform/src/dispatch.rs:177-181)"
+            "{who}: 0x6A82 must be marked Layer::Dispatcher — the dispatcher answers it on a \
+             SELECT naming an unregistered AID (platform/src/dispatch.rs:177-181), so every \
+             table carries that origin even where the applet also uses the word"
         );
     }
     // PIV is the one applet that also uses the word itself, so it is the one
@@ -2294,6 +2552,17 @@ fn every_applet_answers_6a82_only_through_the_dispatcher() {
         piv_6a82_rows, 1,
         "PIV's 0x6A82 row names both origins in its `origin` string \
          (dispatch.rs:23 for the AID path and lib.rs:25 for an absent GET DATA object)"
+    );
+    // US-1643 made Nostr the second applet that answers 6A82 from `process`
+    // (the design §2.2.0 assigns it: "no such identity at idx" is a fact
+    // about the *identity store*, not about routing) — so the census's old
+    // premise ("no applet here returns it from `process`") is now stated as
+    // the two-applet exception it actually is.
+    let nostr_6a82_rows = NOSTR.iter().filter(|c| c.sw == 0x6A82).count();
+    assert_eq!(
+        nostr_6a82_rows, 2,
+        "Nostr carries both origins — the dispatcher row and one applet-layer \
+         'no such identity' row naming every idx-taking read (US-1643/US-1645)"
     );
     // Sanity: the census is not vacuous — every table has at least one
     // applet-layer row, so `Layer` discriminates rather than being constant.

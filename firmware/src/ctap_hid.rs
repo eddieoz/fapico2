@@ -167,6 +167,39 @@ pub const CTAPHID_INIT_CAP_FLAGS: u8 = 0x05;
 /// capFlags(1).
 pub const CTAPHID_INIT_REPLY_LEN: usize = 17;
 
+/// The Nostr interface's INIT `capFlags` (US-1661, design §A.8.3 #8): **0x00
+/// — a claim of nothing**.
+///
+/// The `capFlags` conventions disagree on which bit says what (see
+/// [`CTAPHID_INIT_CAP_FLAGS`]'s history: the CTAP 2.1 spec reads 0x01 as CBOR,
+/// the de-facto `fido2`/pico-keys-sdk reading reads 0x04 as CBOR — which is
+/// why the FIDO interface's `0x05` sets both). The disagreement is exactly
+/// what this constant exploits: under *either* convention, any nonzero value
+/// among 0x01/0x04/0x05 claims CTAP2 or WINK capability. The Nostr interface
+/// serves neither — it speaks the CTAPHID **framing** (INIT handshake, CID
+/// allocation, PING, sequence packets, CANCEL, error codes) with the Nostr
+/// command set in the vendor range 0x40–0x7F, and a generic CTAPHID client
+/// must see a **non-CTAP2 vendor device**, not a second authenticator
+/// competing with the FIDO interface. `NOSTR_INIT_CAP_FLAGS = 0x00` is the
+/// only value that reads as CTAP2-incapable under both conventions at once.
+///
+/// `nostr_init_reply_claims_only_what_it_serves` decodes the reply under both
+/// assignments and fails if either reader could conclude "CTAP2".
+pub const NOSTR_INIT_CAP_FLAGS: u8 = 0x00;
+
+/// The Nostr interface's vendor version bytes (US-1661): the **applet's**
+/// version, not the YubiKey firmware pair the FIDO interface carries. The
+/// FIDO interface reports the management applet's 5.4 pair because yubikit
+/// reads INIT bytes 13..15 as `device_version` and gates YubiKey
+/// management-protocol work on them; that rationale is FIDO-client-specific
+/// and the Nostr interface must not inherit the claim — a yubikit client
+/// never opens this interface (it selects on the FIDO usage page), and a
+/// generic CTAPHID client should see *fapico2's* applet version. Kept in
+/// step with `apps/nostr`'s `APPLET_VERSION` (major, minor) by test:
+/// `nostr_init_reply_claims_only_what_it_serves` asserts the pair, so a
+/// version bump that leaves this constant behind is a red.
+pub const NOSTR_VENDOR_VERSION: (u8, u8, u8) = (0x00, 0x01, 0x00);
+
 /// Build the 17-byte CTAPHID_INIT reply payload.
 ///
 /// US-1507: extracted verbatim from the INIT arm of `dispatch` in
@@ -200,6 +233,31 @@ pub fn init_reply(
     inner[14] = version_minor;
     inner[15] = version_build;
     inner[16] = CTAPHID_INIT_CAP_FLAGS;
+    inner
+}
+
+/// Build the 17-byte CTAPHID_INIT reply payload for the **Nostr** interface
+/// (US-1661).
+///
+/// The framing is the shared CTAPHID v2 one (versionInterface stays 0x02 —
+/// that is what the framing is), but the capability claim is
+/// [`NOSTR_INIT_CAP_FLAGS`] (0x00 — CTAP2-incapable under both conventions)
+/// and the version bytes are [`NOSTR_VENDOR_VERSION`], the applet's own, not
+/// the YubiKey firmware pair. The body is a deliberate near-copy of
+/// [`init_reply`] rather than a parameterized call: the FIDO reply's
+/// capability byte is a *documented decision* ([`CTAPHID_INIT_CAP_FLAGS`])
+/// that this interface must not inherit silently, and a `cap_flags`
+/// parameter would let a future caller do exactly that.
+pub fn nostr_init_reply(nonce: &[u8], new_channel: &[u8; 4]) -> [u8; CTAPHID_INIT_REPLY_LEN] {
+    let mut inner = [0u8; CTAPHID_INIT_REPLY_LEN];
+    let n = nonce.len().min(8);
+    inner[..n].copy_from_slice(&nonce[..n]);
+    inner[8..12].copy_from_slice(new_channel);
+    inner[12] = 0x02; // versionInterface (2 = CTAP HID v2) — the framing
+    inner[13] = NOSTR_VENDOR_VERSION.0;
+    inner[14] = NOSTR_VENDOR_VERSION.1;
+    inner[15] = NOSTR_VENDOR_VERSION.2;
+    inner[16] = NOSTR_INIT_CAP_FLAGS;
     inner
 }
 
@@ -419,14 +477,41 @@ impl HidAssembler {
 /// story removes. The nonce stays in the signature as the allocation trigger.)
 pub struct CidAllocator {
     counter: u32,
+    /// The exclusive upper bound this allocator's CIDs stay under — its own
+    /// wrap constant. The FIDO interface wraps at [`HID_CID_DOMAIN_SEPARATED`]
+    /// (bit 31 is the HID presence-tag domain); the Nostr interface
+    /// (US-1659, design §A.8.3a #2) wraps at `0x2000_0000` because its tags
+    /// are `0x6000_0000 | CID` (bits 30+29) and OR-folding is not injective:
+    /// a free-running cid ≥ 0x2000_0000 would set bit 29 inside the CID
+    /// itself, and cid `0x0000_0002`, `0x2000_0002` and `0x6000_0002` would
+    /// all fold onto tag `0x6000_0002` — a silent cross-tab grant.
+    limit: u32,
 }
 
 impl CidAllocator {
-    /// Starts above the all-zero reserved channel.
+    /// Starts above the all-zero reserved channel, in the FIDO interface's
+    /// 31-bit space.
     pub const fn new() -> Self {
-        Self { counter: 0 }
+        Self { counter: 0, limit: HID_CID_DOMAIN_SEPARATED }
+    }
+
+    /// A clamped allocator for an interface whose presence tags are
+    /// OR-folded onto the CID: the counter may never reach the bits the tag
+    /// mask occupies. The Nostr interface's tag domain starts at
+    /// `0x6000_0000`, so its CID space is clamped to cid < [`NOSTR_CID_LIMIT`]
+    /// (US-1659).
+    pub const fn clamped(limit: u32) -> Self {
+        Self { counter: 0, limit }
     }
 }
+
+/// US-1659: the Nostr interface's CID clamp — the wrap constant of a
+/// `CidAllocator::clamped` allocator. The Nostr presence tags are
+/// `0x6000_0000 | cid` (bits 30+29), so a free-running cid at or above
+/// `0x2000_0000` would fold bits into the tag mask and OR-folding stops
+/// being injective. `pub` for US-1660's serve state, which constructs the
+/// clamped allocator at the device seam.
+pub const NOSTR_CID_LIMIT: u32 = 0x2000_0000;
 
 impl Default for CidAllocator {
     fn default() -> Self {
@@ -440,7 +525,13 @@ impl CidAllocator {
     /// (US-921 review P0-1: lets the wraparound guard be exercised without
     /// 2^31 allocations).
     fn from_counter(counter: u32) -> Self {
-        Self { counter }
+        Self { counter, limit: HID_CID_DOMAIN_SEPARATED }
+    }
+
+    /// Test-only companion: place the counter under an arbitrary limit,
+    /// for the clamped allocator's wrap tests (US-1659).
+    fn from_counter_limited(counter: u32, limit: u32) -> Self {
+        Self { counter, limit }
     }
 }
 
@@ -458,10 +549,10 @@ impl CidAllocator {
         let _ = nonce;
         loop {
             self.counter = self.counter.wrapping_add(1);
-            if self.counter >= HID_CID_DOMAIN_SEPARATED {
-                // The 31-bit CID space is exhausted: wrap to the start
-                // (the next increment lands on 1 — the bridge channel,
-                // skipped below like every reserved value).
+            if self.counter >= self.limit {
+                // This allocator's CID space is exhausted: wrap to the
+                // start (the next increment lands on 1 — the bridge
+                // channel, skipped below like every reserved value).
                 self.counter = 0;
                 continue;
             }
@@ -520,6 +611,73 @@ mod tests {
         f[4] = seq;
         f[5..5 + bytes.len()].copy_from_slice(bytes);
         f
+    }
+
+    /// US-1659 (design §A.8.3a #2, §2.7.1): the Nostr interface's allocator
+    /// is range-clamped to cid < `0x2000_0000` and the interface's tags
+    /// (`0x6000_0000 | CID`, `fapico2_nostr::hid_presence_tag`) are injective
+    /// over that space and disjoint from the other two domains. OR-folding
+    /// is not injective in general: for a free-running cid ≥ 0x2000_0000,
+    /// bits 29/30 of the cid fold into the tag mask — cid 0x0000_0002,
+    /// 0x2000_0002 and 0x6000_0002 would all yield tag 0x6000_0002 — which
+    /// is a silent cross-tab grant: a press armed for one tab consumable by
+    /// another.
+    #[test]
+    #[cfg(feature = "device")]
+    fn nostr_cid_allocator_is_clamped_and_tags_injective() {
+        use fapico2_nostr::{hid_presence_tag, NOSTR_HID_TAG_DOMAIN, NOSTR_TAG_DOMAIN};
+
+        // The Nostr allocator wraps under its own limit — the clamp is the
+        // fix, so it is what the test exercises.
+        let mut alloc = CidAllocator::clamped(NOSTR_CID_LIMIT);
+        assert_eq!(alloc.allocate(&[]), [0, 0, 0, 2], "bridge CID skipped, counting from 2");
+
+        // Boundary: at the top of the clamped space the counter wraps back
+        // into the safe range instead of stepping into the tag mask's bits —
+        // the fold would live exactly here.
+        let mut at_edge = CidAllocator::from_counter_limited(NOSTR_CID_LIMIT - 2, NOSTR_CID_LIMIT);
+        let last = at_edge.allocate(&[]);
+        assert_eq!(last, [0x1F, 0xFF, 0xFF, 0xFF], "the last clamped CID is issued");
+        // …then the counter wraps to the start of the safe range (bridge
+        // channel skipped), never crossing the clamp.
+        assert_eq!(at_edge.allocate(&[]), [0, 0, 0, 2]);
+        // Every issued CID keeps the clamp's bits clear — the property the
+        // tag injectivity below depends on.
+        assert_eq!(u32::from_be_bytes(last) & NOSTR_CID_LIMIT, 0);
+
+        // Injectivity within the Nostr-HID domain: distinct channels yield
+        // distinct tags (exercised over the interesting bit patterns — the
+        // full space is 2^29, the fold lives at the mask's edges).
+        for cid_u32 in [
+            0x0000_0002u32,      // the first legal CID
+            0x1FFF_FFFFu32,      // the last CID under the clamp
+            0x0000_0003u32,      // the one the fold example collides on
+            0x0100_0000u32,      // a CID with interior bits set
+        ] {
+            let cid = cid_u32.to_be_bytes();
+            let tag = hid_presence_tag(cid);
+            // The mask's bits must be exactly the domain's — a cid under the
+            // clamp cannot steal bit 29 or bit 30 or reach bit 31.
+            assert_eq!(tag & 0xE000_0000, NOSTR_HID_TAG_DOMAIN);
+            assert_eq!(tag & !0xE000_0000, cid_u32 & 0x1FFF_FFFF);
+        }
+
+        // Cross-domain disjointness (§A.8.3 #1): the three presence-tag
+        // domains never overlap. FIDO HID is `0x8000_0000 | CID`
+        // (fapico2_fido::presence_tag_from_channel), the CCID Nostr applet
+        // is `0x4000_0000 | idx` (fapico2_nostr::presence_tag), and this
+        // interface is `0x6000_0000 | CID`.
+        let cid = [0x00, 0x00, 0x00, 0x02];
+        let nostr_hid = hid_presence_tag(cid);
+        let fido_hid = 0x8000_0000 | u32::from_be_bytes(cid); // the FIDO encoding
+        let ccid_nostr = NOSTR_TAG_DOMAIN | 2u32; // the CCID applet's idx-2 tag
+        assert_ne!(nostr_hid, fido_hid);
+        assert_ne!(nostr_hid, ccid_nostr);
+        assert_ne!(fido_hid, ccid_nostr);
+        // …and the FIDO domain's bit-31 invariant holds under this one: no
+        // Nostr-HID tag can have bit 31 set, so a Nostr press can never arm
+        // (or arm-consume) a FIDO window.
+        assert_eq!(nostr_hid & 0x8000_0000, 0);
     }
 
     fn busy_check(alloc: &mut CidAllocator, _asm: &mut HidAssembler, nonce: &[u8]) -> [u8; 4] {
@@ -748,5 +906,55 @@ mod tests {
         // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04 CBOR).
         assert_ne!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: no CTAP2 support");
         assert_ne!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: no WINK");
+    }
+
+    /// US-1661 (design §A.8.3 #8, §2.7.1): the Nostr interface's INIT reply
+    /// must not read as a CTAP2-capable YubiKey under **either** capFlags
+    /// convention, and its version bytes are the applet's, not the YubiKey
+    /// firmware pair. A generic CTAPHID client opening the vendor interface
+    /// must see a non-CTAP2 vendor device — the claim-vs-honour failure
+    /// AGENTS §4 exists to prevent, one interface earlier than the CBOR path.
+    #[test]
+    fn nostr_init_reply_claims_only_what_it_serves() {
+        let nonce: [u8; 8] = [0xB0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let mut alloc = CidAllocator::clamped(crate::ctap_hid::HID_CID_DOMAIN_SEPARATED >> 2);
+        let channel = alloc.allocate(&nonce);
+
+        let inner = nostr_init_reply(&nonce, &channel);
+
+        // The framing half is still CTAPHID: nonce echo, fresh CID,
+        // versionInterface 2.
+        assert_eq!(&inner[..8], &nonce[..]);
+        assert_eq!(&inner[8..12], &channel[..]);
+        assert_eq!(inner[12], 0x02, "versionInterface must be 2 — the framing is CTAPHID v2");
+
+        let cap = inner[16];
+        assert_eq!(cap, NOSTR_INIT_CAP_FLAGS);
+
+        // Decoder 1 — CTAP 2.1 spec §11.2.1.1 (0x01 CBOR, 0x04 WINK): neither
+        // bit set, so a spec reader cannot conclude CTAP2 (or WINK).
+        assert_eq!(cap & SPEC_CBOR, 0, "spec reader concluded: CTAP2 capable");
+        assert_eq!(cap & SPEC_WINK, 0, "spec reader concluded: WINK capable");
+
+        // Decoder 2 — pico-keys-sdk / `fido2` CAPABILITY (0x01 WINK, 0x04
+        // CBOR): same conclusion, opposite assignment.
+        assert_eq!(cap & DEFACTO_CBOR, 0, "de-facto reader concluded: CTAP2 capable");
+        assert_eq!(cap & DEFACTO_WINK, 0, "de-facto reader concluded: WINK capable");
+
+        // The version bytes are the vendor's own — not the 5.4 pair the FIDO
+        // interface carries for yubikit's device_version gate.
+        assert_ne!(
+            (inner[13], inner[14], inner[15]),
+            (5, 4, 0),
+            "the Nostr interface must not claim YubiKey firmware"
+        );
+        // …and they track the applet's own version pair, so a version bump
+        // that leaves the constant behind is a red.
+        #[cfg(feature = "device")]
+        assert_eq!(
+            (inner[13], inner[14]),
+            (fapico2_nostr::APPLET_VERSION[0], fapico2_nostr::APPLET_VERSION[1]),
+            "NOSTR_VENDOR_VERSION must track apps/nostr's APPLET_VERSION"
+        );
     }
 }

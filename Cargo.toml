@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["firmware", "platform", "apps", "apps/fido", "apps/oath", "apps/openpgp", "apps/mgmt", "apps/piv", "apps/vendor_led", "apps/rescue"]
+members = ["firmware", "platform", "apps", "apps/fido", "apps/oath", "apps/openpgp", "apps/mgmt", "apps/piv", "apps/vendor_led", "apps/rescue", "apps/nostr"]
 exclude = ["vendor/opcard", "emu-harness"]
 default-members = ["firmware"]
 

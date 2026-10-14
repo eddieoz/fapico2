@@ -32,7 +32,7 @@
 //!
 //! **Deliberately not asserted equal: the capacity number itself**, and the
 //! reason is the point of the story rather than an evasion of it. The device's
-//! capacity is [`FIDO_CAPACITY`] — 856, derived from the region's geometry. The
+//! capacity is [`FIDO_CAPACITY`] — 848, derived from the region's geometry. The
 //! host twin's is whatever `MemoryKeystore::with_max_creds` was given, which in
 //! a test is chosen to make the test fast and on a board would be a fiction.
 //! Comparing them would assert that they differ; skipping them would assert
@@ -446,7 +446,7 @@ impl Twin for Dev {
     /// Fill the region to `FIDO_CAPACITY` **through the store**, then make one
     /// more enrolment through the command path and return its status.
     ///
-    /// **Why the fill is not done through makeCredential.** 856 enrolments at
+    /// **Why the fill is not done through makeCredential.** 848 enrolments at
     /// one P-256 keygen + one self-attestation signature + one sector-atomic
     /// commit each is minutes of host CPU, and the *interesting* half — the
     /// command path's own refusal — is the single call after the fill. The fill

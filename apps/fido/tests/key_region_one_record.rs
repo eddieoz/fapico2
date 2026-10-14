@@ -768,7 +768,7 @@ fn the_first_operation_reads_but_does_not_erase() {
 /// The store's own resident cost is one field — the region borrow.
 ///
 /// Pinned rather than asserted in a comment, because the whole RAM argument
-/// (`fido_store.rs`, "Why the whole array had to go") is a number: 856 resident
+/// (`fido_store.rs`, "Why the whole array had to go") is a number: 848 resident
 /// `DeviceCredential`s would be 616,320 bytes of `.bss` against 532,480 bytes of
 /// RAM, and `FidoRecordStore` is what makes that false.
 #[test]

@@ -291,6 +291,114 @@ fn the_index_path_reads_a_dump_with_no_pin() {
 }
 
 // ---------------------------------------------------------------------------
+// US-1638 — the Nostr domain: AAD separation and a device-bound key
+// ---------------------------------------------------------------------------
+
+/// The scenario's "given": a valid record sealed for domain Nostr, slot 7,
+/// generation 12 — the same shape a `nostr_store` record will have.
+fn record_for_nostr_slot_7_generation_12(key: &crypto::PayloadKey) -> Sealed {
+    Sealed::new(key, RecordAad::new(KeyDomain::Nostr, slot(7), 12), PLAINTEXT)
+}
+
+/// The Nostr payload key: the same three-input derivation OATH uses, with
+/// [`crypto::NOSTR_PAYLOAD_SECRET`] as the third input.
+fn nostr_payload_key() -> crypto::PayloadKey {
+    crypto::derive_payload_key(&OTP, &CHIPID, &crypto::NOSTR_PAYLOAD_SECRET).expect("nostr key")
+}
+
+#[test]
+fn a_nostr_record_does_not_unseal_as_fido_or_oath() {
+    // The AAD half of US-1638's acceptance: a Nostr record physically cannot
+    // open as a FIDO or an OATH record — same key, same slot, same generation,
+    // only the domain tag differs. One assertion per domain because each is its
+    // own byte in the AAD, the same one-variant-one-test discipline as US-1548.
+    let key = nostr_payload_key();
+    let sealed = record_for_nostr_slot_7_generation_12(&key);
+
+    assert!(
+        !sealed.opens_as(&key, RecordAad::new(KeyDomain::Fido, slot(7), 12)),
+        "a record sealed for domain Nostr unsealed as domain FIDO"
+    );
+    assert!(
+        !sealed.opens_as(&key, RecordAad::new(KeyDomain::Oath, slot(7), 12)),
+        "a record sealed for domain Nostr unsealed as domain OATH"
+    );
+    assert!(sealed.opens_as_itself(&key), "the Nostr domain does not open its own record");
+}
+
+#[test]
+fn a_fido_record_does_not_unseal_as_nostr() {
+    // The inverse transplant: a FIDO record presented under the Nostr tag.
+    // Both directions are tested because a one-way refusal is also what a
+    // domain tag that is ignored entirely produces.
+    let key = nostr_payload_key();
+    let sealed = record_for_fido_slot_7_generation_12(&key);
+
+    assert!(
+        !sealed.opens_as(&key, RecordAad::new(KeyDomain::Nostr, slot(7), 12)),
+        "a FIDO record unsealed as domain Nostr"
+    );
+}
+
+#[test]
+fn a_fido_record_in_a_nostr_slot_does_not_open_under_the_nostr_key() {
+    // The story's second test, exactly: a FIDO-sealed record written into a
+    // Nostr slot fails to open under KeyDomain::Nostr. The two attempts differ
+    // in *both* AAD inputs a thief could control after copying bytes around —
+    // the domain tag and the slot — and both must refuse. This is the record
+    // the occupancy guard (US-1641) refuses to overwrite on sight of this fact.
+    let key = nostr_payload_key();
+    let fido_key = payload_key();
+    let sealed = record_for_fido_slot_7_generation_12(&fido_key);
+
+    assert!(
+        !sealed.opens_as(&key, RecordAad::new(KeyDomain::Nostr, slot(7), 12)),
+        "a FIDO record copied into a Nostr slot opened as Nostr"
+    );
+    assert!(
+        !sealed.opens_as(&key, RecordAad::new(KeyDomain::Fido, slot(7), 12)),
+        "a FIDO record opened under the Nostr payload key"
+    );
+}
+
+#[test]
+fn the_nostr_payload_key_is_device_bound_and_domain_distinct() {
+    // The key half of US-1638's acceptance: no PIN-derived input anywhere in
+    // the derivation. The honest form of that assertion is a signature check —
+    // `NOSTR_PAYLOAD_SECRET` is a compile-time constant, so `derive_payload_key`
+    // never sees PIN material for this domain — plus the cross-domain property
+    // the AAD tests above rely on: the Nostr key differs from a PIN-derived
+    // one, so a Nostr record cannot open even under the right domain tag with
+    // the wrong key, and vice versa.
+    let nostr = nostr_payload_key();
+    let with_pin = payload_key();
+
+    assert_ne!(
+        nostr.as_bytes(),
+        with_pin.as_bytes(),
+        "the Nostr payload key collided with a PIN-derived payload key"
+    );
+
+    // And the derivation is a pure function of (otp, chipid, constant): the
+    // same inputs give the same key, and a different chipid does not.
+    let again = crypto::derive_payload_key(&OTP, &CHIPID, &crypto::NOSTR_PAYLOAD_SECRET)
+        .expect("nostr key");
+    assert_eq!(nostr.as_bytes(), again.as_bytes());
+    let other_chip = crypto::derive_payload_key(
+        &OTP,
+        &[0u8; 8],
+        &crypto::NOSTR_PAYLOAD_SECRET,
+    )
+    .expect("nostr key on another chip");
+    assert_ne!(nostr.as_bytes(), other_chip.as_bytes(), "the key is not device-bound");
+
+    // The unknown-tag decoder covers the new tag: `from_tag(3)` decodes, and
+    // a tag this build does not know still decodes to nothing.
+    assert_eq!(KeyDomain::from_tag(3), Some(KeyDomain::Nostr));
+    assert_eq!(KeyDomain::Nostr.tag(), 3);
+}
+
+// ---------------------------------------------------------------------------
 // US-1548 — a record cannot be transplanted or replayed
 // ---------------------------------------------------------------------------
 
@@ -427,10 +535,14 @@ fn an_unknown_domain_tag_decodes_to_nothing() {
     // read as one it does: `from_tag` returns `None`, and a caller that
     // defaulted here would authenticate an unknown applet's record as FIDO.
     assert_eq!(KeyDomain::from_tag(0), None);
-    assert_eq!(KeyDomain::from_tag(3), None);
+    // Tag 3 was "unknown" until US-1638 claimed it for Nostr; 4 is the next
+    // free tag, and the refusal must cover it the same way.
+    assert_eq!(KeyDomain::from_tag(3), Some(KeyDomain::Nostr));
+    assert_eq!(KeyDomain::from_tag(4), None);
     assert_eq!(KeyDomain::from_tag(0xff), None);
     assert_eq!(KeyDomain::from_tag(KeyDomain::Fido.tag()), Some(KeyDomain::Fido));
     assert_eq!(KeyDomain::from_tag(KeyDomain::Oath.tag()), Some(KeyDomain::Oath));
+    assert_eq!(KeyDomain::from_tag(KeyDomain::Nostr.tag()), Some(KeyDomain::Nostr));
 }
 
 #[test]

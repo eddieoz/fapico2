@@ -306,6 +306,16 @@ bespoke_required = [
 "scopeguard@1.2.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers scopeguard 1.2.0. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "sec1@0.7.3" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers sec1 0.7.3. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "sec1@0.8.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers sec1 0.8.1. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
+# US-1636: the Nostr applet's crypto (US-1634's measured spike set).
+# secp256kfun is the crate that will carry the applet's identity keys — the
+# most sensitive new surface — so its reason is deliberately NOT the
+# boilerplate: 0.12.1 was chosen over reusing the workspace's k256 by the
+# US-1634 measurement (see ADR 0004), its 0BSD licence was reviewed as its
+# own edit (US-1635), and the BIP-340 vectors it must pass are the applet's
+# own red test (US-1645).
+"secp256kfun@0.12.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers secp256kfun 0.12.1. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit — it carries the Nostr applet's signing keys (see the note above). See docs/supply-chain.md."
+"secp256kfun_arithmetic_macros@0.2.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers secp256kfun_arithmetic_macros 0.2.0. It IS in the RP2350 device closure (cargo tree lists proc-macro crates on normal edges), so it is worth a human audit; it generates the field arithmetic secp256kfun compiles from. See docs/supply-chain.md."
+"subtle-ng@2.5.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers subtle-ng 2.5.0. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit — it is the constant-time trait layer under secp256kfun's scalar arithmetic. See docs/supply-chain.md."
 "semver-parser@0.7.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers semver-parser 0.7.0. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "semver@0.9.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers semver 0.9.0. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "serde-byte-array@0.1.2" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers serde-byte-array 0.1.2. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."

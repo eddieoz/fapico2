@@ -43,6 +43,10 @@ CLIENT_PORT = 35970  # shared relay: tests connect here
 #   36121           test_redteam.py OATH-presence private HID port (US-132)
 #   36011/36012     test_openpgp_chaining.py private relay (US-181)
 #   36111           test_openpgp_chaining.py private HID port (US-181)
+#   36013/36014     nostr_ccid.py 'select' private relay (US-1651)
+#   36015/36016     nostr_ccid.py 'keymgmt' private relay (US-1651)
+#   36017/36018     nostr_ccid.py 'deny' private relay — presence-deny
+#                   emulator, a separate process from the auto-ack one (US-1651)
 #   35973           dead dial port for direct-spawn FIDO-only emulators
 # Every private relay is spawned with explicit --ccid-port/--client-port and
 # its emulator is pointed at the private dial-in via FAPICO2_CCID_PORT.

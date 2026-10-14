@@ -23,9 +23,10 @@
 
 use fapico2_platform::ccid::message::HEADER;
 
-/// Max CCID message on the wire: 10-byte standard CCID header + body
-/// (body cap = C `USB_BUFFER_SIZE` parity, 2048 + 16).
-pub const MAX_WIRE: usize = 10 + 2048 + 16;
+/// Max CCID message on the wire — the platform's constant (US-1644 moved the
+/// definition to `platform/src/ccid.rs::message::MAX_WIRE` so host-side crates
+/// can assert against the device transport without a firmware dev-dependency).
+pub use fapico2_platform::ccid::message::MAX_WIRE;
 
 /// A partial message older than this window is dropped and the assembly
 /// state resyncs (US-920; the EPIC's "e.g. 2 s").
@@ -205,15 +206,29 @@ impl CcidReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::cell::Cell;
     use fapico2_platform::ccid::message::{PC_TO_RDR_GET_SLOT_STATUS, PC_TO_RDR_XFR_BLOCK};
 
-    static NOW_MS: AtomicU64 = AtomicU64::new(0);
+    // US-1681: the tests' clock is **thread-local**, not a shared static.
+    // The review (2026-10-10) observed `fresh_message_processes_after_
+    // partial_timeout` flake once in four full-suite runs; the mechanism,
+    // reproduced under `--test-threads=8`, was the shared static clock: a
+    // sibling test's `advance(..)` fired between this test's `feed` and its
+    // next `feed`/`poll`, so an in-window partial read as stale
+    // (`partial_inside_window_is_not_dropped` failed with `Some(Resync)`
+    // from a `feed` that must return `None`). A thread-local clock gives
+    // every test thread its own deterministic timeline — the timeout
+    // boundary is exercised by `advance` alone, never by scheduling.
+    // No change to the reassembly path itself: production keeps the
+    // injected `now_ms` fn.
+    thread_local! {
+        static NOW_MS: Cell<u64> = const { Cell::new(0) };
+    }
     fn fake_now() -> u64 {
-        NOW_MS.load(Ordering::Relaxed)
+        NOW_MS.with(|c| c.get())
     }
     fn advance(ms: u64) {
-        NOW_MS.fetch_add(ms, Ordering::Relaxed);
+        NOW_MS.with(|c| c.set(c.get() + ms));
     }
 
     /// A canonical GetSlotStatus (10-byte header, dwLength 0).

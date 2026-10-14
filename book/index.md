@@ -34,7 +34,7 @@ Then put them on a board you own: tap it, type your PIN once, and you are in. No
   <div class="usecase">
     <div class="uc-icon">🔑</div>
     <h3>Passkey logins</h3>
-    <p>Register once in any browser; from then on, login is a touch and the PIN. Room for <strong>856 resident passkeys</strong> — a YubiKey 5 holds 100.</p>
+    <p>Register once in any browser; from then on, login is a touch and the PIN. Room for <strong>848 resident passkeys</strong> — a YubiKey 5 holds 100.</p>
   </div>
   <div class="usecase">
     <div class="uc-icon">⌨️</div>
@@ -72,13 +72,15 @@ Then put them on a board you own: tap it, type your PIN once, and you are in. No
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP | CCID | ykman otp |
 | Management | device config, rescue surface | CCID | ykman, PicoForge |
+| Nostr | BIP-340 event signing, NIP-44 encryption | vendor HID + CCID | fapico2 Nostr extension |
 
 The board speaks dialects your machine already knows: browsers and `ykman` over CTAP-HID, GnuPG and Yubico Authenticator over CCID — and your phone talks to it over a USB OTG cable once [it claims a Yubico identity](./interop/index.md#on-a-phone). The first hour with the board: [Using the device](./using/index.md). Deeper walks: the [how-tos](./how-to/index.md) for SSH and Linux login, end to end.
 
 ## Capacity
 
-- **856 resident passkeys** — measured to refusal on hardware. For scale: a YubiKey 5 holds 100.
+- **848 resident passkeys** — measured to refusal on hardware. For scale: a YubiKey 5 holds 100.
 - **68 OATH credentials** reserved in the key store.
+- **8 Nostr identities** — BIP-340 signing and NIP-44 encryption, through the browser extension: [the applet](./features/nostr.md).
 
 One board replaces a drawer of tokens.
 

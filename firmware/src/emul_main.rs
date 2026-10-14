@@ -13,6 +13,14 @@ use fapico2_openpgp::OpenPgpApp;
 use fapico2_platform::trusted_backend::with_host_backend;
 use fapico2_piv::PivApp;
 use fapico2_vendor_led::VendorLedApp;
+// US-1642: the Nostr applet (AID F0 00 00 00 02).
+use fapico2_nostr::NostrApp;
+// US-1643: the Nostr key-region stand-in (a `FileKeyRegion` over a host file)
+// and the payload-key derivation that seals it.
+use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
+use fapico2_platform::keyregion::host::FileKeyRegion;
+use fapico2_platform::keyregion::nostr_store::NostrRegion;
+use fapico2_platform::keyregion::TOTAL_SLOTS;
 use fapico2_rescue::{
     FlashStats, PhySnapshot, PhyUpdate, RebootMode, RescueApp, RescueConfigHandler,
     RescueDeviceHandler,
@@ -349,6 +357,37 @@ fn emul_now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
+/// US-1643: the emulation stand-in for the device's OTP row — the third
+/// input of the payload-key derivation, beside [`EMULATION_CHIPID`] and
+/// [`NOSTR_PAYLOAD_SECRET`]. A host has no OTP controller; a fixed,
+/// non-zero stand-in keeps the derivation deterministic, so a region file
+/// written by one run opens under the next (the same property the emulation
+/// store key gives the partition image).
+const EMULATION_OTP_ROW: [u8; 32] = [
+    0x3f, 0x21, 0x9e, 0xd4, 0x8a, 0x07, 0xc5, 0x61, 0xb2, 0xf8, 0x30, 0x94, 0x6d, 0x1a, 0xe7, 0x52,
+    0x0c, 0xbb, 0x48, 0xdf, 0x76, 0x13, 0xa9, 0x5e, 0x84, 0x2b, 0xf1, 0x69, 0x9d, 0x04, 0xd3, 0x7a,
+];
+
+/// US-1643: open the Nostr key-region file, creating a fresh one on first
+/// boot — the emulator's analogue of the device's fifth handle over the
+/// flash window. `None` means the medium is unusable (a corrupt file the
+/// format refuses, or an I/O error); the caller degrades to a storeless
+/// applet, which refuses its reads rather than reset over a file it cannot
+/// read (FX-409 parity).
+fn open_or_create_nostr_region(path: &std::path::Path) -> Option<NostrRegion> {
+    let region = if path.exists() {
+        FileKeyRegion::open(path).ok()?
+    } else {
+        FileKeyRegion::create(path, TOTAL_SLOTS).ok()?
+    };
+    let key = derive_payload_key(
+        &EMULATION_OTP_ROW,
+        &EMULATION_CHIPID.to_be_bytes(),
+        &NOSTR_PAYLOAD_SECRET,
+    )?;
+    Some(NostrRegion::new(Box::new(region), key))
+}
+
 fn main() {
     env_logger::init();
     // US-921: the emulation mirrors the device window machinery over the
@@ -657,6 +696,34 @@ fn main() {
         .with_device_handler(unsafe {
             &mut *core::ptr::addr_of_mut!(EMUL_RESCUE_DEVICE_HANDLER)
         });
+    // US-1643: the Nostr applet's key-region stand-in — a `FileKeyRegion`
+    // over a host file, the emulator's fifth-handle analogue. The file
+    // persists across emulator restarts exactly as the partition image does
+    // (identities survive a restart, device parity), and
+    // `FAPICO2_NOSTR_REGION` overrides the shared temp path (FX-409 parity
+    // with `FAPICO2_SECURE_PARTITION`).
+    let nostr_region_path = match std::env::var("FAPICO2_NOSTR_REGION") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir().join("fapico2_nostr_region.bin"),
+    };
+    eprintln!("nostr region: {}", nostr_region_path.display());
+    let mut nostr_app = match open_or_create_nostr_region(&nostr_region_path) {
+        Some(region) => NostrApp::boot(region),
+        None => {
+            eprintln!("fapico2: nostr region open failed; the applet will refuse its reads");
+            NostrApp::new()
+        }
+    };
+    // US-1646: the nostr deny hook — the OATH one's exact shape above. The
+    // nostr applet's host default auto-acks (`default_user_present()`), so
+    // without this hook the 6985 touch refusal is un-exercisable over CCID
+    // and the presence suites only ever prove the grant path.
+    if let Ok(v) = std::env::var("FAPICO2_NOSTR_PRESENCE") {
+        if v == "deny" {
+            nostr_app = nostr_app.with_presence_grant(|_| false);
+            eprintln!("nostr presence: denied (FAPICO2_NOSTR_PRESENCE=deny)");
+        }
+    }
     // Registered apps must outlive the dispatcher, so it is declared last.
     // S-721-2 (D-D): the OpenPGP client is the S-721-1 no_std "call thyself"
     // `SyscallRunner` client on the host backend (option A — the same
@@ -665,13 +732,13 @@ fn main() {
     // `with_host_backend`.
     with_host_backend("fapico2-openpgp", |client| {
         let mut openpgp_app = OpenPgpApp::new(client);
-        // Seven registrations (management, OATH, OTP, OpenPGP, PIV, vendor
-        // LED, Rescue) into a capacity-7 dispatcher — exactly full, so an
-        // eighth registration would fail the `push` and be reported rather than
-        // silently dropped. US-161/162/163 took this from six to seven; the
-        // device path registers six (`apps::registry::CCID_AIDS`) because it
-        // does not carry PIV.
-        let mut dispatcher: Dispatcher<7> = Dispatcher::new();
+        // Eight registrations (management, OATH, OTP, OpenPGP, PIV, vendor
+        // LED, Rescue, Nostr) into a capacity-8 dispatcher — exactly full, so a
+        // ninth registration would fail the `push` and be reported rather than
+        // silently dropped. US-161/162/163 took this from six to seven and
+        // US-1642 took it to eight; the device path registers seven
+        // (`apps::registry::CCID_AIDS`) because it does not carry PIV.
+        let mut dispatcher: Dispatcher<8> = Dispatcher::new();
         dispatcher.register(&mut management_app);
         dispatcher.register(&mut oath_app);
         dispatcher.register(&mut otp_app);
@@ -679,6 +746,7 @@ fn main() {
         dispatcher.register(&mut piv_app);
         dispatcher.register(&mut vendor_led_app);
         dispatcher.register(&mut rescue_app);
+        dispatcher.register(&mut nostr_app);
         serve_loop(
             &mut transport,
             &mut fido_app,
@@ -924,7 +992,7 @@ fn copy_answer(resp: &[u8], out: &mut HeaplessVec<u8, CTAP2_MAX_MSG>) -> usize {
 fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     transport: &mut EmulationTransport,
     fido_app: &mut FidoApp<K>,
-    dispatcher: &mut Dispatcher<7>,
+    dispatcher: &mut Dispatcher<8>,
     store: &mut HostSecureStore,
     partition_path: &std::path::Path,
 ) {
@@ -935,7 +1003,7 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     // a private `HidAssembler` and three private consent loops.
     let mut ctap_out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
     let mut srv = HidServe::new(emul_now_ms, &mut ctap_out);
-    let mut slot = PendingUp::new();
+    let mut slot = PendingUp::<{ fapico2_firmware::pending_up::PENDING_UP_PAYLOAD_MAX }>::new();
     let mut app = EmulFido {
         app: fido_app,
         store,
@@ -1073,7 +1141,7 @@ mod us1524_tests {
         fn assert_shared(_: &HidServe<'_>, _: &PendingUp) {}
         let mut out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
         let mut srv = HidServe::new(emul_now_ms, &mut out);
-        assert_shared(&srv, &PendingUp::new());
+        assert_shared(&srv, &PendingUp::<{ fapico2_firmware::pending_up::PENDING_UP_PAYLOAD_MAX }>::new());
     }
 
     /// US-1524: `CTAP_READ_CONFIG` (`0x42`) used to answer

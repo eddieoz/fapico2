@@ -311,3 +311,31 @@ unbindable pair, which is why the pair is worth checking first.
 4. Re-run the size gate: the string constants are `.rodata` and the AAGUID is
    read on the attested-credential path.
 5. Say so in the commit message, and if it is the AAGUID, say what it breaks.
+
+## The Nostr vendor interface does not move any of this (US-1657)
+
+The composite now carries a **fourth interface** — a third HID interface on
+vendor usage page `0xFF00` (`platform/src/nostr_hid.rs`), appended after OTP so
+no earlier interface number shifts; `Usb::new` asserts the order
+`(CCID=0, CTAP=1, OTP=2, Nostr=3)` at enumeration, so a future insert that would
+shift a load-bearing number fails the boot rather than renumbering clients.
+
+What the identity story inherits, re-verified against the new descriptor:
+
+* **`scripts/fix_usb_identity.py` is unaffected.** It discovers the device
+  through python-fido2's `CtapHidDevice`, which selects HID nodes by the
+  *FIDO* usage page `0xF1D0` — a page the new interface deliberately does not
+  use. The repair path still finds the CTAP interface and still talks to the
+  same VID/PID (one pair, applied to the whole device).
+* **The udev rule is PID-free by design.** `platform/udev/70-fapico2-nostr.rules`
+  scopes on `idVendor=="fa20"` only, because the identity workflow treats PID as
+  user-changeable: a rule bound to the default PID would silently stop granting
+  access after an operator re-identified the board.
+* **Changing VID/PID voids the extension's binding.** The browser extension's
+  WebHID `requestDevice` filter hard-binds on `(vendorId, productId)` **and**
+  `usagePage`/`usage` (design §A.8.3b #2). After an identity change the
+  extension cannot see the device until it is re-paired (re-run the chooser).
+  The udev rule keeps granting OS-level access — the two layers bind
+  independently, and only the extension's needs re-pairing.
+* **libccid's table is unchanged** — the CCID interface is not touched, and the
+  browser path does not route through `pcscd` at all.

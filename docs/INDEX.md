@@ -29,13 +29,24 @@ deliberately **not in git**.
 - [secure-storage-comparison.md](secure-storage-comparison.md) — adversarial comparison of key-at-rest against pico-fido/pico-openpgp/pico-hsm/RS-Key.
 - [secure-storage-story-matrix.md](secure-storage-story-matrix.md) — tracked evidence index for the secure-storage epic.
 - [adr/](adr/README.md) — architecture decision records (PIV/RSA, provisioning policy, TrustZone).
+- [nostr-presence-audit.md](nostr-presence-audit.md) — the Nostr presence-gate adversarial audit
+  (2026-10-12): the CANCEL-repark orphaned-grant replay (Critical, PoC-confirmed), the folded-FIDO-tag
+  mask check, the proxy-swallowed mgmt-RESET wipe, the CCID arm that can never grant — arbitration,
+  decision log D1–D10, the red-then-green fix series, and the hardware acceptance
+  ([evidence](evidence/nostr-presence-audit/hardware.md): D7/D6 verified live, two new
+  prompt-visibility findings F-A15 fixed / F-A16 recorded).
+- [adr/0005-nostr-key-storage.md](adr/0005-nostr-key-storage.md) — the Nostr records' device-bound
+  key derivation, the FIDO-range carve and occupancy guard, the deliberate second secp256k1
+  implementation, and the scalar RAM-lifetime amendment.
 
-The three red-team security assessments live in
+The three round-based red-team security assessments live in
 [`archive/`](archive/README.md): [round 2](archive/SECURITY-ASSESSMENT-ROUND2.md)
 (the deep record), [round 3](archive/SECURITY-ASSESSMENT-ROUND3.md) (the
 same-day report) and the [round-3 remediation
 record](archive/SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) (what is fixed, with
-the hardware evidence).
+the hardware evidence). The Nostr arc's own red-team pass is
+[archive/SECURITY-ASSESSMENT-NOSTR.md](archive/SECURITY-ASSESSMENT-NOSTR.md)
+(2026-10-10, firmware + extension).
 
 ## Living budgets and gates (CI reads these — do not move)
 

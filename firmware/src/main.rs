@@ -53,6 +53,7 @@ use fapico2_vendor_led::VendorLedApp;
 // US-161/162/163 (PICOForge-COMPAT Phase H): the Rescue applet's two owners
 // are wired in `boot.rs`; only the applet itself is constructed here.
 use fapico2_rescue::RescueApp;
+// US-1642: the Nostr applet (AID F0 00 00 00 02).
 
 // Diagnostic event logging (`dbg-log` feature, off by default): in a
 // diagnostic build the macro records `(task, event, a, b)` into the RAM
@@ -280,6 +281,44 @@ fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
     ))
 }
 
+/// US-1643: the Nostr region, asked lazily by the applet's provider on its
+/// first read — the same shape as [`oath_region`], with no legacy fallback:
+/// Nostr has only ever had the keyregion store, so `None` means the applet
+/// refuses its reads with the store-fault status word (`6F00`) rather than
+/// answering from anywhere else. There is no legacy Nostr store to degrade
+/// to, and S10's "degrade" here is exactly that refusal.
+///
+/// The handle cannot be taken before the boot's key-region release gate runs,
+/// and the applet is constructed before that line — which is why this is a
+/// provider the applet asks on demand rather than an eager `NostrApp::boot`.
+///
+/// (The gate in `platform/tests/key_region_boot_gate.rs` reads this file as
+/// text, so this comment does not spell the release call the way the source
+/// does — that is the gate's needle, not prose.)
+fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
+    let key = boot::derive_nostr_payload_key()?;
+    let region = boot::take_nostr_key_region()?;
+    Some(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+        ::alloc::boxed::Box::new(region),
+        key,
+    ))
+}
+
+/// US-1644: the Nostr applet's randomness — the boot pool filled from the
+/// DRBG (see `init_nostr_rng_pool`'s call site in `main` for why the pool
+/// and not the generator itself), stretched on exhaustion.
+fn nostr_random(out: &mut [u8]) {
+    // SAFETY: `init_nostr_rng_pool` wrote both slots exactly once on this
+    // boot path, in the DRBG window, before USB; nothing rewrites them.
+    let pool = unsafe {
+        &mut *(*core::ptr::addr_of_mut!(boot::NOSTR_RNG_POOL)).as_mut_ptr()
+    };
+    let cursor = unsafe {
+        &mut *(*core::ptr::addr_of_mut!(boot::NOSTR_RNG_CURSOR)).as_mut_ptr()
+    };
+    fapico2_platform::trng::stretch_pool(pool, cursor, out);
+}
+
 fn boot_oath<T: Trng>(
     trng: &mut T,
     store: &mut boot::DeviceStore,
@@ -369,6 +408,16 @@ async fn main(spawner: Spawner) -> ! {
     assert!(
         fapico2_firmware::presence::set_touch_prompt_hook(Some(button::set_touch_prompt_led)),
         "touch-prompt hook double-install"
+    );
+    // D7 (docs/nostr-presence-audit.md F-A4): the Nostr CCID arm's
+    // blocking touch wait — the OpenPGP US-914 pattern under the Nostr
+    // command's own request-bound tag. The hook lives in the lib; the
+    // wait's LED and pad sampler are this bin's (`button.rs`). Without
+    // the install the arm fails closed (no grant, ever), so a forgotten
+    // boot line shows up as dead CCID key management, not as a bypass.
+    assert!(
+        fapico2_firmware::presence::set_nostr_ccid_wait_hook(Some(button::nostr_wait_grant)),
+        "nostr CCID wait hook double-install"
     );
     // Boot-phase rung 2: everything from here to the store mount is TRNG /
     // clock bring-up (`Rp2350Trng::from_peri`, the `TIMER0` proof, the boot
@@ -821,6 +870,14 @@ async fn main(spawner: Spawner) -> ! {
     // here, on the boot path, before any request has arrived.
     let fido_app = boot_fido(&mut *drbg, store);
     bphase!(crate::dbg::P_BOOT_FIDO);
+    // US-1644: the Nostr applet's boot-time RNG pool. This is the last
+    // point the DRBG is borrowable — `boot::take_drbg`, further down, hands
+    // the generator to the trussed platform by value — so the applet draws
+    // from a pool filled here (the OATH app's `fill_rng_pool` pattern: every
+    // random byte on the device comes from the DRBG). The draw lives in the
+    // applet (`draw_boot_pool`), because boot.rs's RNG-gate cap for the
+    // infallible seam is zero.
+    unsafe { boot::init_nostr_rng_pool(fapico2_nostr::draw_boot_pool(&mut *drbg)) };
     // US-921: the shared presence runtime is the FIDO user-presence grant
     // path — one pending-request slot bound to the BOOTSEL latch; a press
     // with no pending request never arms anything. The gate is
@@ -937,6 +994,24 @@ async fn main(spawner: Spawner) -> ! {
     // here and not read until `release_key_region`.
     unsafe {
         boot::init_oath_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
+            p.FLASH.clone_unchecked(),
+        )))
+    };
+
+    // US-1643: Nostr needs a **FIFTH** handle over the same physical window,
+    // for the same two reasons OATH needed a fourth: `NostrApp::boot` takes
+    // ownership of its handle for the life of the process, and two `&mut` to
+    // one object is UB whether or not the non-overlap argument holds. Nostr
+    // owns `[NOSTR_FIRST_SLOT, NOSTR_SLOT_LIMIT)` at the top of FIDO's former
+    // range — disjoint from OATH's head and FIDO's body by geometry
+    // (`keyregion/mod.rs`'s tiling check) — and the same single-core, no-yield
+    // serialization applies.
+    //
+    // SAFETY: as for the fourth handle above. `boot::init_nostr_key_region` —
+    // single-core boot path, before any task exists; the slot is written once
+    // here and not read until `release_key_region`.
+    unsafe {
+        boot::init_nostr_key_region(boot::KeyRegionHandle::new(Flash::new_blocking(
             p.FLASH.clone_unchecked(),
         )))
     };
@@ -1152,9 +1227,50 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
+    // US-1642/US-1643: the Nostr applet (AID `F0 00 00 00 02`). The region
+    // cannot be attached eagerly here — `boot::take_nostr_key_region` answers
+    // `None` until `release_key_region()`, several lines below — so the
+    // applet is constructed bare and asks `nostr_region` on its first read
+    // (`install_region_provider`'s OATH precedent). Static memory for the
+    // same reason as the six above.
+    // US-1646: the presence wiring is a **required** edit (§2.6) — the
+    // builder call's absence would degrade to `default_user_present()`,
+    // which is `false` on device and bricks every private operation with
+    // nothing failing to point at. The injected grant is the STRICT one-shot
+    // path (`begin_request`/`poll_press`/`request`/`end_request` under the
+    // §2.3.1 bit-30 tag `presence_tag(idx)`) — never the join-or-open
+    // `window_grant` the OATH/mgmt apps use, under which a same-tag SIGN
+    // would join another SIGN's open window and inherit its press: a
+    // signature over attacker-chosen bytes authorised by a touch for
+    // different bytes.
+    // US-1663: the grant is the domain-discriminating `nostr_grant`, not the
+    // bare strict path — the CCID arm still gets strict one-shot semantics
+    // (bit-30 tags fall through to `request_grant`), while the HID vendor
+    // arm's tags (`0x6000_0000 | cid`) resolve to tag-bound consumption
+    // inside the window that arm itself opened when it parked the request.
+    // `nostr_grant` never *opens* a window; it only consumes inside the one
+    // the transport owns, under that command's own tag.
+    // US-1658: the applet now lives behind `nostr_shared::NOSTR_APP`'s shared Mutex
+    // (both transports reach it), so the boot path installs the providers
+    // through the lock instead of consuming a builder by value.
+    fapico2_firmware::nostr_shared::install_nostr_providers(
+        nostr_region,
+        nostr_random,
+        fapico2_firmware::presence::nostr_grant,
+    );
+
     // Build + register the dispatcher on the boot path so it too stays off the
     // task frame. Registration is a hard boot error (duplicate AID / capacity):
     // an assert parks here — equivalent to the old in-task parking guard.
+    // The Nostr slot is the mutex proxy (US-1658): the dispatcher holds
+    // `&'static mut dyn App`, and the app behind the Mutex admits no stable
+    // `&mut` — so the CCID arm reaches it through `NostrViaMutex`, which
+    // locks per request. The lock is held only inside the synchronous
+    // `process`, never across a touch wait.
+    let nostr_proxy = boot::init_static_slot(
+        core::ptr::addr_of_mut!(fapico2_firmware::nostr_shared::NOSTR_CCID_PROXY),
+        fapico2_firmware::nostr_shared::NostrViaMutex,
+    );
     let mut dispatcher = Dispatcher::new();
     assert!(
         register_ccid_apps(
@@ -1165,6 +1281,7 @@ async fn main(spawner: Spawner) -> ! {
             openpgp_app,
             vendor_led_app,
             rescue_app,
+            nostr_proxy,
         ),
         "ccid app registration failed (duplicate AID or capacity)"
     );
@@ -1307,6 +1424,8 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(tasks::hid_task(
             parts.hid_in,
             parts.hid_out,
+            parts.nostr_in,
+            parts.nostr_out,
             fido_app,
             hid_store,
             hid_flash,

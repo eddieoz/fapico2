@@ -120,7 +120,7 @@ pub const TRUSSED_FS_KB: u32 = 1024;
 /// `python3 tests/scripts/raise_flash_budget.py <KiB> --reason "..."`, which
 /// moves every copy in one step instead of leaving the next reader to find
 /// them one red at a time.
-pub const FIRMWARE_FLASH_BUDGET_KIB: u32 = 1664;
+pub const FIRMWARE_FLASH_BUDGET_KIB: u32 = 1680;
 
 /// The reserved secure-partition region, in KiB, at the **top** of flash.
 ///

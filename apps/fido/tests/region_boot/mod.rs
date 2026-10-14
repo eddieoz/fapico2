@@ -710,7 +710,7 @@ impl Device {
     /// **The cost is `tests/capacity_boundary.rs`'s, not this file's to pay
     /// inside a parity script**: the allocator is a linear scan by design
     /// (`slotmap.rs`, "Lowest free slot is a linear scan"), so enrolling *n*
-    /// credentials costs ~n²/2 header reads and 856 is ~366,000 1 KiB reads.
+    /// credentials costs ~n²/2 header reads and 848 is ~360,000 1 KiB reads.
     /// What a caller wants from this is a region that is *full*, so that the
     /// next command-path enrolment is refused — and that single call is the part
     /// worth driving through `process_ctap2_with_store`.

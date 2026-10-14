@@ -1,37 +1,40 @@
 //! US-386 TDD — device CCID app registry.
 //!
-//! The device build must wire exactly six CCID apps behind the AID dispatcher
-//! (Management, OATH, OTP, OpenPGP, vendor LED, Rescue) with distinct AIDs;
-//! FIDO rides the HID transport (not AID-dispatched) and PIV is deferred. This
-//! test proves the registry holds six entries with the six expected, distinct
-//! AIDs, using the real app objects so a duplicate/typo'd AID is caught at
-//! compile-test time.
+//! The device build must wire exactly seven CCID apps behind the AID
+//! dispatcher (Management, OATH, OTP, OpenPGP, vendor LED, Rescue, Nostr) with
+//! distinct AIDs; FIDO rides the HID transport (not AID-dispatched) and PIV is
+//! deferred. This test proves the registry holds seven entries with the seven
+//! expected, distinct AIDs, using the real app objects so a duplicate/typo'd
+//! AID is caught at compile-test time.
 //!
 //! US-160 (PICOForge-COMPAT) took the set from four to five when the RS-Key
-//! vendor LED applet (`F0 00 00 00 01`) was added, and US-161/162/163 (Phase H)
-//! took it to six with the **Rescue** applet (`A0 58 3F C1 9B 7E 4F 21`). The
-//! Rescue AID is a *standard* one rather than a vendor one — it is shared by
-//! pico-fido's C `rescue.c` and the RS-Key Rust applet — which is exactly why
-//! the set is pinned here against the client source rather than left implicit:
-//! a typo there is silent, the SELECT answers `6A82`, and the Config screen is
-//! unreachable with no other test failing.
+//! vendor LED applet (`F0 00 00 00 01`) was added, US-161/162/163 (Phase H)
+//! took it to six with the **Rescue** applet (`A0 58 3F C1 9B 7E 4F 21`), and
+//! US-1642 (Nostr) took it to seven with the **Nostr** applet
+//! (`F0 00 00 00 02`, EPIC design §2.1). The Rescue AID is a *standard* one
+//! rather than a vendor one — it is shared by pico-fido's C `rescue.c` and the
+//! RS-Key Rust applet — which is exactly why the set is pinned here against the
+//! client source rather than left implicit: a typo there is silent, the SELECT
+//! answers `6A82`, and the Config screen is unreachable with no other test
+//! failing.
 //!
 //! (USB-level `lsusb` + live SELECT validation is Phase 6 hardware acceptance.)
 
 use fapico2_apps::registry::{register_ccid_apps, CCID_AIDS};
 use fapico2_mgmt::ManagementApp;
+use fapico2_nostr::NostrApp;
 use fapico2_oath::{OathApp, OtpApp};
 use fapico2_openpgp::{with_ram_client, OpenPgpApp};
 use fapico2_platform::dispatch::{App, Dispatcher};
 use fapico2_rescue::RescueApp;
 use fapico2_vendor_led::VendorLedApp;
 
-/// All six device CCID apps register cleanly into a `Dispatcher<6>` (no
+/// All seven device CCID apps register cleanly into a `Dispatcher<7>` (no
 /// duplicate AID, capacity holds). The OpenPGP (opcard/trussed-virt) client
 /// only lives inside `with_ram_client`, so the whole registration runs within
 /// it.
 #[test]
-fn device_registers_six_ccid_apps_with_distinct_aid() {
+fn device_registers_seven_ccid_apps_with_distinct_aid() {
     // Unique client id per process so parallel test runs never collide on the
     // trussed-virt IPC channel.
     let client_id = format!("fapico2-registry-{}", std::process::id());
@@ -41,6 +44,7 @@ fn device_registers_six_ccid_apps_with_distinct_aid() {
         let mut oath = OathApp::new();
         let mut otp = OtpApp::new();
         let mut vendor_led = VendorLedApp::new();
+        let mut nostr = NostrApp::new();
         // The Rescue applet is constructed **bare** here — no config owner, no
         // device handler — on purpose. Registration is a wiring assertion, and
         // a bare applet is the honest thing to register: a handler needs a
@@ -57,8 +61,9 @@ fn device_registers_six_ccid_apps_with_distinct_aid() {
         assert_eq!(openpgp.aid(), AID_EXPECTED[3]);
         assert_eq!(vendor_led.aid(), AID_EXPECTED[4]);
         assert_eq!(rescue.aid(), AID_EXPECTED[5]);
+        assert_eq!(nostr.aid(), AID_EXPECTED[6]);
 
-        let mut d: Dispatcher<6> = Dispatcher::new();
+        let mut d: Dispatcher<7> = Dispatcher::new();
         assert!(
             register_ccid_apps(
                 &mut d,
@@ -68,16 +73,17 @@ fn device_registers_six_ccid_apps_with_distinct_aid() {
                 &mut openpgp,
                 &mut vendor_led,
                 &mut rescue,
+                &mut nostr,
             ),
-            "all six device CCID apps must register (distinct AIDs, capacity 6)"
+            "all seven device CCID apps must register (distinct AIDs, capacity 7)"
         );
     });
 }
 
-/// The six AIDs are exactly the ones the merged suite drives and are pairwise
-/// distinct.
+/// The seven AIDs are exactly the ones the merged suite drives and are
+/// pairwise distinct.
 #[test]
-fn ccid_aid_set_is_the_six_device_apps() {
+fn ccid_aid_set_is_the_seven_device_apps() {
     assert_eq!(CCID_AIDS, AID_EXPECTED);
     for (i, a) in CCID_AIDS.iter().enumerate() {
         for b in &CCID_AIDS[i + 1..] {
@@ -97,8 +103,9 @@ fn ccid_aid_set_is_the_six_device_apps() {
 ///
 /// The current set clears it comfortably: Management, OATH and OTP all begin
 /// `A0 00 00 05 27` and diverge at byte 5 (`0x47` / `0x21` / `0x20`); Rescue
-/// diverges from the rest at byte 1 (`0x58`); OpenPGP and vendor LED differ
-/// in their first byte outright.
+/// diverges from the rest at byte 1 (`0x58`); OpenPGP differs in its first
+/// byte outright; and the two vendor applets begin `F0 00 00 00` and diverge
+/// at byte 5 (`0x01` / `0x02`).
 #[test]
 fn no_device_aid_is_a_prefix_of_another() {
     for (i, a) in CCID_AIDS.iter().enumerate() {
@@ -170,9 +177,9 @@ fn rescue_aid_is_the_one_the_client_selects() {
     );
 }
 
-/// The six device AIDs, in registration order (shared by both tests so a
+/// The seven device AIDs, in registration order (shared by both tests so a
 /// change in one place fails both).
-const AID_EXPECTED: [&[u8]; 6] = [
+const AID_EXPECTED: [&[u8]; 7] = [
     // Management (matches `management.c` `man_aid`).
     &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17],
     // OATH.
@@ -185,4 +192,6 @@ const AID_EXPECTED: [&[u8]; 6] = [
     &[0xF0, 0x00, 0x00, 0x00, 0x01],
     // RS-Key Rescue applet.
     &[0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21],
+    // Nostr applet (US-1642, EPIC design §2.1).
+    &[0xF0, 0x00, 0x00, 0x00, 0x02],
 ];

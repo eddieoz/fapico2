@@ -787,7 +787,7 @@ mod tests {
         // A fresh origin: the two drives of one `both()` share this thread, and
         // a leftover value from the first would open the second mid-drive.
         reset_clock();
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<{ crate::pending_up::PENDING_UP_PAYLOAD_MAX }>::new();
         let mut delivered = 0usize;
         let started = StdInstant::now();
         for i in 0..plan.passes() {

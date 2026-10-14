@@ -9,7 +9,30 @@ and the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added — the Nostr applet (branch `feat/nostr`)
+
+- **Nostr identities on the device**: up to 8 BIP-340 identities with on-chip
+  signing and NIP-44 v2 encryption, served over CCID (AID `F0 00 00 00 02`,
+  plain APDUs) and over a third USB HID interface (usage page `0xFF00`,
+  CTAPHID vendor commands `0x40`–`0x4A`). Keys are device-bound (ADR 0005),
+  sealed per-record in the keyregion's new Nostr domain; every command that
+  uses or changes the private set is touch-gated, with per-transport presence
+  tags that survived a dedicated adversarial audit
+  (`docs/nostr-presence-audit.md`, hardware-verified 2026-10-12).
+- **The fapico2 Nostr browser extension** (Chrome 116+, WebHID) exposes the
+  NIP-07 `window.nostr` API — sign, NIP-44 encrypt/decrypt, key management —
+  with a per-site, per-action approval prompt and the physical touch as final
+  consent. Verified end-to-end against hardware.
+- **Capacity change**: FIDO2 resident passkeys move 856 → 848 (8 slots carved
+  from the top of FIDO's range for Nostr, existing records untouched and
+  guarded by the occupancy rule); measured to refusal at the carved geometry.
+- **Reset semantics**: the management applet's `RESET` now wipes Nostr with
+  everything else; CTAP2 `authenticatorReset` still spares it.
+- **Docs**: [ADR 0005](docs/adr/0005-nostr-key-storage.md) (key storage, the
+  second secp256k1 implementation, the scalar RAM-lifetime amendment), the
+  presence-gate audit, the red-team assessment of the arc
+  (`docs/archive/SECURITY-ASSESSMENT-NOSTR.md`), and the user/implementation
+  pages in `book/` (`book/how-to/nostr.md`, `book/features/nostr.md`).
 
 ## [1.0.0] — 2026-10-01
 

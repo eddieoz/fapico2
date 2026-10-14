@@ -53,7 +53,8 @@
 //! `Some(store)`), so the slot hands the command back to the caller and never
 //! tries to keep the borrow alive itself. It does not own the reply either:
 //! the answer of a re-drive lands in the serve loop's own response buffer,
-//! and only the *refusal* shape is recorded here (1 byte of CTAP2, or 2 bytes
+//! and only the *refusal* shape is recorded here (1 byte of CTAP2, 2 bytes
+//! of U2F, or — US-1663 — the vendor's 5-byte sw-only envelope
 //! of U2F) because that is what a window that expires unanswered has to send.
 //!
 //! # Occupancy is fail-closed, and a refusal is a refusal
@@ -88,6 +89,13 @@ pub enum PendingKind {
     Ctap2,
     /// A U2F APDU inside a `CTAP_HID_MSG` frame.
     U2f,
+    /// US-1663: a Nostr vendor command (`0x40–0x4A`) on the vendor HID
+    /// interface, riding the CBOR request/response envelopes of
+    /// `nostr_wire`. The frame command of its answer is the command byte
+    /// itself (`WindowTicket::ctap_cmd` carries it), and the answer payload
+    /// is the CBOR envelope, not a bare status word — the re-drive and the
+    /// close paths therefore treat this arm differently from the two above.
+    Vendor,
 }
 
 /// Why [`PendingUp::park`] declined to take the slot.
@@ -119,8 +127,8 @@ pub struct WindowTicket {
     /// (`presence_tag_from_channel` of `channel`, domain-separated into the
     /// HID space by the caller).
     pub tag: u32,
-    /// The CTAP2 opcode, for [`PendingKind::Ctap2`]. `0` for
-    /// [`PendingKind::U2f`].
+    /// The CTAP2 opcode, for [`PendingKind::Ctap2`]; the vendor command
+    /// byte for [`PendingKind::Vendor`]. `0` for [`PendingKind::U2f`].
     pub ctap_cmd: u8,
     /// The loop's exit deadline, as stamped by `TouchWindow::open`.
     pub deadline_ms: u64,
@@ -152,18 +160,29 @@ pub enum SlotPoll<'a> {
 ///
 /// Single occupancy, fail-closed, bounded payload. See the module docs for
 /// why this is a pure value type rather than a set of atomics.
-pub struct PendingUp {
+///
+/// The payload bound is a const-generic parameter, defaulting to
+/// [`PENDING_UP_PAYLOAD_MAX`]: every existing use is unchanged
+/// (`PendingUp` bare = the 1024 B CTAPHID slot), and US-1660 instantiates
+/// the Nostr interface's own slot as `PendingUp<2048>` — its parked
+/// `NIP44_ENCRYPT` request (peer key + ~1.8 KiB of plaintext) does not fit
+/// the CTAPHID bound (design §A.8.3 #6). The behaviour (occupancy, cadence,
+/// refusals) is identical at any bound by construction — the parameter
+/// sizes the array and nothing else.
+pub struct PendingUp<const PAYLOAD_MAX: usize = PENDING_UP_PAYLOAD_MAX> {
     occupied: bool,
     ticket: WindowTicket,
     payload_len: u16,
-    payload: [u8; PENDING_UP_PAYLOAD_MAX],
+    payload: [u8; PAYLOAD_MAX],
     /// The refusal the parked command last answered with while it still
-    /// needed the touch: one byte of CTAP2 (`0x3B`), or the two-byte U2F
+    /// needed the touch: one byte of CTAP2 (`0x3B`), the two-byte U2F
     /// `6985` / `0700` shape (`presence::u2f_up_refusal` admits nothing
-    /// else). Kept so a window that expires can send back exactly what the
-    /// command last said, rather than re-driving it one last time and
-    /// answering whatever that produced.
-    refusal: [u8; 2],
+    /// else), or — US-1663 — the vendor's sw-only CBOR envelope,
+    /// `[0xA1, 0x01, 0x19, hi, lo]`, five bytes. Kept so a window that
+    /// expires (or is cancelled) can send back exactly what the command
+    /// last said, rather than re-driving it one last time and answering
+    /// whatever that produced.
+    refusal: [u8; 5],
     refusal_len: u8,
     /// When the last keepalive went out for this window (US-1506).
     ///
@@ -189,7 +208,7 @@ impl Default for PendingUp {
     }
 }
 
-impl PendingUp {
+impl<const PAYLOAD_MAX: usize> PendingUp<PAYLOAD_MAX> {
     /// An empty slot. `const` so the device can park one in `.bss`
     /// (`boot::PENDING_UP`) with no runtime initialisation.
     pub const fn new() -> Self {
@@ -203,8 +222,8 @@ impl PendingUp {
                 deadline_ms: 0,
             },
             payload_len: 0,
-            payload: [0; PENDING_UP_PAYLOAD_MAX],
-            refusal: [0; 2],
+            payload: [0; PAYLOAD_MAX],
+            refusal: [0; 5],
             refusal_len: 0,
             last_keepalive_ms: 0,
             keepalive_sent: false,
@@ -276,13 +295,13 @@ impl PendingUp {
         if self.occupied {
             return Err(ParkRefusal::Occupied);
         }
-        if payload.len() > PENDING_UP_PAYLOAD_MAX {
+        if payload.len() > PAYLOAD_MAX {
             return Err(ParkRefusal::PayloadTooLarge);
         }
         self.payload[..payload.len()].copy_from_slice(payload);
         self.payload_len = payload.len() as u16;
         self.ticket = ticket;
-        self.refusal = [0; 2];
+        self.refusal = [0; 5];
         self.refusal_len = 0;
         self.last_keepalive_ms = 0;
         self.keepalive_sent = false;
@@ -292,10 +311,11 @@ impl PendingUp {
 
     /// Record the answer a re-drive produced while the touch is still owed.
     ///
-    /// Called only with a refusal shape — CTAP2 `0x3B`, or the two U2F bytes
-    /// `presence::u2f_up_refusal` recognises. Anything longer would not be
-    /// the refusal and is ignored rather than silently truncated into a
-    /// plausible-looking reply.
+    /// Called only with a refusal shape — CTAP2 `0x3B`, the two U2F bytes
+    /// `presence::u2f_up_refusal` recognises, or the vendor's sw-only CBOR
+    /// envelope `[0xA1, 0x01, 0x19, hi, lo]` (US-1663). Anything longer
+    /// would not be the refusal and is ignored rather than silently
+    /// truncated into a plausible-looking reply.
     pub fn note_refusal(&mut self, answer: &[u8]) {
         if answer.len() > self.refusal.len() {
             return;
@@ -379,7 +399,7 @@ mod tests {
     /// harvested, which is US-921's defect with the sign flipped.
     #[test]
     fn a_second_park_is_refused_not_queued() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert_eq!(slot.park(ticket(0x8000_0009, 30_000), &[1, 2, 3]), Ok(()));
         assert!(slot.is_occupied());
         assert_eq!(
@@ -416,7 +436,7 @@ mod tests {
              MakeCredential/GetAssertion must fit, and a hostile one must not be \
              able to turn the slot into a memory-growth lever"
         );
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let at_bound = [0x5Au8; PENDING_UP_PAYLOAD_MAX];
         assert_eq!(slot.park(ticket(1, 30_000), &at_bound), Ok(()));
         let live = slot.parked().expect("at the bound parks");
@@ -442,7 +462,7 @@ mod tests {
     #[test]
     fn poll_walks_idle_live_expired_and_take_closes_once() {
         NOW.store(1_000, Ordering::Relaxed);
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert!(matches!(slot.poll(NOW.load(Ordering::Relaxed)), SlotPoll::Idle));
         assert_eq!(slot.take(), None, "nothing to close");
 
@@ -473,17 +493,22 @@ mod tests {
     /// with — the exact bytes the command last produced, and nothing else.
     #[test]
     fn the_refusal_is_recorded_bounded_and_survives_until_close() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         slot.park(ticket(1, 10), &[0x01]).unwrap();
         assert!(slot.refusal().is_empty(), "nothing recorded before the first re-drive");
         slot.note_refusal(&[0x3B]);
         assert_eq!(slot.refusal(), &[0x3B]);
         slot.note_refusal(&[0x69, 0x85]);
         assert_eq!(slot.refusal(), &[0x69, 0x85], "the U2F shape replaces the CTAP2 one");
-        // Longer than the two refusal shapes: ignored, not truncated — a
+        // US-1663: the vendor envelope is a legitimate refusal shape now —
+        // the sw-only CBOR answer, stored whole so a cancelled or expired
+        // window can end on exactly what the command last said.
+        slot.note_refusal(&[0xA1, 0x01, 0x19, 0x69, 0x85]);
+        assert_eq!(slot.refusal(), &[0xA1, 0x01, 0x19, 0x69, 0x85]);
+        // Longer than the widest refusal shape: ignored, not truncated — a
         // plausible-looking half-answer would be worse than none.
-        slot.note_refusal(&[0x69, 0x85, 0x00]);
-        assert_eq!(slot.refusal(), &[0x69, 0x85]);
+        slot.note_refusal(&[0xA1, 0x01, 0x19, 0x69, 0x85, 0x00]);
+        assert_eq!(slot.refusal(), &[0xA1, 0x01, 0x19, 0x69, 0x85]);
 
         // A re-park starts from a clean refusal, so a stale byte from the
         // previous window can never answer this one.
@@ -498,7 +523,7 @@ mod tests {
     /// app, instead of letting it consume a grant armed for the parked one.
     #[test]
     fn contention_is_decided_by_presence_tag() {
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         assert!(!slot.contends_with(0x8000_0009), "an empty slot contends with nothing");
         slot.park(ticket(0x8000_0009, 10), &[0x01]).unwrap();
         assert!(slot.contends_with(0x8000_0009));

@@ -1,9 +1,10 @@
 //! Device CCID app registry (US-386).
 //!
-//! The device wires exactly **six** CCID apps behind the AID dispatcher:
-//! **Management, OATH, OTP, OpenPGP, the RS-Key vendor LED applet, and the
-//! RS-Key Rescue applet**. FIDO2/U2F rides the separate HID transport (it is
-//! not AID-dispatched), and PIV is deferred out of v1.0.0.
+//! The device wires exactly **seven** CCID apps behind the AID dispatcher:
+//! **Management, OATH, OTP, OpenPGP, the RS-Key vendor LED applet, the
+//! RS-Key Rescue applet, and the Nostr applet**. FIDO2/U2F rides the separate
+//! HID transport (it is not AID-dispatched), and PIV is deferred out of
+//! v1.0.0.
 //!
 //! US-160 (PICOForge-COMPAT) added the vendor LED applet, taking the set from
 //! four to five. It is a *vendor* AID (`F0 00 00 00 01`,
@@ -21,6 +22,13 @@
 //! same ordinary way — the client's SELECT is `00 A4 04 04 08 <AID>`
 //! (`picoforge/src/hal/transport/pcsc.rs:53-61`) and the dispatcher keys on P1
 //! alone, so the client's `P2 = 0x04` again needs no special casing.
+//!
+//! US-1642 (Nostr) added the **Nostr** applet, the set's seventh member, at
+//! the second vendor-range AID `F0 00 00 00 02` (EPIC design §2.1). It is
+//! reachable the same ordinary way — an AID SELECT on P1 — and, unlike Rescue,
+//! it shares its first four bytes with the vendor LED applet's AID, diverging
+//! at byte 5; the prefix rule (`no_device_aid_is_a_prefix_of_another`) still
+//! holds because neither AID is a prefix of the other.
 //!
 //! It is registered on the **device**, not only in the emulator, and that is
 //! the deliberate call: the client reaches it over CCID, which is a device
@@ -54,41 +62,50 @@ pub const AID_VENDOR_LED: &[u8] = fapico2_vendor_led::VENDOR_LED_AID;
 /// [`AID_VENDOR_LED`]: one owner, and the applet crate's copy is what
 /// [`App::aid`] returns.
 pub const AID_RESCUE: &[u8] = fapico2_rescue::RESCUE_AID;
+/// Nostr applet AID (US-1642, EPIC design §2.1). Re-exported from
+/// `fapico2-nostr` for the same reason as [`AID_VENDOR_LED`].
+pub const AID_NOSTR: &[u8] = fapico2_nostr::NOSTR_AID;
 
-/// The six AIDs the device registers behind the CCID dispatcher, in
+/// The seven AIDs the device registers behind the CCID dispatcher, in
 /// registration order.
-pub const CCID_AIDS: [&[u8]; 6] = [
+pub const CCID_AIDS: [&[u8]; 7] = [
     AID_MANAGEMENT,
     AID_OATH,
     AID_OTP,
     AID_OPENPGP,
     AID_VENDOR_LED,
     AID_RESCUE,
+    AID_NOSTR,
 ];
 
-/// Register the six device CCID apps into `d`.
+/// Register the seven device CCID apps into `d`.
 ///
-/// Returns `true` only if **all six** register successfully — i.e. the AIDs
-/// are distinct (the dispatcher rejects a duplicate AID) and the `N = 6`
+/// Returns `true` only if **all seven** register successfully — i.e. the AIDs
+/// are distinct (the dispatcher rejects a duplicate AID) and the `N = 7`
 /// capacity holds. A `false` return means the device would mis-wire an app
 /// and must not boot into the serve loop.
 ///
 /// The `Dispatcher<'a, N>` const generic and this signature move together:
 /// `N` is the dispatcher's fixed registration capacity, so adding an app means
-/// widening both. A `N` left at 4 would make the fifth `register` fail on the
-/// full `Vec`, and the `&&` chain would short-circuit `false` — the device
+/// widening both. A `N` left at 6 would make the seventh `register` fail on
+/// the full `Vec`, and the `&&` chain would short-circuit `false` — the device
 /// would refuse to boot rather than half-wire, which is the intended failure
 /// mode but for the wrong reason.
 // US-939: `#[inline(never)]` -- async-main frame discipline.
+// US-1642: eight parameters, one per registered applet plus the dispatcher —
+// the same shape `handle_ccid_message` already carries an allow for. The
+// signature is the registry's whole point: widening it is the required edit.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub fn register_ccid_apps<'a>(
-    d: &mut Dispatcher<'a, 6>,
+    d: &mut Dispatcher<'a, 7>,
     management: &'a mut dyn App,
     oath: &'a mut dyn App,
     otp: &'a mut dyn App,
     openpgp: &'a mut dyn App,
     vendor_led: &'a mut dyn App,
     rescue: &'a mut dyn App,
+    nostr: &'a mut dyn App,
 ) -> bool {
     d.register(management)
         && d.register(oath)
@@ -96,4 +113,5 @@ pub fn register_ccid_apps<'a>(
         && d.register(openpgp)
         && d.register(vendor_led)
         && d.register(rescue)
+        && d.register(nostr)
 }

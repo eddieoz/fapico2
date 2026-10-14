@@ -189,6 +189,9 @@
 //! OATH_CAPACITY unchanged:                            68
 //! SCRATCHPAD_SLOTS unchanged:                          4
 //! 856 + 68 + 4 + 32 (index) == 960                     ok
+//!
+//! (US-1639 then carves eight Nostr slots from the top of FIDO's range:
+//! FIDO_CAPACITY 856 -> 848, and 848 + 68 + 4 + 8 + 32 (index) == 960.)
 //! ```
 //!
 //! So `mod.rs` needs one more term in its partition — `index::INDEX_SLOT_COUNT`

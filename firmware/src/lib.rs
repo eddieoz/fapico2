@@ -30,11 +30,11 @@ compile_error!(
 /// |---|---:|
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
-/// | `embassy_main` | 168 |
-/// | `hid_task` | 12,328 |
+/// | `embassy_main` | 176 |
+/// | `hid_task` | 4,720 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **21,944** |
+/// | **total** | **14,344** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
 /// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.49x** this demand (floor
@@ -83,13 +83,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 21_944;
+pub const TASK_ARENA_DEMAND_B: usize = 14_344;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "7eaf364b32cbcc1b2d38dd8c3129c193b826a6e488bd6724df3e68927a0c7634";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "40825090fde7433939059769693d113060def8f16e6cf76ae251b8dd8f24c3c5";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
@@ -138,6 +138,21 @@ pub mod pending_up;
 /// emulation builds pull in.
 #[cfg(any(feature = "device", feature = "emulation"))]
 pub mod hid_serve;
+/// US-1658: the shared Nostr applet — `NOSTR_APP` behind the first
+/// device-code blocking mutex, with the one `with_nostr` accessor both
+/// transports use and the CCID dispatcher's zero-sized proxy. Gated like
+/// [`hid_serve`] because it needs `embassy-sync` and the applet crate; a
+/// lib module (not a `boot.rs` static) so the shared-ownership shape is
+/// host-testable — the device bin is arm-only and has no host test target.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod nostr_shared;
+/// US-1662: the vendor CTAPHID wire dialect — the command-byte map over
+/// `0x40–0x7F` with NIP-46 method semantics (D20) and the CBOR envelopes that
+/// carry D13's status vocabulary across the transport. A lib module so both
+/// dispatch impls (the device one behind the shared mutex and the tests'
+/// host one) compose the same encoding core.
+#[cfg(any(feature = "device", feature = "emulation"))]
+pub mod nostr_wire;
 /// US-1524: the **emulation binary's** half of the CTAP-HID seam — the
 /// `HidLink`/`HidIo` transport adapter and one iteration of the shared serve
 /// loop — so `emul_main.rs` no longer carries its own assembler, reply framer,

@@ -301,7 +301,11 @@ def doc_checks(doc, text, sha, blocks, sections, data, bss, syms,
         )
     if f"{sha[:12]}" not in doc and sha not in doc:
         failures.append(f"doc: shipping UF2 sha256 ({sha[:12]}…) not recorded")
-    if not re.search(rf"\b{blocks}\s+blocks?\b", doc):
+    # The document groups digits (`3,349 blocks`, like every ledger entry);
+    # accept the plain form too, so a future entry's grouping cannot fail
+    # the check for punctuation.
+    if not (re.search(rf"\b{blocks:,}\s+blocks?\b", doc)
+            or re.search(rf"\b{blocks}\s+blocks?\b", doc)):
         failures.append(f"doc: UF2 block count ({blocks}) not recorded")
     if "3670016" not in doc.replace(",", "") and "3,670,016" not in doc:
         failures.append("doc: size-gate ceiling (3,670,016) not noted")

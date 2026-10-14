@@ -25,6 +25,7 @@ use fapico2_vendor_led::VendorLedApp;
 use fapico2_rescue::{
     PhySnapshot, PhyUpdate, RebootMode, RescueApp, RescueConfigHandler, RescueDeviceHandler,
 };
+// US-1642: the Nostr applet (AID F0 00 00 00 02), `no_std` like the others.
 // S-721-2: the OpenPGP app owns the trussed platform client by value
 // (taken out of the backend static with `trusted_backend::take_client`).
 use fapico2_platform::trusted_backend::{Client, DevicePlatform, OpcardDispatch};
@@ -549,6 +550,76 @@ pub fn derive_oath_payload_key() -> Option<fapico2_platform::keyregion::crypto::
         &chipid.to_be_bytes(),
         &fapico2_platform::keyregion::oath_store::OATH_PAYLOAD_SECRET,
     )
+}
+
+/// US-1643: the Nostr applet's **own** key-region handle — a fifth
+/// `DeviceKeyRegion` over the same physical window, with disjoint slot ranges
+/// by geometry (Nostr owns `[NOSTR_FIRST_SLOT, NOSTR_SLOT_LIMIT)`, asserted
+/// by `keyregion/mod.rs`'s tiling). The same `Option` take-once shape as
+/// [`OATH_KEY_REGION`]: a bare `MaybeUninit<KeyRegionHandle>` would make a
+/// double-take a silent double-move.
+pub static mut NOSTR_KEY_REGION: core::mem::MaybeUninit<Option<KeyRegionHandle>> =
+    core::mem::MaybeUninit::uninit();
+
+/// Stage Nostr's key-region handle. Single-core boot path, once, before any
+/// task exists — the [`init_key_region`] discipline.
+pub unsafe fn init_nostr_key_region(region: KeyRegionHandle) {
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).write(Some(region)) };
+}
+
+/// Take Nostr's region handle by value, once.
+///
+/// Shares [`KEY_REGION_READY`] rather than carrying its own flag, exactly as
+/// [`take_oath_key_region`] does: one release publishes both.
+pub fn take_nostr_key_region() -> Option<KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `init_nostr_key_region` wrote the slot exactly once on the boot
+    // path before any task existed, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that. The `Option` is `.take()`n, so at most
+    // one caller ever moves the value out and any later caller reads `None`.
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).assume_init_mut().take() }
+}
+
+/// US-1643: the key the Nostr region's records are sealed under.
+///
+/// Same root as every other store key on the device, the same shape as
+/// [`derive_oath_payload_key`] — and the same **`Option`, never
+/// [`fatal_boot`]** reasoning: a missing OTP row or chipid degrades Nostr to
+/// an applet that answers APDUs and refuses its reads with the store-fault
+/// status word rather than reporting a fiction about what is on the device.
+#[inline(never)]
+pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
+    let otp_key_1 = read_otp_key_1()?;
+    let chipid = embassy_rp::otp::get_chipid().ok()?;
+    fapico2_platform::keyregion::crypto::derive_payload_key(
+        &otp_key_1,
+        &chipid.to_be_bytes(),
+        &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
+    )
+}
+
+/// US-1644: the Nostr applet's boot-time randomness pool, and its drain
+/// cursor. Filled once from the DRBG in the same window that fills the FIDO
+/// app's pool (the generator is handed to the trussed platform by value —
+/// [`take_drbg`] — and is not borrowable after that), then stretched by
+/// `main.rs`'s provider through [`fapico2_platform::trng::stretch_pool`]
+/// whenever the applet draws for `GENERATE_KEY` or a `SIGN` nonce.
+pub static mut NOSTR_RNG_POOL: core::mem::MaybeUninit<heapless::Vec<u8, 256>> =
+    core::mem::MaybeUninit::uninit();
+pub static mut NOSTR_RNG_CURSOR: core::mem::MaybeUninit<usize> =
+    core::mem::MaybeUninit::uninit();
+
+/// Publish a Nostr boot pool into [`NOSTR_RNG_POOL`]. The draw itself lives
+/// in the applet (`fapico2_nostr::draw_boot_pool`) — the same shape as the
+/// OATH app's `fill_rng_pool` — because this file's RNG-gate cap for the
+/// infallible `Trng::random_bytes` is **zero** by design: the boot path has
+/// no business naming the draw at all, only receiving its result. Call in
+/// the DRBG window, before [`take_drbg`].
+pub unsafe fn init_nostr_rng_pool(pool: heapless::Vec<u8, 256>) {
+    init_static_slot(core::ptr::addr_of_mut!(NOSTR_RNG_POOL), pool);
+    init_static_slot(core::ptr::addr_of_mut!(NOSTR_RNG_CURSOR), 0usize);
 }
 
 /// Publish the staged key region. **Called once, after `mark!(RUNG_USB)`.**
@@ -1453,6 +1524,55 @@ pub static mut HID_RESP: HeaplessVec<u8, { fapico2_fido::CTAP2_MAX_MSG }> = Heap
 pub static mut PENDING_UP: fapico2_firmware::pending_up::PendingUp =
     fapico2_firmware::pending_up::PendingUp::new();
 
+/// US-1660: the Nostr interface's own response buffer — **2,048 B, not
+/// 7,609**: the largest reply a Nostr command produces is the 1,862-byte
+/// `NIP44_ENCRYPT` payload plus 7 bytes of CTAPHID framing, and the CTAPHID
+/// 7,609 bound would be a buffer for a capability this interface does not
+/// have (see `hid_serve::NOSTR_RESP_MAX` for the derivation). A static for
+/// the same reason [`HID_RESP`] is: inside `hid_task` it would sit in the
+/// byte-accounted async frame. Same single-owner discipline: the HID task's
+/// Nostr half is the only reader.
+pub static mut NOSTR_RESP: HeaplessVec<u8, { fapico2_firmware::hid_serve::NOSTR_RESP_MAX }> =
+    HeaplessVec::new();
+
+/// US-1660: the Nostr interface's own parked consent window —
+/// `PendingUp<2048>`, not the CTAPHID slot's `PendingUp` (default 1024): a
+/// parked `NIP44_ENCRYPT` request carries the 33-byte peer key plus up to
+/// ~1.8 KiB of plaintext, which does not fit 1024 (design §A.8.3 #6). Its
+/// own instance — not the shared one — because one task serves two
+/// interfaces and each interface's window must be closable, expirable and
+/// keepalive-cadenced independently; the single consent SLOT on the presence
+/// runtime is still one, which is exactly the cross-transport contention
+/// US-1663 bounds. Same `.bss`-not-frame reasoning as [`PENDING_UP`].
+pub static mut NOSTR_PENDING_UP: fapico2_firmware::pending_up::PendingUp<2048> =
+    fapico2_firmware::pending_up::PendingUp::new();
+
+/// US-1660: the FIDO interface's serve struct, hoisted out of `hid_task`'s
+/// async frame. `HidServe` owns a CTAPHID reassembly buffer of
+/// `CTAPHID_MAX_MSG` (7,609 B); owning it by value in the task body is what
+/// the arena measurement (`lib.rs::TASK_ARENA_DEMAND_B`) accounts — and a
+/// second, Nostr-sized copy of the same struct pushed `hid_task` to 20,160 B
+/// against the 32,772 B arena (1.10×, inside the 1.25× floor's fail band).
+/// Written straight into the slot by `init_static_slot_with` on the task's
+/// first poll — the value never transits the frame — and from then on
+/// `hid_task` holds the sole `&'static mut`.
+///
+/// Initialisation happens at the top of `hid_task`, not on the boot path,
+/// which is a deliberate relaxation of [`init_static_slot`]'s "before any
+/// task exists" boot-path timing: the slot is still written **exactly once**,
+/// before the first `.await` of the only task that reads it, so no observer
+/// can see the half-initialised state the boot-path rule exists to prevent.
+pub static mut FIDO_SERVE: core::mem::MaybeUninit<fapico2_firmware::hid_serve::HidServe<'static>> =
+    core::mem::MaybeUninit::uninit();
+
+/// US-1660: the Nostr interface's serve struct — same reasoning as
+/// [`FIDO_SERVE`], one instance per interface so each keeps its own
+/// reassembly state and CID allocator. Written once by `hid_task`, read by
+/// nobody else.
+pub static mut NOSTR_SERVE: core::mem::MaybeUninit<
+    fapico2_firmware::hid_serve::NostrServe<'static>,
+> = core::mem::MaybeUninit::uninit();
+
 /// US-413 S-413-4: the C key row (`OTP_MKEK_ROW 0xE90`, 32 bytes = 16 ECC
 /// words, `otp_rp2350.c:33,69-72`), read memory-mapped exactly like the C
 /// firmware does (readable from any code — no read-protect; the runtime
@@ -1860,25 +1980,25 @@ pub fn ensure_fw_manifest(store: &mut DeviceStore) -> fw_manifest::ForeignImageD
     }
 }
 
-/// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
-/// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
-/// chipid read (rung 6, a page-0 read that had already passed at rung 3)
-/// intermittently failed ~80 consecutive times and parked the board with
-/// fatal signature id 2; with the write out, 15 power cycles across timings
-/// produced zero parks. The write was D-14's runtime-only half of a lock
-/// whose durable half never shipped, so what it mitigated was the D-14
-/// residual (same-session write access to the key row) that D-14 already
-/// records as unshipped; the durable mitigation remains US-924's lock-page
-/// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
-/// 0002 amendment.
-///
-/// If a runtime lock is ever reinstated, note that the register model in the
-/// removed implementation ("256 pages of 16 rows, one register per 4 pages")
-/// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
-/// of 64 rows, one register per page) — they only coincide on the *number*
-/// 58. Whatever the correct model is, the measured fact stands: the write
-/// correlated with page-0 read failures, and the burden of proof is on any
-/// reinstatement.
+// US-918's runtime `sw_lock` write of the key row's page was REMOVED on
+// 2026-10-11 on A/B evidence: with the write in place, the boot's *later*
+// chipid read (rung 6, a page-0 read that had already passed at rung 3)
+// intermittently failed ~80 consecutive times and parked the board with
+// fatal signature id 2; with the write out, 15 power cycles across timings
+// produced zero parks. The write was D-14's runtime-only half of a lock
+// whose durable half never shipped, so what it mitigated was the D-14
+// residual (same-session write access to the key row) that D-14 already
+// records as unshipped; the durable mitigation remains US-924's lock-page
+// burn. Full record: `docs/pico-fido2-to-fapico2-migration.md` and the ADR
+// 0002 amendment.
+//
+// If a runtime lock is ever reinstated, note that the register model in the
+// removed implementation ("256 pages of 16 rows, one register per 4 pages")
+// disagrees with both `pico-keys-sdk` and the RP2350 register map (64 pages
+// of 64 rows, one register per page) — they only coincide on the *number*
+// 58. Whatever the correct model is, the measured fact stands: the write
+// correlated with page-0 read failures, and the burden of proof is on any
+// reinstatement.
 
 /// Restore captured OpenPGP state after backend mount and before registration.
 /// Missing hardware identity is acceptable only when there is no capture.
@@ -1999,17 +2119,17 @@ pub static mut VENDOR_LED_APP: core::mem::MaybeUninit<VendorLedApp> =
 pub static mut RESCUE_APP: core::mem::MaybeUninit<RescueApp> =
     core::mem::MaybeUninit::uninit();
 
-// The CCID dispatcher holds the five apps by reference. Built + registered on
+// The CCID dispatcher holds the seven apps by reference. Built + registered on
 // the boot path and stored in its own write-once static slot so it never
 // lives on the task frame either; `ccid_task` only borrows a `&'static mut`
 // to it.
 //
-// US-160: `4 → 5`; US-161/162/163: `5 → 6`. This const generic,
-// `register_ccid_apps`' `Dispatcher<'a, 6>` parameter and the six `register`
-// calls move together — the dispatcher's registration capacity *is* this
-// number, so a stale `5` would make the sixth `register` fail on a full `Vec`
-// and the device would refuse to boot rather than half-wire.
-pub static mut CCID_DISPATCHER: core::mem::MaybeUninit<Dispatcher<'static, 6>> =
+// US-160: `4 → 5`; US-161/162/163: `5 → 6`; US-1642: `6 → 7`. This const
+// generic, `register_ccid_apps`' `Dispatcher<'a, 7>` parameter and the seven
+// `register` calls move together — the dispatcher's registration capacity *is*
+// this number, so a stale `6` would make the seventh `register` fail on a full
+// `Vec` and the device would refuse to boot rather than half-wire.
+pub static mut CCID_DISPATCHER: core::mem::MaybeUninit<Dispatcher<'static, 7>> =
     core::mem::MaybeUninit::uninit();
 
 /// Construct `value` into a write-once `static mut` slot and hand back the

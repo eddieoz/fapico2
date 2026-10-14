@@ -910,13 +910,18 @@ fn the_index_covers_every_record_the_region_can_hold() {
     let region = MemRegion::erased();
     let record_slots = region.slots();
     assert_eq!(record_slots, TOTAL_SLOTS);
-    // `mod.rs` partitions the region into four reservations and asserts they
-    // tile it exactly: FIDO records, OATH records, the commit scratchpad, and
-    // this index. Only the first two hold records, so neither the scratchpad
-    // nor the index itself needs an index entry.
+    // `mod.rs` partitions the region into five reservations and asserts they
+    // tile it exactly: FIDO records, OATH records, the commit scratchpad,
+    // Nostr's range (US-1639), and this index. Only the first two hold
+    // records, so neither the scratchpad nor the index itself needs an index
+    // entry — and Nostr's records are indexed by its own store, not this one.
     assert_eq!(
         record_slots,
-        FIDO_CAPACITY + OATH_CAPACITY + SCRATCHPAD_SLOTS + index::INDEX_SLOT_COUNT,
+        FIDO_CAPACITY
+            + OATH_CAPACITY
+            + SCRATCHPAD_SLOTS
+            + fapico2_platform::keyregion::NOSTR_CAPACITY
+            + index::INDEX_SLOT_COUNT,
         "every slot in the region is FIDO, OATH, the commit scratchpad, or the index; the first \
          two need an entry and the other two do not"
     );

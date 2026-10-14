@@ -7,7 +7,7 @@
 //! implementation, and it is gated
 //! `all(feature = "host-backend", not(target_arch = "arm"))`. So on hardware
 //! there was **none**: `fido_store.rs` and `oath_store.rs` are written,
-//! `FIDO_CAPACITY` is 856, and the fifth passkey is still refused with
+//! `FIDO_CAPACITY` is 848, and the fifth passkey is still refused with
 //! `KeyStoreFull` because nothing can reach the region those adapters address.
 //! This is the device half.
 //!

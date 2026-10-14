@@ -2,9 +2,13 @@
 //!
 //! EPIC `RUST-MIGRATION` — Phase 0 Task 0.3 (US-303/304) + US-386 (serve loop).
 //!
-//! Builds an `embassy-usb` composite device with two interfaces:
+//! Builds an `embassy-usb` composite device with four interfaces:
 //! * CCID (class 0x0B) — bulk IN/OUT endpoints for OATH/OTP/OpenPGP/mgmt.
 //! * HID (class 0x03, interrupt IN **and OUT**) — CTAP1/2 FIDO.
+//! * HID (class 0x03, interrupt IN only) — Yubico OTP (feature reports).
+//! * HID (class 0x03, interrupt IN **and OUT**, usage page `0xFF00`) — the
+//!   Nostr vendor interface (US-1657), appended **after** OTP so no earlier
+//!   interface number shifts.
 //!
 //! [`Usb::into_parts`] hands the firmware two groups of handles:
 //!
@@ -73,6 +77,8 @@ struct HidInterfacesHandler {
     ctap_itf: u8,
     /// Yubico OTP interface number.
     otp_itf: u8,
+    /// Nostr vendor-HID interface number (US-1657).
+    nostr_itf: u8,
 }
 
 impl HidInterfacesHandler {
@@ -169,6 +175,39 @@ impl HidInterfacesHandler {
             _ => None,
         }
     }
+
+    fn control_in_nostr<'a>(&'a mut self, req: Request) -> Option<InResponse<'a>> {
+        if req.index != self.nostr_itf as u16 {
+            return None;
+        }
+        if !matches!(
+            (req.request_type, req.recipient),
+            (RequestType::Standard, Recipient::Interface)
+        ) {
+            return None;
+        }
+        match crate::nostr_hid::control_in(req.request, req.value) {
+            crate::hid_control::InReply::Data(d) => Some(InResponse::Accepted(d)),
+            crate::hid_control::InReply::Rejected => Some(InResponse::Rejected),
+            crate::hid_control::InReply::NotHandled => None,
+        }
+    }
+
+    fn control_out_nostr(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        if req.index != self.nostr_itf as u16 {
+            return None;
+        }
+        match (req.request_type, req.recipient) {
+            (RequestType::Class, Recipient::Interface) => {
+                match crate::nostr_hid::control_out(req.request, req.value, data) {
+                    crate::nostr_hid::OutReply::Accepted => Some(OutResponse::Accepted),
+                    crate::nostr_hid::OutReply::Rejected => Some(OutResponse::Rejected),
+                    crate::nostr_hid::OutReply::NotHandled => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Handler for HidInterfacesHandler {
@@ -176,6 +215,7 @@ impl Handler for HidInterfacesHandler {
         match req.index {
             i if i == self.ctap_itf as u16 => self.control_in_ctap(req),
             i if i == self.otp_itf as u16 => self.control_in_otp(req, buf),
+            i if i == self.nostr_itf as u16 => self.control_in_nostr(req),
             _ => None,
         }
     }
@@ -184,6 +224,7 @@ impl Handler for HidInterfacesHandler {
         match req.index {
             i if i == self.ctap_itf as u16 => self.control_out_ctap(req, data),
             i if i == self.otp_itf as u16 => self.control_out_otp(req, data),
+            i if i == self.nostr_itf as u16 => self.control_out_nostr(req, data),
             _ => None,
         }
     }
@@ -311,6 +352,12 @@ pub struct UsbParts<'d> {
     pub hid_in: Endpoint<'d, USB, In>,
     /// HID interrupt OUT — host→device (read CTAP HID reports from here).
     pub hid_out: Endpoint<'d, USB, Out>,
+    /// Nostr HID interrupt IN — device→host (write CTAPHID-framed Nostr
+    /// responses here; US-1657).
+    pub nostr_in: Endpoint<'d, USB, In>,
+    /// Nostr HID interrupt OUT — host→device (read CTAPHID-framed Nostr
+    /// commands from here).
+    pub nostr_out: Endpoint<'d, USB, Out>,
 }
 
 /// Builder for the composite device. Call [`new`], then [`into_parts`] to
@@ -510,12 +557,47 @@ impl<'d> Usb<'d> {
             let _otp_in = alt.endpoint_interrupt_in(None, 64, 10);
             u8::from(otp_itf)
         };
-        // One composite handler answers both HID interfaces (see the struct
-        // docs — embassy-usb keeps a single `Handler`).
+        // --- HID interface (Nostr vendor, usage page 0xFF00) ---
+        // US-1657 (design §A.8/D23): the browser transport. Appended **after
+        // OTP** so no earlier interface number ever shifts (OTP's number is
+        // load-bearing for yubikit's OTP transport, CCID's for pcscd).
+        // Speaks CTAPHID framing with the Nostr command set in the vendor
+        // command range 0x40–0x7F; the report descriptor is served on
+        // GET_DESCRIPTOR(Report) by `HidInterfacesHandler`.
+        let (nostr_in, nostr_out, nostr_itf) = {
+            let mut func = builder.function(0x03, 0x00, 0x00);
+            let mut iface = func.interface();
+            let nostr_itf = iface.interface_number();
+            let mut alt = iface.alt_setting(0x03, 0x00, 0x00, None);
+            // Class descriptor BEFORE the endpoints — the interface-extra
+            // discipline the three blocks above document (E7).
+            alt.descriptor(0x21, &crate::nostr_hid::NOSTR_HID_CLASS_DESCRIPTOR[2..]);
+            let in_ep = alt.endpoint_interrupt_in(None, 64, 10);
+            let out_ep = alt.endpoint_interrupt_out(None, 64, 10);
+            (in_ep, out_ep, u8::from(nostr_itf))
+        };
+        // The composite's interface numbers are derived from call order
+        // (embassy-usb assigns each `interface()` sequentially), and three of
+        // them are load-bearing off the device: CCID's for pcscd, CTAP's for
+        // every FIDO client, OTP's for yubikit. The Nostr interface is
+        // **appended** so none of those shift; these asserts make a reorder
+        // fail at enumeration rather than as a client-visible regression —
+        // the descriptor-level answer to "a descriptor test asserting the
+        // interface order" (US-1657; the wiring itself is only compiled on
+        // arm, so a host test cannot see it — see the blind-spot note in
+        // `platform/tests/usb.rs`).
+        assert_eq!(
+            (hid_itf, otp_itf, nostr_itf),
+            (1, 2, 3),
+            "composite interface order moved: CCID=0, CTAP=1, OTP=2, Nostr=3 is the contract"
+        );
+        // One composite handler answers all three HID interfaces (see the
+        // struct docs — embassy-usb keeps a single `Handler`).
         let hid_handler: &'d mut HidInterfacesHandler = unsafe {
             (&mut *core::ptr::addr_of_mut!(HID_INTERFACES_HANDLER)).write(HidInterfacesHandler {
                 ctap_itf: hid_itf,
                 otp_itf,
+                nostr_itf,
             })
         };
         builder.handler(hid_handler);
@@ -528,6 +610,8 @@ impl<'d> Usb<'d> {
                 ccid_out,
                 hid_in,
                 hid_out,
+                nostr_in,
+                nostr_out,
             },
         }
     }

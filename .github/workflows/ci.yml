@@ -119,7 +119,14 @@ env:
   # the measured per-feature image growth (US-OTP-HID +3,584 B, US-1519
   # +5,120 B), so the ratchet fires on notable growth rather than on every
   # 512-byte block.
-  FIRMWARE_FLASH_BUDGET_KIB: 1664
+  # 2026-10-12 raised this from 1664 to 1680 KiB, on purpose, with the reason
+  # recorded here because the number is the layout's argument: the Nostr
+  # applet arc (US-1630-1688): secp256kfun BIP-340 signing, the NIP-44 pair,
+  # the keyregion Nostr domain and the HID serve path — the ADR 0005 spike
+  # projected ~25 KB of text, the real delta is +28.5 KB (US-1675), consuming
+  # the headroom the pre-Nostr baseline left. Audit F-A6
+  # (docs/nostr-presence-audit.md).
+  FIRMWARE_FLASH_BUDGET_KIB: 1680
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
 # the largest exposure in the tree. Previously this file declared no
@@ -793,12 +800,21 @@ jobs:
       # LED sequence, so it is host-testable and belongs in the gate job beside
       # the other no-hardware assertions — NOT in the emulator pytest gate,
       # which needs a built emulation binary this job does not have.
+      # The runner image stopped shipping pytest for /usr/bin/python3 (it
+      # broke this step on main on 2026-10-11: "No module named pytest"), so
+      # the pytest this step needs is provided here rather than assumed —
+      # a tiny venv, ~5 s, and the job's no-toolchain property (about RUST)
+      # is unchanged. pytest loads tests/conftest.py for any run under
+      # tests/, and that file imports fido2 at module level, so fido2 rides
+      # along (the same >=2,<3 range tests/requirements.txt pins).
       - name: "Gate: the boot-ladder classifier (US-1302)"
         working-directory: fapico2
         run: |
           set -uo pipefail
           echo "--- classify_ladder over recorded blink sequences ---"
-          python3 -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
+          python3 -m venv /tmp/gates-pytest-venv
+          /tmp/gates-pytest-venv/bin/pip install --quiet pytest "fido2>=2,<3"
+          /tmp/gates-pytest-venv/bin/python -m pytest tests/hardware/test_boot_ladder.py -q -p no:cacheprovider
           echo "ok: boot-ladder classifier green"
 
   # ---------------------------------------------------------------------------

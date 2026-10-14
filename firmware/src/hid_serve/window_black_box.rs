@@ -404,7 +404,7 @@ impl Rig {
                 let mut srv = HidServe::new(now_ms, &mut ctap_out);
                 let mut io = DeviceIo { bus: bus.clone() };
                 let mut app = ScriptedApp;
-                let mut slot = PendingUp::new();
+                let mut slot = PendingUp::<{ crate::pending_up::PENDING_UP_PAYLOAD_MAX }>::new();
                 // `serve_loop` is `loop { serve_once(..).await }`
                 // (`hid_serve.rs`); this is that loop and the rig's own
                 // stop/wedge accounting, and nothing else.

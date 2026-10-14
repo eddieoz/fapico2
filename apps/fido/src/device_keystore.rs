@@ -22,7 +22,7 @@
 //! neither:
 //!
 //! * **Capacity — [`DEVICE_MAX_CREDS`].** How many passkeys the device can
-//!   hold. This is [`fapico2_platform::keyregion::FIDO_CAPACITY`] (856 at the
+//!   hold. This is [`fapico2_platform::keyregion::FIDO_CAPACITY`] (848 at the
 //!   shipping geometry), which is a function of the region's size, the measured
 //!   record size, the commit protocol and the index reservation
 //!   (`keyregion/mod.rs`, "Capacities — derived, never asserted"). The old `12`
@@ -80,10 +80,10 @@ pub const KEYSTORE_SLOT: &[u8] = b"fido.keystore.v1";
 
 /// **The capacity: how many FIDO credentials this device can hold.**
 ///
-/// [`fapico2_platform::keyregion::FIDO_CAPACITY`] — **856** at the shipping
+/// [`fapico2_platform::keyregion::FIDO_CAPACITY`] — **848** at the shipping
 /// geometry, and derived rather than asserted: `keyregion/mod.rs` computes it
-/// as `TOTAL_SLOTS − OATH_CAPACITY − SCRATCHPAD_SLOTS − INDEX_SLOT_COUNT` and
-/// has a compile-time assertion that the four terms claim every slot exactly
+/// as `TOTAL_SLOTS − OATH_CAPACITY − SCRATCHPAD_SLOTS − INDEX_SLOT_COUNT −
+/// NOSTR_CAPACITY` and has a compile-time assertion that the five terms claim every slot exactly
 /// once. Change the region's size, the measured record size, the commit
 /// protocol or the index reservation and this number moves with them.
 ///
@@ -107,7 +107,7 @@ pub const DEVICE_MAX_CREDS: usize = FIDO_CAPACITY as usize;
 ///
 /// Left implicit, that is a divergence a reader cannot see and a test cannot
 /// state: the host twin's `MemoryKeystore::with_max_creds(4)` reports a total of
-/// 4, the device reports 856, and both numbers are correct answers to "how many
+/// 4, the device reports 848, and both numbers are correct answers to "how many
 /// credentials can this hold?". A parity assertion that just compared the two
 /// numbers would be asserting that they differ; one that skipped the number
 /// would be asserting nothing.
@@ -190,7 +190,7 @@ impl CredentialBackend {
 /// It is also the array size of [`DeviceKeystore::credentials`], so it is a
 /// **RAM** figure as much as a format one: `DeviceCredential` measures 720
 /// bytes, so 12 of them is 8,640 bytes of `.bss`. A resident array sized to
-/// [`DEVICE_MAX_CREDS`] would be 856 × 720 = **616,320 bytes** against 532,480
+/// [`DEVICE_MAX_CREDS`] would be 848 × 720 = **610,560 bytes** against 532,480
 /// bytes of RAM on an RP2350 — which is why the per-record store
 /// (`keyregion::fido_store::FidoRecordStore`) is stateless and loads one
 /// credential at a time into a bounded `CredentialWindow`, and why the array is
@@ -206,7 +206,7 @@ pub const SNAPSHOT_MAX_CREDS: usize = 12;
 ///
 /// It is emphatically **not** a capacity and must not be one: each element is
 /// 64 bytes of credential ID (72 with the `heapless` length), so sizing these
-/// vectors at [`DEVICE_MAX_CREDS`] would be 856 × 72 = **61,632 bytes of stack**
+/// vectors at [`DEVICE_MAX_CREDS`] would be 848 × 72 = **61,056 bytes of stack**
 /// in `get_assertion`, on a task whose whole frame is already the boot path's
 /// 5,056-byte budget in miniature. The number lives here so the two are never
 /// confused again.
@@ -3006,7 +3006,7 @@ pub const E_NO_REGION: &str =
 /// [`CounterWindow::PENDING_MAX`] entries — so it is bounded by the *batch*,
 /// never by the store. That is what keeps it compatible with the derived
 /// capacity: `DeviceCredential` is 720 bytes and a resident array of them is
-/// the thing [`DEVICE_MAX_CREDS`] = 856 can never have
+/// the thing [`DEVICE_MAX_CREDS`] = 848 can never have
 /// (`fido_store.rs`'s module docs).
 ///
 /// # The invariant, and the weakening
@@ -3543,8 +3543,8 @@ enum Raise {
 /// `DeviceKeystore::credentials` is a resident
 /// `HeaplessVec<DeviceCredential, 12>` — 12 × 720 B = **8,640 bytes of `.bss`**
 /// and a ceiling of twelve, against a derived region capacity of
-/// [`FIDO_CAPACITY`] (**856**). Resizing that array to the capacity is
-/// arithmetically impossible: 856 × 720 = 616 KB against 532 KB of RAM on the
+/// [`FIDO_CAPACITY`] (**848**). Resizing that array to the capacity is
+/// arithmetically impossible: 848 × 720 = 610 KB against 532 KB of RAM on the
 /// part. This type is the other shape — nothing resident, one credential
 /// decrypted at a time into the caller's [`CredentialWindow`] — and it is what
 /// makes the capacity reachable at all.
@@ -4089,7 +4089,7 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
     /// The slot of the `n`-th FIDO index entry, in index order.
     ///
     /// **A cursor, not a materialised list.** credMgmt's `enumerateRPs` has to
-    /// walk every credential the device holds, and at 856 credentials a
+    /// walk every credential the device holds, and at 848 credentials a
     /// `Vec<Slot>` of them is 1.7 KB — on a task frame that already carries an
     /// 836-byte `CredentialWindow`. Walking the index one entry at a time and
     /// keeping one `Slot` is the same reason `index::walk_present` streams a

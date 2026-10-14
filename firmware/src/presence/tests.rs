@@ -1395,3 +1395,31 @@ fn the_device_cbor_arm_still_has_the_shape_the_model_assumes() {
         );
     }
 }
+
+/// F-A2 (docs/nostr-presence-audit.md): the domain check must be exact —
+/// bits 30 and 29 set, bit 31 clear. A mask on bit 30 alone also admits a
+/// *folded FIDO* tag `0xE000_xxxx` (FIDO tags are `0x8000_0000 | cid` and
+/// the FIDO CID allocator wraps at `0x8000_0000` unclamped) — a FIDO login
+/// press would authorize a Nostr command. Pure-function test: no runtime,
+/// no `TEST_LOCK`, no press injection.
+#[test]
+fn nostr_window_tag_domain_check_is_exact() {
+    use super::is_nostr_window_tag;
+    // Every legal Nostr HID tag: 0x6000_0000 | cid, cid < 0x2000_0000.
+    assert!(is_nostr_window_tag(0x6000_0000));
+    assert!(is_nostr_window_tag(0x6000_0042));
+    assert!(
+        is_nostr_window_tag(0x7FFF_FFFF),
+        "the clamp's ceiling is a legal Nostr HID tag"
+    );
+    // The fold: FIDO tags whose cid carries bit 29 set — bit 31 stays set.
+    assert!(!is_nostr_window_tag(0xE000_0042), "a folded FIDO tag is not ours");
+    assert!(!is_nostr_window_tag(0xFFFF_FFFF));
+    // FIDO's normal range, the CCID domain, the §2.3.1 inventory.
+    assert!(!is_nostr_window_tag(0x8000_0042));
+    assert!(
+        !is_nostr_window_tag(0x4000_0042),
+        "the CCID bit-30 domain is not a window tag"
+    );
+    assert!(!is_nostr_window_tag(0x1C), "the mgmt/rescue inventory is not ours");
+}

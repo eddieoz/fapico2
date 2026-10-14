@@ -163,6 +163,20 @@ pub const CTAP_KEEPALIVE_PERIOD_MS: u64 = 250;
 /// refusal is observable as SW=6985 rather than a host-side abort.
 pub const CCID_WINDOW_MS: u64 = 15_000;
 
+/// US-1660 (design §A.8.3a #4, §A.8.3 #2): the Nostr vendor interface's own
+/// touch window — **15 s, not the CTAP2 30 s**, and not [`CCID_WINDOW_MS`]
+/// either. Reusing either would couple two unrelated rationales: the CTAP2
+/// window is 30 s because that is what the CTAP2 hosts we serve tolerate
+/// (measured: 30047.7 ms), while the Nostr window is short because a flappy
+/// browser tab must not be able to hold the single consent slot against a
+/// Chrome WebAuthn ceremony for half a minute — the cross-transport
+/// contention is bounded by the *shorter* of the two windows, so the Nostr
+/// side is the one that moves. 15 s matches [`CCID_WINDOW_MS`]'s ceiling by
+/// coincidence of the same constraint family (a host-side transaction abort
+/// is one of the things a too-long window risks), but the constants stay
+/// separate on purpose: change one, the other does not follow.
+pub const NOSTR_TOUCH_WINDOW_MS: u64 = 15_000;
+
 /// US-921: the CTAP2 touch window as a value — the pure policy piece the
 /// HID loop bounds its keepalive retries with (`open` stamps the budget
 /// from the current clock; `expired` is the loop's exit condition). The
@@ -177,12 +191,22 @@ pub struct TouchWindow {
 }
 
 impl TouchWindow {
-    /// Open a touch window for `tag` at `now_ms`.
-    pub fn open(tag: u32, now_ms: u64) -> Self {
+    /// Open a touch window for `tag` at `now_ms`, with the caller's budget.
+    ///
+    /// US-1660: parameterized so the Nostr interface can open its own,
+    /// shorter window ([`NOSTR_TOUCH_WINDOW_MS`]) without inheriting the
+    /// CTAP2 decision — the hard-wired form was exactly the coupling
+    /// §A.8.3a #4 forbids.
+    pub fn open_for(tag: u32, now_ms: u64, window_ms: u64) -> Self {
         Self {
             tag,
-            deadline_ms: now_ms.saturating_add(CTAP_TOUCH_WINDOW_MS),
+            deadline_ms: now_ms.saturating_add(window_ms),
         }
+    }
+
+    /// Open a touch window for `tag` at `now_ms`, on the CTAP2 budget.
+    pub fn open(tag: u32, now_ms: u64) -> Self {
+        Self::open_for(tag, now_ms, CTAP_TOUCH_WINDOW_MS)
     }
 
     /// Whether the window has run out at `now_ms`.
@@ -769,6 +793,145 @@ pub fn request_grant(tag: u32) -> bool {
     // SAFETY: device bin — `init` ran at boot before any task; no .await
     // inside this op, so the cooperative executor serializes access.
     unsafe { runtime().request_grant(tag) }
+}
+
+/// US-1663: which transport is driving the Nostr applet right now. The
+/// applet is **transport-blind** — it asks its gate with the CCID-form tag
+/// (`apps/nostr::presence_tag(idx)`, the §2.3.1 bit-30 domain) whatever the
+/// transport — so the transport context cannot ride in the tag. It rides
+/// here instead: the HID arm sets it around its synchronous app call and
+/// [`nostr_grant`] reads it inside that same call. The cooperative
+/// single-task executor makes a static exact rather than racy — nothing
+/// can interleave between the arm's set and the applet's gate call — and
+/// the shared-applet mutex ([`crate::nostr_shared::NOSTR_APP`]) serialises
+/// the two transports the same way.
+static NOSTR_HID_GRANT_CONTEXT: AtomicBool = AtomicBool::new(false);
+
+/// Mark the synchronous stretch in which the shared applet is running on
+/// the HID vendor arm (US-1663). Set by the arm immediately before
+/// `process_vendor` and cleared immediately after — the applet's gate call
+/// happens strictly inside.
+pub fn enter_nostr_hid_grant_context() {
+    NOSTR_HID_GRANT_CONTEXT.store(true, Ordering::SeqCst);
+}
+
+/// Clear the HID-arm context (the paired unset of
+/// [`enter_nostr_hid_grant_context`]).
+pub fn exit_nostr_hid_grant_context() {
+    NOSTR_HID_GRANT_CONTEXT.store(false, Ordering::SeqCst);
+}
+
+/// The tag of the window currently holding the pending slot, if any.
+/// Read by [`nostr_grant`]'s HID arm; a `None` means no window is open.
+pub fn pending_window_tag() -> Option<u32> {
+    // SAFETY: device bin — `init` ran at boot before any task; no .await
+    // inside this op, so the cooperative executor serializes access.
+    unsafe { runtime().svc.pending_tag() }
+}
+
+/// The Nostr HID window-tag domain, exactly: bits 30 and 29 set, bit 31
+/// clear — the range `0x6000_0000 | cid` with the Nostr CID allocator's
+/// clamp (`cid < 0x2000_0000`, `ctap_hid.rs`) guarantees. A mask on bit 30
+/// alone would also admit a *folded FIDO* tag `0xE000_xxxx` (FIDO tags are
+/// `0x8000_0000 | cid` and the FIDO allocator wraps at `0x8000_0000`
+/// unclamped), and a FIDO press would authorize a Nostr command
+/// (`docs/nostr-presence-audit.md` F-A2).
+fn is_nostr_window_tag(tag: u32) -> bool {
+    tag & 0xE000_0000 == 0x6000_0000
+}
+
+/// D7 (`docs/nostr-presence-audit.md` F-A4): the Nostr CCID arm's wait
+/// hook. `nostr_grant` lives in this lib, but the blocking touch wait
+/// drives the device bin's LED and pad sampler (`button.rs`, bin-only) —
+/// the same layering the touch-prompt hook below solves. The device bin
+/// installs `button::nostr_wait_grant` at boot (next to the touch-prompt
+/// install); host builds install nothing. Write-once, exactly like
+/// [`set_touch_prompt_hook`] — the first install wins, a second returns
+/// `false` so a boot-ordering mistake is loud rather than silent.
+static NOSTR_CCID_WAIT_SET: AtomicBool = AtomicBool::new(false);
+static mut NOSTR_CCID_WAIT_FN: Option<fn(u32) -> bool> = None;
+
+/// Install the Nostr CCID arm's blocking touch wait (device wiring:
+/// `main` registers `button::nostr_wait_grant` at boot, next to the
+/// touch-prompt hook). Returns `false` on a second call.
+pub fn set_nostr_ccid_wait_hook(hook: Option<fn(u32) -> bool>) -> bool {
+    if NOSTR_CCID_WAIT_SET.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    unsafe {
+        // SAFETY: write-once before any task runs (boot discipline, the
+        // RUNTIME_SLOT pattern) — no aliasing exists yet.
+        core::ptr::addr_of_mut!(NOSTR_CCID_WAIT_FN).write(hook);
+    }
+    true
+}
+
+/// The installed CCID wait hook, if any.
+fn nostr_ccid_wait_hook() -> Option<fn(u32) -> bool> {
+    if NOSTR_CCID_WAIT_SET.load(Ordering::SeqCst) {
+        // SAFETY: read of the write-once slot, sequenced after the flag.
+        unsafe { core::ptr::addr_of!(NOSTR_CCID_WAIT_FN).read() }
+    } else {
+        None
+    }
+}
+
+/// US-1663: the Nostr applet's grant — the one provider both transports
+/// share, discriminated by the transport context rather than by the tag,
+/// because the applet's tag is transport-blind.
+///
+/// * **CCID arm** (context clear): the blocking touch wait — the OpenPGP
+///   US-914 pattern, via the boot-installed wait hook
+///   ([`set_nostr_ccid_wait_hook`]; the device bin installs
+///   `button::nostr_wait_grant`) under the
+///   command's own request-bound tag. D7 (`docs/nostr-presence-audit.md`
+///   F-A4): the strict one-shot poll this arm used before can never grant
+///   on hardware — the dispatch is synchronous and the button task drains
+///   a press within one tick — so it held the slot for microseconds and
+///   answered `6985` forever. The wait holds the slot for the attempt; a
+///   same-tag SIGN still never joins another SIGN's grant, because the
+///   grant is bound to this command's pending slot alone and dies with it
+///   (F-A1's rule).
+/// * **HID vendor arm** (context set): the transaction bound is the window
+///   the arm parked — one command per window (park-not-queue, US-1510) — so
+///   the gate consumes join-only, via [`request_grant_in_window`], under
+///   **the open window's own tag** (`0x6000_0000 | cid`, §A.8.3 #1). The
+///   applet's CCID-form tag is not the bound here and is not consulted: the
+///   press is armed only while that window is open, and it is spent on the
+///   command the arm re-drove. Fail-closed in both degenerate shapes: no
+///   window open (the first, pre-park app call — the refusal that CREATES
+///   the window) or a window under a non-HID domain (a FIDO or CCID window
+///   owns the slot — the US-1663 contention bound, exact per F-A2). Either
+///   way the applet hears `6985` and the press, if any, stays with its own
+///   window.
+///
+/// What this does **not** weaken: `request_grant_in_window` never opens a
+/// window and never burns a grant on a tag mismatch; a press armed for the
+/// Nostr HID window is still unconsumable by FIDO (disjoint tag domains),
+/// and a CCID command concurrent with a HID window still takes the wait
+/// path and finds the slot busy.
+pub fn nostr_grant(tag: u32) -> bool {
+    if NOSTR_HID_GRANT_CONTEXT.load(Ordering::SeqCst) {
+        match pending_window_tag() {
+            Some(t) if is_nostr_window_tag(t) => request_grant_in_window(t),
+            _ => false,
+        }
+    } else {
+        // D7 (docs/nostr-presence-audit.md F-A4): the CCID arm blocks in
+        // the OpenPGP wait shape under this command's own request-bound
+        // tag — the strict one-shot poll can never observe a press on
+        // hardware (the dispatch is synchronous; the button task drains
+        // within one tick). The hook is the device bin's
+        // `button::nostr_wait_grant`, installed at boot; absent it fails
+        // CLOSED — a missing install must not silently degrade to a path
+        // that cannot grant. With F-A1's fix the grant cannot outlive the
+        // wait, and the single pending slot means no other command can
+        // join it.
+        match nostr_ccid_wait_hook() {
+            Some(wait) => wait(tag),
+            None => false,
+        }
+    }
 }
 
 /// US-914: the device touch-to-sign wait (injected into the OpenPGP app

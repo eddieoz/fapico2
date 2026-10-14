@@ -781,7 +781,11 @@ a new key.
 * **It is still a shared budget.** §3.1a applies unchanged and with more force:
   the index, the OATH records, the PIN state and the vendor state all live in
   the same region, and OATH records pay `commit::SECTOR_ERASES_PER_COMMIT` per
-  durable write of their own.
+  durable write of their own. The Nostr identity records live here too
+  (US-1639's carve, ADR 0005): each Nostr identity write is one durable
+  commit — 3 sector erases, 2 of them on the shared scratchpad sector
+  (`commit.rs`, `SCRATCHPAD_ERASES_PER_COMMIT = 2`) — so Nostr wears the same
+  scratchpad bottleneck this section already names.
 * **Batching still buys the same order of magnitude.** 6/32 = 0.19 sector
   erases per assertion against 8 before it, so the *wear per assertion* fell
   43×; the *lifetime* fell 4×, and those two numbers disagree because the

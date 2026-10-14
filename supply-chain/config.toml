@@ -958,6 +958,14 @@ criteria = "safe-to-deploy"
 version = "0.8.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.secp256kfun]]
+version = "0.12.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.secp256kfun_arithmetic_macros]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.semver]]
 version = "0.9.0"
 criteria = "safe-to-deploy"
@@ -1068,6 +1076,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.string_cache]]
 version = "0.8.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.subtle-ng]]
+version = "2.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.syn]]

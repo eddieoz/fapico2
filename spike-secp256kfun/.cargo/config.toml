@@ -1,0 +1,4 @@
+# The spike is a detached workspace: drop the firmware's linker scripts so the
+# measurement bin links with rust-lld's defaults.
+[target.thumbv8m.main-none-eabi]
+rustflags = ["--cfg", "armv8m_main"]

@@ -62,7 +62,9 @@ use crate::ctap_hid::{
     CTAPHID_KEEPALIVE_UPNEEDED, HID_ERR_INVALID_CMD, HID_ERR_INVALID_LEN,
 };
 use crate::pending_up::{ParkRefusal, PendingKind, PendingUp, WindowTicket};
-use crate::presence::{self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, TouchWindow};
+use crate::presence::{
+    self, CTAP_KEEPALIVE_PERIOD_MS, CTAP_TOUCH_WINDOW_MS, NOSTR_TOUCH_WINDOW_MS, TouchWindow,
+};
 
 /// `CTAP_READ_CONFIG` (`0x42`) — yubikit's `CTAP_VENDOR_FIRST + 2`.
 ///
@@ -122,31 +124,47 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 ///
 /// ## The arithmetic
 ///
-/// Three CTAPHID reply writes plus the one keepalive period the outbound read
-/// is bounded by. Walking one [`serve_once`] pass, in order, while a window is
-/// live:
+/// Five CTAPHID reply writes plus the one keepalive period the outbound read
+/// is bounded by. Walking one [`serve_once_dual`] pass, in order, while a
+/// window is live on **either** interface:
 ///
-/// 1. **the bounded read.** A frame that arrives on the OUT endpoint is
+/// 1. **the bounded read.** A frame that arrives on either OUT endpoint is
 ///    picked up within [`CTAP_KEEPALIVE_PERIOD_MS`] (now **250 ms**),
-///    because [`read_one`] is bounded by it. This is the term US-1506
+///    because `read_either` is bounded by it. This is the term US-1506
 ///    moved, and it moved *with* the emitted cadence, because the same
 ///    constant is both — see the note there on why they must not be
 ///    split.
-/// 2. **the live window's keepalive** — [`redrive_window`], one reply, at
+/// 2. **the FIDO window's keepalive** — [`redrive_window`], one reply, at
 ///    most [`HID_REPLY_WRITE_TIMEOUT_MS`] (500 ms) if the host has stopped
 ///    reading the IN endpoint (US-1504).
-/// 3. **a `check_timeout` error** — [`serve_once`] step 2, and only if a
+/// 3. **the Nostr window's keepalive** — [`redrive_vendor_window`]
+///    (US-1663), one reply, same bound. The second arm is US-1660's
+///    structural change and the reason this sum grew by one term: both
+///    windows are re-driven on the same clock, each at most one reply per
+///    pass, so a pass that carries two live keepalives carries two writes.
+/// 4. **a `check_timeout` error on the FIDO interface** — and only if a
 ///    fragmented transaction really is stale. One more reply, same bound.
-/// 4. **the dispatched answer** — the frame read in step 1 is dispatched
+/// 5. **a `check_timeout` error on the Nostr interface** — same bound. Each
+///    interface has its own assembler, so both can hold a stale transaction
+///    in the same pass.
+/// 6. **the dispatched answer** — the frame read in step 1 is dispatched
 ///    and answered with exactly **one** reply, same bound.
 ///
-/// So **1750 ms worst case** (3 x 500 + 250) against a host that has
+/// So **2750 ms worst case** (5 x 500 + 250) against a host that has
 /// stopped reading the IN endpoint, and **one keepalive period (250 ms)**
 /// against a host that is actually reading it — the case the blackout is
-/// about, where the three replies complete immediately rather than costing
+/// about, where the five replies complete immediately rather than costing
 /// their deadlines.
 ///
-/// ## Why the term count went *down*
+/// US-1660's note on the cadence, restated now that the Nostr arm has a
+/// window too: with two windows live, each pass re-drives **both**, so a
+/// flash persist or a slow re-drive on one interface delays the *other
+/// interface's* keepalive by however long that pass ran — the one-clock
+/// bound §A.8.3 #7 accepted. The cadence is bounded by the pass period,
+/// not guaranteed to 250 ms sharp, and both arms' keepalives are advisory
+/// frames clients tolerate jitter on.
+///
+/// ## Why the term count went *down* (and then back up)
 ///
 /// The published 2100 ms counted **four** replies: the live window's
 /// keepalive, the assembler's timeout error, **the dispatched command's
@@ -170,8 +188,10 @@ pub use crate::hid_reply::HID_REPLY_WRITE_TIMEOUT_MS;
 /// **enumerate the pass frame by frame, add only what is still there, and
 /// publish a bound no wider than what the deadlines actually cover.** A term
 /// that is not a deadline is not a term; a case the sum does not describe is
-/// not a case the sum may claim.
-pub const SERVE_BOUND_MS: u64 = 3 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
+/// not a case the sum may claim. US-1663 applies the same rule in the other
+/// direction: the Nostr arm's window added two real terms (its keepalive,
+/// its own stale-transaction check), and the sum grew by exactly those two.
+pub const SERVE_BOUND_MS: u64 = 5 * HID_REPLY_WRITE_TIMEOUT_MS + CTAP_KEEPALIVE_PERIOD_MS;
 
 /// Something the serve loop wants the transport to say in its log. The loop
 /// itself has no logger: `defmt` is a device concern, and US-1504 moved the
@@ -537,9 +557,10 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
         // The U2F arm keeps its recorded refusal: CTAP1 has no cancel code,
         // and `6985` / `0700` is the one shape that is both true and
         // parseable.
-        let mut refusal = [0u8; 2];
-        let mut n = slot.refusal().len().min(refusal.len());
-        refusal[..n].copy_from_slice(&slot.refusal()[..n]);
+        let stored = slot.refusal();
+        let mut refusal = [0u8; 16];
+        let mut n = stored.len().min(refusal.len());
+        refusal[..n].copy_from_slice(&stored[..n]);
         let kind = slot.parked().map(|p| p.ticket.kind).unwrap_or(PendingKind::Ctap2);
         if kind == PendingKind::Ctap2 {
             refusal[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
@@ -550,7 +571,7 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
             reply(
                 io,
                 &ticket.channel,
-                frame_cmd(ticket.kind),
+                frame_cmd(&ticket),
                 &refusal[..n],
             )
             .await;
@@ -588,6 +609,13 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
             let len = app.process_u2f(parked.payload, ctap_out);
             (presence::u2f_up_refusal(&ctap_out[..len]), len)
         }
+        // A vendor ticket is only ever parked by the vendor arm into the
+        // Nostr interface's own slot (its own PendingUp instance); this loop
+        // re-drives the FIDO slot, so it can only be reached through a FIDO
+        // or U2F park. A Vendor here is a wiring bug, not a recoverable
+        // state — fail loud (the boot-fatal discipline) rather than answering
+        // a host with a fabricated sentence.
+        PendingKind::Vendor => unreachable!("Vendor ticket in the FIDO re-drive slot"),
     };
 
     if still_owed {
@@ -615,18 +643,109 @@ async fn redrive_window<S: HidIo, A: FidoDispatch>(
     // window is over and this is the final reply.
     close_window(slot);
     if app.persist() {
-        reply(io, &channel, frame_cmd(kind), &ctap_out[..len]).await;
+        // The FIDO re-drive's final answer: this arm only ever parks
+        // `Ctap2`/`U2f` (the vendor arm has its own re-drive below), so the
+        // frame command is the plain kind mapping.
+        let frame = match kind {
+            PendingKind::Ctap2 => CTAP_HID_CBOR,
+            PendingKind::U2f => CTAP_HID_MSG,
+            PendingKind::Vendor => unreachable!("the FIDO re-drive never parks a vendor command"),
+        };
+        reply(io, &channel, frame, &ctap_out[..len]).await;
     } else {
         io.note(HidNote::PersistFailed);
         reply(io, &channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
     }
 }
 
-/// The CTAP-HID frame command a window's answer goes out on.
-const fn frame_cmd(kind: PendingKind) -> u8 {
-    match kind {
+/// US-1663: the Nostr arm's window re-drive — the vendor twin of
+/// [`redrive_window`], on the same clock and the same pass order (re-assert
+/// the prompt, re-run the command, emit at most one rate-limited keepalive).
+///
+/// The differences are the wire shapes, nothing else: the parked payload is
+/// the CBOR request envelope, the re-drive calls `process_vendor` with the
+/// command's own byte, and "still owed" is decoded from the envelope's `sw`
+/// field (`0x6985` — the same word that opened the window) rather than a
+/// one-byte CTAP2 status. The final answer — grant consumed, or any other
+/// status the applet produced — goes out on the parked command's own byte
+/// with the full envelope, and the window closes.
+///
+/// On expiry the stored refusal goes out unrewritten: the vendor vocabulary
+/// has no `KEEPALIVE_CANCEL` (US-1506's word is CTAP2's), and `0x6985` is
+/// the terminal sentence the window was already speaking. A press landing
+/// on the closing tick cannot retroactively authorise what the window
+/// refused — the command is deliberately NOT re-driven one last time (the
+/// US-921 rule in the time dimension).
+async fn redrive_vendor_window<S: HidIo, N: NostrDispatch>(
+    now_ms: fn() -> u64,
+    out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    io: &mut S,
+    app: &mut N,
+    slot: &mut PendingUp<2048>,
+) {
+    if !slot.is_occupied() {
+        return;
+    }
+    let now = now_ms();
+
+    if slot.is_expired(now) {
+        // Copied out before `close_window` takes the slot — the recorded
+        // refusal dies with it, and it IS the answer.
+        let stored = slot.refusal();
+        let mut refusal = [0u8; 16];
+        let n = stored.len().min(refusal.len());
+        refusal[..n].copy_from_slice(&stored[..n]);
+        let ticket = close_window(slot);
+        reply(io, &ticket.channel, frame_cmd(&ticket), &refusal[..n]).await;
+        return;
+    }
+
+    let Some(parked) = slot.parked() else { return };
+    let channel = parked.ticket.channel;
+    let cmd = parked.ticket.ctap_cmd;
+
+    // Re-assert the prompt: the heartbeat flickers it off between passes
+    // (the shared-pin contract, and the same reason the FIDO re-drive
+    // re-asserts it after every keepalive).
+    presence::touch_prompt(true);
+
+    // US-1663: the applet is transport-blind — it asks its gate with the
+    // CCID-form tag on every transport — so the arm marks the synchronous
+    // stretch of this call and `presence::nostr_grant` routes the ask to the
+    // window this loop parked. Cleared before anything else can run: the
+    // executor is cooperative and nothing awaits between the two.
+    presence::enter_nostr_hid_grant_context();
+    let n = app.process_vendor(cmd, parked.payload, out);
+    presence::exit_nostr_hid_grant_context();
+    let owed =
+        n >= 2 && u16::from_be_bytes([out[n - 2], out[n - 1]]) == crate::nostr_wire::SW_TOUCH_REQUIRED;
+    if owed {
+        slot.note_refusal(&out[..n]);
+        // Rate-limited to [`CTAP_KEEPALIVE_PERIOD_MS`], `0x02` UP NEEDED —
+        // which is true now, and only now (the same US-1506 discipline the
+        // FIDO re-drive states in full).
+        if slot.keepalive_due(now_ms()) {
+            slot.note_keepalive(now_ms());
+            reply(io, &channel, CTAP_HID_KEEPALIVE, &[CTAPHID_KEEPALIVE_UPNEEDED]).await;
+        }
+        return;
+    }
+
+    // The grant was consumed (or the command answered a non-touch status):
+    // the window is over and this is the final reply.
+    let ticket = close_window(slot);
+    reply(io, &ticket.channel, frame_cmd(&ticket), &out[..n]).await;
+}
+
+/// The CTAP-HID frame command a window's answer goes out on. The vendor
+/// arm (US-1663) answers on its own command byte — the reply frame of a
+/// parked `SIGN` is a `SIGN` frame, the same rule US-1662 pinned for the
+/// immediate path.
+fn frame_cmd(ticket: &WindowTicket) -> u8 {
+    match ticket.kind {
         PendingKind::Ctap2 => CTAP_HID_CBOR,
         PendingKind::U2f => CTAP_HID_MSG,
+        PendingKind::Vendor => ticket.ctap_cmd,
     }
 }
 
@@ -639,7 +758,7 @@ const fn frame_cmd(kind: PendingKind) -> u8 {
 /// can grant again for the life of the process. One function, so the three
 /// calls cannot drift apart — this is the pairing US-921's leak analysis
 /// turned on, and it is why there is no other way out of a window.
-fn close_window(slot: &mut PendingUp) -> WindowTicket {
+fn close_window<const PAYLOAD_MAX: usize>(slot: &mut PendingUp<PAYLOAD_MAX>) -> WindowTicket {
     match slot.take() {
         Some(ticket) => {
             presence::end_window(ticket.tag);
@@ -1030,10 +1149,13 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
         // is also why this arm can be ordered with the native commands.
         if slot.is_occupied() {
             // Copied out before `close_window` takes the slot: `take()`
-            // clears the recorded refusal, and the U2F arm's answer is that
-            // refusal. Reading it afterwards would answer a U2F cancel with a
-            // zero-length APDU response.
-            let mut answer = [0u8; 2];
+            // clears the recorded refusal, and the U2F and vendor arms'
+            // answers are that refusal. Reading it afterwards would answer
+            // a U2F cancel with a zero-length APDU response or a vendor
+            // cancel with an empty envelope. 16 bytes holds the widest
+            // recorded refusal on any pending kind (the vendor sw-only
+            // envelope is 5).
+            let mut answer = [0u8; 16];
             let n = slot.refusal().len().min(answer.len());
             answer[..n].copy_from_slice(&slot.refusal()[..n]);
             let ticket = close_window(slot);
@@ -1063,8 +1185,16 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
                         n
                     }
                 }
+                // US-1663: the vendor sentence the cancel ends with is the
+                // recorded refusal itself — the parked command's CBOR
+                // envelope, unrewritten. The vendor vocabulary has no
+                // KEEPALIVE_CANCEL byte to substitute: `6985` inside the
+                // envelope IS the terminal answer, so re-drive and cancel
+                // end on the same word. (The envelope is never empty here —
+                // the park recorded it before the window opened.)
+                PendingKind::Vendor => n,
             };
-            reply(io, &ticket.channel, frame_cmd(ticket.kind), &answer[..len]).await;
+            reply(io, &ticket.channel, frame_cmd(&ticket), &answer[..len]).await;
         }
     } else if cmd == 0x41 && !payload.is_empty() && payload[0] == 0x05 {
         // Vendor vault function (pico-fido2 vendor protocol).
@@ -1200,6 +1330,502 @@ async fn dispatch<S: HidIo, A: FidoDispatch>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// US-1660: one task serves both HID interfaces
+//
+// A second hid-sized task future does not fit the arena headroom (design
+// §A.8.3 #4), so the Nostr interface is served by the SAME task as the
+// FIDO interface: each interface keeps its own assembler, its own CID
+// allocator, its own response buffer and its own parked-window slot
+// (`HidServe` / `PENDING_UP` for FIDO, [`NostrServe`] /
+// `boot::NOSTR_PENDING_UP` for Nostr), and one serve pass reads whichever
+// interface has a report first. The policy (window redrive, keepalive
+// cadence, reply deadlines) stays in the shared helpers —
+// [`redrive_window`], [`reply`], [`read_one`]'s bound — exactly so the
+// second interface inherits it rather than a copy of it.
+//
+// ## The .bss arithmetic, recorded for US-1664's re-measure
+//
+// The big buffers are hoisted to write-once statics
+// (`boot::NOSTR_RESP`, `boot::NOSTR_PENDING_UP`) because the task's async
+// frame is byte-accounted (`TASK_ARENA_DEMAND_B`): 2,048 (response
+// buffer) + 2,112 (`PendingUp<2048>`) ≈ 4.2 KB of .bss — against the
+// design's 12–17 KB estimate, which priced a second CTAP2-sized (7,609 B)
+// buffer; the Nostr interface never answers a largeBlobs reply, so a
+// 2 KiB bound is honest for it (derivation on [`NOSTR_RESP_MAX`]). The
+// rest of the second serve state (assembler, allocator, two 64-byte
+// reports) is frame-resident, and the nightly re-measure charges it where
+// it actually lands.
+// ---------------------------------------------------------------------------
+
+/// US-1660: the Nostr interface's response-buffer bound, in bytes.
+///
+/// The largest reply a Nostr command produces is the `NIP44_ENCRYPT`
+/// payload — `0x02 ‖ nonce(32) ‖ ct(2+1+padded) ‖ mac(32)` with
+/// `padded = calc_padded_len(1792) = 1792` — 1,862 B at apps/nostr's
+/// `MAX_PLAINTEXT`, plus 7 bytes of CTAPHID reply framing (channel,
+/// command, length): 1,869 B. 2,048 bounds that and never truncates a
+/// legal reply; the CTAPHID 7,609 bound would be a buffer for a capability
+/// the Nostr interface does not have (it never answers a CTAP2 largeBlobs
+/// reply).
+pub const NOSTR_RESP_MAX: usize = 2048;
+
+/// US-1660: the Nostr interface's half of the dual serve state.
+///
+/// The same pieces [`HidServe`] carries for FIDO — assembler, CID
+/// allocator, report, response buffer — sized and clamped for the Nostr
+/// interface: the allocator is [`crate::ctap_hid::NOSTR_CID_LIMIT`]-clamped
+/// (US-1659; a free-running cid would fold into the presence-tag mask), and
+/// the response buffer is [`NOSTR_RESP_MAX`]-bounded. There is deliberately
+/// no `reads`/`blocked_live_passes` instrumentation here: those exist for
+/// the US-1509 blackout assertions on the FIDO loop, and the Nostr loop's
+/// own consent semantics are US-1663's stories.
+pub struct NostrServe<'a> {
+    assembler: HidAssembler,
+    cid_alloc: CidAllocator,
+    report: [u8; HID_REPORT_SIZE],
+    out: &'a mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    now_ms: fn() -> u64,
+}
+
+impl<'a> NostrServe<'a> {
+    /// `now_ms` and the response buffer borrow, as [`HidServe::new`]. The
+    /// allocator is the clamped one; nothing else about the Nostr interface
+    /// is specialized at construction.
+    pub fn new(now_ms: fn() -> u64, out: &'a mut HeaplessVec<u8, NOSTR_RESP_MAX>) -> Self {
+        Self {
+            assembler: HidAssembler::new(now_ms),
+            cid_alloc: CidAllocator::clamped(crate::ctap_hid::NOSTR_CID_LIMIT),
+            report: [0u8; HID_REPORT_SIZE],
+            out,
+            now_ms,
+        }
+    }
+}
+
+/// US-1662: the Nostr arm's dispatch seam, beside [`FidoDispatch`]. The
+/// vendor command byte and its CBOR payload go in; the CBOR response (D13's
+/// status vocabulary as fields — see `nostr_wire`) goes into `out`, and the
+/// return value is the response length.
+///
+/// Synchronous, like everything behind the applet: `App::process` is, and the
+/// vendor arm must not hold its request/response scratch across an `.await`
+/// (the hoisted-static discipline of `boot::NOSTR_RESP` applies to any buffer
+/// the impl owns).
+pub trait NostrDispatch {
+    /// One vendor command. `cmd` is in the spec-reserved range `0x40–0x7F`
+    /// (`nostr_wire::is_vendor_command`); an unmapped method is answered
+    /// **in band** with `sw = SW_INS_NOT_SUPPORTED` (the D20
+    /// `error unsupported-method`), never as a CTAPHID framing error.
+    fn process_vendor(
+        &mut self,
+        cmd: u8,
+        payload: &[u8],
+        out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    ) -> usize;
+}
+
+/// The serve loop over both interfaces. Never returns: `hid_task` is a
+/// `#[task]`.
+// The two arms are symmetric by design — four params per interface — and
+// collapsing them into a struct would hide that symmetry from the reader.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_loop_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
+    fido: &mut HidServe<'_>,
+    io_f: &mut S,
+    app: &mut A,
+    slot_f: &mut PendingUp,
+    nostr: &mut NostrServe<'_>,
+    nostr_app: &mut N,
+    io_n: &mut S,
+    slot_n: &mut PendingUp<2048>,
+) -> ! {
+    loop {
+        serve_once_dual(fido, io_f, app, slot_f, nostr, nostr_app, io_n, slot_n).await;
+    }
+}
+
+/// Which interface a read came from — or none.
+enum Picked {
+    Fido(usize),
+    Nostr(usize),
+    /// A bounded read expired with both windows live, or a read delivered a
+    /// zero-length report: nothing to feed this pass.
+    Quiet,
+}
+
+/// One serve-loop iteration over BOTH interfaces. The order per interface is
+/// the same contract [`serve_once`] states; the cross-interface order is:
+///
+/// 1. re-drive the FIDO consent window (US-1509) — the Nostr slot cannot
+///    hold a window until US-1662 adds its vendor commands, so there is
+///    nothing to re-drive on that half yet;
+/// 2. expire stale fragmented transactions on both interfaces
+///    (CTAP-HID §11.2.3);
+/// 3. **read whichever OUT endpoint has a report first** — bounded by one
+///    keepalive period while ANY window is open (either interface's), so one
+///    interface's window cannot starve the other's keepalive cadence, nor
+///    an idle interface's frame starvation. The loser of the race is not
+///    dropped: its report stays in the endpoint buffer (the [`HidIo`]
+///    cancellation contract) and the next pass picks it up;
+/// 4. feed the winner's assembler and dispatch on the winner's path — a
+///    frame that arrived on the Nostr interface NEVER reaches the FIDO
+///    dispatch, and vice versa.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_once_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
+    fido: &mut HidServe<'_>,
+    io_f: &mut S,
+    app: &mut A,
+    slot_f: &mut PendingUp,
+    nostr: &mut NostrServe<'_>,
+    nostr_app: &mut N,
+    io_n: &mut S,
+    slot_n: &mut PendingUp<2048>,
+) {
+    #[cfg(test)]
+    {
+        fido.reads += 1;
+    }
+
+    let HidServe {
+        assembler: asm_f,
+        cid_alloc: cid_f,
+        report: rep_f,
+        ctap_out,
+        now_ms: now_f,
+        ..
+    } = fido;
+    let ctap_out = &mut **ctap_out;
+    let now_f = *now_f;
+    let NostrServe {
+        assembler: asm_n,
+        cid_alloc: cid_n,
+        report: rep_n,
+        out: nostr_out,
+        now_ms: now_n,
+    } = nostr;
+    let nostr_out = &mut **nostr_out;
+    let now_n = *now_n;
+
+    redrive_window(now_f, ctap_out, io_f, app, slot_f).await;
+    // US-1663: the Nostr arm's window is re-driven on the same pass — the
+    // two windows share one clock, which is the §A.8.3 #7 arithmetic this
+    // file publishes in [`SERVE_BOUND_MS`].
+    redrive_vendor_window(now_n, nostr_out, io_n, nostr_app, slot_n).await;
+
+    if let Some((channel, code)) = asm_f.check_timeout() {
+        reply(io_f, &channel, CTAP_HID_ERROR, &[code]).await;
+    }
+    if let Some((channel, code)) = asm_n.check_timeout() {
+        reply(io_n, &channel, CTAP_HID_ERROR, &[code]).await;
+    }
+
+    let bounded = slot_f.is_occupied() || slot_n.is_occupied();
+    let picked = read_either(rep_f, rep_n, io_f, io_n, bounded).await;
+    match picked {
+        Picked::Quiet => {}
+        Picked::Fido(n) => {
+            match asm_f.feed(&rep_f[..n]) {
+                HidFeed::NeedMore => {}
+                HidFeed::Err(channel, code) => {
+                    reply(io_f, &channel, CTAP_HID_ERROR, &[code]).await;
+                }
+                HidFeed::Ready(cmd) => {
+                    let channel = asm_f.channel();
+                    io_f.note_command(
+                        cmd,
+                        asm_f.payload().len() as u16,
+                        u32::from_be_bytes(channel),
+                    );
+                    app.sync_generations();
+                    dispatch(
+                        cid_f,
+                        ctap_out,
+                        now_f,
+                        io_f,
+                        app,
+                        slot_f,
+                        &channel,
+                        cmd,
+                        asm_f.payload(),
+                    )
+                    .await;
+                }
+            }
+        }
+        Picked::Nostr(n) => {
+            match asm_n.feed(&rep_n[..n]) {
+                HidFeed::NeedMore => {}
+                HidFeed::Err(channel, code) => {
+                    reply(io_n, &channel, CTAP_HID_ERROR, &[code]).await;
+                }
+                HidFeed::Ready(cmd) => {
+                    let channel = asm_n.channel();
+                    io_n.note_command(
+                        cmd,
+                        asm_n.payload().len() as u16,
+                        u32::from_be_bytes(channel),
+                    );
+                    nostr_dispatch(
+                        cid_n,
+                        nostr_out,
+                        now_n,
+                        io_n,
+                        slot_n,
+                        nostr_app,
+                        &channel,
+                        cmd,
+                        asm_n.payload(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Read whichever interface has a report first (US-1660).
+///
+/// `embassy_futures::select` races the two reads; the loser is dropped, and
+/// the [`HidIo`] cancellation contract says its packet (if any) stays in the
+/// endpoint buffer for the next pass. While a window is open on EITHER
+/// interface the race is bounded by one keepalive period — the same bound
+/// [`read_one`] gives the single-interface loop, now covering both windows'
+/// cadence from one clock. A read failure on either side is noted on that
+/// side and the pass backs off, exactly as [`serve_once`] does.
+async fn read_either<S: HidIo>(
+    rep_f: &mut [u8; HID_REPORT_SIZE],
+    rep_n: &mut [u8; HID_REPORT_SIZE],
+    io_f: &mut S,
+    io_n: &mut S,
+    bounded: bool,
+) -> Picked {
+    // The race future borrows both transports, so the failure notes below
+    // can only run after it is dropped — the block scopes it out before the
+    // match, and the winner/loser outputs are values that outlive it.
+    let outcome = {
+        let race = core::pin::pin!(embassy_futures::select::select(
+            io_f.read_report(rep_f),
+            io_n.read_report(rep_n),
+        ));
+        if !bounded {
+            race.await
+        } else {
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_millis(CTAP_KEEPALIVE_PERIOD_MS),
+                race,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                // One keepalive period elapsed with both windows live and no
+                // report on either interface: not an error — the next pass
+                // re-drives both windows and races again.
+                Err(_) => return Picked::Quiet,
+            }
+        }
+    };
+    match outcome {
+        embassy_futures::select::Either::First(Ok(n)) if n > 0 => Picked::Fido(n),
+        embassy_futures::select::Either::Second(Ok(n)) if n > 0 => Picked::Nostr(n),
+        embassy_futures::select::Either::First(Err(_)) => {
+            io_f.note(HidNote::ReadFailed);
+            embassy_time::Timer::after_millis(10).await;
+            Picked::Quiet
+        }
+        embassy_futures::select::Either::Second(Err(_)) => {
+            io_n.note(HidNote::ReadFailed);
+            embassy_time::Timer::after_millis(10).await;
+            Picked::Quiet
+        }
+        // A zero-length report on either side — [`serve_once`]'s `n == 0`
+        // early return, per side.
+        _ => Picked::Quiet,
+    }
+}
+
+/// Dispatch one complete CTAP-HID message on the NOSTR interface.
+///
+/// US-1660 ships the generic framing arms only — INIT (the honest reply,
+/// US-1661), PING, WINK, CANCEL (which closes the Nostr slot's window; the
+/// slot cannot hold one until US-1662) — and refuses everything else with
+/// `INVALID_CMD`. The vendor-range commands (`0x40–0x7F`, the NIP-46
+/// semantics of design §A.8.2) and the consent-window arms arrive with
+/// US-1662/US-1663; until then a browser client can handshake and ping and
+/// nothing more, and the refusal is loud rather than silent.
+#[allow(clippy::too_many_arguments)]
+/// US-1663: the Nostr interface's presence-tag domain — `0x6000_0000 | CID`
+/// (§A.8.3 #1, the cross-interface tag-collision fix). The FIDO interface
+/// derives `0x8000_0000 | CID` and the Nostr-CCID path `0x4000_0000 | idx`;
+/// the three are disjoint by construction, and the vendor arm's CID
+/// allocator is range-clamped (`NOSTR_CID_LIMIT`) so the OR-fold stays
+/// injective (§A.8.3a #2).
+pub fn nostr_tag_from_channel(channel: [u8; 4]) -> u32 {
+    0x6000_0000 | u32::from_be_bytes(channel)
+}
+
+// The width mirrors [`dispatch`] argument for argument — the two arms of one
+// serve pass are symmetric on purpose (US-1663): every argument here has its
+// FIDO-side twin, and reshaping one arm alone would hide that symmetry.
+#[allow(clippy::too_many_arguments)]
+async fn nostr_dispatch<S: HidIo, N: NostrDispatch>(
+    cid_alloc: &mut CidAllocator,
+    out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+    now_ms: fn() -> u64,
+    io: &mut S,
+    slot: &mut PendingUp<2048>,
+    nostr_app: &mut N,
+    channel: &[u8; 4],
+    cmd: u8,
+    payload: &[u8],
+) {
+    if cmd == CTAP_HID_INIT {
+        let nonce = if payload.len() >= 8 {
+            &payload[..8]
+        } else {
+            payload
+        };
+        let new_channel = cid_alloc.allocate(nonce);
+        // US-1661: the honest reply — capFlags claim nothing CTAP2, and the
+        // vendor version bytes track the applet, not the YubiKey firmware.
+        let inner = crate::ctap_hid::nostr_init_reply(nonce, &new_channel);
+        reply(io, channel, CTAP_HID_INIT, &inner).await;
+    } else if cmd == CTAP_HID_PING {
+        reply(io, channel, CTAP_HID_PING, payload).await;
+    } else if cmd == CTAP_HID_WINK {
+        reply(io, channel, CTAP_HID_WINK, &[]).await;
+    } else if cmd == CTAP_HID_CANCEL {
+        // The Nostr slot's window close (US-1663 owns the consent semantics;
+        // the arm is here now so a client can always CANCEL and the close
+        // path exists before a window can exist to close).
+        if slot.is_occupied() {
+            // Copied out before `close_window` takes the slot (the recorded
+            // refusal dies with it), and widened for the vendor arm: the
+            // answer there is the **whole stored envelope** — the CBOR
+            // `map {1: sw}` shape, up to 5 bytes — not a status word.
+            let stored = slot.refusal();
+            let mut answer = [0u8; 16];
+            let n = stored.len().min(answer.len());
+            answer[..n].copy_from_slice(&stored[..n]);
+            let ticket = close_window(slot);
+            let len = match ticket.kind {
+                PendingKind::Ctap2 => {
+                    answer[0] = CTAP2_ERR_KEEPALIVE_CANCEL;
+                    1
+                }
+                PendingKind::U2f => {
+                    if n == 0 {
+                        answer[..2].copy_from_slice(&[0x69, 0x85]);
+                        2
+                    } else {
+                        n
+                    }
+                }
+                // US-1663: the vendor vocabulary has no cancel word — the
+                // envelope's `0x6985` IS the terminal sentence ("the touch
+                // you were asked for did not happen"), so the stored
+                // refusal goes out unrewritten, on the parked command's
+                // own byte.
+                PendingKind::Vendor => n,
+            };
+            reply(io, &ticket.channel, frame_cmd(&ticket), &answer[..len]).await;
+        }
+        // No window: silence, as [`dispatch`]'s CANCEL arm does (CTAPHID
+        // spec; a CANCEL is never acknowledged).
+    } else if crate::nostr_wire::is_vendor_command(cmd) {
+        // US-1663: the consent semantics on this arm are the FIDO arm's,
+        // inherited rather than rebuilt — park on the touch refusal, stream
+        // keepalives, answer a second request **refused, never queued**
+        // (US-1510). The refusal-before-app rule carries over too: with the
+        // slot occupied, every vendor command is refused without running
+        // the applet, because running it could only produce another touch
+        // request (the strict gate would refuse it) or, worse, let a
+        // second command reach for the same button the first is waiting on.
+        // The client-side contract is one transaction per interface
+        // (§A.8.3 #9), so this is the conservative side and it is bounded
+        // by the 15 s window.
+        if slot.is_occupied() {
+            let n = crate::nostr_wire::encode_response(
+                crate::nostr_wire::SW_TOUCH_REQUIRED,
+                &[],
+                out,
+            );
+            reply(io, channel, cmd, &out[..n]).await;
+            return;
+        }
+        let tag = nostr_tag_from_channel(*channel);
+        // US-1662: the vendor range carries the Nostr command set. The
+        // dispatch impl is synchronous — its scratch (the request APDU and
+        // the applet's `MAX_RESPONSE` answer) never crosses this `.await` —
+        // and the reply goes out on the method's own channel with the same
+        // command byte, the CBOR response in the payload.
+        // US-1663: same context discipline as the re-drive above — the first
+        // app call happens before any window exists, so the gate refuses
+        // (that refusal is what CREATES the window), and every later call
+        // runs inside the parked window's transaction bound.
+        presence::enter_nostr_hid_grant_context();
+        let n = nostr_app.process_vendor(cmd, payload, out);
+        presence::exit_nostr_hid_grant_context();
+        // A touch refusal parks: the same US-921/US-1509 move the FIDO arm
+        // makes. The window is the strict path's transaction bound — 15 s
+        // (`NOSTR_TOUCH_WINDOW_MS`, §A.8.3a #4), not a join-or-open window;
+        // the press is consumed on the re-drive, one command per window.
+        let owed = n >= 2
+            && u16::from_be_bytes([out[n - 2], out[n - 1]]) == crate::nostr_wire::SW_TOUCH_REQUIRED;
+        if owed {
+            let ticket = WindowTicket {
+                kind: PendingKind::Vendor,
+                channel: *channel,
+                tag,
+                ctap_cmd: cmd,
+                deadline_ms: TouchWindow::open_for(tag, now_ms(), NOSTR_TOUCH_WINDOW_MS)
+                    .deadline_ms,
+            };
+            match slot.park(ticket, payload) {
+                Ok(()) => {
+                    // The envelope is the recorded refusal: the CANCEL answer
+                    // and the expiry answer both come from it, and either can
+                    // arrive before the first re-drive (the FIDO arm records
+                    // its first refusal at the park for the same reason).
+                    slot.note_refusal(&out[..n]);
+                    if presence::begin_window(tag, NOSTR_TOUCH_WINDOW_MS) {
+                        presence::touch_prompt(true);
+                        // The window's first keepalive, `0x01` PROCESSING —
+                        // the same US-1506 discipline as the FIDO arm: sent
+                        // once, the moment the window really is open.
+                        slot.note_keepalive(now_ms());
+                        reply(
+                            io,
+                            channel,
+                            CTAP_HID_KEEPALIVE,
+                            &[CTAPHID_KEEPALIVE_PROCESSING],
+                        )
+                        .await;
+                        return;
+                    }
+                    // The platform presence slot is busy — a CCID window or
+                    // a FIDO ceremony owns it (US-1663's contention bound).
+                    // Un-park and fall through to the plain touch refusal:
+                    // no `end_window` and no prompt clear, because this
+                    // window never began and clearing the prompt would put
+                    // out a light the *other* window lit.
+                    slot.take();
+                }
+                Err(_) => {
+                    // `PayloadTooLarge`: a request the slot cannot hold
+                    // keeps its synchronous refusal and never converts
+                    // into a window (and so never into a 15 s wait). No
+                    // re-answer needed — the envelope in `out` is exactly
+                    // that refusal.
+                }
+            }
+        }
+        reply(io, channel, cmd, &out[..n]).await;
+    } else {
+        reply(io, channel, CTAP_HID_ERROR, &[HID_ERR_INVALID_CMD]).await;
+    }
+}
+
 /// US-1511: the consent-window story as an end-to-end **black-box** test over
 /// the host seam — 64-byte reports in on one end, 64-byte reports out on the
 /// other, the shipped serve loop in a thread of its own, a real idle OUT
@@ -1233,6 +1859,7 @@ pub(crate) mod tests {
 
     use crate::ctap_hid::HID_CONT_PAYLOAD;
     use crate::pending_up::PENDING_UP_PAYLOAD_MAX;
+    use fapico2_nostr::NostrApp;
 
     /// Wall-clock ceiling for one drive of the serve loop in the harness.
     ///
@@ -1828,7 +2455,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         block_on(
             "a windowed command mid-window is refused without reaching the app",
             drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(900)),
@@ -1870,7 +2497,7 @@ pub(crate) mod tests {
         let mut srv2 = HidServe::new(host_now_ms, &mut ctap_out2);
         let mut io2 = Script::new(bus2.clone());
         let mut app2 = FakeApp::new(grant2.clone());
-        let mut slot2 = PendingUp::new();
+        let mut slot2 = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         block_on(
             "a non-windowed command mid-window runs to completion in the same pass",
             drive(&mut srv2, &mut io2, &mut app2, &mut slot2, StdDuration::from_millis(900)),
@@ -1975,7 +2602,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1502: PING on a second channel during a consent window",
@@ -2038,7 +2665,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1508: getInfo on a second channel during a consent window",
@@ -2087,7 +2714,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1509: serve loop keeps reading during a window",
@@ -2193,7 +2820,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
         let sent: Arc<Mutex<Vec<(StdInstant, Sent)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let bound = StdDuration::from_millis(SERVE_BOUND_MS);
@@ -2275,7 +2902,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: second UP request while a window is open",
@@ -2364,7 +2991,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1604: a reset with no press",
@@ -2515,7 +3142,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: oversize request",
@@ -2631,7 +3258,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         let (mut worst, mut passes) = (0usize, 0usize);
         block_on("US-1506: per-pass reply count", async {
@@ -2748,7 +3375,7 @@ pub(crate) mod tests {
             let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
             let mut io = Script::new(bus.clone());
             let mut app = FakeApp::new(grant.clone());
-            let mut slot = PendingUp::new();
+            let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
             let t0 = StdInstant::now();
             if let Some(at) = grant_at {
@@ -2939,7 +3566,7 @@ pub(crate) mod tests {
             let mut srv = HidServe::new(fake_now, &mut ctap_out);
             let mut io = Script::new(bus.clone());
             let mut app = FakeApp::new(grant.clone());
-            let mut slot = PendingUp::new();
+            let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
             // A couple of real-time passes so the window is live and has sent
             // at least its 0x01. The clock is then moved past the deadline;
@@ -3009,7 +3636,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel during a consent window",
@@ -3084,7 +3711,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel with no window open",
@@ -3127,7 +3754,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1505: cancel during a U2F consent window",
@@ -3189,7 +3816,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "U2F: register parks and the loop keeps reading",
@@ -3252,7 +3879,7 @@ pub(crate) mod tests {
         let mut srv = HidServe::new(host_now_ms, &mut ctap_out);
         let mut io = Script::new(bus.clone());
         let mut app = FakeApp::new(grant.clone());
-        let mut slot = PendingUp::new();
+        let mut slot = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
 
         block_on(
             "US-1510: second U2F request while a window is open",
@@ -3280,5 +3907,1187 @@ pub(crate) mod tests {
             "US-1510: release the U2F window",
             drive(&mut srv, &mut io, &mut app, &mut slot, StdDuration::from_millis(400)),
         );
+    }
+
+    // ── US-1660: one task, two interfaces ──────────────────────────────────
+
+    /// One pass of the dual-interface loop, abandoned like [`drive_one_pass`]
+    /// when it parks (no window can be open in these tests, so the abandon
+    /// only ever fires on the final idle pass).
+    async fn dual_pass<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
+        fido: &mut HidServe<'_>,
+        io_f: &mut S,
+        app: &mut A,
+        slot_f: &mut PendingUp,
+        nostr: &mut NostrServe<'_>,
+        nostr_app: &mut N,
+        io_n: &mut S,
+        slot_n: &mut PendingUp<2048>,
+    ) {
+        let _ = embassy_time::with_timeout(
+            DRIVE_IDLE_PARK,
+            serve_once_dual(fido, io_f, app, slot_f, nostr, nostr_app, io_n, slot_n),
+        )
+        .await
+        .is_err();
+    }
+
+    /// US-1660: a frame that arrives on one interface is answered ON THAT
+    /// interface, by that interface's dispatcher — and the two interfaces'
+    /// answers are visibly different where they should be.
+    ///
+    /// The distinguishing observation: an INIT on the FIDO interface gets
+    /// [`init_reply`]'s YubiKey-5.4/CTAP2-capable bytes, an INIT on the Nostr
+    /// interface gets [`nostr_init_reply`]'s vendor bytes (US-1661) — same
+    /// command, same report shape, different interface, and each reply must
+    /// land on its OWN interface. A cross-wiring (the Nostr report read by
+    /// the FIDO half, or the reply written to the other IN endpoint) would
+    /// put a CTAP2-capable reply on the browser-facing interface or a vendor
+    /// reply on ykman's — exactly the claim-vs-honour failures §A.8.3 #8
+    /// exists to prevent.
+    #[test]
+    fn us1660_a_frame_is_answered_on_its_own_interface() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+        let mut never = NeverVendor;
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let nonce = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        // Pass 1: an INIT on the FIDO interface only.
+        bus_f.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
+        block_on(
+            "US-1660: the FIDO INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
+        );
+        // Pass 2: an INIT on the Nostr interface only.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &nonce));
+        block_on(
+            "US-1660: the Nostr INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
+        );
+
+        // The FIDO interface answered with the FIDO INIT: capFlags 0x05 and
+        // the YubiKey 5.4 version pair (US-1507), and a FIDO-domain channel.
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 1, "exactly the INIT reply, nothing else");
+        assert_eq!(fido_sent[0].cmd, CTAP_HID_INIT);
+        // reply layout: nonce(8) ‖ cid(4) ‖ iface-version(0x02) ‖ major ‖
+        // minor ‖ build ‖ capFlags — so bytes 13..16 are the version triple
+        // and 16 is capFlags (US-1507).
+        assert_eq!(&fido_sent[0].payload[12..17], &[0x02, 5, 4, 0, 0x05], "FIDO interface claims CTAP2 + YubiKey 5.4");
+        assert_eq!(fido_sent[0].channel, bc, "the INIT reply goes out on the broadcast channel per spec");
+
+        // The Nostr interface answered with the honest vendor INIT: capFlags
+        // 0x00 under both conventions and the applet version (US-1661), on
+        // ITS OWN bus — no FIDO reply crossed over, no Nostr reply crossed
+        // onto the FIDO bus.
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 1, "exactly the INIT reply, nothing else");
+        assert_eq!(nostr_sent[0].cmd, CTAP_HID_INIT);
+        // Same layout, nostr_init_reply's values: version bytes 0.1.0 and
+        // capFlags 0x00 under both conventions (US-1661).
+        assert_eq!(&nostr_sent[0].payload[12..17], &[0x02, 0x00, 0x01, 0x00, 0x00], "Nostr interface claims vendor 0.1.0 and no CTAP2");
+
+        // And the app never ran: INIT is transport-only on both interfaces.
+        assert!(app.up_calls.is_empty());
+    }
+
+    /// US-1660: a command the Nostr interface does not serve is refused with
+    /// a loud CTAPHID ERROR frame ON the Nostr interface — it never reaches
+    /// the FIDO dispatch, and it never crosses interfaces.
+    ///
+    /// US-1662 replaces this refusal with the vendor-range arms; until then
+    /// this is the pin that keeps the routing honest while the command set
+    /// grows.
+    #[test]
+    fn us1660_a_nostr_command_is_refused_loudly_and_never_reaches_fido() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+        let mut never = NeverVendor;
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        // The INIT handshake first (allocates the Nostr channel).
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1660: INIT",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
+        );
+
+        // A CTAP2 CBOR command on the NOSTR interface: refused INVALID_CMD.
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CBOR, &[0x01]));
+        block_on(
+            "US-1660: the refused command pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut never, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        assert_eq!(nostr_sent[1].cmd, CTAP_HID_ERROR);
+        assert_eq!(nostr_sent[1].payload, vec![HID_ERR_INVALID_CMD]);
+        assert_eq!(nostr_sent[1].channel, ch, "the error is answered on the command's channel");
+
+        // The FIDO interface saw nothing, and the FIDO app never ran.
+        assert!(bus_f.lock().unwrap().sent.is_empty());
+        assert!(app.up_calls.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // US-1662 — the vendor command set over the Nostr interface
+    //
+    // Every round-trip below drives the REAL applet over a fresh region: the
+    // path under test is vendor frame → CBOR request → applet APDU →
+    // (data ‖ SW) → CBOR response, with the `sw` field asserted as D13's
+    // vocabulary crossing (§A.8.3b #8) — the same codes the CCID path answers.
+    // The harness discipline is the US-1660 one, unchanged: one report per
+    // pass, so every frame below gets its own `dual_pass`.
+    // -----------------------------------------------------------------------
+
+    /// A dispatch that must never run: US-1660's transport-routing pins are
+    /// transport-only, and a vendor command reaching the applet there would
+    /// be a routing defect, not a stub gap.
+    struct NeverVendor;
+    impl NostrDispatch for NeverVendor {
+        fn process_vendor(
+            &mut self,
+            _cmd: u8,
+            _payload: &[u8],
+            _out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+        ) -> usize {
+            panic!("a vendor command reached the dispatch in a transport-only test");
+        }
+    }
+
+    /// The vendor arm's fixture: the real applet booted over a fresh region —
+    /// the same shape `apps/nostr`'s suites and `nostr_shared`'s US-1658 test
+    /// boot — with a constant RNG (a uniform `0x01` fill is a valid secret
+    /// scalar, so `GENERATE_KEY` succeeds) and an injectable presence grant.
+    /// It runs the same `process_vendor_through` body the device impl runs;
+    /// the buffers are host stack, which is exactly the point of the seam.
+    struct VendorNostr {
+        app: NostrApp,
+    }
+
+    fn rng_constant(out: &mut [u8]) {
+        out.fill(0x01);
+    }
+
+    /// The host-default presence grant: every touch auto-acks, so the
+    /// success-path tests never depend on a button.
+    fn auto_grant(_tag: u32) -> bool {
+        true
+    }
+
+    /// The never-granting presence fixture: the touch-refusal vocabulary
+    /// crossing is the row of §2.2.0 a browser client meets first.
+    fn no_grant(_tag: u32) -> bool {
+        false
+    }
+
+    impl VendorNostr {
+        fn booted(tag: &str, grant: fn(u32) -> bool) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fapico2-us1662-{tag}-{}.bin",
+                std::process::id()
+            ));
+            std::fs::remove_file(&path).ok();
+            let region = fapico2_platform::keyregion::host::FileKeyRegion::create(
+                &path,
+                fapico2_platform::keyregion::TOTAL_SLOTS,
+            )
+            .expect("a fresh region file");
+            let otp_row: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x11));
+            let chipid: [u8; 8] = 0x0000_BADC_0FFE_EE01_0203_u64.to_be_bytes();
+            let key = fapico2_platform::keyregion::crypto::derive_payload_key(
+                &otp_row,
+                &chipid,
+                &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
+            )
+            .expect("a non-zero OTP row");
+            let app = NostrApp::boot(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                Box::new(region),
+                key,
+            ))
+            .with_rng_provider(rng_constant)
+            .with_presence_grant(grant);
+            Self { app }
+        }
+    }
+
+    impl NostrDispatch for VendorNostr {
+        fn process_vendor(
+            &mut self,
+            cmd: u8,
+            payload: &[u8],
+            out: &mut HeaplessVec<u8, NOSTR_RESP_MAX>,
+        ) -> usize {
+            use fapico2_platform::dispatch::App as _;
+            let mut req: HeaplessVec<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }> =
+                HeaplessVec::new();
+            let mut resp: HeaplessVec<u8, MAX_RESPONSE> = HeaplessVec::new();
+            crate::nostr_wire::process_vendor_through(
+                cmd,
+                payload,
+                &mut req,
+                &mut resp,
+                |apdu, resp| self.app.process(apdu, resp),
+                out,
+            )
+        }
+    }
+
+    /// US-1662: `GET_PUBKEY` and `GENERATE_KEY` round-trip over the vendor
+    /// interface with the vocabulary fields intact — `6A82` ("that identity
+    /// is not on the device") for an empty slot, then `9000` with the 32-byte
+    /// `npub` once it exists.
+    #[test]
+    fn us1662_pubkey_round_trip_with_vocabulary_fields() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("pubkey", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_GET_PUBKEY,
+        };
+
+        // Pass 1: INIT handshake on the Nostr interface.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // Pass 2: GET_PUBKEY on the empty set.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GET_PUBKEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1662: the GET_PUBKEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2, "the INIT reply, then the command reply");
+        assert_eq!(nostr_sent[1].cmd, NOSTR_CMD_GET_PUBKEY, "the reply rides the method's own command byte");
+        assert_eq!(nostr_sent[1].channel, ch, "answered on the command's channel");
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6A82, "an empty slot is the no-such-identity word");
+        assert!(data.is_empty());
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "nothing crossed to the FIDO bus");
+        assert!(app.up_calls.is_empty(), "the FIDO app never ran");
+
+        // Pass 3: GENERATE_KEY (touch auto-acked on the host, RNG pinned)
+        // → 9000, npub(32) — and the npub survives the transport.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        let (sw, npub) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(npub.len(), 32, "GENERATE_KEY returns the 32-byte npub");
+    }
+
+    /// US-1662: `sign_event`'s contract is the 32-byte sighash split (D20) —
+    /// the sighash rides the request, the BIP-340 signature comes back with
+    /// the npub prepended, exactly the §2.2 `SIGN` shape.
+    #[test]
+    fn us1662_sign_round_trips_the_32_byte_sighash() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("sign", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_SIGN,
+        };
+
+        let sighash: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x40));
+
+        // Pass 1: INIT.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        // Pass 2: GENERATE_KEY so the identity exists.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        // Pass 3: SIGN the sighash.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_SIGN,
+            &encode_request(0, &sighash).unwrap(),
+        ));
+        block_on(
+            "US-1662: the SIGN pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        let (sw, npub) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(npub.len(), 32);
+
+        let (sw, signed) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000, "the touch is host-acked and the sighash signs");
+        assert_eq!(signed.len(), 96, "npub(32) ‖ sig(64) — the §2.2 SIGN shape");
+        assert_eq!(&signed[..32], npub, "the signing identity is echoed");
+        // The signature is 64 bytes of Schnorr over the sighash; its exact
+        // bytes are the apps/nostr vector suite's business — here the shape
+        // and the identity binding are what the transport pins.
+    }
+
+    /// US-1662: `nip44_encrypt`/`decrypt` round-trip — the arguments exceed
+    /// one APDU length byte (the 1,792-byte plaintext plus the 32-byte peer
+    /// key), so the extended-Lc APDU build is what gets exercised, and the
+    /// ciphertext comes back through the 2 KiB wire buffer whole.
+    #[test]
+    fn us1662_nip44_round_trips_the_extended_length_argument() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("nip44", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{
+            decode_response, encode_request, NOSTR_CMD_GENERATE_KEY, NOSTR_CMD_NIP44_DECRYPT,
+            NOSTR_CMD_NIP44_ENCRYPT,
+        };
+
+        // Pass 1: INIT; Pass 2: GENERATE_KEY — the identity's own npub is
+        // then the peer key: a real x-only point.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1662: the GENERATE_KEY pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, npub) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+
+        // Pass 3: ENCRYPT — peer(32) ‖ plaintext(1792), 1,824 bytes of
+        // argument, far beyond one Lc byte.
+        let plaintext: [u8; 1792] = core::array::from_fn(|i| (i as u16) as u8);
+        let mut arg = HeaplessVec::<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }>::new();
+        arg.extend_from_slice(npub).unwrap();
+        arg.extend_from_slice(&plaintext).unwrap();
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_NIP44_ENCRYPT,
+            &encode_request(0, &arg).unwrap(),
+        ));
+        // The 1.9 KB command rides ~30 HID reports and a pass reads one, so
+        // drive the loop until the reply lands — the assembler reassembles
+        // across passes, exactly as it would on the wire.
+        block_on("US-1662: the NIP-44 ENCRYPT passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 3 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 200, "the ENCRYPT reply never landed");
+            }
+        });
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, ct) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x9000, "the 1.8 KB ciphertext crosses the 2 KiB wire buffer whole");
+        assert!(ct.len() > 1700, "the NIP-44 payload shape (version ‖ nonce ‖ ct ‖ mac)");
+        assert!(ct.len() < 2048 - 16, "it fits the NOSTR_RESP_MAX budget with framing");
+
+        // Pass 4: DECRYPT — sender(32) ‖ payload, again beyond one Lc byte —
+        // and the plaintext comes back exactly as it went in.
+        let mut arg = HeaplessVec::<u8, { crate::nostr_wire::NOSTR_APDU_REQ_MAX }>::new();
+        arg.extend_from_slice(npub).unwrap();
+        arg.extend_from_slice(ct).unwrap();
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_NIP44_DECRYPT,
+            &encode_request(0, &arg).unwrap(),
+        ));
+        block_on("US-1662: the NIP-44 DECRYPT passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 4 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 200, "the DECRYPT reply never landed");
+            }
+        });
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        let (sw, back) = decode_response(&nostr_sent[3].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(back, &plaintext[..], "the decrypted plaintext matches byte for byte");
+    }
+
+    /// US-1679: the serve-loop end of the capacity story — a **full
+    /// 7,609-byte vendor frame** (`CTAPHID_MAX_MSG`, the largest the CTAPHID
+    /// framing can carry) whose CBOR argument sits far above the §2.2.1 wire
+    /// cap answers the `SW_WRONG_DATA` (0x6A80) envelope on the method's own
+    /// command byte: a hostile frame dies as a status word, not a wedge and
+    /// not a panic. Red against the pre-US-1678 tip, where the same frame
+    /// rebooted the device in `build_apdu`'s `unwrap`
+    /// (`an_argument_above_the_wire_cap_is_refused_in_band` is its
+    /// unit-level twin).
+    #[test]
+    fn an_oversized_vendor_frame_answers_in_band() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("oversize", auto_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::ctap_hid::CTAPHID_MAX_MSG;
+        use crate::nostr_wire::{decode_response, NOSTR_CMD_SIGN, SW_WRONG_DATA};
+
+        // Pass 1: INIT handshake on the Nostr interface.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1679: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // Pass 2: one full 7,609-byte vendor frame — `array(2) [1, bytes(7,604)]`,
+        // hand-built because `encode_request`'s buffer is itself a derived
+        // capacity and cannot hold the hostile shape.
+        let mut msg = vec![0x82, 0x01, 0x59];
+        msg.extend_from_slice(&((CTAPHID_MAX_MSG - 5) as u16).to_be_bytes());
+        msg.extend_from_slice(&[0xC3; CTAPHID_MAX_MSG - 5]);
+        assert_eq!(msg.len(), CTAPHID_MAX_MSG, "the frame is the wire maximum");
+        bus_n.lock().unwrap().inbound.extend(frame(ch, NOSTR_CMD_SIGN, &msg));
+        block_on("US-1679: the oversized frame passes", async {
+            let mut passes = 0;
+            while bus_n.lock().unwrap().sent.len() < 2 {
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n).await;
+                passes += 1;
+                assert!(passes < 300, "the oversized frame's reply never landed");
+            }
+        });
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2, "the INIT reply, then the in-band refusal");
+        assert_eq!(nostr_sent[1].cmd, NOSTR_CMD_SIGN, "answered on the method's own command byte");
+        assert_eq!(nostr_sent[1].channel, ch);
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, SW_WRONG_DATA, "the in-band 6A80 — the defined refusal");
+        assert!(data.is_empty());
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "nothing crossed to the FIDO bus");
+        assert!(app.up_calls.is_empty(), "the FIDO app never ran");
+    }
+
+    /// US-1662: an unsupported method is answered **in band** on its own
+    /// channel — the D20 `error unsupported-method` semantics as the
+    /// vocabulary's `0x6D00` — not as a CTAPHID framing error, and never
+    /// reaching the FIDO app.
+    #[test]
+    fn us1662_unsupported_method_answers_in_band() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("unsupported", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, encode_request};
+
+        // Pass 1: INIT; Pass 2: a command in the reserved vendor range that
+        // names no method this device serves (a client expecting NIP-04
+        // shared-secret semantics would land here).
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x50, &encode_request(0, &[]).unwrap()));
+        block_on(
+            "US-1662: the unsupported-method pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        assert_eq!(nostr_sent[1].cmd, 0x50, "answered on the method's own byte");
+        assert_ne!(nostr_sent[1].cmd, CTAP_HID_ERROR, "the framing is fine — the method is what is refused");
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6D00, "SW_INS_NOT_SUPPORTED — the unsupported-method word");
+        assert!(data.is_empty());
+        assert!(app.up_calls.is_empty());
+    }
+
+    /// US-1662: a malformed request envelope is `6A80` in band — a client
+    /// that sent garbage still gets a readable answer, not silence and not a
+    /// framing fault.
+    #[test]
+    fn us1662_malformed_request_is_a_vocabulary_field() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("malformed", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, NOSTR_CMD_GET_PUBKEY};
+
+        // Pass 1: INIT; Pass 2: a one-byte, non-CBOR payload.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(ch, NOSTR_CMD_GET_PUBKEY, &[0xFF]));
+        block_on(
+            "US-1662: the malformed-request pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6A80);
+        assert!(data.is_empty());
+    }
+
+    /// US-1662: the touch refusal crosses the transport as the vocabulary —
+    /// `6985`, "press the button" — the row of §2.2.0 a browser client meets
+    /// first (US-1663 wires the window and keepalives on top of it).
+    #[test]
+    fn us1662_touch_refusal_crosses_the_vocabulary() {
+        let _guard = test_guard();
+        fn now() -> u64 {
+            0
+        }
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("touch-refused", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(now, &mut resp_f);
+        let mut srv_n = NostrServe::new(now, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let bc = [0xFF, 0xFF, 0xFF, 0xFF];
+        let ch = [0x00, 0x00, 0x00, 0x02];
+
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Pass 1: INIT; Pass 2: GENERATE_KEY with the grant refusing.
+        bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
+        block_on(
+            "US-1662: the INIT pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1662: the touch-refusal pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 2);
+        // US-1663: a touch refusal no longer answers synchronously — the
+        // command is parked and the window announces itself with the `0x01`
+        // PROCESSING keepalive. The word still crossed the transport (the
+        // envelope holds it), but it reaches the host on the close path, so
+        // that is what this test now drives: CANCEL, and the recorded
+        // refusal comes back unrewritten on the parked command's own byte.
+        assert_eq!(nostr_sent[1].cmd, CTAP_HID_KEEPALIVE);
+        assert_eq!(nostr_sent[1].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1662: the CANCEL close",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 3);
+        assert_eq!(nostr_sent[2].cmd, NOSTR_CMD_GENERATE_KEY, "the refusal answers on the parked command's own byte");
+        let (sw, data) = decode_response(&nostr_sent[2].payload).unwrap();
+        assert_eq!(sw, 0x6985, "the touch-required word crossed the transport");
+        assert!(data.is_empty());
+    }
+
+    // ── US-1663: the consent machinery, inherited ────────────────────────────
+
+    /// A controllable clock for the US-1663 tests. Keepalive rate limiting and
+    /// window expiry are functions of the serve loop's `now_ms`, and these
+    /// tests move it in ≥250 ms steps between passes — the device clock never
+    /// stops, and neither may a test's. Every US-1663 test takes the serve
+    /// guard first, so this static is contended the same way the presence
+    /// slot is: one test at a time.
+    static VNOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn vnow() -> u64 {
+        VNOW.load(Ordering::SeqCst)
+    }
+
+    fn vset(ms: u64) {
+        VNOW.store(ms, Ordering::SeqCst);
+    }
+
+    /// The expiry fixture's gate: counts how often the applet asked for a
+    /// touch, and never grants. The count is how the test sees "the expiry
+    /// path did not re-ask for a touch".
+    static EXPIRY_GRANT_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn expiry_no_grant(_tag: u32) -> bool {
+        EXPIRY_GRANT_CALLS.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    /// The parked command's own channel, without reaching into the slot type.
+    fn parked_channel<const N: usize>(slot: &PendingUp<N>) -> [u8; 4] {
+        slot.parked().expect("the window must still be parked").ticket.channel
+    }
+
+    /// US-1663, the whole consent story on the vendor arm: a touch refusal
+    /// **parks** (the FIDO arm's US-921/US-1509 move), the window announces
+    /// itself with `0x01` PROCESSING, refused re-drives stream rate-limited
+    /// `0x02` UP NEEDED, and a press inside the window is consumed by the
+    /// parked command's own re-drive — answered on the parked command's byte,
+    /// window closed. The applet's gate is `presence::nostr_grant` itself,
+    /// the same fn `main.rs` wires: the press is consumed through the
+    /// tag-bound, join-only window path, not a fixture shortcut.
+    #[test]
+    fn us1663_touch_refusal_parks_streams_and_the_grant_lands() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-park", presence::nostr_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // The touch refusal parks, and the window announces itself.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].cmd, CTAP_HID_KEEPALIVE);
+        assert_eq!(sent[0].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch);
+
+        // Two refused re-drives: `0x02` UP NEEDED, rate-limited to the
+        // keepalive period — at +300 ms one arrives, and the *next* one only
+        // at +600 ms, so the cadence is asserted, not assumed.
+        for (ms, prior_len) in [(300u64, 1usize), (600, 2)] {
+            vset(ms);
+            block_on(
+                "US-1663: a refused re-drive pass",
+                dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+            );
+            let sent = bus_n.lock().unwrap().sent.clone();
+            assert_eq!(sent.len(), prior_len + 1);
+            assert_eq!(
+                sent.last().unwrap().cmd, CTAP_HID_KEEPALIVE,
+                "a refused re-drive streams, it does not answer"
+            );
+            assert_eq!(sent.last().unwrap().payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+        }
+
+        // A press inside the window is consumed by the parked command's own
+        // re-drive, and the answer goes out on the parked command's byte.
+        presence::emul_inject_press();
+        vset(900);
+        block_on(
+            "US-1663: the granted re-drive pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[3].cmd, NOSTR_CMD_GENERATE_KEY, "the answer is on the parked command's own byte");
+        let (sw, data) = decode_response(&sent[3].payload).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(data.len(), 32, "GENERATE_KEY answered with the identity");
+        assert!(!slot_n.is_occupied(), "the window closed with the answer");
+        assert!(bus_f.lock().unwrap().sent.is_empty(), "the Nostr window never touched the FIDO interface");
+    }
+
+    /// US-1663 + US-1510: a second vendor request while a window is parked is
+    /// **refused, never queued** — the same rule the FIDO slot holds, and
+    /// refused *before the app runs* (running it could only reach for the
+    /// same button). The parked command keeps the slot: the refusal does not
+    /// replace it, and the re-drive keeps streaming for the first requester.
+    #[test]
+    fn us1663_second_vendor_request_while_parked_is_refused_not_queued() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-busy", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch1 = [0x00, 0x00, 0x00, 0x02];
+        let ch2 = [0x00, 0x00, 0x00, 0x03];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Park the first requester.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch1,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+
+        // A second requester, on its own channel, in the same window: the
+        // refusal is synchronous and immediate — and this pass also carries
+        // the parked command's own rate-limited `0x02`, so the two sentences
+        // go out together, each on its own channel.
+        vset(300);
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch2,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the busy pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 3, "park's 0x01, this pass's 0x02, and the refusal");
+        assert_eq!(sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED], "the parked command still owns the stream");
+        assert_eq!(sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+        assert_eq!(sent[2].cmd, NOSTR_CMD_GENERATE_KEY, "the refusal is on the second requester's own byte");
+        let (sw, data) = decode_response(&sent[2].payload).unwrap();
+        assert_eq!(sw, 0x6985, "the busy refusal is the touch-required word");
+        assert!(data.is_empty());
+
+        // Not queued: the slot still holds the FIRST requester.
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch1);
+
+        // Cleanup through the shipped close path — which also pins that the
+        // parked command (not the refusal) is what the close answers.
+        bus_n.lock().unwrap().inbound.extend(frame(ch1, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        let last = sent.last().unwrap();
+        assert_eq!(last.cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, _) = decode_response(&last.payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(!slot_n.is_occupied());
+    }
+
+    /// US-1663's contention bound, direction one: the Nostr window holds the
+    /// platform's single presence slot, so a FIDO `makeCredential` arriving
+    /// mid-window cannot open its own. The command falls through to its plain
+    /// `UpRequired` answer — the same state the pre-fix code reached and kept —
+    /// and the Nostr window is untouched: it keeps the slot and the parked
+    /// command keeps its ticket.
+    #[test]
+    fn us1663_nostr_window_open_refuses_a_fido_ceremony() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-nostr-first", no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        let ca = [0x00, 0x00, 0x00, 0x09];
+        use crate::nostr_wire::{encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Park the Nostr command: its window owns the presence slot.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the nostr park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_n.is_occupied());
+
+        // A FIDO makeCredential while that window is open: the app answers
+        // UpRequired, the park is attempted, and `begin_window` fails — so
+        // the FIDO arm un-parks and falls through to the plain `[0x3B]`
+        // answer. No FIDO keepalive: no FIDO window exists to announce.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CBOR, &[0x01, 0x01]));
+        block_on(
+            "US-1663: the contending makeCredential pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 1, "exactly the fall-through answer, no keepalive");
+        assert_eq!(fido_sent[0].cmd, CTAP_HID_CBOR);
+        assert_eq!(fido_sent[0].payload, vec![0x3B]);
+        assert!(!slot_f.is_occupied(), "the FIDO window never opened");
+
+        // The Nostr window is untouched by the attempt.
+        assert!(slot_n.is_occupied());
+        assert_eq!(parked_channel(&slot_n), ch);
+
+        // Cleanup: the parked Nostr window closes through the shipped path.
+        bus_n.lock().unwrap().inbound.extend(frame(ch, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(!slot_n.is_occupied());
+    }
+
+    /// US-1663's contention bound, direction two: a FIDO window holds the
+    /// slot, so a vendor command cannot park. It still runs — the applet's
+    /// gate refuses under the FIDO window's tag, join-only — and the touch
+    /// refusal that comes back cannot convert into a window: the arm un-parks
+    /// and answers the envelope synchronously. The FIDO window is untouched.
+    #[test]
+    fn us1663_fido_window_open_refuses_a_vendor_command() {
+        let _g = serve_test_guard();
+        vset(0);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-fido-first", presence::nostr_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        let ca = [0x00, 0x00, 0x00, 0x09];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        // Open the FIDO window: makeCredential parks and announces.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CBOR, &[0x01, 0x01]));
+        block_on(
+            "US-1663: the fido park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_f.is_occupied());
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent[0].payload, vec![CTAPHID_KEEPALIVE_PROCESSING]);
+
+        // A vendor command while that window is open: the applet's gate is
+        // tag-bound (`nostr_grant`), refuses under the FIDO tag, and the
+        // touch refusal that results cannot park — `begin_window` fails, the
+        // slot is un-parked, and the envelope answers synchronously.
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the contending vendor pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let nostr_sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(nostr_sent.len(), 1, "the refusal, synchronously — no keepalive of its own");
+        assert_eq!(nostr_sent[0].cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, data) = decode_response(&nostr_sent[0].payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(data.is_empty());
+        assert!(!slot_n.is_occupied(), "the vendor window never opened");
+
+        // The FIDO window is untouched and still streaming.
+        assert!(slot_f.is_occupied());
+        vset(300);
+        block_on(
+            "US-1663: the fido redrive pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let fido_sent = bus_f.lock().unwrap().sent.clone();
+        assert_eq!(fido_sent.len(), 2);
+        assert_eq!(fido_sent[1].payload, vec![CTAPHID_KEEPALIVE_UPNEEDED]);
+
+        // Cleanup: the FIDO window closes through the shipped path.
+        bus_f.lock().unwrap().inbound.extend(frame(ca, CTAP_HID_CANCEL, &[]));
+        block_on(
+            "US-1663: the cleanup cancel",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(!slot_f.is_occupied());
+    }
+
+    /// US-1663's expiry sentence: a window that runs out answers with the
+    /// **recorded refusal** — exactly the bytes the command last produced —
+    /// and does **not** re-ask the app for a touch. Re-driving at expiry
+    /// would be a fourth grant request for a command the client may have
+    /// already given up on; the envelope is the terminal sentence, and
+    /// nothing grants after it.
+    #[test]
+    fn us1663_expiry_answers_the_recorded_refusal_without_a_late_grant() {
+        let _g = serve_test_guard();
+        vset(0);
+        EXPIRY_GRANT_CALLS.store(0, Ordering::SeqCst);
+
+        let bus_f = Arc::new(Mutex::new(Bus::default()));
+        let bus_n = Arc::new(Mutex::new(Bus::default()));
+        let mut io_f = Script::new(bus_f.clone());
+        let mut io_n = Script::new(bus_n.clone());
+        let grant = Arc::new(AtomicBool::new(false));
+        let mut app = FakeApp::new(grant);
+        let mut vend = VendorNostr::booted("us1663-expiry", expiry_no_grant);
+
+        let mut resp_f = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
+        let mut resp_n = HeaplessVec::<u8, NOSTR_RESP_MAX>::new();
+        let mut srv_f = HidServe::new(vnow, &mut resp_f);
+        let mut srv_n = NostrServe::new(vnow, &mut resp_n);
+        let mut slot_f = PendingUp::<PENDING_UP_PAYLOAD_MAX>::new();
+        let mut slot_n = PendingUp::<2048>::new();
+
+        let ch = [0x00, 0x00, 0x00, 0x02];
+        use crate::nostr_wire::{decode_response, encode_request, NOSTR_CMD_GENERATE_KEY};
+
+        bus_n.lock().unwrap().inbound.extend(frame(
+            ch,
+            NOSTR_CMD_GENERATE_KEY,
+            &encode_request(0, &[]).unwrap(),
+        ));
+        block_on(
+            "US-1663: the park pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert!(slot_n.is_occupied());
+        assert_eq!(
+            EXPIRY_GRANT_CALLS.load(Ordering::SeqCst), 1,
+            "the park asked once"
+        );
+
+        // Past the 15 s deadline: the recorded refusal is the answer, on the
+        // parked command's own byte, and the app is NOT asked again.
+        vset(15_001);
+        block_on(
+            "US-1663: the expiry pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        let sent = bus_n.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 2, "the park's 0x01 and the expiry answer, nothing between");
+        assert_eq!(sent[1].cmd, NOSTR_CMD_GENERATE_KEY);
+        let (sw, data) = decode_response(&sent[1].payload).unwrap();
+        assert_eq!(sw, 0x6985);
+        assert!(data.is_empty());
+        assert!(!slot_n.is_occupied(), "the window closed with the expiry");
+        assert_eq!(
+            EXPIRY_GRANT_CALLS.load(Ordering::SeqCst), 1,
+            "the expiry path must not re-ask for a touch"
+        );
+
+        // And after the close, the dead window sends nothing: the slot is
+        // empty, so a later pass is idle on this interface.
+        vset(16_000);
+        block_on(
+            "US-1663: the idle pass",
+            dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
+        );
+        assert_eq!(bus_n.lock().unwrap().sent.len(), 2);
     }
 }
