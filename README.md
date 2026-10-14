@@ -1,4 +1,4 @@
-# fapico2
+# fapico2 - The F**king Authenticator
 
 **The F\*\*king Authenticator.** Your passkeys, PGP keys and 2FA tokens — on hardware you own.
 
