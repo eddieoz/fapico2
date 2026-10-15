@@ -836,3 +836,69 @@ fn session_survives_deselect_and_spans_transports() {
     assert_eq!(sw, SW_OK);
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1698: the gate fires before the touch — no press is wasted
+// ---------------------------------------------------------------------------
+
+/// Counting presence deny: counts how many times the press path consulted
+/// the grant, and denies every press. A `fn` pointer cannot carry state,
+/// so the counter is a static — one test owns it at a time.
+static PRESSES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_deny(_tag: u32) -> bool {
+    PRESSES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    false
+}
+
+/// **A locked board never reaches the press path, even with a grant
+/// already armed.** The standing refusal order is shape → state → touch;
+/// the gate sits between shape and state, so on a PIN+locked board a
+/// well-formed SIGN answers [`SW_PIN_SESSION_REQUIRED`] with the grant
+/// unconsulted — the armed grant dies with its request, consumed by the
+/// refusal, never by a signature. After VERIFY the gate opens and the
+/// same request finally reaches the touch check, where the counting grant
+/// is consulted (once) and denies: `6985`, the touch word, which is the
+/// *second* consent a locked board never asked for.
+#[test]
+fn pin_gate_fires_before_touch_and_eats_the_grant() {
+    use fapico2_nostr::SW_PIN_SESSION_REQUIRED;
+
+    let path = region_path("gate-before-touch");
+    std::fs::remove_file(&path).ok();
+    // Setup needs an identity, and IMPORT is touch-gated — so the
+    // identity is imported on an app without the counting grant, and the
+    // counting app boots over the finished region (a second boot, which
+    // also re-derives `pin_set` the way a real reconnect does).
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK);
+    let mut app = NostrApp::boot(open_region(&path))
+        .with_rng_provider(pinned_salt)
+        .with_presence_grant(counting_deny);
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+
+    // Locked, request arrives with the grant "armed": the gate refuses
+    // and the press path is never entered.
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "the gate word, not the touch word");
+    assert_eq!(
+        PRESSES.load(core::sync::atomic::Ordering::SeqCst),
+        0,
+        "no presence_grant call reached the press path on a locked board"
+    );
+
+    // Unlocked, the same request: the gate opens, the touch check runs,
+    // the grant is consulted exactly once and denies.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, 0x6985, "unlocked, the touch word is the honest answer");
+    assert_eq!(
+        PRESSES.load(core::sync::atomic::Ordering::SeqCst),
+        1,
+        "the touch arm was entered exactly once, after the gate"
+    );
+    std::fs::remove_file(&path).ok();
+}
