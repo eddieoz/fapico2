@@ -1392,7 +1392,9 @@ impl NostrApp {
     /// `Mutex` (§8), RAM-only — a power cycle closes every session. On a
     /// board with no PIN the answer is [`SW_PIN_NOT_SET`] and nothing is
     /// touched: the no-PIN state is the ungated state, and VERIFY must
-    /// not be able to create it.
+    /// not be able to create it. On a **torn** record (US-1695) the
+    /// answer is [`SW_PIN_LOCKED`]: the fail-closed posture, never a
+    /// fiction of "no PIN", with management `RESET` as the only recovery.
     fn verify_pin(
         &mut self,
         _p1: u8, // the INS is the selector; P1/P2 are zeroes or the command is malformed
@@ -1419,7 +1421,14 @@ impl NostrApp {
                     (Some(SW_PIN_NOT_SET), false, false)
                 }
                 Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => {
-                    (Some(SW_STORE_FAULT), true, false)
+                    // US-1695: a torn or foreign record fails closed, and
+                    // the fail-closed posture for VERIFY is the lockout
+                    // word — no client can tell "ruined" from "locked",
+                    // and both mean "you cannot get in; RESET is the
+                    // remedy". Never "no PIN": that is the cache that
+                    // lifts the gate, and this is the cache that must
+                    // not exist.
+                    (Some(SW_PIN_LOCKED), true, false)
                 }
                 Err(_) => (Some(SW_STORE_FAULT), true, false),
                 Ok(PinEntry::Live(record)) => match Self::check_pin(&mut store, record, data) {

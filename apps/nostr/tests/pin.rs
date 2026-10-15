@@ -20,7 +20,9 @@ use fapico2_nostr::{
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
 use fapico2_platform::keyregion::host::FileKeyRegion;
-use fapico2_platform::keyregion::nostr_store::{NostrRegion, PinEntry};
+use fapico2_platform::keyregion::nostr_store::{
+    NostrRegion, NOSTR_PIN_BODY_LEN, PinEntry,
+};
 use fapico2_platform::keyregion::TOTAL_SLOTS;
 use heapless::Vec as HeaplessVec;
 
@@ -399,7 +401,7 @@ fn verify_pin_sets_the_session_flag() {
 /// **A wrong verify decrements the durable counter and answers `63C<rx>`**
 /// — the same vocabulary CHANGE burns, one verb earlier.
 #[test]
-fn wrong_pin_decrements_and_reports_63Cx() {
+fn wrong_pin_decrements_and_reports_63cx() {
     let (mut app, path) = booted_app("verify-wrong");
     let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
     assert_eq!(sw, SW_OK);
@@ -524,5 +526,84 @@ fn lock_answers_9000_in_every_state_and_leaks_nothing() {
         PinEntry::Live(record) => assert_eq!(record.counter, PIN_MAX_RETRIES),
         other => panic!("expected the full record, got {other:?}"),
     }
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1695: fail closed on a torn PinRecord
+// ---------------------------------------------------------------------------
+
+/// The raw slot bytes of a Nostr-domain record sealed with the fixture key
+/// at an arbitrary body — the torn-record fabric for the pin slot.
+fn torn_pin_image(generation: u32, body: &[u8]) -> Vec<u8> {
+    use fapico2_platform::keyregion::record::{self, Domain, RecordHeader};
+    let otp_row: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(0x11));
+    let chipid: [u8; 8] = 0x0000_BADC_0FFE_EE01_0203_u64.to_be_bytes();
+    let key = derive_payload_key(&otp_row, &chipid, &NOSTR_PAYLOAD_SECRET).expect("key");
+    let pin = fapico2_platform::keyregion::nostr_store::nostr_pin_slot()
+        .expect("the carve's geometry names the PIN slot");
+    let header = RecordHeader::new(Domain::Nostr, pin, generation);
+    let mut nonce = [0u8; record::NONCE_LEN];
+    nonce[..4].copy_from_slice(&generation.to_le_bytes());
+    nonce[4..].copy_from_slice(b"nostrst!");
+    let sealed = record::seal(&header, key.as_bytes(), &nonce, body).expect("seal");
+    let image = record::encode(&header, &sealed).expect("encode");
+    image.as_bytes().to_vec()
+}
+
+/// **A torn PinRecord fails closed**: the applet boots over a region whose
+/// pin slot holds a record that opens as ours but is not a PIN body — and
+/// every custody verb treats it as *locked*, never as *no PIN*. VERIFY
+/// answers [`SW_PIN_LOCKED`], SET refuses (a torn slot is not an unset
+/// board), CHANGE refuses, and nothing anywhere repairs or tombstones:
+/// after every refusal the slot still holds the same broken record, and
+/// the recovery is management `RESET` (US-1701's wipe) — documented, not
+/// papered over in code.
+#[test]
+fn torn_pin_record_fails_closed() {
+    use fapico2_platform::keyregion::KeyRegion;
+
+    // Truncated-write-shaped torn record: our key, a 50-byte body.
+    let path = region_path("torn");
+    std::fs::remove_file(&path).ok();
+    let mut region = FileKeyRegion::create(&path, TOTAL_SLOTS).expect("create");
+    let pin = fapico2_platform::keyregion::nostr_store::nostr_pin_slot()
+        .expect("the carve's geometry names the PIN slot");
+    region
+        .program(pin, 0, &torn_pin_image(1, &[0x7F; 50]))
+        .expect("the torn record programs into a virgin slot");
+
+    let mut app = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_LOCKED, "VERIFY on a torn record is the locked posture");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_STORE_FAULT, "a torn slot is not an unset board");
+    let (_, sw) = call(&mut app, &change_pin(PIN, NEW_PIN));
+    assert_eq!(sw, SW_STORE_FAULT, "there is no PIN to change without a verify");
+    assert!(
+        matches!(stored_pin(&path), PinEntry::Undecodable),
+        "nothing repaired or tombstoned the torn record"
+    );
+    std::fs::remove_file(&path).ok();
+
+    // Flipped-bit-shaped torn record: a valid PIN body, one ciphertext
+    // byte flipped. The AEAD refuses; the posture is the same.
+    let path = region_path("torn-flip");
+    std::fs::remove_file(&path).ok();
+    let mut salt = [0u8; 16];
+    pinned_salt(&mut salt);
+    let mut body = [0u8; NOSTR_PIN_BODY_LEN];
+    body[0] = PIN_MAX_RETRIES;
+    body[1..17].copy_from_slice(&salt);
+    body[17..].copy_from_slice(&pin_verifier(PIN, &salt));
+    let mut image = torn_pin_image(1, &body);
+    let first_ct = fapico2_platform::keyregion::record::RECORD_HEADER_LEN
+        + fapico2_platform::keyregion::record::NONCE_LEN;
+    image[first_ct] ^= 0x01;
+    let mut region = FileKeyRegion::create(&path, TOTAL_SLOTS).expect("create");
+    region.program(pin, 0, &image).expect("program the flipped record");
+    let mut app = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_LOCKED, "a flipped bit is the same locked posture");
     std::fs::remove_file(&path).ok();
 }
