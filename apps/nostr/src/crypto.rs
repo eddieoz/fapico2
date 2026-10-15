@@ -42,6 +42,19 @@ pub fn pin_verifier(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Constant-time equality for the verifier comparison — the check a
+/// secret-derived value deserves. An early-return `==` leaks a prefix
+/// match through timing; the fold below runs the full width whatever the
+/// bytes are. (`diff == 0` at the end is safe: `diff` itself does not
+/// depend on where the mismatch was.)
+pub fn verifier_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn mul_norm<S1, T2, S2>(
     s: &Scalar<S1, NonZero>,
     p: &Point<T2, S2, NonZero>,

@@ -14,7 +14,8 @@
 use fapico2_nostr::crypto::pin_verifier;
 use fapico2_nostr::NostrApp;
 use fapico2_nostr::{
-    INS_SET_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_STORE_FAULT, SW_WRONG_DATA,
+    INS_SET_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED, SW_PIN_NOT_SET,
+    SW_STORE_FAULT, SW_WRONG_DATA,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -24,6 +25,7 @@ use fapico2_platform::keyregion::TOTAL_SLOTS;
 use heapless::Vec as HeaplessVec;
 
 const PIN: &[u8] = b"731742"; // six bytes, the minimum
+const NEW_PIN: &[u8] = b"246813";
 
 // ---------------------------------------------------------------------------
 // Fixtures (the keymgmt.rs set, mirrored — test files do not name each other)
@@ -72,12 +74,19 @@ fn set_pin(p1: u8, data: &[u8]) -> HeaplessVec<u8, 300> {
     a
 }
 
-/// A deterministic salt: the applet draws 16 bytes for the PIN salt, and the
-/// bytes' *values* are not load-bearing — only that the stored verifier is
-/// a function of them, which the round trip re-derives.
+/// A deterministic salt that **varies per draw** — the applet draws once per
+/// PIN ceremony (set, change), and US-1692's fresh-salt claim needs the
+/// second draw to differ from the first. The bytes' *values* are otherwise
+/// not load-bearing: the stored verifier is a function of them, which the
+/// round trip re-derives.
 fn pinned_salt(out: &mut [u8]) {
+    use core::cell::Cell;
+    thread_local! {
+        static DRAW: Cell<u8> = const { Cell::new(0) };
+    }
+    let nth = DRAW.with(|d| d.replace(d.get().wrapping_add(1)));
     for (i, b) in out.iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(0x5B).wrapping_add(0xA0);
+        *b = (i as u8).wrapping_mul(0x5B).wrapping_add(0xA0).wrapping_add(nth.wrapping_mul(0x11));
     }
 }
 
@@ -176,14 +185,20 @@ fn set_pin_twice_is_refused_and_the_first_record_survives() {
     std::fs::remove_file(&path).ok();
 }
 
-/// **Setting is not unlocking, and a P1 other than `0x00` is not `SET_PIN`.**
-/// P1 `0x01` is `CHANGE_PIN`'s arm (US-1692) — until that story lands it is
-/// a `6A86`, not a silent alias of the set path.
+/// **The P1 byte is the verb selector and unknown P1s are `6A86`.** P1
+/// `0x01` is `CHANGE_PIN`'s arm (US-1692) — pinned here by the *shape* it
+/// refuses: a bare 6-byte payload is a valid `SET_PIN` but fails
+/// `CHANGE_PIN`'s `lc ‖ current ‖ new` shape, so the `6A80` proves the
+/// route. P1 `0x02` is no ceremony at all.
 #[test]
-fn set_pin_p1_other_than_zero_is_wrong_p1() {
+fn set_pin_p1_selects_the_ceremony() {
     let (mut app, path) = booted_app("p1");
+    // A P1 0x01 arm would be CHANGE: it refuses the bare payload on shape.
     let (_, sw) = call(&mut app, &set_pin(0x01, PIN));
-    assert_eq!(sw, 0x6A86, "P1 0x01 is CHANGE_PIN's arm, not an alias");
+    assert_eq!(sw, SW_WRONG_DATA, "P1 0x01 routed to CHANGE_PIN, whose shape this fails");
+    // An unknown P1 is the dispatcher's own refusal, before any state read.
+    let (_, sw) = call(&mut app, &set_pin(0x02, PIN));
+    assert_eq!(sw, 0x6A86);
     let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
     assert_eq!(sw, SW_OK);
     std::fs::remove_file(&path).ok();
@@ -197,4 +212,139 @@ fn set_pin_without_a_store_refuses() {
     let mut app = NostrApp::new();
     let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
     assert_eq!(sw, SW_STORE_FAULT);
+}
+
+// ---------------------------------------------------------------------------
+// US-1692: CHANGE_PIN
+// ---------------------------------------------------------------------------
+
+/// The CHANGE_PIN APDU: `lc(1) ‖ current(lc) ‖ new`.
+fn change_pin(current: &[u8], new: &[u8]) -> HeaplessVec<u8, 300> {
+    let mut a = HeaplessVec::new();
+    a.extend_from_slice(&[0x00, INS_SET_PIN, 0x01, 0x00]).unwrap();
+    let payload_len = 1 + current.len() + new.len();
+    a.push(payload_len as u8).unwrap();
+    a.push(current.len() as u8).unwrap();
+    a.extend_from_slice(current).unwrap();
+    a.extend_from_slice(new).unwrap();
+    a
+}
+
+/// **A wrong `current` is a failed verify, not a fresh refusal** — the
+/// durable budget burns (`63C2` after one failure from 3), the record's
+/// salt and verifier are untouched by the failed attempt, three wrong
+/// currents lock the board, and the lock answers [`SW_PIN_LOCKED`] for
+/// *any* payload afterwards — including the correct current, because the
+/// retry counter, not a fresh budget, governs.
+#[test]
+fn change_pin_requires_the_current_pin() {
+    let (mut app, path) = booted_app("change-wrong");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+
+    let (_, sw) = call(&mut app, &change_pin(b"999999", NEW_PIN));
+    assert_eq!(sw, 0x63C2, "one failure from 3 leaves 2");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => {
+            assert_eq!(record.counter, 2, "the decrement is durable");
+            assert_eq!(
+                record.verifier,
+                pin_verifier(PIN, &record.salt),
+                "the failed attempt did not touch the verifier"
+            );
+        }
+        other => panic!("expected the untouched record, got {other:?}"),
+    }
+
+    let (_, sw) = call(&mut app, &change_pin(b"999999", NEW_PIN));
+    assert_eq!(sw, 0x63C1, "two failures leave 1");
+    let (_, sw) = call(&mut app, &change_pin(b"999999", NEW_PIN));
+    assert_eq!(sw, SW_PIN_LOCKED, "the third failure is 63C0 — the bottom of the same vocabulary");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, 0),
+        other => panic!("expected the exhausted record, got {other:?}"),
+    }
+
+    // Locked answers the same word for any payload, and never below zero.
+    for _ in 0..3 {
+        let (_, sw) = call(&mut app, &change_pin(b"999999", NEW_PIN));
+        assert_eq!(sw, SW_PIN_LOCKED, "the lock does not re-burn the counter");
+    }
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, 0, "never below zero"),
+        other => panic!("expected the exhausted record, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A verified change rewrites the record with a fresh salt, resets the
+/// counter to full, and the old PIN stops verifying** — the preimage the
+/// old verifier held is gone, which is why the salt is fresh rather than
+/// carried over.
+#[test]
+fn change_pin_rewrites_verifier_and_resets_counter() {
+    let (mut app, path) = booted_app("change-ok");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let old_salt = match stored_pin(&path) {
+        PinEntry::Live(record) => record.salt,
+        other => panic!("expected a live record, got {other:?}"),
+    };
+
+    // One burned attempt first: the reset must climb back to full.
+    let (_, sw) = call(&mut app, &change_pin(b"999999", NEW_PIN));
+    assert_eq!(sw, 0x63C2);
+
+    let (_, sw) = call(&mut app, &change_pin(PIN, NEW_PIN));
+    assert_eq!(sw, SW_OK, "the correct current verifies");
+    let record = match stored_pin(&path) {
+        PinEntry::Live(record) => record,
+        other => panic!("expected the new record, got {other:?}"),
+    };
+    assert_ne!(record.salt, old_salt, "the change derives a fresh salt");
+    assert_eq!(record.verifier, pin_verifier(NEW_PIN, &record.salt));
+    assert_eq!(record.counter, PIN_MAX_RETRIES, "a verified change resets the budget");
+
+    // The old PIN no longer verifies — and costs a retry, because the
+    // retry counter, not the ceremony's politeness, governs.
+    let (_, sw) = call(&mut app, &change_pin(PIN, NEW_PIN));
+    assert_eq!(sw, 0x63C2, "the old current is a failed verify against the new record");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The shape refusal precedes any state read** — a short payload is
+/// `6A80` even on a board with no PIN at all, and a well-shaped CHANGE on
+/// a no-PIN board is [`SW_PIN_NOT_SET`], which is how the two refusals
+/// stay distinguishable. A malformed payload on a PIN-set board burns
+/// nothing: shape is checked before the counter is ever read.
+#[test]
+fn change_pin_shape_refusal_precedes_any_state_read() {
+    // Short payload on a no-PIN board.
+    let (mut app, path) = booted_app("change-shape");
+    let mut short: HeaplessVec<u8, 300> = HeaplessVec::new();
+    short.extend_from_slice(&[0x00, INS_SET_PIN, 0x01, 0x00, 12, 0x06]).unwrap();
+    let (_, sw) = call(&mut app, &short);
+    assert_eq!(sw, SW_WRONG_DATA, "twelve bytes is under the 6+6+1 minimum");
+    let (_, sw) = call(&mut app, &change_pin(PIN, NEW_PIN));
+    assert_eq!(sw, SW_PIN_NOT_SET, "well-shaped on a no-PIN board is a different refusal");
+    std::fs::remove_file(&path).ok();
+
+    // Malformed payloads on a PIN-set board burn no retries.
+    let (mut app, path) = booted_app("change-shape2");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let malformed: [HeaplessVec<u8, 300>; 3] = [
+        change_pin(b"12345", NEW_PIN),   // current under 6
+        change_pin(PIN, b"12345"),       // new under 6
+        change_pin(&[0x41u8; 65], NEW_PIN), // current over 64
+    ];
+    for apdu in malformed {
+        let (_, sw) = call(&mut app, &apdu);
+        assert_eq!(sw, SW_WRONG_DATA, "shape is refused before the budget is read");
+    }
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, PIN_MAX_RETRIES),
+        other => panic!("expected a full budget, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
 }

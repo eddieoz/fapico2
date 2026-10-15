@@ -1245,17 +1245,138 @@ impl NostrApp {
                         };
                         match store.write_pin(&record) {
                             Ok(_) => (None, true),
-                            Err(_) => (Some(SW_STORE_FAULT), false),
+                            // A commit that may have landed is not a
+                            // board without a PIN: cache fail-closed.
+                            Err(_) => (Some(SW_STORE_FAULT), true),
                         }
                     }
                 }
-                Err(_) => (Some(SW_STORE_FAULT), false),
+                // A read fault leaves the slot's state unknown — the
+                // cache fails closed, same as the Undecodable arm.
+                Err(_) => (Some(SW_STORE_FAULT), true),
             }
         };
         let (sw, pin_set) = outcome;
         write_sw(resp, sw.unwrap_or(SW_OK));
         self.pin_set = pin_set;
         self.pin_unlocked = false;
+    }
+
+    /// The verify leg US-1692 and US-1693 share: compare `pin` against
+    /// `record` in constant time and **make the outcome durable** — a
+    /// success resets the counter to [`PIN_MAX_RETRIES`], a failure
+    /// decrements it and rewrites the record through the full commit path,
+    /// so the budget survives the power cycle a RAM counter would refund.
+    /// A board already at zero is locked and answers [`SW_PIN_LOCKED`] for
+    /// any payload; the counter is never decremented below zero. The word
+    /// for a failure is the `63CX` vocabulary itself — `63C<remaining>` —
+    /// which meets [`SW_PIN_LOCKED`] (`63C0`) at the bottom of its own
+    /// range, the same continuity OpenPGP's retry counter has.
+    ///
+    /// A commit fault is [`SW_STORE_FAULT`] in both directions: the
+    /// operation's outcome is unknown and must not be reported as either a
+    /// success the caller would unlock on or a refunded attempt.
+    fn check_pin(
+        store: &mut fapico2_platform::keyregion::nostr_store::NostrStore<'_>,
+        record: fapico2_platform::keyregion::nostr_store::NostrPinRecord,
+        pin: &[u8],
+    ) -> Result<(), Sw> {
+        use fapico2_platform::keyregion::nostr_store::NostrPinRecord;
+        if record.counter == 0 {
+            return Err(SW_PIN_LOCKED);
+        }
+        if crypto::verifier_eq(&crypto::pin_verifier(pin, &record.salt), &record.verifier) {
+            let reset = NostrPinRecord { counter: PIN_MAX_RETRIES, ..record };
+            match store.write_pin(&reset) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(SW_STORE_FAULT),
+            }
+        } else {
+            let remaining = record.counter - 1;
+            let burned = NostrPinRecord { counter: remaining, ..record };
+            match store.write_pin(&burned) {
+                Ok(_) => Err(if remaining == 0 {
+                    SW_PIN_LOCKED
+                } else {
+                    0x63C0 | remaining as u16
+                }),
+                Err(_) => Err(SW_STORE_FAULT),
+            }
+        }
+    }
+
+    /// US-1692: `CHANGE_PIN` (INS `0x1C`, P1 `0x01`, payload
+    /// `lc(1) ‖ current(lc) ‖ new`) — the length byte is what makes
+    /// `current ‖ new` unambiguous without a delimiter a PIN byte could
+    /// equal, and it is why the minimum payload is 13 bytes (6+6+1).
+    ///
+    /// The current PIN is verified **first**, against the durable budget:
+    /// a wrong `current` is a failed verify (`63CX`, the counter burns),
+    /// never a fresh refusal — three wrong currents in a row lock the
+    /// board exactly as three wrong verifies would. A verified change
+    /// derives a **fresh** salt (the old salt's verifier has had the old
+    /// PIN as its preimage), writes the new record, and answers `9000`.
+    /// The session flag is deliberately untouched: changing your PIN does
+    /// not open a session, and on an unlocked board it does not close one
+    /// — the flag records *who is verified*, and the answer did not change.
+    fn change_pin(
+        &mut self,
+        _p1: u8, // `0x01` by the time this runs — the dispatcher selected the arm
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::{NostrPinRecord, PinEntry};
+        if p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        // Shape before any state read — a short payload is `6A80` however
+        // wrong the board's PIN state happens to be.
+        let Some((current, new)) = parse_change_payload(data) else {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        };
+        let rng = self.rng;
+        // (status word, the pin_set the cache must end at). The session
+        // flag is not written: verified or not, a change does not unlock.
+        let outcome = {
+            let Some(mut store) = self.store(resp) else { return };
+            match store.read_pin() {
+                Ok(PinEntry::Empty) | Ok(PinEntry::Tombstone) => {
+                    (Some(SW_PIN_NOT_SET), false)
+                }
+                Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => {
+                    // Fail closed: an unidentified occupant is not an
+                    // unset board, and no honest answer distinguishes
+                    // "locked" from "ruined" from the outside.
+                    (Some(SW_STORE_FAULT), true)
+                }
+                Err(_) => (Some(SW_STORE_FAULT), true),
+                Ok(PinEntry::Live(record)) => match Self::check_pin(&mut store, record, current) {
+                    Err(sw) => (Some(sw), true),
+                    Ok(()) => {
+                        let mut salt = [0u8; 16];
+                        if draw_random(rng, &mut salt).is_none() {
+                            (Some(SW_STORE_FAULT), true)
+                        } else {
+                            let fresh = NostrPinRecord {
+                                counter: PIN_MAX_RETRIES,
+                                salt,
+                                verifier: crypto::pin_verifier(new, &salt),
+                            };
+                            match store.write_pin(&fresh) {
+                                Ok(_) => (None, true),
+                                Err(_) => (Some(SW_STORE_FAULT), true),
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        let (sw, pin_set) = outcome;
+        write_sw(resp, sw.unwrap_or(SW_OK));
+        self.pin_set = pin_set;
     }
 }
 
@@ -1345,7 +1466,13 @@ impl App for NostrApp {
             INS_SET_LABEL => self.set_label(p1, p2, data, resp),
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
             INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
-            INS_SET_PIN => self.set_pin(p1, p2, data, resp),
+            INS_SET_PIN => {
+                if p1 == 0x01 {
+                    self.change_pin(p1, p2, data, resp)
+                } else {
+                    self.set_pin(p1, p2, data, resp)
+                }
+            }
             _ => write_sw(resp, SW_INS_NOT_SUPPORTED),
         }
     }
@@ -1382,6 +1509,24 @@ fn parse_data(apdu: &[u8]) -> Result<&[u8], Sw> {
 
 fn write_sw(resp: &mut HeaplessVec<u8, MAX_RESPONSE>, sw: Sw) {
     resp.extend_from_slice(&sw.to_be_bytes()).ok();
+}
+
+/// US-1692's `CHANGE_PIN` payload: `lc(1) ‖ current(lc) ‖ new`, both PINs
+/// 6–64 bytes. `None` on any shape violation — an `lc` outside the PIN
+/// range, a `new` outside it, or a length that does not add up.
+fn parse_change_payload(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    let lc = *data.first()? as usize;
+    if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&lc) {
+        return None;
+    }
+    if data.len() < 1 + lc + PIN_MIN_LEN {
+        return None;
+    }
+    let new = &data[1 + lc..];
+    if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&new.len()) {
+        return None;
+    }
+    Some((&data[1..1 + lc], new))
 }
 
 /// The NIP-44 v1 "ECC key" marker (design §2.2.0): the key form that needs
