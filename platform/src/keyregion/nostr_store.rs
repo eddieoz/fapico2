@@ -67,7 +67,10 @@ use super::commit::{self, CommitError, CommitPlan, CommitReport, Recovery};
 use super::crypto::{KeyDomain, PayloadKey, RecordAad, RECORD_OVERHEAD};
 use super::record::{self, Domain, RecordOccupancy};
 use super::slotmap::Occupancy;
-use super::{KeyRegion, NOSTR_CAPACITY, NOSTR_FIRST_SLOT, NOSTR_RECORD_MAX, Sealed, Slot, SlotRead, TOTAL_SLOTS};
+use super::{
+    KeyRegion, NOSTR_CAPACITY, NOSTR_FIRST_SLOT, NOSTR_PIN_FIRST_SLOT, NOSTR_PIN_SLOT,
+    NOSTR_RECORD_MAX, Sealed, Slot, SlotRead, TOTAL_SLOTS,
+};
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -90,6 +93,57 @@ pub const NOSTR_LABEL_MAX: usize = 32;
 /// An identity body is exactly [`NOSTR_BODY_LEN`] bytes and a valid BIP-340
 /// scalar is never zero, so a one-byte body is unambiguous from both sides.
 pub const TOMBSTONE: &[u8] = &[0x00];
+
+/// The reseat completion marker's body (US-1713): a fixed magic, sealed
+/// under the *current* (post-ceremony) key at the marker slot. It is 24
+/// bytes, so it decodes as neither an identity (97) nor a PIN record (49)
+/// nor a tombstone (1) — the marker is its own fact, readable only by a
+/// store that holds the custody key.
+pub const RESEAT_MARKER: &[u8] = b"fapico2/nostr-reseat/v1";
+
+/// The reseat marker's slot: the pin carve's first padding slot — inside
+/// Nostr's custody domain, outside every allocator's range
+/// (`mod.rs`'s `NOSTR_PIN_FIRST_SLOT`). Only [`NostrStore::reseat`] writes
+/// it.
+pub const fn reseat_marker_slot() -> Slot {
+    // Unwrapped by construction: `NOSTR_PIN_FIRST_SLOT` is a region
+    // constant the carve's own assertions pin inside the region's `u16`
+    // slot range.
+    match Slot::new(NOSTR_PIN_FIRST_SLOT as u16) {
+        Some(slot) => slot,
+        None => Slot::new(0).expect("NOSTR_PIN_FIRST_SLOT cannot be out of range"),
+    }
+}
+
+/// What one [`NostrStore::reseat`] did, per slot class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReseatReport {
+    /// Slots that opened under the legacy key and were resealed under the
+    /// custody key.
+    pub migrated: usize,
+    /// Slots that already open under the custody key — skipped, never
+    /// rewritten. A resumed reseat reports the interrupted prefix here.
+    pub already: usize,
+}
+
+/// Open one decoded record under the current key, falling through to the
+/// legacy window when the open fails and the window is open (US-1713). The
+/// window is the read path only: the occupancy guard and every write run
+/// under the current key alone.
+fn open_with_window(
+    header: &record::RecordHeader,
+    sealed: &Sealed,
+    key: &PayloadKey,
+    legacy: Option<&PayloadKey>,
+) -> SlotRead<record::Plaintext> {
+    match record::open(header, key.as_bytes(), sealed) {
+        SlotRead::Present(pt) => SlotRead::Present(pt),
+        other => match legacy {
+            Some(legacy) => record::open(header, legacy.as_bytes(), sealed),
+            None => other,
+        },
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The identity body
@@ -191,6 +245,86 @@ impl fmt::Debug for NostrIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// The PIN custody record
+// ---------------------------------------------------------------------------
+
+/// The PIN record body's exact width: `counter(1) ‖ salt(16) ‖ verifier(32)`
+/// (US-1690). Fixed for the same reason as [`NOSTR_BODY_LEN`] — and strictly
+/// narrower than it, so the slot bound sized for the identity body needs no
+/// re-derivation for the PIN record.
+pub const NOSTR_PIN_BODY_LEN: usize = 1 + 16 + 32;
+
+/// The PIN verifier record: everything custody needs to check a PIN and count
+/// its retries, and nothing more.
+///
+/// `verifier` is `SHA256(salt ‖ pin)` over a TRNG `salt` — the OATH
+/// `PinRecord` pattern (`apps/oath/src/oath_core.rs`), not a second design.
+/// None of the three fields is a secret in the AEAD sense — the record is
+/// sealed anyway, under the same device key and the same AAD shape as an
+/// identity, because consistency is the security property here: one record
+/// format, one key hierarchy.
+///
+/// `Copy` because it is 49 bytes read and written once per operation. The
+/// `Debug` prints the counter and redacts the verifier: a hash of a low-
+/// entropy secret in a log buffer is an offline guess the user paid for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct NostrPinRecord {
+    /// Consecutive failed verifications, 0–15 with 15 the lockout. The
+    /// applet owns the vocabulary; the store only carries the byte.
+    pub counter: u8,
+    /// The TRNG salt the verifier was derived over. Rotated on every
+    /// successful set or change.
+    pub salt: [u8; 16],
+    /// `SHA256(salt ‖ pin)` — the thing a VERIFY_PIN compares against.
+    pub verifier: [u8; 32],
+}
+
+impl NostrPinRecord {
+    /// Encode into `out` ([`NOSTR_PIN_BODY_LEN`] bytes). Returns the length
+    /// written, always [`NOSTR_PIN_BODY_LEN`].
+    pub fn encode(&self, out: &mut [u8; NOSTR_PIN_BODY_LEN]) -> usize {
+        out[0] = self.counter;
+        out[1..17].copy_from_slice(&self.salt);
+        out[17..49].copy_from_slice(&self.verifier);
+        NOSTR_PIN_BODY_LEN
+    }
+
+    /// Decode a PIN record body. `None` on any other length — including
+    /// [`TOMBSTONE`], which is how a cleared PIN reads as something other
+    /// than garbage.
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != NOSTR_PIN_BODY_LEN {
+            return None;
+        }
+        let mut record = NostrPinRecord {
+            counter: body[0],
+            salt: [0u8; 16],
+            verifier: [0u8; 32],
+        };
+        record.salt.copy_from_slice(&body[1..17]);
+        record.verifier.copy_from_slice(&body[17..49]);
+        Some(record)
+    }
+
+    /// Whether this body is the tombstone a PIN clear commits — the same
+    /// one-byte body an identity delete commits, because a second tombstone
+    /// shape would be a second thing every reader must rule out.
+    pub fn is_tombstone(body: &[u8]) -> bool {
+        body == TOMBSTONE
+    }
+}
+
+impl fmt::Debug for NostrPinRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NostrPinRecord")
+            .field("counter", &self.counter)
+            .field("salt", &"<16 bytes>")
+            .field("verifier", &"<redacted>")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors and read outcomes
 // ---------------------------------------------------------------------------
 
@@ -275,6 +409,27 @@ pub enum Entry {
     Foreign,
 }
 
+/// What the PIN slot holds, as [`NostrStore::read_pin`] reports it.
+///
+/// The same five-way split as [`Entry`], with two differences the record's
+/// role dictates: there is exactly one PIN slot, so no index is taken, and a
+/// tombstone here means "PIN cleared" rather than "identity deleted".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinEntry {
+    /// The slot is erased or its header failed its CRC — the no-PIN state.
+    Empty,
+    /// The slot holds a PIN record this device's key opens.
+    Live(NostrPinRecord),
+    /// The slot holds a committed delete — the PIN was cleared.
+    Tombstone,
+    /// The slot opens as ours but will not decode to a [`NostrPinRecord`].
+    /// US-1695's fail-closed case: the applet must treat this as
+    /// `pin_set` + locked, never as "no PIN".
+    Undecodable,
+    /// The slot holds a record some *other* domain wrote.
+    Foreign,
+}
+
 // ---------------------------------------------------------------------------
 // The store view
 // ---------------------------------------------------------------------------
@@ -283,15 +438,37 @@ pub enum Entry {
 ///
 /// The same shape as [`super::oath_store::OathStore`], for the same reasons:
 /// the key is derived once per session and borrowed per operation.
+///
+/// **The dual-KDF read window (US-1713).** `legacy` is `Some` only while a
+/// reseat is interrupted — marker-less, post-lock — and names the
+/// pre-custody key the records that have not migrated yet still open under.
+/// Reads fall through to it; **writes never do**: the occupancy guard runs
+/// under `key` alone, so a normal write cannot overwrite a legacy-sealed
+/// record it did not reseat — the guard's invariant holds in the window,
+/// and only [`NostrStore::reseat`] crosses it. Dropping `legacy` (what
+/// [`NostrRegion::reseat`] does once the marker stands) is the G1
+/// assertion made structural: after the marker, the store cannot even
+/// *try* the legacy key.
 pub struct NostrStore<'r> {
     region: &'r mut dyn KeyRegion,
     key: &'r PayloadKey,
+    legacy: Option<&'r PayloadKey>,
 }
 
 impl<'r> NostrStore<'r> {
     /// A view over `region`, sealing and opening with `key`.
     pub fn new(region: &'r mut dyn KeyRegion, key: &'r PayloadKey) -> Self {
-        NostrStore { region, key }
+        NostrStore { region, key, legacy: None }
+    }
+
+    /// A view over `region` with the dual-KDF read window open — the
+    /// interrupted-reseat state, and nothing else (US-1713).
+    pub fn new_with_window(
+        region: &'r mut dyn KeyRegion,
+        key: &'r PayloadKey,
+        legacy: &'r PayloadKey,
+    ) -> Self {
+        NostrStore { region, key, legacy: Some(legacy) }
     }
 
     /// The region itself, for a caller that has to inspect the medium.
@@ -330,7 +507,8 @@ impl<'r> NostrStore<'r> {
         if decoded.header().domain() != Domain::Nostr {
             return Ok(Entry::Foreign);
         }
-        let opened = match record::open(decoded.header(), self.key.as_bytes(), decoded.body()) {
+        let opened = match open_with_window(decoded.header(), decoded.body(), self.key, self.legacy)
+        {
             SlotRead::Present(pt) => pt,
             SlotRead::Absent | SlotRead::Fault(_) => return Ok(Entry::Undecodable),
         };
@@ -342,6 +520,69 @@ impl<'r> NostrStore<'r> {
             Some(id) => Ok(Entry::Live(id)),
             None => Ok(Entry::Undecodable),
         }
+    }
+
+    /// The PIN slot's [`Slot`], refused when this *region* is too short to
+    /// hold it — the same short-region guard [`Self::slot_for`] applies, for
+    /// the same reason: the geometry is a claim about the shipping region.
+    ///
+    /// There is exactly one PIN slot and it takes no applet-side index; that
+    /// is the typed-apartness US-1690 asks for. Identity accessors go through
+    /// [`nostr_slot`], which cannot reach [`NOSTR_PIN_SLOT`] — it sits below
+    /// [`NOSTR_FIRST_SLOT`] — and this accessor never takes an index, so
+    /// `read_pin` on an identity index and `read` on the PIN slot are both
+    /// unreachable by construction.
+    fn pin_slot(&self) -> Result<Slot, NostrStoreError> {
+        let slot = nostr_pin_slot().ok_or(NostrStoreError::Fault(E_NO_PIN_SLOT))?;
+        if !holds_slot(self.region, slot) {
+            return Err(NostrStoreError::Fault(E_SHORT_REGION));
+        }
+        Ok(slot)
+    }
+
+    /// Read the PIN slot and open it, as a [`PinEntry`].
+    ///
+    /// The same open flow as [`Self::read`] — decode, domain check, AEAD
+    /// open, then the record's own codec — because the PIN record earns
+    /// nothing from a second code path and could lose the audit's fixes to
+    /// one. The AAD binds this slot's own index, so a PIN record replayed
+    /// into an identity slot (or the reverse) fails the AEAD, not just the
+    /// codec.
+    pub fn read_pin(&mut self) -> Result<PinEntry, NostrStoreError> {
+        let slot = self.pin_slot()?;
+        let raw = self.region.read_slot(slot).map_err(NostrStoreError::Fault)?;
+        let decoded = match record::decode(slot, &raw) {
+            SlotRead::Present(d) => d,
+            SlotRead::Absent => return Ok(PinEntry::Empty),
+            SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
+        };
+        if decoded.header().domain() != Domain::Nostr {
+            return Ok(PinEntry::Foreign);
+        }
+        let opened = match open_with_window(decoded.header(), decoded.body(), self.key, self.legacy)
+        {
+            SlotRead::Present(pt) => pt,
+            SlotRead::Absent | SlotRead::Fault(_) => return Ok(PinEntry::Undecodable),
+        };
+        let body = opened.as_slice();
+        if NostrPinRecord::is_tombstone(body) {
+            return Ok(PinEntry::Tombstone);
+        }
+        match NostrPinRecord::decode(body) {
+            Some(record) => Ok(PinEntry::Live(record)),
+            None => Ok(PinEntry::Undecodable),
+        }
+    }
+
+    /// Commit one [`NostrPinRecord`] to the PIN slot, through the same
+    /// occupancy guard [`Self::write`] uses. The guard's refusals carry over
+    /// unchanged: a foreign occupant in the PIN slot is
+    /// [`NostrStoreError::OccupiedForeign`], never a silent overwrite — the
+    /// stale-passkey lesson, applied to the slot custody lives in.
+    pub fn write_pin(&mut self, record: &NostrPinRecord) -> Result<CommitReport, NostrStoreError> {
+        let mut body = [0u8; NOSTR_PIN_BODY_LEN];
+        let n = record.encode(&mut body);
+        self.commit_body_at(self.pin_slot()?, &body[..n])
     }
 
     /// The occupancy guard (US-1641), in the design's fixed order, returning
@@ -435,6 +676,16 @@ impl<'r> NostrStore<'r> {
     /// decode leaves nothing to advance past and the tombstone commits at
     /// generation 1. A fault-class decode (the region itself is failing)
     /// is refused, never papered over.
+    /// US-1701: the PIN record's destination on a factory wipe — a
+    /// tombstone through the same durable commit path a delete uses
+    /// (OATH's `self.pin = None` in `reset_state`, made durable). Reads
+    /// back as [`PinEntry::Tombstone`]: the board is PIN-less, and the
+    /// slot is reusable by `write_pin` like any committed record.
+    pub fn clear_pin(&mut self) -> Result<CommitReport, NostrStoreError> {
+        let slot = self.pin_slot()?;
+        self.commit_body_at(slot, TOMBSTONE)
+    }
+
     pub fn force_tombstone(&mut self, index: u16) -> Result<CommitReport, NostrStoreError> {
         let slot = self.slot_for(index)?;
         let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
@@ -462,12 +713,158 @@ impl<'r> NostrStore<'r> {
 
     /// The shared commit path: guard, seal, commit.
     fn commit_body(&mut self, index: u16, body: &[u8]) -> Result<CommitReport, NostrStoreError> {
-        let slot = self.slot_for(index)?;
+        self.commit_body_at(self.slot_for(index)?, body)
+    }
+
+    /// The shared commit path for an already-resolved slot: guard, seal,
+    /// commit. [`Self::commit_body`] is identity-indexed; [`Self::write_pin`]
+    /// reaches the PIN slot here, through the same guard, seal, and commit —
+    /// one commit path, not two.
+    fn commit_body_at(
+        &mut self,
+        slot: Slot,
+        body: &[u8],
+    ) -> Result<CommitReport, NostrStoreError> {
         let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
         let generation = self.admission(slot)?;
         let sealed = self.seal(slot, generation, body)?;
         let plan = CommitPlan::new(scratchpad, slot, Domain::Nostr, generation);
         commit::commit(self.region, plan, &sealed).map_err(NostrStoreError::Commit)
+    }
+
+    // -----------------------------------------------------------------------
+    // US-1713 — reseat: bulk migration to the custody key
+    // -----------------------------------------------------------------------
+
+    /// The whole Nostr domain, in migration order: the identity slots, then
+    /// the PIN slot. The reseat marker's slot is *not* in this list — it
+    /// lives in the pin carve's padding and only the marker itself writes
+    /// there.
+    fn reseat_domain_slots(&self) -> alloc::vec::Vec<Slot> {
+        let mut slots = alloc::vec::Vec::new();
+        for i in 0..NOSTR_SLOTS {
+            if let Some(slot) = nostr_slot(i as u16) {
+                slots.push(slot);
+            }
+        }
+        if let Ok(slot) = self.pin_slot() {
+            slots.push(slot);
+        }
+        slots
+    }
+
+    /// Whether the reseat completion marker stands. The marker is a record
+    /// at [`NOSTR_PIN_FIRST_SLOT`] — inside Nostr's custody domain, outside
+    /// every allocator's range — sealed under the *current* key with
+    /// [`RESEAT_MARKER`] as its body: it opens only for a store that holds
+    /// the post-ceremony key, which is what "complete" means.
+    pub fn reseat_complete(&mut self) -> Result<bool, NostrStoreError> {
+        let slot = Slot::new(super::NOSTR_PIN_FIRST_SLOT as u16)
+            .ok_or(NostrStoreError::Fault(E_NO_MARKER_SLOT))?;
+        if !holds_slot(self.region, slot) {
+            return Err(NostrStoreError::Fault(E_SHORT_REGION));
+        }
+        let raw = self.region.read_slot(slot).map_err(NostrStoreError::Fault)?;
+        let decoded = match record::decode(slot, &raw) {
+            SlotRead::Present(d) => d,
+            SlotRead::Absent => return Ok(false),
+            SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
+        };
+        if decoded.header().domain() != Domain::Nostr {
+            return Ok(false);
+        }
+        match record::open(decoded.header(), self.key.as_bytes(), decoded.body()) {
+            SlotRead::Present(pt) => Ok(pt.as_slice() == RESEAT_MARKER),
+            SlotRead::Absent | SlotRead::Fault(_) => Ok(false),
+        }
+    }
+
+    /// US-1713 — `reseat`: migrate every record in the Nostr domain from the
+    /// legacy constant-KDF key to the custody key, then write the completion
+    /// marker.
+    ///
+    /// **The legacy key is a leg of this signature.** Each occupied slot is
+    /// opened under `legacy` *inside this call* — the guard's
+    /// identify-before-overwrite rule, with the legacy key as the
+    /// identification — so the two write paths cannot drift: a reseat that
+    /// could not name the legacy key would not compile.
+    ///
+    /// The walk, per slot: a virgin slot holds nothing of ours; an occupant
+    /// that opens under the *current* key is already migrated and is never
+    /// rewritten; an occupant that opens under `legacy` is resealed body-for-
+    /// body at the next generation through the same scratchpad two-phase
+    /// commit every other write uses; an occupant that opens under neither
+    /// — a stale FIDO record, a transplant, an undecodable husk — refuses
+    /// with [`NostrStoreError::OccupiedForeign`] and **no marker**: the
+    /// migration stops fail-closed rather than half-complete.
+    ///
+    /// The marker is written only after every slot succeeded. A power cut
+    /// before it lands leaves a marker-less state that re-enters this
+    /// function idempotently: migrated slots now open under the current key
+    /// and are skipped, the rest are still legacy-sealed, and the walk
+    /// resumes where it stopped. The dual-KDF read window
+    /// ([`NostrStore::new_with_window`]) exists for exactly that interrupted
+    /// state and nothing else.
+    pub fn reseat(&mut self, legacy: &PayloadKey) -> Result<ReseatReport, NostrStoreError> {
+        if self.reseat_complete()? {
+            return Ok(ReseatReport { migrated: 0, already: 0 });
+        }
+        let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
+        let mut report = ReseatReport { migrated: 0, already: 0 };
+        for slot in self.reseat_domain_slots() {
+            let raw = self.region.read_slot(slot).map_err(NostrStoreError::Fault)?;
+            if !RecordOccupancy.occupied(&raw) {
+                continue; // virgin: nothing of ours to migrate
+            }
+            let decoded = match record::decode(slot, &raw) {
+                SlotRead::Present(d) => d,
+                SlotRead::Absent => return Err(NostrStoreError::OccupiedForeign { slot }),
+                SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
+            };
+            if decoded.header().domain() != Domain::Nostr {
+                return Err(NostrStoreError::OccupiedForeign { slot });
+            }
+            if matches!(
+                record::open(decoded.header(), self.key.as_bytes(), decoded.body()),
+                SlotRead::Present(_)
+            ) {
+                // Already under the custody key: never rewritten.
+                report.already += 1;
+                continue;
+            }
+            // The reseat leg: the occupant must open under the legacy key.
+            let body = match record::open(decoded.header(), legacy.as_bytes(), decoded.body()) {
+                SlotRead::Present(pt) => pt,
+                SlotRead::Absent | SlotRead::Fault(_) => {
+                    return Err(NostrStoreError::OccupiedForeign { slot })
+                }
+            };
+            let generation = decoded
+                .header()
+                .generation()
+                .checked_add(1)
+                .ok_or(NostrStoreError::GenerationExhausted { slot })?;
+            let owned = alloc::vec::Vec::from(body.as_slice());
+            let sealed = self.seal(slot, generation, &owned)?;
+            let plan = CommitPlan::new(scratchpad, slot, Domain::Nostr, generation);
+            commit::commit(self.region, plan, &sealed).map_err(NostrStoreError::Commit)?;
+            report.migrated += 1;
+        }
+        // The completion marker, written last — after every slot succeeded.
+        self.commit_body_at(reseat_marker_slot(), RESEAT_MARKER)?;
+        Ok(report)
+    }
+
+    /// US-1714: the reseat whose migration leg is this store's own dual-KDF
+    /// read window — the [`Option<&PayloadKey>`] is `Copy`, so naming it
+    /// costs nothing and borrows nothing away from `self`. The region form
+    /// ([`NostrRegion::reseat_via_window`]) is the entry point the ceremony
+    /// verb uses; this half exists because the migration leg lives here.
+    pub fn reseat_via_window(&mut self) -> Result<ReseatReport, NostrStoreError> {
+        match self.legacy {
+            Some(legacy) => self.reseat(legacy),
+            None => Err(NostrStoreError::Fault(E_NO_RESEAT_WINDOW)),
+        }
     }
 }
 
@@ -479,6 +876,20 @@ const E_NO_SCRATCHPAD: &str =
 /// The region handed to a [`NostrStore`] is shorter than the geometry.
 const E_SHORT_REGION: &str =
     "key region: the region is shorter than the slot the Nostr geometry names";
+
+/// The reseat marker slot could not be named — impossible on this geometry,
+/// and named rather than `unwrap`ed for the same reason as
+/// [`E_NO_SCRATCHPAD`].
+const E_NO_MARKER_SLOT: &str = "key region: the reseat marker slot is outside the slot range";
+
+/// The reseat-through-window was asked of a region that carries no window —
+/// the caller is in the wrong world (see [`NostrRegion::reseat_via_window`]).
+const E_NO_RESEAT_WINDOW: &str = "key region: the reseat window is not open";
+
+/// The PIN slot could not be named — impossible on this geometry (the carve's
+/// assertions in `mod.rs` pin it inside the region), and named rather than
+/// `unwrap`ed for the same reason as [`E_NO_SCRATCHPAD`].
+const E_NO_PIN_SLOT: &str = "key region: the Nostr PIN slot is outside the region geometry";
 
 /// Whether `slot` is inside the region this view was handed.
 ///
@@ -502,6 +913,15 @@ pub const fn nostr_slot(index: u16) -> Option<Slot> {
     } else {
         None
     }
+}
+
+/// The PIN slot's [`Slot`], refusing nothing because there is nothing to
+/// refuse: the slot is a constant of the carve (US-1689), not a parameter of
+/// the call. That is the typed-apartness itself — an identity index cannot
+/// name this slot through [`nostr_slot`] (it sits below [`NOSTR_FIRST_SLOT`]),
+/// and a PIN access cannot name an identity slot because this takes no index.
+pub const fn nostr_pin_slot() -> Option<Slot> {
+    Slot::new(NOSTR_PIN_SLOT as u16)
 }
 
 /// The scratchpad slot commits stage through: the region's **shared** one,
@@ -536,6 +956,20 @@ const _: () = {
         NOSTR_FIRST_SLOT + NOSTR_SLOTS <= TOTAL_SLOTS,
         "Nostr's reservation must sit inside the region"
     );
+    // The PIN record is strictly narrower than the identity body, so the slot
+    // bound sized from the identity needs no re-derivation for the PIN —
+    // assert rather than assume, the same rule as the identity body's own.
+    assert!(
+        NOSTR_PIN_BODY_LEN + RECORD_OVERHEAD <= NOSTR_RECORD_MAX as usize,
+        "the PIN record must fit the slot the region addresses without widening it"
+    );
+    // The typed-apartness: the PIN slot sits below the identity range, so
+    // `nostr_slot` cannot reach it and the two accessor families are disjoint
+    // by construction, not by discipline.
+    assert!(
+        NOSTR_PIN_SLOT < NOSTR_FIRST_SLOT,
+        "the PIN slot must sit below the identity range or the accessors overlap"
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -552,17 +986,81 @@ const _: () = {
 pub struct NostrRegion {
     region: Box<dyn KeyRegion>,
     key: PayloadKey,
+    /// The dual-KDF read window (US-1713): `Some` while a reseat is
+    /// interrupted — marker-less, post-lock — `None` once the marker
+    /// stands. Dropping it is the G1 assertion made structural: after the
+    /// marker the store cannot even *try* the legacy key.
+    legacy: Option<PayloadKey>,
 }
 
 impl NostrRegion {
     /// Take ownership of a region and the key to seal its records with.
     pub fn new(region: Box<dyn KeyRegion>, key: PayloadKey) -> Self {
-        NostrRegion { region, key }
+        NostrRegion { region, key, legacy: None }
+    }
+
+    /// Take ownership with the dual-KDF read window open — the
+    /// interrupted-reseat state, and nothing else (US-1713). Reads fall
+    /// through to `legacy`; writes run under `key` alone.
+    pub fn with_legacy_window(
+        region: Box<dyn KeyRegion>,
+        key: PayloadKey,
+        legacy: PayloadKey,
+    ) -> Self {
+        NostrRegion { region, key, legacy: Some(legacy) }
     }
 
     /// A borrowed view for one operation.
     pub fn store(&mut self) -> NostrStore<'_> {
-        NostrStore::new(self.region.as_mut(), &self.key)
+        match &self.legacy {
+            Some(legacy) => NostrStore::new_with_window(self.region.as_mut(), &self.key, legacy),
+            None => NostrStore::new(self.region.as_mut(), &self.key),
+        }
+    }
+
+    /// US-1713: run the reseat with `legacy` as the migration leg. On the
+    /// `Ok` path the marker stands, and the legacy window closes — the G1
+    /// assertion, structural: the handle that holds the region after this
+    /// returns cannot open anything under the legacy key, because it no
+    /// longer carries it.
+    pub fn reseat(&mut self, legacy: &PayloadKey) -> Result<ReseatReport, NostrStoreError> {
+        let report = self.store().reseat(legacy)?;
+        self.legacy = None;
+        Ok(report)
+    }
+
+    /// US-1714: the reseat whose migration leg is this region's own dual-KDF
+    /// window. The ceremony verb runs it on the region the *provider* just
+    /// opened — the provider attaches the legacy window exactly when the
+    /// marker is absent, so the window is the legacy key without the
+    /// applet ever holding key material: the region's maker is the only
+    /// place in the process that derives one. On the `Ok` path the window
+    /// closes, the same structural G1 assertion [`NostrRegion::reseat`]
+    /// makes.
+    ///
+    /// A region without a window refuses: a custody-keyed region with the
+    /// marker standing needs no migration, and a legacy-keyed one has no
+    /// custody key to migrate *to* — the caller re-attaches instead of
+    /// guessing which world it is in.
+    pub fn reseat_via_window(&mut self) -> Result<ReseatReport, NostrStoreError> {
+        match self.legacy {
+            Some(_) => self.store().reseat_via_window(),
+            None => Err(NostrStoreError::Fault(E_NO_RESEAT_WINDOW)),
+        }
+    }
+
+    /// Whether the dual-KDF read window is open.
+    pub fn legacy_window_open(&self) -> bool {
+        self.legacy.is_some()
+    }
+
+    /// Close the window without touching the medium (US-1714). The region
+    /// provider's attach policy uses it: the window goes on when the
+    /// marker might be absent and comes off the moment the marker
+    /// provably stands — the same predicate [`NostrRegion::reseat`]'s
+    /// `Ok` path enforces, applied at every attach instead of once.
+    pub fn close_legacy_window(&mut self) {
+        self.legacy = None;
     }
 
     /// The region alone — for a caller that has to inspect or repair the

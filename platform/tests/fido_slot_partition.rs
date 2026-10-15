@@ -233,9 +233,9 @@ fn the_first_fido_record_address_is_unchanged_by_the_carve() {
 /// (`update`) is the path under test, exactly as for OATH above.
 #[test]
 fn a_fido_write_to_a_carved_nostr_slot_is_refused() {
-    use fapico2_platform::keyregion::{is_nostr_slot, FIDO_SLOT_LIMIT, NOSTR_FIRST_SLOT};
+    use fapico2_platform::keyregion::{is_nostr_slot, FIDO_SLOT_LIMIT, NOSTR_FIRST_SLOT, NOSTR_PIN_FIRST_SLOT};
 
-    assert_eq!(FIDO_SLOT_LIMIT, NOSTR_FIRST_SLOT);
+    assert_eq!(FIDO_SLOT_LIMIT, NOSTR_PIN_FIRST_SLOT);
     let carved = slot(NOSTR_FIRST_SLOT);
     assert!(
         is_nostr_slot(carved),

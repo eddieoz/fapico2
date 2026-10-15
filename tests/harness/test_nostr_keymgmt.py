@@ -47,14 +47,15 @@ def test_get_info_layout_over_ccid(emu):
     assert sw == SW_OK
     # applet_ver(2) ‖ caps(2) ‖ max_plaintext(2) ‖ n_identities(1) ‖ flags(1)
     assert len(data) == 8
-    assert data[0:2] == b"\x00\x01"  # APPLET_VERSION
+    assert data[0:2] == b"\x00\x02"  # APPLET_VERSION (US-1700 dialect bump)
     caps = int.from_bytes(data[2:4], "big")
-    assert caps == 0x0003  # key mgmt (0x0001) + NIP-44 (0x0002), both served
+    assert caps == 0x000F  # key mgmt + NIP-44 + PIN + ceremony (US-1714)
     # The wire-cap value: the largest plaintext whose chunk-rounded padding
     # still fits MAX_WIRE (2074) — 1792 pads to itself, 1793 pads to 2048 and
     # would push the encrypt response off the wire.
     assert int.from_bytes(data[4:6], "big") == 1792  # max_plaintext
     assert data[6] == 0  # empty store
+    assert data[7] == 0  # flags: no PIN on this board (v0.2.0-compatible 0)
 
 
 def test_generate_import_sign_round_trip(emu):
@@ -115,8 +116,9 @@ def test_set_label_delete_export_trio(emu):
     assert data[35] == 7
     assert data[36:43] == b"primary"
 
-    data, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))
-    assert sw == SW_OK and len(data) == 32  # the scalar comes back
+    # EXPORT_KEY is gone (US-1699): the custody rule is only in, never out.
+    _, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))
+    assert sw == 0x6D00
 
     data, sw = emu.send(apdu(INS_DELETE_KEY, p1=0))
     assert sw == SW_OK and data == npub0  # the answer names what it destroyed

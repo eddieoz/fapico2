@@ -451,3 +451,151 @@ fn a_truncated_extended_lc_form_is_refused() {
     assert!(!data.is_empty(), "GET_INFO's success shape survives");
     std::fs::remove_file(path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1699: EXPORT_KEY is gone
+// ---------------------------------------------------------------------------
+
+/// **EXPORT_KEY is refused on the CCID channel** (US-1699): the only
+/// secret-returning command the applet ever had no longer exists, so the
+/// `0x1A` APDU falls through to the dispatcher's `6D00` with an empty
+/// body — no code path in the applet returns `id.scalar` any more (the
+/// method is deleted, and the grep for the scalar-returning responder is
+/// now a grep for a name that only occurs in tests naming its absence).
+/// The slot it targeted is untouched.
+#[test]
+fn export_is_gone_on_ccid() {
+    let path = region_path("export-gone");
+    std::fs::remove_file(&path).ok();
+    {
+        let mut region = fixture_region(&path);
+        let mut store = region.store();
+        store
+            .write(0, &identity(0x50, [0x77; 32], b""))
+            .expect("seed idx 0");
+    }
+    let mut app = NostrApp::boot(open_region(&path));
+    let (data, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
+    assert_eq!(sw, 0x6D00, "EXPORT_KEY is refused, not served");
+    assert!(data.is_empty(), "no frame leaks the secret");
+    // The refused slot is untouched: GET_PUBKEY still serves the npub.
+    let (_, sw) = call(&mut app, &apdu(INS_GET_PUBKEY, 0, 0, &[]));
+    assert_eq!(sw, SW_OK, "the identity behind the refused slot survives");
+    std::fs::remove_file(&path).ok();
+}
+
+/// Six bytes, the PIN minimum — the PIN verbs' payload shape (US-1691).
+const PIN_BYTES: &[u8] = b"731742";
+/// A second six-byte PIN for the change ceremony rows.
+const NEWPIN_BYTES: &[u8] = b"246813";
+/// A wrong PIN — same shape, different bytes.
+const WRONG: &[u8] = b"000000";
+
+/// **GET_INFO advertises the PIN capability and the PIN state** (US-1700):
+/// caps gain `CAP_PIN_MGMT = 0x0004`, and the flags byte stops being a
+/// reserved zero and becomes the PIN state — bit 0 = PIN set, bit 1 =
+/// session unlocked, bit 2 = custody migration pending (never set yet; the
+/// ceremony stories own it). The bits derive from the same cache the gate
+/// reads, and a no-PIN board answers `0x00`, byte-compatible with v0.2.0
+/// readers. The extension distinguishes old firmware (hide PIN UI), PIN-less
+/// boards (no PIN UI) and locked boards (PIN dialog) from this response
+/// alone.
+#[test]
+fn getinfo_advertises_pin_capability_and_state() {
+    use fapico2_nostr::{
+        CAP_PIN_MGMT, FLAG_MIGRATION_PENDING, FLAG_PIN_SET, FLAG_SESSION_UNLOCKED, INS_SIGN,
+        SW_PIN_SESSION_REQUIRED,
+    };
+
+    // No PIN: caps carry the new bit, flags are the v0.2.0-compatible zero.
+    let (mut app, path) = booted_app("getinfo-pin-nopin");
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(u16::from_be_bytes([data[2], data[3]]), CAPS);
+    assert_eq!(CAPS & CAP_PIN_MGMT, CAP_PIN_MGMT, "the PIN dialect is advertised");
+    assert_eq!(data[7], 0x00, "a no-PIN board's flags are the reserved zero");
+    std::fs::remove_file(path).ok();
+
+    // PIN + locked: bit 0 alone.
+    let path = region_path("getinfo-pin-locked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0, 0, PIN_BYTES)); // SET_PIN
+    assert_eq!(sw, SW_OK);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    // A PIN-set board that has not run the ceremony also reports the
+    // migration pending (US-1714, bit 2).
+    assert_eq!(
+        data[7],
+        FLAG_PIN_SET | FLAG_MIGRATION_PENDING,
+        "locked board: PIN set, session closed, migration pending"
+    );
+    // The advertisement agrees with the command paths: a gated command on
+    // this exact state is refused, which is what bit 0 without bit 1 says.
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, 0, &[0x42; 32]));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED);
+    std::fs::remove_file(&path).ok();
+
+    // PIN + unlocked: bits 0 and 1.
+    let path = region_path("getinfo-pin-unlocked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(0x1B, 0, 0, PIN_BYTES)); // VERIFY_PIN
+    assert_eq!(sw, SW_OK);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED | FLAG_MIGRATION_PENDING);
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1702: the PIN custody verbs over the vendor wire (applet level)
+// ---------------------------------------------------------------------------
+
+/// **The PIN verbs answer the APDUs the vendor bridge builds.** The
+/// envelope is `[idx, arg]` with idx riding P1 (F-A8), so over the vendor
+/// channel SET is `[0, pin]` → `[00, 0x1C, 0, 00, 6, pin…]` and CHANGE is
+/// `[1, lc ‖ current ‖ new]` → the same frame at P1 1. This test is the
+/// applet half of `nostr_wire.rs::verify_set_lock_map_to_pin_ins`: the
+/// mapping arms and the envelope decode live there; here the response
+/// vocabulary these frames produce is pinned, because the vendor layer
+/// wraps it into `{1: sw}` on the HID channel verbatim.
+#[test]
+fn verify_set_lock_map_to_pin_ins() {
+    use fapico2_nostr::{INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN, SW_PIN_LOCKED, SW_PIN_NOT_SET};
+
+    let path = region_path("vendor-pin-verbs");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+
+    // SET over the vendor shape: `[0, pin]`.
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK, "SET is the idx-0 arm");
+    // CHANGE over the vendor shape: `[1, lc ‖ current ‖ new]`. A wrong
+    // current PIN burns a retry, and the 63CX answer rides the vendor
+    // channel verbatim — the CBOR `sw` field carries 63C2, two left.
+    let mut change: HeaplessVec<u8, 64> = HeaplessVec::new();
+    change.push(WRONG.len() as u8).unwrap();
+    change.extend_from_slice(WRONG).unwrap();
+    change.extend_from_slice(NEWPIN_BYTES).unwrap();
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 1, 0, &change));
+    assert_eq!(sw, SW_PIN_LOCKED | 0x02, "63C2 rides the vendor channel verbatim");
+    // VERIFY opens the session (pin is the consent — no touch).
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK);
+    // And LOCK closes it on the same channel.
+    let (_, sw) = call(&mut app, &apdu(INS_LOCK, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    // VERIFY on a PIN-less board is the unset answer, the vocabulary a
+    // fresh-emulator client sees.
+    let path2 = region_path("vendor-pin-unset");
+    std::fs::remove_file(&path2).ok();
+    let mut app = NostrApp::boot(fixture_region(&path2));
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_PIN_NOT_SET);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&path2).ok();
+}

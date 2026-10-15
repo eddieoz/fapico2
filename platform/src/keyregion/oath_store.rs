@@ -187,8 +187,8 @@ use super::crypto::{KeyDomain, PayloadKey, RecordAad, RECORD_OVERHEAD};
 use super::index;
 use super::record::{self, Domain};
 use super::{
-    KeyRegion, NOSTR_CAPACITY, Sealed, Slot, SlotRead, FIDO_CAPACITY, OATH_CAPACITY,
-    SCRATCHPAD_SLOTS, SLOTS_PER_SECTOR, TOTAL_SLOTS,
+    KeyRegion, NOSTR_CAPACITY, NOSTR_PIN_CARVE_SLOTS, Sealed, Slot, SlotRead, FIDO_CAPACITY,
+    OATH_CAPACITY, SCRATCHPAD_SLOTS, SLOTS_PER_SECTOR, TOTAL_SLOTS,
 };
 
 use crate::ckey::OATH_SEAL_OVERHEAD;
@@ -1024,10 +1024,15 @@ const _: () = {
         "the scratchpad must start exactly where OATH's area ends"
     );
     assert!(
-        FIDO_FIRST_SLOT + FIDO_CAPACITY == TOTAL_SLOTS - index::INDEX_SLOT_COUNT - NOSTR_CAPACITY,
-        "OATH + scratchpad + FIDO + Nostr + index must tile the region exactly once — the same \
-         accounting mod.rs asserts, restated here from the OATH side (Nostr is the fifth \
-         reservation, US-1639; it sits between FIDO's end and the index)"
+        FIDO_FIRST_SLOT + FIDO_CAPACITY
+            == TOTAL_SLOTS
+                - index::INDEX_SLOT_COUNT
+                - NOSTR_CAPACITY
+                - NOSTR_PIN_CARVE_SLOTS,
+        "OATH + scratchpad + FIDO + Nostr + the PIN carve must tile the region exactly once — \
+         the same accounting mod.rs asserts, restated here from the OATH side (Nostr is the \
+         fifth reservation, US-1639; the PIN carve, US-1689, is the sixth; both sit between \
+         FIDO's end and the index)"
     );
 };
 

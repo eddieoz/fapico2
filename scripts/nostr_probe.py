@@ -24,6 +24,17 @@ INS_LIST_KEYS = 0x11
 INS_GENERATE_KEY = 0x13
 INS_DELETE_KEY = 0x19
 INS_RESET = 0x1E  # the management applet's RESET
+#: The PIN custody dialect (US-1691..1694, US-1702). Touch-free by design:
+#: the PIN is the consent. CCID legs only here — the emulator never
+#: exposes the Nostr HID interface, so the HID arm of this dialect is
+#: exercised by driving these same INS through the extension on hardware
+#: (US-1704's transcript), not by this PC-SC script.
+INS_VERIFY_PIN = 0x1B
+INS_SET_PIN = 0x1C  # P1 0 = SET, P1 1 = CHANGE
+INS_LOCK = 0x1D
+SW_PIN_LOCKED = 0x63C0
+SW_PIN_NOT_SET = 0x6A82
+SW_PIN_SESSION_REQUIRED = 0x6982
 
 
 def select(conn, aid):
@@ -56,6 +67,47 @@ def main():
         sw, data = apdu(INS_LIST_KEYS)
         n = data[0] if data else -1
         return sw, n
+
+    # ---- US-1704: the optional --pin legs ------------------------------
+    #
+    # --pin walks the custody dialect over the *device*: SET (the leg
+    # asks for a fresh PIN on stdin — no default, because a PIN nobody
+    # chose is not a PIN), VERIFY, the gate opening and closing on a
+    # gated command family, LOCK, and the durable 63CX rows. Reaching
+    # the HID arm of this dialect needs the extension driving the same
+    # INS over WebHID; the transcript records what the CCID leg saw and
+    # what the extension echoed back.
+    if "--pin" in sys.argv:
+        import getpass
+        pin = getpass.getpass("PIN to establish (6..64 chars): ").encode()
+        assert 6 <= len(pin) <= 64, "the PIN must be 6..64 bytes"
+        print("\n[P1] SET_PIN")
+        sw, _ = apdu(INS_SET_PIN, 0, pin)
+        print(f"  -> SW={sw:#06x} (expect 9000; 6A82 = already set)")
+        print("\n[P2] SIGN while locked — the gate word")
+        sw, _ = apdu(INS_GENERATE_KEY, 0)
+        print(f"  -> SW={sw:#06x} (expect {SW_PIN_SESSION_REQUIRED:#06x} before any touch prompt)")
+        print("\n[P3] VERIFY_PIN")
+        sw, _ = apdu(INS_VERIFY_PIN, 0, pin)
+        print(f"  -> SW={sw:#06x} (expect 9000)")
+        print("\n[P4] two wrong VERIFYs then the right one — the 63CX rows")
+        wrong = b"000000"
+        for _ in range(2):
+            sw, _ = apdu(INS_VERIFY_PIN, 0, wrong)
+            print(f"  -> SW={sw:#06x} (expect 63C2, then 63C1)")
+        sw, _ = apdu(INS_VERIFY_PIN, 0, pin)
+        print(f"  -> SW={sw:#06x} (expect 9000; the success resets the counter)")
+        print("\n[P5] LOCK")
+        sw, _ = apdu(INS_LOCK)
+        print(f"  -> SW={sw:#06x} (expect 9000)")
+        print("\n[P6] verify survives deselect: re-select the applet, then VERIFY")
+        sw, _ = select(conn, NOSTR_AID)
+        assert sw == 0x9000
+        sw, _ = apdu(INS_VERIFY_PIN, 0, pin)
+        print(f"  -> SW={sw:#06x} (expect 9000 — the session is applet-global, not per-connection)")
+        print("\n--pin legs done; the full gated-command matrix is the emulator suite's")
+        conn.disconnect()
+        return
 
     print("\n[0/5] baseline: LIST_KEYS")
     sw, n = list_keys()

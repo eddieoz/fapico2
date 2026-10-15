@@ -116,12 +116,12 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 821,796 | `0x10000200` | no (flash) |
-| `.rodata` | 20,708 | `0x100c8c28` | no (flash) |
-| `.data` | 13,780 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100d12e0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 401,000 | `0x200035d8` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20065440` | yes |
+| `.text` | 827,672 | `0x10000200` | no (flash) |
+| `.rodata` | 20,808 | `0x100ca318` | no (flash) |
+| `.data` | 13,884 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
+| `.gnu.sgstubs` | 0 | `0x100d2aa0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 400,940 | `0x20003640` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x2006546c` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -141,12 +141,22 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 889,348 B** · **`.data` = 13,780 B** · **`.bss` = 402,024 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 895,428 B** · **`.data` = 13,884 B** · **`.bss` = 401,964 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 415,804 B** (415,808 B address-to-address: `__sheap` `0x20065840` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20065840` → **main stack zone = 116,672 B** of 532,480 B of SRAM.
+**RAM statics = 415,848 B** (415,852 B address-to-address: `__sheap` `0x2006586c` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2006586c` → **main stack zone = 116,628 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
+
+**Date: 2026-10-16 (flash ratchet raised 1680 → 1696 KiB, by `raise_flash_budget.py`).**
+
+Reason recorded with the number: the OTP custody ceremony arc (US-1710-1716): the custody-row primitive and three-way classifier, the two-population OTP probe, the reseat bulk migration, CEREMONY_START and the provider re-mint — the PIN-custody epic's device code, measured at +6 KiB over the ratchet the presence-fix series raised (F-A6)
+
+Shipping image at the raise: 1726976 B = 3373 blocks = 1686 KiB. Budget 1696 KiB = 1736704 B, which is 9728 B of headroom.
+Fresh ELF at the raise: `text` 895,428 B (+6,080 over the 2026-10-13 record — the ceremony's device code: the custody classifier, the probe and the reseat), Berkeley `.bss` 401,964 B (**32,212 B** RAM headroom). `check_size_report.py` green at these numbers. Shipping UF2 sha256 `208d51d48777a4f81c748cb493b2fc9d13c7c6cf7affc6be3d4990804ad30a45`, reproducibility-checked in CI.
+
+The ratchet is the only *near-term* bound on the shipping image: the 3.5 MiB text ceiling is ~2 MB above the current build and cannot fire on ordinary growth, and the flash-map geometry (`FIRMWARE_GROWTH_END`) is the hard limit past which the image would link over the trussed filesystem. Headroom here is deliberate and finite — the next raise is a decision, not an accident, which is why the reason is recorded next to the number in `.github/workflows/ci.yml` and in `platform/src/flashmap.rs`.
+
 
 **Date: 2026-10-12 (flash ratchet raised 1664 → 1680 KiB, by `raise_flash_budget.py`).**
 

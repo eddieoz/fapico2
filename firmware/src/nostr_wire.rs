@@ -53,12 +53,32 @@ pub const NOSTR_CMD_LIST_KEYS: u8 = 0x45;
 pub const NOSTR_CMD_GENERATE_KEY: u8 = 0x46;
 /// §2.2 `IMPORT_KEY`.
 pub const NOSTR_CMD_IMPORT_KEY: u8 = 0x47;
-/// §2.2 `EXPORT_KEY` (D12) — touch-gated, permanent.
+/// §2.2 `EXPORT_KEY` (D12) — **retired by US-1699** (custody: only in,
+/// never out). The constant stays so the wire tables and the negative
+/// tests can name the byte; it is unmapped in `vendor_to_ins`, so `0x48`
+/// answers the in-band [`fapico2_platform::dispatch::SW_INS_NOT_SUPPORTED`]
+/// like any other unsupported method.
 pub const NOSTR_CMD_EXPORT_KEY: u8 = 0x48;
 /// §2.2 `DELETE_KEY`.
 pub const NOSTR_CMD_DELETE_KEY: u8 = 0x49;
 /// §2.2 `SET_LABEL`.
 pub const NOSTR_CMD_SET_LABEL: u8 = 0x4A;
+/// §2.2 `VERIFY_PIN` — opens the custody session. Touch-free by design:
+/// the PIN **is** the consent (§2.2).
+pub const NOSTR_CMD_VERIFY_PIN: u8 = 0x4B;
+/// §2.2 `SET_PIN`/`CHANGE_PIN` — the idx field of the `[idx, arg]` envelope
+/// rides P1, so `0` selects SET (establish custody on an unset board) and
+/// `1` selects CHANGE (verify-the-current-PIN ceremony). The PIN rides
+/// `arg` in the applet's own payload shape (`lc ‖ current ‖ new` for
+/// CHANGE, bare `pin` for SET).
+pub const NOSTR_CMD_SET_PIN: u8 = 0x4C;
+/// §2.2 `LOCK` — closes the custody session, idempotent, non-leaking.
+pub const NOSTR_CMD_LOCK: u8 = 0x4D;
+/// §2.2 `CEREMONY_START` (US-1714) — the explicit custody-migration
+/// ceremony. No `[idx, arg]` envelope: the INS is the whole instruction.
+/// The extension's consent dialog (US-1716) gates the request client-side;
+/// the device's own gates live in the verb.
+pub const NOSTR_CMD_CEREMONY_START: u8 = 0x4E;
 
 /// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
 /// above the applet's `MAX_REQUEST_ARG` is decodable, so every vendor arm
@@ -100,9 +120,9 @@ pub fn is_vendor_command(cmd: u8) -> bool {
 /// SW_INS_NOT_SUPPORTED`] — the D20 refusal — rather than a framing fault.
 pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
     use fapico2_nostr::{
-        INS_DELETE_KEY, INS_EXPORT_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
-        INS_IMPORT_KEY, INS_LIST_KEYS, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_LABEL,
-        INS_SIGN,
+        INS_CEREMONY_START, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
+        INS_IMPORT_KEY, INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT,
+        INS_SET_LABEL, INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN,
     };
     let ins = match cmd {
         NOSTR_CMD_PING => INS_GET_INFO,
@@ -113,9 +133,12 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
         NOSTR_CMD_LIST_KEYS => INS_LIST_KEYS,
         NOSTR_CMD_GENERATE_KEY => INS_GENERATE_KEY,
         NOSTR_CMD_IMPORT_KEY => INS_IMPORT_KEY,
-        NOSTR_CMD_EXPORT_KEY => INS_EXPORT_KEY,
         NOSTR_CMD_DELETE_KEY => INS_DELETE_KEY,
         NOSTR_CMD_SET_LABEL => INS_SET_LABEL,
+        NOSTR_CMD_VERIFY_PIN => INS_VERIFY_PIN,
+        NOSTR_CMD_SET_PIN => INS_SET_PIN,
+        NOSTR_CMD_LOCK => INS_LOCK,
+        NOSTR_CMD_CEREMONY_START => INS_CEREMONY_START,
         _ => return None,
     };
     Some(ins)
@@ -412,6 +435,79 @@ mod tests {
             Some((0xFF, &[][..])),
             "idx 0xFF is the one-byte ceiling"
         );
+    }
+
+    /// US-1702: the PIN custody verbs ride the vendor channel, one arm
+    /// each — `0x4B` VERIFY, `0x4C` SET/CHANGE (idx rides P1), `0x4D`
+    /// LOCK — and the PIN survives `decode_request` inside `arg` (49 bytes
+    /// of change payload, well under the 1,891-byte request cap). The
+    /// §8 note holds by construction: `0x4B`/`0x4C`/`0x4D` are Nostr
+    /// interface bytes; the RS-Key `0x41` and the CCID INS values live on
+    /// other interfaces and never meet them (`hid_serve.rs` routes by
+    /// interface; `us1660_a_nostr_command_is_refused_loudly_and_never_
+    /// reaches_fido` re-pins that). `0x48` — the retired EXPORT byte —
+    /// stays unmapped, so custody's "only in, never out" holds on both
+    /// transports.
+    #[test]
+    fn verify_set_lock_map_to_pin_ins() {
+        use fapico2_nostr::{INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN};
+        assert_eq!(vendor_to_ins(NOSTR_CMD_VERIFY_PIN), Some(INS_VERIFY_PIN));
+        assert_eq!(vendor_to_ins(NOSTR_CMD_SET_PIN), Some(INS_SET_PIN));
+        assert_eq!(vendor_to_ins(NOSTR_CMD_LOCK), Some(INS_LOCK));
+        // The change ceremony is the idx field: P1 0x01 rides through the
+        // envelope to the applet's P1, which selects CHANGE over SET.
+        // A PIN payload survives the envelope decoder: a 6-byte pin in
+        // `arg`, idx intact — the bytes the APDU bridge turns into
+        // `[00, 0x1C, idx, 00, lc, pin…]`.
+        let pin_req = [0x82, 0x00, 0x46, b'7', b'3', b'1', b'7', b'4', b'2'];
+        assert_eq!(
+            decode_request_inner(&pin_req),
+            Some((0x00, &pin_req[3..])),
+            "the PIN rides `arg` whole, under the request cap"
+        );
+        // And the retired byte stays retired.
+        assert_eq!(vendor_to_ins(NOSTR_CMD_EXPORT_KEY), None);
+    }
+
+    /// US-1715: the ceremony rides the vendor channel as `0x4E`, mapped to
+    /// the applet's `INS_CEREMONY_START` like every other §2.2 verb — the
+    /// request has no argument (the verb *is* the consent, delivered by the
+    /// extension's dialog), and the empty-`arg` ping form decodes clean.
+    #[test]
+    fn ceremony_start_maps_to_the_ceremony_ins() {
+        use fapico2_nostr::INS_CEREMONY_START;
+        assert_eq!(vendor_to_ins(NOSTR_CMD_CEREMONY_START), Some(INS_CEREMONY_START));
+        let req = [0x82, 0x00, 0x40]; // array(2) [0, bytes ""] — the ping form
+        assert_eq!(
+            decode_request_inner(&req),
+            Some((0x00, &req[3..])),
+            "the ceremony request is argument-free, idx intact"
+        );
+    }
+
+    /// US-1699: the retired `EXPORT_KEY` vendor byte is an **unsupported
+    /// method** — `0x48` answers the in-band `6D00` (the CBOR `sw` field)
+    /// without the applet ever running, the same class of refusal as any
+    /// other unmapped byte in `0x40..=0x7F`. The applet closure panics: if
+    /// a future edit re-maps the byte, this test names the channel that
+    /// leaked the secret.
+    #[test]
+    fn export_is_gone_on_vendor_hid() {
+        let payload = [0x82, 0x00, 0x40]; // array(2) [0, bytes ""] — the ping form
+        let mut req = HeaplessVec::new();
+        let mut resp = HeaplessVec::new();
+        let mut out = HeaplessVec::new();
+        let n = process_vendor_through(
+            NOSTR_CMD_EXPORT_KEY,
+            &payload,
+            &mut req,
+            &mut resp,
+            |_apdu, _| panic!("the retired EXPORT byte reached the applet"),
+            &mut out,
+        );
+        let (sw, data) = decode_response(&out[..n]).unwrap();
+        assert_eq!(sw, SW_INS_NOT_SUPPORTED, "0x48 is refused in band");
+        assert!(data.is_empty(), "no frame leaks the secret");
     }
 
     /// The envelope shapes are the extension's executable spec: request and

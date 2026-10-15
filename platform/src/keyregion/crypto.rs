@@ -626,6 +626,77 @@ fn open_with(key: &[u8; KEY_LEN], aad: &RecordAad, sealed: &[u8], out: &mut [u8]
     Some(pt_len)
 }
 
+// ---------------------------------------------------------------------------
+// The Nostr key source — the one named seam (US-1713)
+// ---------------------------------------------------------------------------
+
+/// Which derivation a Nostr region's records seal under — the **one named
+/// seam** the custody migration (US-1713) asks for: the applet names a
+/// source, this module derives the key, and no applet code carries an
+/// `if legacy { … } else { … }` fork of its own.
+///
+/// The two variants are the whole migration's key story:
+///
+/// * [`NostrKeySource::LegacyConstant`] is the pre-custody key — the
+///   constant [`NOSTR_PAYLOAD_SECRET`] over the OTP root, what every board
+///   flashed before the ceremony carries, and what a v0.2.0 possessor can
+///   re-derive offline. After the ceremony's marker, **no record may open
+///   under it** (the G1 assertion): otherwise the offline PIN-verifier
+///   attack re-enters through the front door.
+/// * [`NostrKeySource::Custody`] is the post-ceremony key: the custody
+///   secret **as the OTP rows read back** (`crate::custody::
+///   custody_secret_bytes` — contents-authoritative, deterministic across
+///   boots and firmware generations) over the same root. This is
+///   `HKDF(otp_key_1, chipid, custody_row)` in the epic's notation:
+///   `derive_payload_key_from_root` expands `root ‖ custody` under
+///   [`PAYLOAD_KEY_INFO`], so the OTP root, the chipid and the custody row
+///   are all in the IKM.
+#[derive(Clone, Copy)]
+pub enum NostrKeySource<'a> {
+    /// The pre-custody constant-KDF key. The thing migration exists to
+    /// retire.
+    LegacyConstant,
+    /// The custody-row key, from the 16 custody bytes as they read back.
+    Custody(&'a [u8; 16]),
+}
+
+/// Domain label for stretching the 16 custody bytes to the payload key's
+/// 32-byte input width: `b"fapico2/nostr-region/custody/v1"`. The stretch
+/// is SHA-256 over this label and the read-back bytes — deterministic, so
+/// every boot and every firmware generation that reads the same rows
+/// derives the same key, and domain-separated, so a custody secret is never
+/// confused with any other 16 bytes in the tree.
+pub const CUSTODY_STRETCH_INFO: &[u8] = b"fapico2/nostr-region/custody/v1";
+
+/// The Nostr payload key, derived by name.
+///
+/// The seam's whole point: a caller that hands this module a
+/// [`NostrKeySource`] cannot also mix the two derivations — there is no
+/// path from the applet to a key that is half legacy, half custody. The
+/// `Option` is [`derive_payload_key`]'s own (a zero OTP row derives
+/// nothing).
+pub fn derive_nostr_payload_key(
+    otp_key_1: &[u8; KEY_LEN],
+    chipid: &[u8; 8],
+    source: NostrKeySource<'_>,
+) -> Option<PayloadKey> {
+    match source {
+        NostrKeySource::LegacyConstant => {
+            derive_payload_key(otp_key_1, chipid, &NOSTR_PAYLOAD_SECRET)
+        }
+        NostrKeySource::Custody(custody) => {
+            let root = derive_otp_root(otp_key_1, chipid)?;
+            let mut stretched = Sha256::new();
+            stretched.update(CUSTODY_STRETCH_INFO);
+            stretched.update(custody);
+            let mut secret: [u8; KEY_LEN] = stretched.finalize().into();
+            let key = derive_payload_key_from_root(&root, &secret);
+            secret.zeroize();
+            Some(key)
+        }
+    }
+}
+
 /// Seal a record body under the **index** key.
 ///
 /// It exists so the index key is not a key that can do nothing: the index is a

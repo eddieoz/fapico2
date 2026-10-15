@@ -390,8 +390,56 @@ decisions, and ADR 0005's amendment records the accepted RAM lifetime of the
 scalar. Reset semantics: management `RESET` wipes Nostr (the proxy forwards
 `factory_wipe`); CTAP2 `authenticatorReset` spares it.
 
+**PIN custody rides the same two transports (US-1689..1706, ADR 0006).** The
+vendor bytes `0x4B` (VERIFY_PIN), `0x4C` (SET_PIN — the envelope idx selects
+SET `0` / CHANGE `1`; the CHANGE payload is `lc(1) ‖ current ‖ new`) and
+`0x4D` (LOCK) map to INS `0x1B`/`0x1C`/`0x1D`; `0x48`/INS `0x1A` (EXPORT) is
+retired and answers `6D00` **in band** on both transports. Custody is
+import-only: there is no export command at all, in any dialect. On a PIN-set
+board every identity-touching command (SIGN, NIP44 ENC/DEC, IMPORT, GENERATE,
+DELETE, SET_LABEL) answers `SW_PIN_SESSION_REQUIRED` (`0x6982`) until VERIFY
+opens a session; the refusal sits **after the shape checks and before the
+state reads and the touch** — armed grants are consumed by refusals, never by
+signatures. The session is a RAM flag behind the applet mutex: cleared by the
+power cycle, NOT by deselect/re-select, spanning both transports. Setting is
+not unlocking — VERIFY is the only setter. A wrong PIN answers `63C0|remaining`
+(durable through record rewrite; `0x63C0` itself is the lockout floor — same
+range, and the undecodable-slot image fails closed on it). The honest
+sentence about test coverage: **a CCID unlock covers the HID arm** — the
+session flag is applet-global, so every gate behavior the CCID emulator
+exercises holds for the vendor-HID arm by construction; the emulator has no
+Nostr HID interface (above), and `scripts/nostr_probe.py --pin` is the
+hardware leg.
+
+**The custody ceremony is the one OTP-writing command, and it is consent-gated
+by construction (US-1712..1716, ADR 0005's custody-row amendment).** The
+vendor byte `0x4E` (→ INS `0x1E`, `CEREMONY_START`) burns the page-locked
+custody page and reseats every record off the legacy constant-KDF onto the
+custody key (`derive_nostr_payload_key(otp_key_1, chipid, custody_row_readback)`
+— contents-authoritative: the input is what the burned page reads back, never
+what was intended). No other command — VERIFY included — triggers a burn or a
+reseat; the verb refuses `SW_PIN_NOT_SET`, `SW_CEREMONY_NOT_NEEDED` (`0x6F02`:
+no PIN, no sealed records, or the marker already stands), and its response
+body is `migrated(2 BE) ‖ already(2 BE)`. `GET_INFO` advertises the offer
+with flags bit 2 (`FLAG_MIGRATION_PENDING = 0x04`, set iff
+`pin_set && !reseat_complete()`) and the capability with
+`CAP_CEREMONY = 0x0008` (`CAPS = 0x000F`). After the marker stands, **no
+record — including the PIN record — opens under the legacy KDF**
+(`no_record_opens_under_legacy_after_marker`, re-checked at every boot attach
+in `nostr_custody_region`: marker stands → the dual-KDF window closes). A
+faulted custody-page read answers `SW_SEALED_UNAVAILABLE` (`0x6F01`) to
+**every** command, RAM-only, judged once per boot, never latching, never
+tombstoning, never `fatal_boot` — the store cannot guess at a key, so it
+refuses. The boot-side derivation rule still applies: virgin/torn custody
+rows derive the **legacy** key (the ceremony resumes), sealed/complete rows
+derive the custody key, and a faulted assessment derives **no** key.
+Downgrade is destruction, not extraction — the residuals are recorded once in
+ADR 0006's downgrade section, and the matrix transcript is
+`docs/audits/2026-10-15-nostr-downgrade-matrix.md`.
+
 Tests: `apps/nostr/tests/` (wire, keymgmt + BIP-340 vectors, NIP-44 vectors,
-presence), `platform/tests/nostr_store.rs`, the emulator suites
+presence, ceremony — `ceremony.rs` holds the consent-gate and sealed-unavailable
+suite), `platform/tests/nostr_store.rs`, the emulator suites
 `tests/harness/test_nostr_select.py` / `test_nostr_keymgmt.py`, the CCID
 hardware probe `scripts/nostr_probe.py`, and the udev rule a Linux extension
 user needs — `platform/udev/70-fapico2-nostr.rules` (scoped to the VID;

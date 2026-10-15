@@ -7,6 +7,49 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.3.0] — 2026-10-15
+
+Full notes in [`docs/release-notes-alpha-v0.3.0.md`](docs/release-notes-alpha-v0.3.0.md).
+
+### Added — Nostr PIN custody
+
+- **The Nostr PIN gate**: import-only custody (`EXPORT_KEY` retired), a
+  session gate on every identity-touching command, the PIN custody verbs
+  `0x4B`/`0x4C`/`0x4D`, and the capability-gated extension flows
+  ([ADR 0006](docs/adr/0006-nostr-pin-custody.md)).
+- **The custody ceremony**: the consented `CEREMONY_START` verb burns a
+  page-locked OTP secret and reseats every record off the legacy KDF —
+  downgrade becomes destruction, not extraction. The residuals are recorded
+  once in ADR 0006's downgrade section; the downgrade-matrix transcript is
+  [`docs/audits/2026-10-15-nostr-downgrade-matrix.md`](docs/audits/2026-10-15-nostr-downgrade-matrix.md).
+
+### Fixed — the device path's PIN cache
+
+- **The PIN cache now derives at the one-shot attach.** The device path never
+  runs `NostrApp::boot` — the region is a lazy provider — so the cache
+  `GET_INFO` reports and the session gate consults stayed at the constructor's
+  `pin_set: false` until a PIN verb ran: after every power cycle the gate stood
+  open and `GET_INFO` answered PIN-less on a PIN-set board. The hardware
+  ceremony probe caught it live (flags `0x00` flipping to `0x05` on a refused
+  `SET_PIN`); the emulator never could, because its path boots eagerly. The
+  first `process` call now derives the cache from the store exactly as a boot
+  would, fail-closed
+  (`tests/pin.rs::the_device_path_derives_the_pin_cache_at_first_attach`).
+
+### Fixed — the device provider is no longer consumed by the first hand-over
+
+- **The custody ceremony's re-entry can re-mint the region.** The device
+  provider was take-once (`boot::take_nostr_key_region` empties its
+  `Option` slot), and the ceremony re-enters it after dropping the applet's
+  handle — so on hardware the second call got `None`, the applet answered
+  `SW_STORE_FAULT` and stayed store-dead until reboot, after the OTP page
+  had already burned. Reproduced twice on the sacrificial board; every host
+  test passed because the emulator's provider re-opens its file per call. A
+  spare `FLASH` singleton is now staged beside the boot hand-over
+  (`boot::nostr_key_region_fresh`), and `nostr_region` is take-then-mint:
+  each re-entry gets an independent handle over the same disjoint window,
+  with at most one live at a time. The completing ceremony ran 0.62 s.
+
 ## [0.2.0] — 2026-10-14
 
 Released as [`fapico2-release-alpha-v0.2.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.2.0);

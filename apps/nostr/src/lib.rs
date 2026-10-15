@@ -129,9 +129,41 @@ pub const INS_SET_LABEL: u8 = 0x18;
 /// (D12); an undecodable slot answers with no body. The request carries
 /// no payload. Touch-gated. US-1649.
 pub const INS_DELETE_KEY: u8 = 0x19;
-/// `EXPORT_KEY` — `scalar(32)`, touch-gated and permanent (§2.2.0a).
-/// US-1649.
+/// `EXPORT_KEY` — **retired by US-1699** (custody: only in, never out).
+/// The constant stays so the negative tests and the wire tables can name
+/// the byte; the dispatcher has no arm for it, so `0x1A` answers the
+/// dispatcher's [`SW_INS_NOT_SUPPORTED`] (`6D00`) on every transport.
 pub const INS_EXPORT_KEY: u8 = 0x1A;
+
+/// `SET_PIN` (P1 `0x00`) — establish PIN custody on an unset board.
+/// Touch-free: the PIN itself is the consent. US-1691. P1 `0x01` on the same
+/// INS is `CHANGE_PIN` (US-1692).
+pub const INS_SET_PIN: u8 = 0x1C;
+/// `VERIFY_PIN` — check a PIN against the record and open the custody
+/// session. Touch-free. US-1693.
+pub const INS_VERIFY_PIN: u8 = 0x1B;
+/// `LOCK` — close the custody session explicitly, idempotently. Touch-free.
+/// US-1694.
+pub const INS_LOCK: u8 = 0x1D;
+/// `CEREMONY_START` (US-1714) — the explicit custody-migration ceremony:
+/// burn the custody rows until the page reads complete, re-derive through
+/// the region provider, reseat every record off the legacy KDF, and stand
+/// the completion marker. P1 = P2 = 0, no payload. **The only verb that
+/// triggers a burn or a reseat** (US-1715) — VERIFY and every other command
+/// migrate nothing implicitly. Neither touch-gated nor session-gated: the
+/// consent is this verb plus the extension's dialog (US-1716, "the button
+/// is not needed"); the refusal gates are [`SW_PIN_NOT_SET`] and
+/// [`SW_CEREMONY_NOT_NEEDED`].
+pub const INS_CEREMONY_START: u8 = 0x1E;
+
+/// The PIN retry budget, reset to this on every successful verify — the
+/// OATH precedent (`MAX_OTP_COUNTER = 3`): a durable budget makes guessing
+/// cost something a power cycle cannot refund.
+pub const PIN_MAX_RETRIES: u8 = 3;
+/// The shortest PIN, in bytes (§2.2's custody table, the OATH 6–64 range).
+pub const PIN_MIN_LEN: usize = 6;
+/// The longest PIN, in bytes. Longer is `6A80`, never truncated.
+pub const PIN_MAX_LEN: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Status words (§2.2.0)
@@ -200,13 +232,52 @@ pub const SW_ECC_UNSUPPORTED: Sw = 0x6B00;
 /// (US-1653/US-1654).
 pub const SW_INVALID_PEER_KEY: Sw = 0x6A87;
 
+// The PIN custody vocabulary (US-1691 and its siblings). The four words are
+// declared together so every PIN story reads the same table; the gate word
+// is named before the gate exists for the same reason [`SW_TOUCH_REQUIRED`]
+// was.
+/// The PIN record does not exist — `6A82`, OpenPGP's "file not found":
+/// there is no PIN to verify against, and the no-PIN state is exactly the
+/// ungated state. Emitted by `VERIFY_PIN`/`CHANGE_PIN` on an unset board.
+pub const SW_PIN_NOT_SET: Sw = 0x6A82;
+/// `SET_PIN` on a board that already has a PIN — `6A82`, the state does not
+/// allow the command. The stored record is untouched; changing a PIN is
+/// `CHANGE_PIN`'s business (US-1692), which verifies the current one.
+pub const SW_PIN_ALREADY_SET: Sw = 0x6A82;
+/// The retry counter is exhausted — `63C0`, the last word of the same
+/// `63CX` vocabulary a wrong PIN answers with. The board is locked until
+/// management `RESET`; the payload is never read again.
+pub const SW_PIN_LOCKED: Sw = 0x63C0;
+/// A PIN exists and the custody session is not open — `6982`, OpenPGP's
+/// CHV-not-verified. The gate word for every secret operation (US-1697);
+/// distinct from [`SW_TOUCH_REQUIRED`] so a host can say which consent is
+/// missing — the token or the finger — and ask for exactly one.
+pub const SW_PIN_SESSION_REQUIRED: Sw = 0x6982;
+/// US-1714: the custody rows faulted at attach — no payload key can be
+/// derived, so no record can be opened **and nothing may be written over
+/// records nobody can read**. Every command answers this word, in band;
+/// nothing repairs, nothing tombstones, and destruction stays
+/// management-`RESET`-only. RAM-only: the state is re-derived at the next
+/// boot, so a power cycle clears it (US-1717's recovery ladder step 1).
+/// Vendor range, beside [`SW_STORE_FAULT`]: the answer is a device-state
+/// fact, not an ISO condition.
+pub const SW_SEALED_UNAVAILABLE: Sw = 0x6F01;
+/// US-1715: `CEREMONY_START` refused because the ceremony has nothing to
+/// do — the marker stands, or the domain holds no identity records to
+/// migrate (the PIN record alone does not justify an irreversible burn).
+/// Vendor range: a device-state fact like [`SW_SEALED_UNAVAILABLE`].
+pub const SW_CEREMONY_NOT_NEEDED: Sw = 0x6F02;
+
 // ---------------------------------------------------------------------------
 // GET_INFO fields
 // ---------------------------------------------------------------------------
 
-/// The applet protocol version, `(0, 1)` — bumped when the wire layout
+/// The applet protocol version, `(0, 2)` — bumped when the wire layout
 /// changes, not when commands are added (clients branch on caps for that).
-pub const APPLET_VERSION: [u8; 2] = [0x00, 0x01];
+/// `(0, 1)` → `(0, 2)` is US-1700: `EXPORT_KEY` retired (US-1699), the PIN
+/// custody dialect (`0x1B`–`0x1D`) in the table, and a live `INFO_FLAGS`
+/// byte where v0.2.0 readers saw a reserved zero.
+pub const APPLET_VERSION: [u8; 2] = [0x00, 0x02];
 
 /// The largest NIP-44 plaintext the applet will accept or return (§2.2.1).
 ///
@@ -250,17 +321,42 @@ pub const MAX_REQUEST_ARG: usize = 32 + MAX_NIP44_PAYLOAD_ARG;
 pub const CAP_KEY_MGMT: u16 = 0x0001;
 /// caps bit 1: the NIP-44 pair (`0x16`/`0x17`) is served. Set with US-1653.
 pub const CAP_NIP44: u16 = 0x0002;
+/// caps bit 2: the PIN custody dialect (`SET_PIN`/`VERIFY_PIN`/`LOCK`,
+/// `0x1B`–`0x1D`) is served. Set with US-1700 — a v0.2.0 client seeing the
+/// bit knows the PIN verbs exist; a client seeing the bumped
+/// [`APPLET_VERSION`] knows `EXPORT_KEY` does not.
+pub const CAP_PIN_MGMT: u16 = 0x0004;
+
+/// caps bit 3: `CEREMONY_START` (`0x1E`) is served (US-1714). Set in the
+/// same edit as the verb — an advertised command that refuses is the §4
+/// failure mode. A v0.2.0-era client ignores unknown bits.
+pub const CAP_CEREMONY: u16 = 0x0008;
 
 /// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] (the key-management trio
-/// `0x13`–`0x15`, US-1644/US-1645) plus [`CAP_NIP44`] (the NIP-44 pair
-/// `0x16`/`0x17`, US-1653). An advertised command that refuses is the §4
+/// `0x13`–`0x15`, US-1644/US-1645), [`CAP_NIP44`] (the NIP-44 pair
+/// `0x16`/`0x17`, US-1653) and [`CAP_PIN_MGMT`] (the PIN custody dialect,
+/// US-1700). An advertised command that refuses is the §4
 /// failure mode (`apps/fido` getInfo history), so this constant changes in
 /// the same commit as the arms it covers — `tests/wire.rs` re-derives the
 /// cap rows and the harness suite asserts the wire value.
-pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44;
+pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT | CAP_CEREMONY;
 
-/// Reserved `flags` byte of `GET_INFO` — zero until a story defines a bit.
-pub const INFO_FLAGS: u8 = 0x00;
+// The `flags` byte of `GET_INFO` (US-1700) — the PIN state bits, derived
+// from the **same cached state the gate and the ceremony read**, so the
+// advertisement cannot lie about the command paths (the §4 rule). A
+// no-PIN board answers `0x00`: byte-compatible with the v0.2.0 readers
+// that saw a reserved zero here.
+/// `flags` bit 0: a PIN record exists — the custody gate is real.
+pub const FLAG_PIN_SET: u8 = 0x01;
+/// `flags` bit 1: the custody session is open — gated commands will run
+/// subject to touch. Meaningful only with bit 0.
+pub const FLAG_SESSION_UNLOCKED: u8 = 0x02;
+/// `flags` bit 2: custody migration pending — an identity set that
+/// predates PIN custody and the ceremony (US-1712+) has something to do
+/// about it. No mechanism sets it yet; it is named here so the byte's
+/// whole layout lands in one GET_INFO change instead of churning every
+/// layout pin twice.
+pub const FLAG_MIGRATION_PENDING: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // bech32 npub (NIP-19)
@@ -368,7 +464,6 @@ pub fn bech32_npub(x_only: &[u8; 32]) -> [u8; BECH32_NPUB_LEN] {
 /// interrupted-commit recovery failed) or the device boot has not reached the
 /// release gate yet, and the applet refuses reads with [`SW_STORE_FAULT`]
 /// rather than reporting a fiction.
-#[derive(Debug, Default)]
 pub struct NostrApp {
     region: Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
     /// The device path's lazy region source — `install_region_provider`'s
@@ -386,6 +481,71 @@ pub struct NostrApp {
     /// it). `None` ⇒ [`default_user_present`] — deny on device, auto-ack on
     /// host — the rescue applet's shape.
     presence_grant: Option<fn(u32) -> bool>,
+    /// PIN custody, cached: a PIN record exists in the PIN slot
+    /// (US-1689/US-1690's slot 919). Derived from the store at boot —
+    /// **fail-closed**: an Undecodable or unreadable record counts as set,
+    /// because "no PIN" is the state that lifts the gate and a cache that
+    /// says so wrongly is the cache that must not exist. `set_pin` and its
+    /// siblings keep it coherent as they commit.
+    pin_set: bool,
+    /// PIN custody, session: the flag every secret operation's gate consults
+    /// (US-1697). Applet-global behind the shared `Mutex` (§8: one applet
+    /// instance per transport pair), RAM-only, so a power cycle closes every
+    /// session — there is no "unlock once, own the board" state. `VERIFY_PIN`
+    /// (US-1693) is the only setter to `true`; `LOCK` (US-1694) and boot
+    /// clear it.
+    pin_unlocked: bool,
+    /// US-1714: the custody OTP leg — what the ceremony may ask of the OTP
+    /// controller (assess, burn, derive) and nothing more. `&'static dyn`
+    /// because the OTP controller is a singleton the firmware owns for the
+    /// process lifetime (the host tests hand a fixture through the same
+    /// seam), and a `fn` pointer cannot lend an object. `None` on paths
+    /// that never wired it: the ceremony refuses loudly, and every other
+    /// command behaves exactly as it did before custody existed.
+    custody_otp: Option<&'static dyn fapico2_platform::otp_cus::OtpAccess>,
+    /// The custody rows' health, cached RAM-only: the sealed-unavailable
+    /// state is decided from the rows **once per boot** and never repaired
+    /// in session, while a power cycle recomputes it from scratch — the
+    /// not-latching property US-1714 pins. `Unknown` until the first
+    /// command asks.
+    custody: CustodyHealth,
+    /// The region provider **as wired**, never cleared by a successful
+    /// attach. The ceremony (US-1714) drops its region view twice — after
+    /// the burn and after the reseat — so the next attach re-derives
+    /// through the provider and lands in the world the rows now describe;
+    /// [`attach_store`] cleared `provider` would leave it `None` and the
+    /// ceremony unable to re-enter. The boot-eager paths (tests, emulator)
+    /// carry `None` here and re-attach nothing.
+    region_source: Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
+}
+
+/// The custody rows' health (US-1714). The three-way split the first
+/// command's attach needs: `Unknown` defers the OTP read, `Usable` means
+/// the rows classify (whatever their ceremony state), and `Faulted` is the
+/// sealed-unavailable state — the key cannot be derived and nothing may
+/// run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CustodyHealth {
+    Unknown,
+    Usable,
+    Faulted,
+}
+
+/// The derived `Debug` said too much once; the replacement redacts on
+/// purpose — a debug print of the applet must never be the thing that
+/// leaks which caches are set, and it cannot name the region either.
+impl core::fmt::Debug for NostrApp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "NostrApp(<redacted>)")
+    }
+}
+
+/// `new()` is the default: the bare applet every construction path starts
+/// from, and the const form the device static needs.
+impl Default for NostrApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NostrApp {
@@ -394,7 +554,17 @@ impl NostrApp {
     /// The registration test (`apps/tests/registry.rs`) registers this
     /// shape; the firmware and the emulator boot a region instead.
     pub const fn new() -> Self {
-        NostrApp { region: None, provider: None, rng: None, presence_grant: None }
+        NostrApp {
+            region: None,
+            provider: None,
+            rng: None,
+            presence_grant: None,
+            pin_set: false,
+            pin_unlocked: false,
+            custody_otp: None,
+            custody: CustodyHealth::Unknown,
+            region_source: None,
+        }
     }
 
     /// Boot the applet over `region`, finishing any commit a power cut
@@ -407,10 +577,40 @@ impl NostrApp {
     /// keeps answering APDUs and refuses every read with [`SW_STORE_FAULT`]
     /// (S10: degrade, never halt — the same shape `boot.rs` uses for a
     /// missing OATH payload key).
+    ///
+    /// The PIN cache derives from the record the region actually holds —
+    /// a boot is the same as a power cycle for the session flag, and the
+    /// `pin_set` half must not assume the constructor's default: an applet
+    /// booted over a board whose PIN survived the cycle would let a second
+    /// `SET_PIN` overwrite custody. Fail-closed: a record that will not
+    /// read or decode counts as a PIN present (US-1695's contract, applied
+    /// at the earliest point it can be).
     pub fn boot(mut region: fapico2_platform::keyregion::nostr_store::NostrRegion) -> Self {
-        match region.store().recover() {
-            Ok(_) => NostrApp { region: Some(region), provider: None, rng: None, presence_grant: None },
-            Err(_) => NostrApp { region: None, provider: None, rng: None, presence_grant: None },
+        let degraded = region.store().recover().is_err();
+        if degraded {
+            return NostrApp {
+                region: None,
+                provider: None,
+                rng: None,
+                presence_grant: None,
+                pin_set: false,
+                pin_unlocked: false,
+                custody_otp: None,
+                custody: CustodyHealth::Unknown,
+                region_source: None,
+            };
+        }
+        let pin_set = pin_boot_classification(region.store().read_pin());
+        NostrApp {
+            region: Some(region),
+            provider: None,
+            rng: None,
+            presence_grant: None,
+            pin_set,
+            pin_unlocked: false,
+            custody_otp: None,
+            custody: CustodyHealth::Unknown,
+            region_source: None,
         }
     }
 
@@ -427,6 +627,20 @@ impl NostrApp {
         provider: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
     ) -> Self {
         self.provider = Some(provider);
+        self.region_source = Some(provider);
+        self
+    }
+
+    /// US-1714: wire the custody OTP leg. See the field docs — the
+    /// ceremony is the only consumer, and the handle is `&'static` for the
+    /// same reason the firmware's statics are: the controller is a
+    /// singleton.
+    pub fn with_custody_otp(
+        mut self,
+        otp: &'static dyn fapico2_platform::otp_cus::OtpAccess,
+    ) -> Self {
+        self.custody_otp = Some(otp);
+        self.custody = CustodyHealth::Unknown;
         self
     }
 
@@ -457,10 +671,40 @@ impl NostrApp {
         region_provider: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
         rng: fn(&mut [u8]),
         grant: fn(u32) -> bool,
+        custody_otp: Option<&'static dyn fapico2_platform::otp_cus::OtpAccess>,
     ) {
         self.provider = Some(region_provider);
+        self.region_source = Some(region_provider);
         self.rng = Some(rng);
         self.presence_grant = Some(grant);
+        self.custody_otp = custody_otp;
+    }
+
+    /// The custody rows' health, decided once per boot (US-1714). The
+    /// faulted read — [`fapico2_platform::custody::CeremonyState::Abort`],
+    /// which is what faulted rows classify to — is the sealed-unavailable
+    /// state; every other answer (virgin, torn, burned, complete) leaves
+    /// the applet runnable, because a key exists in each of those worlds.
+    fn custody_faulted(&mut self) -> bool {
+        if self.custody == CustodyHealth::Unknown {
+            self.custody = match self.custody_otp {
+                // Never wired: no custody rows are in play on this path,
+                // and the ceremony's own wiring-bug refusal covers the
+                // verb. Every pre-custody behavior is unchanged.
+                None => CustodyHealth::Usable,
+                Some(otp) => {
+                    if matches!(
+                        fapico2_platform::custody::assess(otp),
+                        fapico2_platform::custody::CeremonyState::Abort
+                    ) {
+                        CustodyHealth::Faulted
+                    } else {
+                        CustodyHealth::Usable
+                    }
+                }
+            };
+        }
+        self.custody == CustodyHealth::Faulted
     }
 
     /// The applet's region view — attaching the deferred region first when
@@ -484,6 +728,11 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        // The cache reads first: the store borrow must span the identity
+        // walk and the pending check, and disjoint locals compose where a
+        // `&mut self` read mid-borrow would not.
+        let pin_set = self.pin_set;
+        let pin_unlocked = self.pin_unlocked;
         let Some(mut store) = self.store(resp) else { return };
         let mut n: u8 = 0;
         for index in 0..NOSTR_SLOTS as u16 {
@@ -496,11 +745,36 @@ impl NostrApp {
                 }
             }
         }
+        // The state bits come from the same cache the gate reads — never
+        // from a fresh store read that could disagree with it mid-flight.
+        let mut flags = 0u8;
+        if pin_set {
+            flags |= FLAG_PIN_SET;
+        }
+        if pin_unlocked {
+            flags |= FLAG_SESSION_UNLOCKED;
+        }
+        // US-1714: migration pending — bit 2, set until the reseat marker
+        // lands. The predicate is the store's own completeness check, the
+        // same one the ceremony and the reseat consult: a PIN-set board
+        // whose domain has not been migrated reads pending, a
+        // ceremony-completed board does not, and a faulted marker read
+        // reads pending (conservative: "set until the marker lands").
+        // Derived from the store and the same `pin_set` cache the gate
+        // reads — never a second opinion about either.
+        if pin_set
+            && match store.reseat_complete() {
+                Ok(complete) => !complete,
+                Err(_) => true,
+            }
+        {
+            flags |= FLAG_MIGRATION_PENDING;
+        }
         resp.extend_from_slice(&APPLET_VERSION).ok();
         resp.extend_from_slice(&CAPS.to_be_bytes()).ok();
         resp.extend_from_slice(&MAX_PLAINTEXT.to_be_bytes()).ok();
         resp.push(n).ok();
-        resp.push(INFO_FLAGS).ok();
+        resp.push(flags).ok();
         write_sw(resp, SW_OK);
     }
 
@@ -591,10 +865,13 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         // Destructure once: the store borrow must coexist with the RNG pool
         // draw, and disjoint field borrows compose where a `&mut self`
         // method call would not.
-        let Self { region, provider, rng, presence_grant } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
 
         // State before the touch (see the doc comment).
@@ -687,9 +964,12 @@ impl NostrApp {
             write_sw(resp, SW_WRONG_DATA);
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         // IMPORT_KEY draws nothing: the scalar is the host's, and its
         // validity is checked above.
-        let Self { region, provider, rng: _, presence_grant } = self;
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         match writability(&mut store, p1 as u16) {
             Ok(true) => {}
@@ -732,7 +1012,10 @@ impl NostrApp {
             write_sw(resp, SW_WRONG_DATA);
             return;
         };
-        let Self { region, provider, rng, presence_grant } = self;
+        if self.gate_refuses(resp) {
+            return;
+        }
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -798,7 +1081,10 @@ impl NostrApp {
             write_sw(resp, sw);
             return;
         }
-        let Self { region, provider, rng, presence_grant } = self;
+        if self.gate_refuses(resp) {
+            return;
+        }
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -900,6 +1186,9 @@ impl NostrApp {
             write_sw(resp, SW_ECC_UNSUPPORTED);
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         let Self { region, provider, presence_grant, .. } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
@@ -960,7 +1249,10 @@ impl NostrApp {
             write_sw(resp, SW_WRONG_DATA);
             return;
         }
-        let Self { region, provider, rng: _, presence_grant } = self;
+        if self.gate_refuses(resp) {
+            return;
+        }
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1027,7 +1319,10 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant } = self;
+        if self.gate_refuses(resp) {
+            return;
+        }
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         // Classify after the form check: a corrupt slot (our tag, a body
         // that will not open) destroys through force_tombstone with no
@@ -1064,41 +1359,474 @@ impl NostrApp {
         write_sw(resp, SW_OK);
     }
 
-    /// `EXPORT_KEY` — P1 = idx; answers `scalar(32)`. Touch-gated and
-    /// permanent (§2.2.0a): the real threat-model downgrade, offered because
-    /// a key nobody can back up is a single point of failure. The README
-    /// (US-1676) says so in the user's terms.
-    fn export_key(
+    /// US-1691: `SET_PIN` (INS `0x1C`, P1 `0x00`) — establish PIN custody on
+    /// an unset board, OATH's `cmd_set_pin` shape (`oath_core.rs:3090`).
+    ///
+    /// Touch-free by design: the PIN itself is the consent, and a ceremony
+    /// that asked for a button too would teach users to press through
+    /// prompts they cannot read on a device with no screen. The refusals
+    /// come in the §2.2.0 order — shape first (`6A80`, before any state is
+    /// read or anything consumed), then state (`6A82` for a board that
+    /// already has a PIN; the stored record is untouched), then the store.
+    ///
+    /// The record commits through the full occupancy-guard path: a fresh
+    /// 16-byte TRNG salt, `counter = PIN_MAX_RETRIES`, and
+    /// `SHA256(salt ‖ pin)` — the verifier, never the PIN; the sealed
+    /// record is opened by [`set_pin_stores_verifier_not_the_pin`] to pin
+    /// that. Success sets the `pin_set` cache and deliberately leaves
+    /// `pin_unlocked` false: **setting is not unlocking — VERIFY is**
+    /// (US-1693), and a set that opened a session would hand whoever could
+    /// reach the USB port the identities the PIN exists to protect.
+    fn set_pin(&mut self, p1: u8, p2: u8, data: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+        use fapico2_platform::keyregion::nostr_store::{NostrPinRecord, PinEntry};
+        if p1 != 0x00 || p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() < PIN_MIN_LEN || data.len() > PIN_MAX_LEN {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        let rng = self.rng;
+        // (status word, the pin_set the cache must end at). `pin_unlocked`
+        // ends at false on every arm — even success: setting is not
+        // unlocking. The cache write happens after the store view ends.
+        let outcome = {
+            let Some(mut store) = self.store(resp) else { return };
+            match store.read_pin() {
+                Ok(PinEntry::Live(_)) => (Some(SW_PIN_ALREADY_SET), true),
+                // Fail closed (US-1695's contract, applied now): a slot that
+                // holds something we cannot identify is not a board without a
+                // PIN, and no honest answer distinguishes "set" from "ruined"
+                // from the outside — so refuse, and cache set.
+                Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => (Some(SW_STORE_FAULT), true),
+                Ok(PinEntry::Empty) | Ok(PinEntry::Tombstone) => {
+                    let mut salt = [0u8; 16];
+                    if draw_random(rng, &mut salt).is_none() {
+                        // The source refused: no record is written, and the
+                        // slot stays empty — the honest cache state is unset.
+                        (Some(SW_STORE_FAULT), false)
+                    } else {
+                        let record = NostrPinRecord {
+                            counter: PIN_MAX_RETRIES,
+                            salt,
+                            verifier: crypto::pin_verifier(data, &salt),
+                        };
+                        match store.write_pin(&record) {
+                            Ok(_) => (None, true),
+                            // A commit that may have landed is not a
+                            // board without a PIN: cache fail-closed.
+                            Err(_) => (Some(SW_STORE_FAULT), true),
+                        }
+                    }
+                }
+                // A read fault leaves the slot's state unknown — the
+                // cache fails closed, same as the Undecodable arm.
+                Err(_) => (Some(SW_STORE_FAULT), true),
+            }
+        };
+        let (sw, pin_set) = outcome;
+        write_sw(resp, sw.unwrap_or(SW_OK));
+        self.pin_set = pin_set;
+        self.pin_unlocked = false;
+    }
+
+    /// The verify leg US-1692 and US-1693 share: compare `pin` against
+    /// `record` in constant time and **make the outcome durable** — a
+    /// success resets the counter to [`PIN_MAX_RETRIES`], a failure
+    /// decrements it and rewrites the record through the full commit path,
+    /// so the budget survives the power cycle a RAM counter would refund.
+    /// A board already at zero is locked and answers [`SW_PIN_LOCKED`] for
+    /// any payload; the counter is never decremented below zero. The word
+    /// for a failure is the `63CX` vocabulary itself — `63C<remaining>` —
+    /// which meets [`SW_PIN_LOCKED`] (`63C0`) at the bottom of its own
+    /// range, the same continuity OpenPGP's retry counter has.
+    ///
+    /// A commit fault is [`SW_STORE_FAULT`] in both directions: the
+    /// operation's outcome is unknown and must not be reported as either a
+    /// success the caller would unlock on or a refunded attempt.
+    fn check_pin(
+        store: &mut fapico2_platform::keyregion::nostr_store::NostrStore<'_>,
+        record: fapico2_platform::keyregion::nostr_store::NostrPinRecord,
+        pin: &[u8],
+    ) -> Result<(), Sw> {
+        use fapico2_platform::keyregion::nostr_store::NostrPinRecord;
+        if record.counter == 0 {
+            return Err(SW_PIN_LOCKED);
+        }
+        if crypto::verifier_eq(&crypto::pin_verifier(pin, &record.salt), &record.verifier) {
+            let reset = NostrPinRecord { counter: PIN_MAX_RETRIES, ..record };
+            match store.write_pin(&reset) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(SW_STORE_FAULT),
+            }
+        } else {
+            let remaining = record.counter - 1;
+            let burned = NostrPinRecord { counter: remaining, ..record };
+            match store.write_pin(&burned) {
+                Ok(_) => Err(if remaining == 0 {
+                    SW_PIN_LOCKED
+                } else {
+                    0x63C0 | remaining as u16
+                }),
+                Err(_) => Err(SW_STORE_FAULT),
+            }
+        }
+    }
+
+    /// US-1692: `CHANGE_PIN` (INS `0x1C`, P1 `0x01`, payload
+    /// `lc(1) ‖ current(lc) ‖ new`) — the length byte is what makes
+    /// `current ‖ new` unambiguous without a delimiter a PIN byte could
+    /// equal, and it is why the minimum payload is 13 bytes (6+6+1).
+    ///
+    /// The current PIN is verified **first**, against the durable budget:
+    /// a wrong `current` is a failed verify (`63CX`, the counter burns),
+    /// never a fresh refusal — three wrong currents in a row lock the
+    /// board exactly as three wrong verifies would. A verified change
+    /// derives a **fresh** salt (the old salt's verifier has had the old
+    /// PIN as its preimage), writes the new record, and answers `9000`.
+    /// The session flag is deliberately untouched: changing your PIN does
+    /// not open a session, and on an unlocked board it does not close one
+    /// — the flag records *who is verified*, and the answer did not change.
+    fn change_pin(
+        &mut self,
+        _p1: u8, // `0x01` by the time this runs — the dispatcher selected the arm
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::{NostrPinRecord, PinEntry};
+        if p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        // Shape before any state read — a short payload is `6A80` however
+        // wrong the board's PIN state happens to be.
+        let Some((current, new)) = parse_change_payload(data) else {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        };
+        let rng = self.rng;
+        // (status word, the pin_set the cache must end at). The session
+        // flag is not written: verified or not, a change does not unlock.
+        let outcome = {
+            let Some(mut store) = self.store(resp) else { return };
+            match store.read_pin() {
+                Ok(PinEntry::Empty) | Ok(PinEntry::Tombstone) => {
+                    (Some(SW_PIN_NOT_SET), false)
+                }
+                Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => {
+                    // Fail closed: an unidentified occupant is not an
+                    // unset board, and no honest answer distinguishes
+                    // "locked" from "ruined" from the outside.
+                    (Some(SW_STORE_FAULT), true)
+                }
+                Err(_) => (Some(SW_STORE_FAULT), true),
+                Ok(PinEntry::Live(record)) => match Self::check_pin(&mut store, record, current) {
+                    Err(sw) => (Some(sw), true),
+                    Ok(()) => {
+                        let mut salt = [0u8; 16];
+                        if draw_random(rng, &mut salt).is_none() {
+                            (Some(SW_STORE_FAULT), true)
+                        } else {
+                            let fresh = NostrPinRecord {
+                                counter: PIN_MAX_RETRIES,
+                                salt,
+                                verifier: crypto::pin_verifier(new, &salt),
+                            };
+                            match store.write_pin(&fresh) {
+                                Ok(_) => (None, true),
+                                Err(_) => (Some(SW_STORE_FAULT), true),
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        let (sw, pin_set) = outcome;
+        write_sw(resp, sw.unwrap_or(SW_OK));
+        self.pin_set = pin_set;
+    }
+
+    /// US-1693: `VERIFY_PIN` (INS `0x1B`, payload `pin(6..64)`) — check a
+    /// PIN against the record and open the custody session. Touch-free:
+    /// the PIN is the consent, and the button consents to *operations*, a
+    /// different thing (§8).
+    ///
+    /// The mechanics are [`Self::check_pin`]'s: constant-time compare,
+    /// durable reset on success, durable decrement on failure, `63CX`
+    /// answers with [`SW_PIN_LOCKED`] (`63C0`) at the bottom of the range.
+    /// What this verb adds is the session flag: **success is the only
+    /// setter to `true`**, and it is applet-global behind the shared
+    /// `Mutex` (§8), RAM-only — a power cycle closes every session. On a
+    /// board with no PIN the answer is [`SW_PIN_NOT_SET`] and nothing is
+    /// touched: the no-PIN state is the ungated state, and VERIFY must
+    /// not be able to create it. On a **torn** record (US-1695) the
+    /// answer is [`SW_PIN_LOCKED`]: the fail-closed posture, never a
+    /// fiction of "no PIN", with management `RESET` as the only recovery.
+    fn verify_pin(
+        &mut self,
+        _p1: u8, // the INS is the selector; P1/P2 are zeroes or the command is malformed
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::PinEntry;
+        if p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() < PIN_MIN_LEN || data.len() > PIN_MAX_LEN {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        // (status word, pin_set, the session flag's next value).
+        let outcome = {
+            let Some(mut store) = self.store(resp) else { return };
+            match store.read_pin() {
+                Ok(PinEntry::Empty) | Ok(PinEntry::Tombstone) => {
+                    // Nothing touched: no verify leg runs, no counter is
+                    // read, and the cache learns only what it knew.
+                    (Some(SW_PIN_NOT_SET), false, false)
+                }
+                Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => {
+                    // US-1695: a torn or foreign record fails closed, and
+                    // the fail-closed posture for VERIFY is the lockout
+                    // word — no client can tell "ruined" from "locked",
+                    // and both mean "you cannot get in; RESET is the
+                    // remedy". Never "no PIN": that is the cache that
+                    // lifts the gate, and this is the cache that must
+                    // not exist.
+                    (Some(SW_PIN_LOCKED), true, false)
+                }
+                Err(_) => (Some(SW_STORE_FAULT), true, false),
+                Ok(PinEntry::Live(record)) => match Self::check_pin(&mut store, record, data) {
+                    Ok(()) => (None, true, true),
+                    Err(sw) => (Some(sw), true, false),
+                },
+            }
+        };
+        let (sw, pin_set, unlocked) = outcome;
+        write_sw(resp, sw.unwrap_or(SW_OK));
+        self.pin_set = pin_set;
+        self.pin_unlocked = unlocked;
+    }
+
+    /// US-1694: `LOCK` (INS `0x1D`, no payload) — close the custody session
+    /// explicitly, on **any** transport, because the flag it clears is
+    /// applet-global behind the shared `Mutex` (§8): the CCID task and the
+    /// vendor-HID task drive the same one applet instance, so there is no
+    /// per-connection session to be out of sync with.
+    ///
+    /// Idempotent by design, and the design has a security reason: a
+    /// `9000` whatever the state was — no PIN, locked, already locked —
+    /// must not leak which state it was in. A `LOCK` that discriminated
+    /// would tell a USB-side attacker whether a session was open, which is
+    /// exactly the fact custody exists to hide. Touch-free: locking is the
+    /// *retreat*, never the dangerous direction.
+    fn lock(
+        &mut self,
+        _p1: u8, // zeroes; the INS is the whole instruction
+        _p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        self.pin_unlocked = false;
+        write_sw(resp, SW_OK);
+    }
+
+    /// US-1714/US-1715: `CEREMONY_START` (INS `0x1E`, P1 = P2 = 0, no
+    /// payload) — the explicit custody-migration ceremony. The response
+    /// body is `migrated(2 BE) ‖ already(2 BE)`, the reseat report.
+    ///
+    /// **The consent shape (US-1715) is the verb.** VERIFY and every other
+    /// command never trigger a burn or a reseat — this is the one arm that
+    /// writes to the OTP controller, reached only by an explicit request
+    /// (the extension's "Migrate now", US-1716). Neither touch-gated nor
+    /// session-gated: the dialog is the consent, the button is not needed
+    /// during the run, and the PIN is not verified by the ceremony —
+    /// nothing secret is opened by it.
+    ///
+    /// The refusal gates, in the order a user can act on them:
+    ///
+    /// 1. **A PIN is set** — the gate exists; nothing to protect otherwise.
+    ///    [`SW_PIN_NOT_SET`].
+    /// 2. **Identity records exist** — the PIN record alone does not
+    ///    justify an irreversible burn: a fresh board burns lazily at its
+    ///    first identity write instead, and until then nothing is lost in
+    ///    the write-failure window. [`SW_CEREMONY_NOT_NEEDED`].
+    /// 3. **The marker is absent** — a ceremony-completed board has
+    ///    nothing to do. [`SW_CEREMONY_NOT_NEEDED`].
+    ///
+    /// The run: the burn (fresh pages run, torn pages resume — never a
+    /// valid word rewritten, US-1712) inside a **bounded** retry budget —
+    /// a stuck word is a fault answered honestly, not a spin on the live
+    /// executor; then the region view is dropped and re-entered through
+    /// the provider, which re-derives from the rows the burn just
+    /// completed — the custody key with the legacy window the absent
+    /// marker demands — and the reseat runs through that window: the
+    /// legacy key never leaves the region's maker, the one place in the
+    /// process that derives key material. The marker lands last (US-1713),
+    /// the view is dropped once more, and the next command finds a
+    /// custody-keyed region with the marker standing.
+    ///
+    /// Every fault answers [`SW_STORE_FAULT`] and leaves the ceremony
+    /// resumable: a power cut or a fault before the marker is exactly the
+    /// interrupted state `reseat` re-enters, and re-running this verb
+    /// finishes it.
+    fn ceremony_start(
         &mut self,
         p1: u8,
         p2: u8,
         data: &[u8],
         resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
     ) {
-        if p2 != 0 {
+        use fapico2_platform::custody::{self, CeremonyState};
+        use fapico2_platform::keyregion::nostr_store::{Entry, NOSTR_SLOTS};
+        if p1 != 0 || p2 != 0 {
             write_sw(resp, SW_WRONG_P1_P2);
             return;
         }
         if !refuse_payload(data, resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant } = self;
-        let Some(mut store) = attach_store(region, provider, resp) else { return };
-        let id = match read_identity(&mut store, p1 as u16) {
-            Ok(id) => id,
-            Err(sw) => {
-                write_sw(resp, sw);
+        // Gate 1: the gate must exist. Cache read, the same one the gate
+        // itself consults.
+        if !self.pin_set {
+            write_sw(resp, SW_PIN_NOT_SET);
+            return;
+        }
+        let Some(otp) = self.custody_otp else {
+            // A wiring bug, not a user error: the device path always
+            // provides the OTP leg, and a host that reaches for the
+            // ceremony without it must hear the honest "broken" word.
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        };
+        let Self { region, provider, region_source, rng, .. } = self;
+
+        // Gates 2 and 3, through the store's own view — the same
+        // completeness predicate GET_INFO's pending bit derives from.
+        let Some(mut store) = attach_store(region, provider, resp) else {
+            return;
+        };
+        let complete = match store.reseat_complete() {
+            Ok(complete) => complete,
+            Err(_) => {
+                write_sw(resp, SW_STORE_FAULT);
                 return;
             }
         };
-        if !user_present(*presence_grant, p1 as u16) {
-            write_sw(resp, SW_TOUCH_REQUIRED);
+        if complete {
+            write_sw(resp, SW_CEREMONY_NOT_NEEDED);
             return;
         }
-        resp.extend_from_slice(&id.scalar).ok();
+        // Gate 2: the PIN record alone does not justify an irreversible
+        // burn. Identity slots — live, tombstone or husk — do.
+        let mut occupied = false;
+        for index in 0..NOSTR_SLOTS as u16 {
+            match store.read(index) {
+                Ok(Entry::Empty) => {}
+                Ok(_) => occupied = true,
+                Err(_) => {
+                    write_sw(resp, SW_STORE_FAULT);
+                    return;
+                }
+            }
+        }
+        if !occupied {
+            write_sw(resp, SW_CEREMONY_NOT_NEEDED);
+            return;
+        }
+
+        // The burn. Two drawn bytes per secret word; a torn answer retries
+        // inside a bounded budget — the boot-path `otp_retry` pattern
+        // freezes a cooperative executor, so the live path spends a budget
+        // and stops.
+        const BURN_BUDGET: usize = 3;
+        let mut burned = false;
+        for _ in 0..BURN_BUDGET {
+            match custody::burn(otp, || ceremony_entropy_word(rng)) {
+                Ok(CeremonyState::Complete) => {
+                    burned = true;
+                    break;
+                }
+                // Torn: resumable, retry within the budget.
+                Ok(_) => {}
+                Err(_) => {
+                    write_sw(resp, SW_STORE_FAULT);
+                    return;
+                }
+            }
+        }
+        if !burned {
+            // A page that keeps tearing is a fault, not a spin — and the
+            // reseat below needs a complete page to open a custody-keyed
+            // region at all.
+            write_sw(resp, SW_STORE_FAULT);
+            return;
+        }
+
+        // The rows read complete. Drop the pre-burn view and re-enter
+        // through the provider — the same policy that opened this region
+        // under the legacy key now opens the next one under the custody
+        // key, with the legacy window the absent marker demands. That
+        // window is the reseat's migration leg: the legacy key never
+        // leaves the provider.
+        *region = None;
+        *provider = *region_source;
+        let Some(mut store) = attach_store(region, provider, resp) else {
+            return;
+        };
+        let report = match store.reseat_via_window() {
+            Ok(report) => report,
+            Err(_) => {
+                write_sw(resp, SW_STORE_FAULT);
+                return;
+            }
+        };
+        // The marker stands. One more re-entry, so the very next command
+        // — the extension re-sends the gated operation — finds the
+        // custody-keyed, marker-complete view.
+        *region = None;
+        *provider = *region_source;
+        if attach_store(region, provider, resp).is_none() {
+            return;
+        }
+        // The counts on the wire are one 2-byte BE field each. The walk is
+        // bounded by the domain (8 identities + the PIN record), so the
+        // narrowing from the report's usize cannot lose anything.
+        let migrated = u16::try_from(report.migrated).unwrap_or(u16::MAX);
+        let already = u16::try_from(report.already).unwrap_or(u16::MAX);
+        resp.extend_from_slice(&migrated.to_be_bytes()).ok();
+        resp.extend_from_slice(&already.to_be_bytes()).ok();
         write_sw(resp, SW_OK);
     }
 
+    /// US-1697: the custody gate, as the one expression the story names.
+    /// Called by every secret operation **after its shape checks and before
+    /// its state reads and touch check** — the standing refusal order gains
+    /// a gate row between shape and state, so a locked board answers
+    /// [`SW_PIN_SESSION_REQUIRED`] for any well-formed payload and never
+    /// enters a press path. The gate is a pure cache read: `pin_set` comes
+    /// from boot/the PIN verbs, `pin_unlocked` from `VERIFY_PIN`/`LOCK`, and
+    /// a no-PIN board fails the conjunction trivially, which is the
+    /// compatibility property — every command on such a board runs exactly
+    /// the code it ran before this gate existed.
+    ///
+    /// Returns `true` when the caller must stop (the refusal is already
+    /// written).
+    fn gate_refuses(&self, resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> bool {
+        if self.pin_set && !self.pin_unlocked {
+            write_sw(resp, SW_PIN_SESSION_REQUIRED);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl App for NostrApp {
@@ -1128,7 +1856,7 @@ impl App for NostrApp {
         let Self { region, provider, .. } = self;
         let mut resp = HeaplessVec::new();
         if let Some(mut store) = attach_store(region, provider, &mut resp) {
-            use fapico2_platform::keyregion::nostr_store::Entry;
+            use fapico2_platform::keyregion::nostr_store::{Entry, PinEntry};
             for index in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
                 // Best effort per slot — `factory_wipe` has no status-word
                 // channel, and a slot that will not commit is reported by
@@ -1149,12 +1877,65 @@ impl App for NostrApp {
                     _ => {}
                 }
             }
+            // US-1701: the PIN slot joins the wipe — a torn record dies
+            // the same death (the occupancy guard would refuse a stale
+            // PIN under a fresh key otherwise, and OATH's `reset_state`
+            // clears its PIN the same way). Best effort: `factory_wipe`
+            // has no status-word channel, and a slot that will not
+            // commit reports through the next read's honest answer.
+            match store.read_pin() {
+                Ok(PinEntry::Live(_)) | Ok(PinEntry::Undecodable) => {
+                    let _ = store.clear_pin();
+                }
+                _ => {}
+            }
         }
+        // Both RAM caches reset with the record: the running instance
+        // answers like the PIN-less board the next boot will report —
+        // the gate is gone, so a gated command runs, and VERIFY says
+        // [`SW_PIN_NOT_SET`]. Stale "set" would be the lie that hides
+        // the identities' absence behind a custody prompt; stale
+        // "unlocked" is never a state a wipe can leave (the gate it
+        // opens no longer protects anything).
+        self.pin_set = false;
+        self.pin_unlocked = false;
     }
 
     /// Dispatch the §2.2 wire table. Unimplemented arms are the US-1642
     /// skeleton refusal until their stories replace them.
     fn process(&mut self, apdu: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) {
+        // US-1714: the sealed-unavailable state. A custody read that faults
+        // means no payload key can be derived — no record can be opened,
+        // and the one thing worse than reading nothing is writing over
+        // records nobody can read. Every command refuses with the distinct
+        // word, nothing repairs, nothing tombstones (the Undecodable
+        // force-tombstone paths below are unreachable in this state), and
+        // destruction stays management-`RESET`-only. RAM-only: the next
+        // boot re-derives from the rows, so a power cycle clears it.
+        // First: nothing attaches here — the faulted provider is never
+        // called, the same "no region opens on a dead custody page" fact
+        // the boot path holds.
+        if self.custody_faulted() {
+            write_sw(resp, SW_SEALED_UNAVAILABLE);
+            return;
+        }
+        // US-1718: the device path never runs [`Self::boot`] — the region is
+        // a lazy provider (`main.rs` asks it on demand), and the cache
+        // `Self::new` starts with would stand in for the store's state until
+        // a PIN verb ran. The first process call is the boot substitute:
+        // derive the cache from the store exactly as a boot would, before
+        // any command logic — the gate, GET_INFO and the ceremony's first
+        // gate all read it, and any command may be the first thing this
+        // applet ever runs. Silent on purpose: a store that will not mount
+        // writes its own word through the dispatch below, and the cache
+        // stays where the fail-closed construction left it.
+        if self.region.is_none() {
+            let Self { region, provider, pin_set, pin_unlocked, .. } = self;
+            if let Some(mut store) = try_attach(region, provider) {
+                *pin_set = pin_boot_classification(store.read_pin());
+                *pin_unlocked = false;
+            }
+        }
         // Header guard first: a sub-4-byte APDU would index `apdu[2]`/
         // `apdu[3]` out of bounds (the US-701 panic class, `apps/mgmt`).
         if apdu.len() < 4 {
@@ -1186,7 +1967,16 @@ impl App for NostrApp {
             INS_NIP44_DECRYPT => self.nip44_decrypt(p1, p2, data, resp),
             INS_SET_LABEL => self.set_label(p1, p2, data, resp),
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
-            INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
+            INS_VERIFY_PIN => self.verify_pin(p1, p2, data, resp),
+            INS_LOCK => self.lock(p1, p2, data, resp),
+            INS_CEREMONY_START => self.ceremony_start(p1, p2, data, resp),
+            INS_SET_PIN => {
+                if p1 == 0x01 {
+                    self.change_pin(p1, p2, data, resp)
+                } else {
+                    self.set_pin(p1, p2, data, resp)
+                }
+            }
             _ => write_sw(resp, SW_INS_NOT_SUPPORTED),
         }
     }
@@ -1223,6 +2013,24 @@ fn parse_data(apdu: &[u8]) -> Result<&[u8], Sw> {
 
 fn write_sw(resp: &mut HeaplessVec<u8, MAX_RESPONSE>, sw: Sw) {
     resp.extend_from_slice(&sw.to_be_bytes()).ok();
+}
+
+/// US-1692's `CHANGE_PIN` payload: `lc(1) ‖ current(lc) ‖ new`, both PINs
+/// 6–64 bytes. `None` on any shape violation — an `lc` outside the PIN
+/// range, a `new` outside it, or a length that does not add up.
+fn parse_change_payload(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    let lc = *data.first()? as usize;
+    if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&lc) {
+        return None;
+    }
+    if data.len() < 1 + lc + PIN_MIN_LEN {
+        return None;
+    }
+    let new = &data[1 + lc..];
+    if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&new.len()) {
+        return None;
+    }
+    Some((&data[1..1 + lc], new))
 }
 
 /// The NIP-44 v1 "ECC key" marker (design §2.2.0): the key form that needs
@@ -1291,10 +2099,45 @@ fn read_identity(
 /// `&mut self` method call would not). A recovery failure keeps the
 /// provider: the next read retries the mount rather than pinning a
 /// transient fault onto the applet for good.
+/// The `pin_set` half of the PIN cache, derived from the store — the one
+/// derivation [`NostrApp::boot`] and the device path's one-shot attach
+/// share, so the two entry points cannot drift. `Empty` and `Tombstone`
+/// are the two honest PIN-less states; everything else — a live record, an
+/// undecodable slot, a faulted read — counts as a PIN present, fail-closed
+/// (US-1695's contract, applied at every derivation point).
+fn pin_boot_classification(
+    entry: Result<
+        fapico2_platform::keyregion::nostr_store::PinEntry,
+        fapico2_platform::keyregion::nostr_store::NostrStoreError,
+    >,
+) -> bool {
+    !matches!(
+        entry,
+        Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Empty)
+            | Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Tombstone)
+    )
+}
+
 fn attach_store<'region>(
     region: &'region mut Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
     provider: &mut Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
     resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'region>> {
+    let store = try_attach(region, provider);
+    if store.is_none() {
+        write_sw(resp, SW_STORE_FAULT);
+    }
+    store
+}
+
+/// The one-shot mount, silent: `Some` when a store view exists afterwards —
+/// previously attached or mounted now. The status word's writer is
+/// separate because the US-1718 cache derivation runs where no status word
+/// may be written (the `process` preamble, before any command logic owns
+/// `resp`).
+fn try_attach<'region>(
+    region: &'region mut Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
+    provider: &mut Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
 ) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'region>> {
     if region.is_none() {
         if let Some(attach) = provider {
@@ -1306,13 +2149,7 @@ fn attach_store<'region>(
             }
         }
     }
-    match region.as_mut() {
-        Some(region) => Some(region.store()),
-        None => {
-            write_sw(resp, SW_STORE_FAULT);
-            None
-        }
-    }
+    region.as_mut().map(|region| region.store())
 }
 
 /// Draw from the applet's randomness source. `None` when there is none —
@@ -1326,6 +2163,17 @@ fn draw_random(rng: Option<fn(&mut [u8])>, out: &mut [u8]) -> Option<()> {
         }
         None => platform_random(out),
     }
+}
+
+/// One burned word's worth of entropy for the ceremony (US-1714): a fresh
+/// uniform `u16` per call, drawn through the applet's randomness source —
+/// the platform's `custody::burn` `word_entropy` contract. A draw that fails is a
+/// zero, which [`burn`] will verify-fail against the row and surface as
+/// the torn path, not as a weak secret silently burned.
+fn ceremony_entropy_word(rng: &Option<fn(&mut [u8])>) -> u16 {
+    let mut buf = [0u8; 2];
+    draw_random(*rng, &mut buf);
+    u16::from_be_bytes(buf)
 }
 
 /// The host/emulation default — OS entropy (`platform::trng`'s free entry

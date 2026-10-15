@@ -1,6 +1,6 @@
 # Nostr identities
 
-The board holds up to **eight Nostr identities** and signs with them: BIP-340 (Schnorr) event signatures and NIP-44 v2 encryption, computed **on the chip**. The private keys never leave the device except through one deliberate, touch-gated export — the same posture the rest of the board applies to passkeys and PGP keys, applied to a social identity that cannot be revoked by anyone.
+The board holds up to **eight Nostr identities** and signs with them: BIP-340 (Schnorr) event signatures and NIP-44 v2 encryption, computed **on the chip**. The private keys never leave the device — custody is **import-only**, and the backup for an imported key is the paper `nsec` from the software step, not a copy on the host. The same posture the rest of the board applies to passkeys and PGP keys, applied to a social identity that cannot be revoked by anyone.
 
 This guide walks the whole journey through the **fapico2 Nostr extension** — the browser extension that speaks the board's vendor protocol over WebHID and exposes the standard NIP-07 `window.nostr` API to web pages. Any Nostr web client that consumes `window.nostr` can sign through the board.
 
@@ -50,8 +50,8 @@ The popup's home state mirrors the board honestly: **fapico2 board connected**, 
 
 There are two paths, and the README states the trade plainly. Read this before clicking either:
 
-- **Recommended — generate in software, write the nsec down, then Import.** The paper copy exists *before* the board is involved, so a lost, bricked or wiped board does not cost the identity. Generate an `nsec1…` with any offline Nostr tool, then use **Import**.
-- **Generate on the device** is for a user who has decided the board is the only copy. **Export** exists as the escape hatch — it is touch-gated and hands the nsec to the browser, which downgrades the threat model to include the machine the board is plugged into. Take it only if you accept that trade: a key nobody can back up is not a security property, it is a single point of failure.
+- **Recommended — generate in software, write the nsec down, then Import.** The paper copy exists *before* the board is involved, so a lost, bricked or wiped board does not cost the identity. Generate an `nsec1…` with any offline Nostr tool, then use **Import**. This is the only path that produces a backup.
+- **Generate on the device** is for a user who has decided the board is the only copy — **permanently**. Custody is import-only: there is no export command, on any firmware, so a device-generated key can never be read off the board. A lost, wiped or bricked board costs the identity. For anything you cannot afford to lose, use the import path above.
 
 ### Generate (on the board)
 
@@ -67,7 +67,7 @@ The board derives and echoes the public key (npub) before it accepts the write; 
 
 Every identity is listed as its label (or *slot N*) with a clipped npub. The radio picks the **active key** — the identity `window.nostr` publishes as — instantly and without a touch; the notice reads *active key is now slot N — sites that cached your other npub will need to reconnect*. An occupancy strip (**N/8 slots ■■···**) shows how much of the set is committed.
 
-Per-key actions live on each row: **copy** the npub, **label** it, **export**, **delete**.
+Per-key actions live on each row: **copy** the npub, **label** it, **delete**.
 
 ### Label
 
@@ -77,11 +77,27 @@ Per-key actions live on each row: **copy** the npub, **label** it, **export**, *
 
 *Delete key* names exactly what it destroys — *This destroys **name** — npub1… (slot N). The key is gone from the device.* — and requires the confirmation checkbox *I understand this is permanent — the key is destroyed on the device* before **Delete &amp; touch** lights up. After the touch, the board answers with the destroyed identity's npub and the extension verifies the echo — a mismatch is reported as a store fault, never a green checkmark. If you are deleting the active key, the popup warns *This is your active key — after deleting, the active key resets to slot 0.*
 
-### Export
+## 5. The board PIN — session custody
 
-*Export key* says what it does in the first sentence: *Export shows the secret scalar once, in this window only.* Checkbox (*I understand this reveals the secret.*) → **Reveal &amp; touch** → the scalar is shown as bech32 `nsec1…` with a **Copy** button, and dropped when the popup closes. One press buys one reveal; the board holds no "exported" state afterwards.
+The identity set can sit behind a **board PIN**. It is optional — a PIN-less board behaves exactly as before — but once set, every command that uses or changes the private key set (sign, encrypt, decrypt, generate, import, delete, label) refuses with *session required* until you verify. The three reads stay open: an npub is public even from a locked board.
 
-## 5. Sign from a web page (NIP-07)
+The popup earns its PIN surface from the board's `GET_INFO`: the **PIN row** shows the offer while no PIN is set, and the **manage** entry once custody exists.
+
+- **Set** — *a PIN guards every key on the board: signing asks for it after each restart, and too many wrong tries lock the device. 6 to 64 characters.* Validated locally before the board is asked.
+- **Verify** — and note the rule the device enforces: *setting the PIN does not open the session — verify it now to unlock signing.* If the verify screen appears mid-operation, it names what was interrupted — *verify and the "signs events" you started continues where it left off* — and the form you were filling resumes after.
+- **Session lifetime** — *it stays open until the board restarts.* The session is RAM-only on the board: a power cycle closes it (verifying again after a restart is normal, not a fault), unplugging and replugging without a power cut does not, and switching between the extension and a PC/SC tool does not either. The device card shows *unlocked — until the board restarts* while the session is open; **Lock** closes it early.
+- **Change** — the current PIN is verified first, *a wrong one burns an attempt, exactly like a wrong unlock*, and changing the PIN never opens or closes the session.
+- **Lockout** — a wrong PIN has a durable three-attempt budget on the board (it survives restarts). At `0` the device is locked and the popup says it plainly: *the device is locked — too many wrong PINs. Recovery is a factory reset from the management applet, which destroys every identity on the board.* There is no back door; that is what the PIN is for.
+
+The PIN itself is never stored — the board holds a verifier, and the PIN never leaves the host's password field.
+
+### The sealing ceremony (one-time, offered, permanent)
+
+On top of the PIN, the popup may offer to **seal** the identities — the banner appears at connect whenever the board advertises a pending migration (a PIN is set and the ceremony has not run). The dialog discloses, in order: *the ceremony seals every identity on the board with a device-bound key — one-time, permanent protection against old-firmware extraction*; *it is irreversible: once run, the identities can never be read by the old firmware again*; *it takes at most a minute — leave the board plugged in; the button is not needed*; and what a forgotten PIN costs — *generated identities are unrecoverable, imported identities come back from your backup file*.
+
+Declining is a recorded choice: a dismissible notice (*the identities on this board are still readable by the old firmware — the sealing ceremony remains available*) stays, and the offer returns at every connect. The firmware never runs it as a side effect — the only command that burns the OTP secret is the explicit one the button sends.
+
+## 6. Sign from a web page (NIP-07)
 
 Any page can ask the standard API:
 
@@ -103,9 +119,11 @@ Three properties worth knowing:
 - **The nonce for NIP-44 encryption is generated on the device**, never supplied by the host, so no browser bug can reuse one.
 - **Grants are per site and per action.** *Remember* on "signs events" for `example.com` says nothing about `other.net`, or about "encrypts for a peer" on the same site. Session grants die with the browser session. Manage them on the popup's **Sites** screen, which lists each host's remembered actions (*reads your public key, signs events — 2026-10-13*) with per-host revoke and a two-step **Revoke all** (**Confirm revoke all** holds for five seconds before it acts).
 
-## 6. The touch, timeouts, and what the errors mean
+## 7. The touch, timeouts, and what the errors mean
 
-The board asks for the BOOTSEL press on every command that uses or changes the private key set — sign, encrypt, decrypt, generate, import, label, delete, export. The three reads (public key, list, ping) are touch-free. There is **no config bit** that turns the touch off.
+The board asks for the BOOTSEL press on every command that uses or changes the private key set — sign, encrypt, decrypt, generate, import, label, delete. The three reads (public key, list, ping) are touch-free. There is **no config bit** that turns the touch off.
+
+On a PIN-set board there is a gate in front of the touch: an unverified session is refused before the button ever lights, and the popup routes you to the verify screen instead (section 5). A touch you press while the session is closed consents to nothing — the refusal consumes the armed grant, never a signature.
 
 The amber touch bar appears the moment the board asks; keepalives keep it live while the board waits. If no press comes, the device refuses with its touch status word and the extension reports it in plain words:
 
@@ -116,28 +134,30 @@ The amber touch bar appears the moment the board asks; keepalives keep it live w
 | *that identity is not on the device* | the slot is empty or tombstoned (`6A82`) | check the Keys screen |
 | *the device refused the data — it could not read the request* | malformed payload (`6A80`) | check what you pasted / the request shape |
 | *the device refused the command length* | the counterparty's key is not a valid curve point (`6A87` on the device — the extension's map words it as a length refusal) | check the counterparty's npub |
-| *the device could not complete the operation — its store faulted* | the store refused (`6F00`) — boot degraded or a slot that would not open | reflash/recovery; see [troubleshooting](#9-troubleshooting) |
+| *the device could not complete the operation — its store faulted* | the store refused (`6F00`) — boot degraded or a slot that would not open | reflash/recovery; see [troubleshooting](#10-troubleshooting) |
 | *the device does not serve that command* | unknown command (`6D00`) — usually a firmware older than the extension | update the board's firmware |
+| *your PIN is needed first* | a gated command answered `6982` — the session is closed (fresh power-up, or LOCK) | verify the PIN; the interrupted operation resumes |
+| *wrong PIN — N attempts left* | the budget answered (`63C1`–`63C3`) | the count is durable; enter the right one |
+| *the device is locked — too many wrong PINs. Recovery is a factory reset from the management applet, which destroys every identity on the board* | `63C0` — the three-attempt budget is spent | deliberate act only; see [what management RESET does](#9-what-management-reset-does) |
 | *ceremony interrupted — the worker restarted mid-operation; try again* | the extension's background worker restarted | retry once |
 | *no Fapico board connected — connect it and try again* | no granted device at all | Connect first |
 
 There is **no silent retry loop** for the touch: a refused request stays refused, and a second request waits its turn in a queue instead of stampeding the board.
 
-## 7. Retiring a compromised key — the order is load-bearing
+## 8. Retiring a compromised key — the order is load-bearing
 
 If an `nsec` leaks:
 
 1. **Publish the NIP-09 (or kind-0) retirement event signed by the old key first.** It may be the last thing that key ever signs.
-2. **`EXPORT_KEY`** — only if you still need something from the key, and only while it is still on the board.
-3. **`DELETE_KEY`** on the Keys screen, touch-gated.
+2. **`DELETE_KEY`** on the Keys screen, touch-gated (and PIN-verified, when a PIN is set).
 
-Delete first and the retirement event can never be signed by anyone — the identity is stranded, not revoked. The board has no networking stack and cannot do this for you (NIP-46 remote signing is rejected by design).
+Delete first and the retirement event can never be signed by anyone — the identity is stranded, not revoked. The board has no networking stack and cannot do this for you (NIP-46 remote signing is rejected by design). If the paper copy of the leaked key still exists, destroy it deliberately — deleting the key from the board does not un-publish it.
 
-## 8. What management RESET does
+## 9. What management RESET does
 
-The management applet's **RESET destroys all eight Nostr identities along with FIDO, OATH and OpenPGP** — "reset" means empty, and the host is obligated to enumerate (LIST_KEYS) and show what will be destroyed before you acknowledge. The scoped CTAP2 `authenticatorReset` (the one a browser or `ykman fido reset` triggers) wipes **only FIDO's range** and leaves Nostr records sealed and intact — the device-bound key derivation depends on nothing the FIDO reset destroys.
+The management applet's **RESET destroys all eight Nostr identities along with FIDO, OATH and OpenPGP** — the board's PIN dies with them, so a lockout is recoverable by the same act that empties the device. "Reset" means empty, and the host is obligated to enumerate (LIST_KEYS) and show what will be destroyed before you acknowledge. The scoped CTAP2 `authenticatorReset` (the one a browser or `ykman fido reset` triggers) wipes **only FIDO's range** and leaves Nostr records sealed and intact — the device-bound key derivation depends on nothing the FIDO reset destroys.
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **The board does not appear in Chrome's chooser.** Linux: the udev rule from step 0 is missing (or not reloaded). Check `lsusb` shows `fa20:` and re-run the `udevadm` lines.
 

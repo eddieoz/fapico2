@@ -6,8 +6,8 @@
 //! magic number written twice.
 //!
 //! ```text
-//! 0x000_000 .. 0x1A4_000   firmware image                  1,680 KiB — the CI ratchet
-//! 0x1A4_000 .. 0x200_000   firmware growth headroom         384 KiB — unreferenced, on purpose
+//! 0x000_000 .. 0x1A8_000   firmware image                  1,696 KiB — the CI ratchet
+//! 0x1A8_000 .. 0x200_000   firmware growth headroom         384 KiB — unreferenced, on purpose
 //! 0x200_000 .. 0x300_000   trussed window                   1,024 KiB
 //!                         ├ 0x200_000 .. 0x2C0_000   ifs     768 KiB — OpenPGP + PIV
 //!                         └ 0x2C0_000 .. 0x300_000   efs     256 KiB — Location::External
@@ -36,7 +36,7 @@
 //!
 //! The trussed window used to sit at `0x102_000`, **inside** the region the CI
 //! flash-budget ratchet is free to grow into. The ratchet allows a firmware
-//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,680 KiB) and the window began
+//! image up to [`FIRMWARE_FLASH_BUDGET_BYTES`] (1,696 KiB) and the window began
 //! at 1,032 KiB, so the geometry was wrong by 504 KiB before this epic touched
 //! it: a firmware image the gate *accepted* could link over the front of the
 //! trussed filesystem, and every OpenPGP and PIV key past that offset would go
@@ -70,7 +70,7 @@ use crate::board;
 use crate::cflash;
 
 /// The firmware flash budget in bytes — the ratchet `ci.yml` enforces against
-/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,680 KiB).
+/// the shipping UF2 (`FIRMWARE_FLASH_BUDGET_KIB`, 1,696 KiB).
 ///
 /// Raised 1536 → 1621 on 2026-10-06 (docs/size-report.md, that date's entry):
 /// the shipping image had already grown past 1,536 KiB across the US-15xx
@@ -88,7 +88,7 @@ use crate::cflash;
 /// start. It is the only place it is written down in Rust; `ci.yml` carries the
 /// same value in KiB because a workflow file cannot import a Rust constant, and
 /// `tests/scripts/check_flash_budget.py` fails the build if the two disagree.
-pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1680 * 1024;
+pub const FIRMWARE_FLASH_BUDGET_BYTES: u32 = 1696 * 1024;
 
 /// The end of the region the firmware may grow into without a layout change:
 /// ~438 KiB of unreferenced headroom above the 2026-10-06 budget (512 KiB

@@ -187,12 +187,26 @@ impl crate::hid_serve::NostrDispatch for NostrViaMutex {
 
 /// Installs the device providers through the lock (US-1658) — the boot path's
 /// only mutation of the applet, done before any task runs.
+///
+/// US-1714: the custody OTP leg rides along. The real controller exists only
+/// behind the device build (`otp_cus` gates it the way `fused_key`'s arm
+/// does); the emulation build runs a virgin custody page by definition — its
+/// region derives through the legacy key and the ceremony is never exercised
+/// there, the same asymmetry §8 records for the vendor-HID path.
 pub fn install_nostr_providers(
     region: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
     rng: fn(&mut [u8]),
     grant: fn(u32) -> bool,
 ) {
-    with_nostr(|app| app.install_providers(region, rng, grant));
+    #[cfg(all(feature = "device", target_arch = "arm"))]
+    static NOSTR_CUSTODY_OTP: fapico2_platform::otp_cus::RealOtp =
+        fapico2_platform::otp_cus::RealOtp;
+    #[cfg(all(feature = "device", target_arch = "arm"))]
+    let custody: Option<&'static dyn fapico2_platform::otp_cus::OtpAccess> =
+        Some(&NOSTR_CUSTODY_OTP);
+    #[cfg(not(all(feature = "device", target_arch = "arm")))]
+    let custody = None;
+    with_nostr(|app| app.install_providers(region, rng, grant, custody));
 }
 
 // ---------------------------------------------------------------------------

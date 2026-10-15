@@ -582,22 +582,134 @@ pub fn take_nostr_key_region() -> Option<KeyRegionHandle> {
     unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).assume_init_mut().take() }
 }
 
-/// US-1643: the key the Nostr region's records are sealed under.
+/// US-1718: a spare `FLASH` singleton, staged beside the boot hand-over, from
+/// which [`nostr_key_region_fresh`] mints **additional** Nostr region handles.
 ///
-/// Same root as every other store key on the device, the same shape as
-/// [`derive_oath_payload_key`] — and the same **`Option`, never
-/// [`fatal_boot`]** reasoning: a missing OTP row or chipid degrades Nostr to
-/// an applet that answers APDUs and refuses its reads with the store-fault
-/// status word rather than reporting a fiction about what is on the device.
-#[inline(never)]
-pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
+/// The custody ceremony's re-entry (`apps/nostr/src/lib.rs`,
+/// `ceremony_start`) drops its region handle and then asks its provider for
+/// the region **again**. [`take_nostr_key_region`] is take-once by design —
+/// the `Option` slot makes a double-take a read of `None`, not a double-move —
+/// so on device that second call got `None` and the applet answered
+/// `SW_STORE_FAULT`, store-dead until reboot. (The emulator's provider re-opens
+/// its file per call, which is why every host test passed.) This stash is the
+/// device path's way to answer that second call.
+///
+/// **Why a `Peri` and not a `Flash`.** `Flash` is neither `Copy` nor `Clone`,
+/// so a stashed handle could mint exactly one region — the bug again. The
+/// `Peri` is `Copy` at heart (`FLASH` is a zero-sized singleton and
+/// `PeripheralType: Copy`), and `clone_unchecked(&self)` mints a fresh owned
+/// clone from a shared reference on every call.
+///
+/// **Why this is sound.** `Flash::new_blocking` stores `Option::None` plus a
+/// `PhantomData` and touches no QSPI register
+/// (`embassy-rp-0.10.0/src/flash.rs:255-260`), so every minted handle is an
+/// independent value over the same disjoint window, exactly like the five
+/// boot-time handles above. The invariant that makes "many handles, one at a
+/// time" sound is the same one [`OATH_KEY_REGION`]'s doc states: at most one
+/// Nostr region handle is live at once. The applet holds its region behind a
+/// single `Option` field and the ceremony **drops** it before asking the
+/// provider again (`apps/nostr/src/lib.rs`: `*region = None;` then re-attach),
+/// single core, no region method ever yields.
+///
+/// Written exactly once on the boot path beside [`init_nostr_key_region`];
+/// read only after [`KEY_REGION_READY`], which [`nostr_key_region_fresh`]
+/// checks.
+pub static mut NOSTR_KEY_REGION_PERI: core::mem::MaybeUninit<Option<embassy_rp::Peri<'static, FLASH>>> =
+    core::mem::MaybeUninit::uninit();
+
+/// Stage the spare `FLASH` singleton. Single-core boot path, once, beside the
+/// other key-region staging calls — the [`init_nostr_key_region`] discipline.
+///
+/// # Safety
+///
+/// The caller must not keep using `peri` afterwards, and must call this
+/// exactly once, before any task exists — the same write-once-slot discipline
+/// as [`init_nostr_key_region`], which the same single-core boot-path argument
+/// covers.
+pub unsafe fn stash_nostr_flash(peri: embassy_rp::Peri<'static, FLASH>) {
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION_PERI)).write(Some(peri)) };
+}
+
+/// Mint a **fresh** Nostr key-region handle — the device provider's answer to
+/// the ceremony's re-entry.
+///
+/// Gated on [`KEY_REGION_READY`] like every other accessor here, so a caller
+/// arriving before [`release_key_region`] gets `None` and the S8/S9 guarantee
+/// holds for re-entry calls exactly as it does for the boot hand-over.
+pub fn nostr_key_region_fresh() -> Option<KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `stash_nostr_flash` wrote the slot exactly once on the boot path
+    // before any task existed, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that. The `Option` is *not* taken: the
+    // stashed `Peri` stays in place and each call clones it
+    // (`PeripheralType: Copy`; `clone_unchecked` mints a fresh owned value
+    // from a shared reference), so this is callable once per ceremony
+    // re-entry, not once per boot. At most one resulting region handle is
+    // live at a time — the invariant argued on `NOSTR_KEY_REGION_PERI` above.
+    let peri = unsafe {
+        (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION_PERI)).assume_init_mut().as_ref()?
+    };
+    let flash = Flash::new_blocking(unsafe { peri.clone_unchecked() });
+    Some(KeyRegionHandle::new(flash))
+}
+
+/// US-1714: the Nostr region view the applet's provider hands over, custody
+/// policy included — the one function in the process that both derives a
+/// key and decides which one.
+///
+/// The policy, per [`fapico2_platform::custody::assess`]:
+///
+/// * **Virgin or torn** — the legacy key, no window. A torn burn has
+///   migrated nothing; the ceremony resumes it.
+/// * **Burned** — the custody key, plus the legacy window exactly when the
+///   reseat marker does not stand: the interrupted state the dual-KDF
+///   window exists for. A marker that stands closes the window again, so
+///   the post-ceremony region carries no legacy leg at all (the G1
+///   assertion, applied at every attach).
+/// * **Faulted** — `None`: no key can exist, and the provider returning
+///   `None` is what the applet's sealed-unavailable state is made of.
+pub fn nostr_custody_region(
+    region: KeyRegionHandle,
+) -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
+    use fapico2_platform::custody::{assess, custody_secret_bytes, CeremonyState};
+    use fapico2_platform::keyregion::crypto::{derive_nostr_payload_key, NostrKeySource};
     let otp_key_1 = read_otp_key_1()?;
-    let chipid = embassy_rp::otp::get_chipid().ok()?;
-    fapico2_platform::keyregion::crypto::derive_payload_key(
-        &otp_key_1,
-        &chipid.to_be_bytes(),
-        &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
-    )
+    let chipid = embassy_rp::otp::get_chipid().ok()?.to_be_bytes();
+    let otp = fapico2_platform::otp_cus::RealOtp;
+    match assess(&otp) {
+        CeremonyState::Abort => None,
+        CeremonyState::Virgin | CeremonyState::Torn => {
+            let key = derive_nostr_payload_key(&otp_key_1, &chipid, NostrKeySource::LegacyConstant)?;
+            Some(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                ::alloc::boxed::Box::new(region),
+                key,
+            ))
+        }
+        CeremonyState::Sealed | CeremonyState::Complete => {
+            let secret = custody_secret_bytes(&otp)?;
+            let key = derive_nostr_payload_key(
+                &otp_key_1,
+                &chipid,
+                NostrKeySource::Custody(&secret),
+            )?;
+            let legacy =
+                derive_nostr_payload_key(&otp_key_1, &chipid, NostrKeySource::LegacyConstant)?;
+            let mut region = fapico2_platform::keyregion::nostr_store::NostrRegion::
+                with_legacy_window(::alloc::boxed::Box::new(region), key, legacy);
+            // A marker that stands closes the window: the completeness
+            // check is the same predicate the reseat and GET_INFO's
+            // pending bit derive from, so the attach policy cannot drift
+            // from them. A faulted marker read keeps the window open —
+            // readable either way, and harmless once every record is
+            // custody-sealed.
+            if region.store().reseat_complete().unwrap_or(false) {
+                region.close_legacy_window();
+            }
+            Some(region)
+        }
+    }
 }
 
 /// US-1644: the Nostr applet's boot-time randomness pool, and its drain

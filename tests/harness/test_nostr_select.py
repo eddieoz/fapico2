@@ -49,8 +49,10 @@ def test_unregistered_aid_is_6a82(emu):
 
 def test_unknown_ins_is_6d00(emu):
     assert emu.select()[1] == SW_OK
-    # 0x1B is inside the §2.2 INS window but unassigned; 0x00 is outside it.
-    _, sw = emu.send(apdu(0x1B))
+    # 0x1F is inside the §2.2 INS window but unassigned (0x1B grew a
+    # VERIFY_PIN in US-1691; 0x1E grew CEREMONY_START in US-1715); 0x00 is
+    # outside it.
+    _, sw = emu.send(apdu(0x1F))
     assert sw == SW_INS_NOT_SUPPORTED
     _, sw = emu.send(apdu(0x00))
     assert sw == SW_INS_NOT_SUPPORTED
@@ -63,8 +65,10 @@ def test_public_reads_answer_on_the_selected_applet(emu):
     data, sw = emu.send(apdu(INS_GET_INFO))
     assert sw == SW_OK
     assert len(data) == 8
-    _, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))  # empty slot → honest answer
-    assert sw == 0x6A82
+    # EXPORT_KEY is retired (US-1699): the byte answers 6D00, empty slot
+    # or live slot alike — the command is gone, not state-dependent.
+    _, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))
+    assert sw == 0x6D00
 
 
 def test_select_is_the_only_way_in(emu):

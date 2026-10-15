@@ -53,7 +53,7 @@ Slot and status behavior is configurable from PicoForge. The LED is the only out
 
 ## Nostr identities
 
-The board holds up to eight BIP-340 Nostr identities and signs with them through the [fapico2 Nostr extension](../how-to/nostr.md) — the browser asks, you approve in a small window, and the physical touch signs. The private keys live in the same sealed store as everything else, and the one command that reveals one (`EXPORT_KEY`) costs a checkbox and a press. The full walk: [Nostr identities](../how-to/nostr.md).
+The board holds up to eight BIP-340 Nostr identities and signs with them through the [fapico2 Nostr extension](../how-to/nostr.md) — the browser asks, you approve in a small window, and the physical touch signs. The private keys live in the same sealed store as everything else and never leave the board — custody is import-only — and an optional board PIN can put the whole set behind a verify that dies with the power cycle. The full walk: [Nostr identities](../how-to/nostr.md).
 
 ## No board yet?
 
