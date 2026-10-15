@@ -170,6 +170,7 @@ pub mod store_v3;
 /// discipline `drbg_seed` already follows for the DRBG seed, extended to the
 /// store key; see the module docs for the pico-hsm failure it is aimed at.
 pub mod fused_key;
+pub mod otp_cus;
 
 pub mod cflash;
 pub mod cfs;
