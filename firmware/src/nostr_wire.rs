@@ -53,7 +53,11 @@ pub const NOSTR_CMD_LIST_KEYS: u8 = 0x45;
 pub const NOSTR_CMD_GENERATE_KEY: u8 = 0x46;
 /// §2.2 `IMPORT_KEY`.
 pub const NOSTR_CMD_IMPORT_KEY: u8 = 0x47;
-/// §2.2 `EXPORT_KEY` (D12) — touch-gated, permanent.
+/// §2.2 `EXPORT_KEY` (D12) — **retired by US-1699** (custody: only in,
+/// never out). The constant stays so the wire tables and the negative
+/// tests can name the byte; it is unmapped in `vendor_to_ins`, so `0x48`
+/// answers the in-band [`fapico2_platform::dispatch::SW_INS_NOT_SUPPORTED`]
+/// like any other unsupported method.
 pub const NOSTR_CMD_EXPORT_KEY: u8 = 0x48;
 /// §2.2 `DELETE_KEY`.
 pub const NOSTR_CMD_DELETE_KEY: u8 = 0x49;
@@ -100,9 +104,8 @@ pub fn is_vendor_command(cmd: u8) -> bool {
 /// SW_INS_NOT_SUPPORTED`] — the D20 refusal — rather than a framing fault.
 pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
     use fapico2_nostr::{
-        INS_DELETE_KEY, INS_EXPORT_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
-        INS_IMPORT_KEY, INS_LIST_KEYS, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_LABEL,
-        INS_SIGN,
+        INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY, INS_IMPORT_KEY,
+        INS_LIST_KEYS, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_LABEL, INS_SIGN,
     };
     let ins = match cmd {
         NOSTR_CMD_PING => INS_GET_INFO,
@@ -113,7 +116,6 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
         NOSTR_CMD_LIST_KEYS => INS_LIST_KEYS,
         NOSTR_CMD_GENERATE_KEY => INS_GENERATE_KEY,
         NOSTR_CMD_IMPORT_KEY => INS_IMPORT_KEY,
-        NOSTR_CMD_EXPORT_KEY => INS_EXPORT_KEY,
         NOSTR_CMD_DELETE_KEY => INS_DELETE_KEY,
         NOSTR_CMD_SET_LABEL => INS_SET_LABEL,
         _ => return None,
@@ -412,6 +414,31 @@ mod tests {
             Some((0xFF, &[][..])),
             "idx 0xFF is the one-byte ceiling"
         );
+    }
+
+    /// US-1699: the retired `EXPORT_KEY` vendor byte is an **unsupported
+    /// method** — `0x48` answers the in-band `6D00` (the CBOR `sw` field)
+    /// without the applet ever running, the same class of refusal as any
+    /// other unmapped byte in `0x40..=0x7F`. The applet closure panics: if
+    /// a future edit re-maps the byte, this test names the channel that
+    /// leaked the secret.
+    #[test]
+    fn export_is_gone_on_vendor_hid() {
+        let payload = [0x82, 0x00, 0x40]; // array(2) [0, bytes ""] — the ping form
+        let mut req = HeaplessVec::new();
+        let mut resp = HeaplessVec::new();
+        let mut out = HeaplessVec::new();
+        let n = process_vendor_through(
+            NOSTR_CMD_EXPORT_KEY,
+            &payload,
+            &mut req,
+            &mut resp,
+            |_apdu, _| panic!("the retired EXPORT byte reached the applet"),
+            &mut out,
+        );
+        let (sw, data) = decode_response(&out[..n]).unwrap();
+        assert_eq!(sw, SW_INS_NOT_SUPPORTED, "0x48 is refused in band");
+        assert!(data.is_empty(), "no frame leaks the secret");
     }
 
     /// The envelope shapes are the extension's executable spec: request and

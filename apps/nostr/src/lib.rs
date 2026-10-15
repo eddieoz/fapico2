@@ -129,8 +129,10 @@ pub const INS_SET_LABEL: u8 = 0x18;
 /// (D12); an undecodable slot answers with no body. The request carries
 /// no payload. Touch-gated. US-1649.
 pub const INS_DELETE_KEY: u8 = 0x19;
-/// `EXPORT_KEY` — `scalar(32)`, touch-gated and permanent (§2.2.0a).
-/// US-1649.
+/// `EXPORT_KEY` — **retired by US-1699** (custody: only in, never out).
+/// The constant stays so the negative tests and the wire tables can name
+/// the byte; the dispatcher has no arm for it, so `0x1A` answers the
+/// dispatcher's [`SW_INS_NOT_SUPPORTED`] (`6D00`) on every transport.
 pub const INS_EXPORT_KEY: u8 = 0x1A;
 
 /// `SET_PIN` (P1 `0x00`) — establish PIN custody on an unset board.
@@ -1176,41 +1178,6 @@ impl NostrApp {
         write_sw(resp, SW_OK);
     }
 
-    /// `EXPORT_KEY` — P1 = idx; answers `scalar(32)`. Touch-gated and
-    /// permanent (§2.2.0a): the real threat-model downgrade, offered because
-    /// a key nobody can back up is a single point of failure. The README
-    /// (US-1676) says so in the user's terms.
-    fn export_key(
-        &mut self,
-        p1: u8,
-        p2: u8,
-        data: &[u8],
-        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
-    ) {
-        if p2 != 0 {
-            write_sw(resp, SW_WRONG_P1_P2);
-            return;
-        }
-        if !refuse_payload(data, resp) {
-            return;
-        }
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _ } = self;
-        let Some(mut store) = attach_store(region, provider, resp) else { return };
-        let id = match read_identity(&mut store, p1 as u16) {
-            Ok(id) => id,
-            Err(sw) => {
-                write_sw(resp, sw);
-                return;
-            }
-        };
-        if !user_present(*presence_grant, p1 as u16) {
-            write_sw(resp, SW_TOUCH_REQUIRED);
-            return;
-        }
-        resp.extend_from_slice(&id.scalar).ok();
-        write_sw(resp, SW_OK);
-    }
-
     /// US-1691: `SET_PIN` (INS `0x1C`, P1 `0x00`) — establish PIN custody on
     /// an unset board, OATH's `cmd_set_pin` shape (`oath_core.rs:3090`).
     ///
@@ -1598,7 +1565,6 @@ impl App for NostrApp {
             INS_NIP44_DECRYPT => self.nip44_decrypt(p1, p2, data, resp),
             INS_SET_LABEL => self.set_label(p1, p2, data, resp),
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
-            INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
             INS_VERIFY_PIN => self.verify_pin(p1, p2, data, resp),
             INS_LOCK => self.lock(p1, p2, data, resp),
             INS_SET_PIN => {

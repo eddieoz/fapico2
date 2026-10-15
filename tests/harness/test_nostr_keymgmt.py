@@ -115,8 +115,9 @@ def test_set_label_delete_export_trio(emu):
     assert data[35] == 7
     assert data[36:43] == b"primary"
 
-    data, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))
-    assert sw == SW_OK and len(data) == 32  # the scalar comes back
+    # EXPORT_KEY is gone (US-1699): the custody rule is only in, never out.
+    _, sw = emu.send(apdu(INS_EXPORT_KEY, p1=0))
+    assert sw == 0x6D00
 
     data, sw = emu.send(apdu(INS_DELETE_KEY, p1=0))
     assert sw == SW_OK and data == npub0  # the answer names what it destroyed

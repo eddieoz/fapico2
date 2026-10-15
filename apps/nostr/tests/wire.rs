@@ -451,3 +451,35 @@ fn a_truncated_extended_lc_form_is_refused() {
     assert!(!data.is_empty(), "GET_INFO's success shape survives");
     std::fs::remove_file(path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1699: EXPORT_KEY is gone
+// ---------------------------------------------------------------------------
+
+/// **EXPORT_KEY is refused on the CCID channel** (US-1699): the only
+/// secret-returning command the applet ever had no longer exists, so the
+/// `0x1A` APDU falls through to the dispatcher's `6D00` with an empty
+/// body — no code path in the applet returns `id.scalar` any more (the
+/// method is deleted, and the grep for the scalar-returning responder is
+/// now a grep for a name that only occurs in tests naming its absence).
+/// The slot it targeted is untouched.
+#[test]
+fn export_is_gone_on_ccid() {
+    let path = region_path("export-gone");
+    std::fs::remove_file(&path).ok();
+    {
+        let mut region = fixture_region(&path);
+        let mut store = region.store();
+        store
+            .write(0, &identity(0x50, [0x77; 32], b""))
+            .expect("seed idx 0");
+    }
+    let mut app = NostrApp::boot(open_region(&path));
+    let (data, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
+    assert_eq!(sw, 0x6D00, "EXPORT_KEY is refused, not served");
+    assert!(data.is_empty(), "no frame leaks the secret");
+    // The refused slot is untouched: GET_PUBKEY still serves the npub.
+    let (_, sw) = call(&mut app, &apdu(INS_GET_PUBKEY, 0, 0, &[]));
+    assert_eq!(sw, SW_OK, "the identity behind the refused slot survives");
+    std::fs::remove_file(&path).ok();
+}

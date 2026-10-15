@@ -491,26 +491,31 @@ fn delete_key_on_an_empty_slot_is_6a82() {
     std::fs::remove_file(path).ok();
 }
 
-/// `EXPORT_KEY` hands back the scalar whose npub is the one GET_PUBKEY
-/// serves — the migration path (§2.2.0a) must be verifiable, not trusted.
+/// **EXPORT_KEY is gone** (US-1699): the custody rule is only in, never
+/// out, and the v0.2.0 population carried by the release notes got no
+/// grandfathering and no flags bit. The `0x1A` APDU falls through to the
+/// dispatcher's `6D00` — on a live slot as on an empty one — and the slot
+/// it targeted is untouched: GET_PUBKEY still serves the same npub, and
+/// nothing in any response body can be the scalar.
 #[test]
-fn export_key_returns_the_scalar_that_matches_get_pubkey() {
-    let (mut app, path, scalar, npub) = seeded_app("export-key");
+fn export_is_gone_on_ccid_and_the_slot_is_untouched() {
+    let (mut app, path, _, npub) = seeded_app("export-key");
     let (data, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
-    assert_eq!(sw, 0x9000, "EXPORT_KEY succeeds on a live identity");
-    assert_eq!(data.as_slice(), scalar.as_slice(), "the scalar comes back");
+    assert_eq!(sw, 0x6D00, "EXPORT_KEY is refused, not served");
+    assert!(data.is_empty(), "no frame leaks the secret");
 
     let served = npub_of(&mut app, 0).expect("GET_PUBKEY still serves the identity");
-    assert_eq!(served, npub, "and the exported scalar derives the served npub");
+    assert_eq!(served, npub, "the refused slot is untouched");
     std::fs::remove_file(path).ok();
 }
 
-/// `EXPORT_KEY` on an empty slot is `6A82`.
+/// The empty-slot form is the same refusal — the command is gone, not
+/// state-dependent.
 #[test]
-fn export_key_on_an_empty_slot_is_6a82() {
+fn export_on_an_empty_slot_is_still_gone() {
     let (mut app, path, _, _) = seeded_app("export-key-empty");
     let (_, sw) = call(&mut app, &apdu(0x1A, 5, 0, &[]));
-    assert_eq!(sw, 0x6A82);
+    assert_eq!(sw, 0x6D00);
     std::fs::remove_file(path).ok();
 }
 
@@ -528,13 +533,12 @@ fn the_destructive_trio_is_refused_without_a_presence_grant() {
     }
     let mut app = NostrApp::boot(open_region(&path)).with_presence_grant(|_| false);
 
-    // SET_LABEL carries the label; DELETE_KEY and EXPORT_KEY take none.
+    // SET_LABEL carries the label; DELETE_KEY takes none. EXPORT_KEY has
+    // no touch gate any more — it has no command at all (US-1699).
     let (_, sw) = call(&mut app, &apdu(0x18, 0, 0, b"x"));
     assert_eq!(sw, 0x6985, "SET_LABEL without a grant");
     let (_, sw) = call(&mut app, &apdu(0x19, 0, 0, &[]));
     assert_eq!(sw, 0x6985, "DELETE_KEY without a grant");
-    let (_, sw) = call(&mut app, &apdu(0x1A, 0, 0, &[]));
-    assert_eq!(sw, 0x6985, "EXPORT_KEY without a grant");
     std::fs::remove_file(path).ok();
 }
 
