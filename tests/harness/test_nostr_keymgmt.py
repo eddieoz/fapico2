@@ -47,14 +47,15 @@ def test_get_info_layout_over_ccid(emu):
     assert sw == SW_OK
     # applet_ver(2) ‖ caps(2) ‖ max_plaintext(2) ‖ n_identities(1) ‖ flags(1)
     assert len(data) == 8
-    assert data[0:2] == b"\x00\x01"  # APPLET_VERSION
+    assert data[0:2] == b"\x00\x02"  # APPLET_VERSION (US-1700 dialect bump)
     caps = int.from_bytes(data[2:4], "big")
-    assert caps == 0x0003  # key mgmt (0x0001) + NIP-44 (0x0002), both served
+    assert caps == 0x0007  # key mgmt + NIP-44 + PIN custody (US-1700)
     # The wire-cap value: the largest plaintext whose chunk-rounded padding
     # still fits MAX_WIRE (2074) — 1792 pads to itself, 1793 pads to 2048 and
     # would push the encrypt response off the wire.
     assert int.from_bytes(data[4:6], "big") == 1792  # max_plaintext
     assert data[6] == 0  # empty store
+    assert data[7] == 0  # flags: no PIN on this board (v0.2.0-compatible 0)
 
 
 def test_generate_import_sign_round_trip(emu):

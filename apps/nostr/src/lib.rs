@@ -248,9 +248,12 @@ pub const SW_PIN_SESSION_REQUIRED: Sw = 0x6982;
 // GET_INFO fields
 // ---------------------------------------------------------------------------
 
-/// The applet protocol version, `(0, 1)` — bumped when the wire layout
+/// The applet protocol version, `(0, 2)` — bumped when the wire layout
 /// changes, not when commands are added (clients branch on caps for that).
-pub const APPLET_VERSION: [u8; 2] = [0x00, 0x01];
+/// `(0, 1)` → `(0, 2)` is US-1700: `EXPORT_KEY` retired (US-1699), the PIN
+/// custody dialect (`0x1B`–`0x1D`) in the table, and a live `INFO_FLAGS`
+/// byte where v0.2.0 readers saw a reserved zero.
+pub const APPLET_VERSION: [u8; 2] = [0x00, 0x02];
 
 /// The largest NIP-44 plaintext the applet will accept or return (§2.2.1).
 ///
@@ -294,17 +297,37 @@ pub const MAX_REQUEST_ARG: usize = 32 + MAX_NIP44_PAYLOAD_ARG;
 pub const CAP_KEY_MGMT: u16 = 0x0001;
 /// caps bit 1: the NIP-44 pair (`0x16`/`0x17`) is served. Set with US-1653.
 pub const CAP_NIP44: u16 = 0x0002;
+/// caps bit 2: the PIN custody dialect (`SET_PIN`/`VERIFY_PIN`/`LOCK`,
+/// `0x1B`–`0x1D`) is served. Set with US-1700 — a v0.2.0 client seeing the
+/// bit knows the PIN verbs exist; a client seeing the bumped
+/// [`APPLET_VERSION`] knows `EXPORT_KEY` does not.
+pub const CAP_PIN_MGMT: u16 = 0x0004;
 
 /// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] (the key-management trio
-/// `0x13`–`0x15`, US-1644/US-1645) plus [`CAP_NIP44`] (the NIP-44 pair
-/// `0x16`/`0x17`, US-1653). An advertised command that refuses is the §4
+/// `0x13`–`0x15`, US-1644/US-1645), [`CAP_NIP44`] (the NIP-44 pair
+/// `0x16`/`0x17`, US-1653) and [`CAP_PIN_MGMT`] (the PIN custody dialect,
+/// US-1700). An advertised command that refuses is the §4
 /// failure mode (`apps/fido` getInfo history), so this constant changes in
 /// the same commit as the arms it covers — `tests/wire.rs` re-derives the
 /// cap rows and the harness suite asserts the wire value.
-pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44;
+pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT;
 
-/// Reserved `flags` byte of `GET_INFO` — zero until a story defines a bit.
-pub const INFO_FLAGS: u8 = 0x00;
+// The `flags` byte of `GET_INFO` (US-1700) — the PIN state bits, derived
+// from the **same cached state the gate and the ceremony read**, so the
+// advertisement cannot lie about the command paths (the §4 rule). A
+// no-PIN board answers `0x00`: byte-compatible with the v0.2.0 readers
+// that saw a reserved zero here.
+/// `flags` bit 0: a PIN record exists — the custody gate is real.
+pub const FLAG_PIN_SET: u8 = 0x01;
+/// `flags` bit 1: the custody session is open — gated commands will run
+/// subject to touch. Meaningful only with bit 0.
+pub const FLAG_SESSION_UNLOCKED: u8 = 0x02;
+/// `flags` bit 2: custody migration pending — an identity set that
+/// predates PIN custody and the ceremony (US-1712+) has something to do
+/// about it. No mechanism sets it yet; it is named here so the byte's
+/// whole layout lands in one GET_INFO change instead of churning every
+/// layout pin twice.
+pub const FLAG_MIGRATION_PENDING: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // bech32 npub (NIP-19)
@@ -589,11 +612,20 @@ impl NostrApp {
                 }
             }
         }
+        // The state bits come from the same cache the gate reads — never
+        // from a fresh store read that could disagree with it mid-flight.
+        let mut flags = 0u8;
+        if self.pin_set {
+            flags |= FLAG_PIN_SET;
+        }
+        if self.pin_unlocked {
+            flags |= FLAG_SESSION_UNLOCKED;
+        }
         resp.extend_from_slice(&APPLET_VERSION).ok();
         resp.extend_from_slice(&CAPS.to_be_bytes()).ok();
         resp.extend_from_slice(&MAX_PLAINTEXT.to_be_bytes()).ok();
         resp.push(n).ok();
-        resp.push(INFO_FLAGS).ok();
+        resp.push(flags).ok();
         write_sw(resp, SW_OK);
     }
 

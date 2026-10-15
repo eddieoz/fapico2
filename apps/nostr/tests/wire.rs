@@ -483,3 +483,59 @@ fn export_is_gone_on_ccid() {
     assert_eq!(sw, SW_OK, "the identity behind the refused slot survives");
     std::fs::remove_file(&path).ok();
 }
+
+/// Six bytes, the PIN minimum — the PIN verbs' payload shape (US-1691).
+const PIN_BYTES: &[u8] = b"731742";
+
+/// **GET_INFO advertises the PIN capability and the PIN state** (US-1700):
+/// caps gain `CAP_PIN_MGMT = 0x0004`, and the flags byte stops being a
+/// reserved zero and becomes the PIN state — bit 0 = PIN set, bit 1 =
+/// session unlocked, bit 2 = custody migration pending (never set yet; the
+/// ceremony stories own it). The bits derive from the same cache the gate
+/// reads, and a no-PIN board answers `0x00`, byte-compatible with v0.2.0
+/// readers. The extension distinguishes old firmware (hide PIN UI), PIN-less
+/// boards (no PIN UI) and locked boards (PIN dialog) from this response
+/// alone.
+#[test]
+fn getinfo_advertises_pin_capability_and_state() {
+    use fapico2_nostr::{
+        CAP_PIN_MGMT, FLAG_PIN_SET, FLAG_SESSION_UNLOCKED, INS_SIGN, SW_PIN_SESSION_REQUIRED,
+    };
+
+    // No PIN: caps carry the new bit, flags are the v0.2.0-compatible zero.
+    let (mut app, path) = booted_app("getinfo-pin-nopin");
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(u16::from_be_bytes([data[2], data[3]]), CAPS);
+    assert_eq!(CAPS & CAP_PIN_MGMT, CAP_PIN_MGMT, "the PIN dialect is advertised");
+    assert_eq!(data[7], 0x00, "a no-PIN board's flags are the reserved zero");
+    std::fs::remove_file(path).ok();
+
+    // PIN + locked: bit 0 alone.
+    let path = region_path("getinfo-pin-locked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0, 0, PIN_BYTES)); // SET_PIN
+    assert_eq!(sw, SW_OK);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7], FLAG_PIN_SET, "locked board: PIN set, session closed");
+    // The advertisement agrees with the command paths: a gated command on
+    // this exact state is refused, which is what bit 0 without bit 1 says.
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, 0, &[0x42; 32]));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED);
+    std::fs::remove_file(&path).ok();
+
+    // PIN + unlocked: bits 0 and 1.
+    let path = region_path("getinfo-pin-unlocked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(0x1B, 0, 0, PIN_BYTES)); // VERIFY_PIN
+    assert_eq!(sw, SW_OK);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED);
+    std::fs::remove_file(&path).ok();
+}

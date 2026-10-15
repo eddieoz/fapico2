@@ -4002,7 +4002,7 @@ pub(crate) mod tests {
         assert_eq!(nostr_sent[0].cmd, CTAP_HID_INIT);
         // Same layout, nostr_init_reply's values: version bytes 0.1.0 and
         // capFlags 0x00 under both conventions (US-1661).
-        assert_eq!(&nostr_sent[0].payload[12..17], &[0x02, 0x00, 0x01, 0x00, 0x00], "Nostr interface claims vendor 0.1.0 and no CTAP2");
+        assert_eq!(&nostr_sent[0].payload[12..17], &[0x02, 0x00, 0x02, 0x00, 0x00], "Nostr interface claims vendor 0.2.0 and no CTAP2");
 
         // And the app never ran: INIT is transport-only on both interfaces.
         assert!(app.up_calls.is_empty());

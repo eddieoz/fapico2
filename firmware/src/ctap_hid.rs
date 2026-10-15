@@ -198,7 +198,7 @@ pub const NOSTR_INIT_CAP_FLAGS: u8 = 0x00;
 /// step with `apps/nostr`'s `APPLET_VERSION` (major, minor) by test:
 /// `nostr_init_reply_claims_only_what_it_serves` asserts the pair, so a
 /// version bump that leaves this constant behind is a red.
-pub const NOSTR_VENDOR_VERSION: (u8, u8, u8) = (0x00, 0x01, 0x00);
+pub const NOSTR_VENDOR_VERSION: (u8, u8, u8) = (0x00, 0x02, 0x00);
 
 /// Build the 17-byte CTAPHID_INIT reply payload.
 ///
