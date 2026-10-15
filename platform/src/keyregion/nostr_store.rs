@@ -601,6 +601,16 @@ impl<'r> NostrStore<'r> {
     /// decode leaves nothing to advance past and the tombstone commits at
     /// generation 1. A fault-class decode (the region itself is failing)
     /// is refused, never papered over.
+    /// US-1701: the PIN record's destination on a factory wipe — a
+    /// tombstone through the same durable commit path a delete uses
+    /// (OATH's `self.pin = None` in `reset_state`, made durable). Reads
+    /// back as [`PinEntry::Tombstone`]: the board is PIN-less, and the
+    /// slot is reusable by `write_pin` like any committed record.
+    pub fn clear_pin(&mut self) -> Result<CommitReport, NostrStoreError> {
+        let slot = self.pin_slot()?;
+        self.commit_body_at(slot, TOMBSTONE)
+    }
+
     pub fn force_tombstone(&mut self, index: u16) -> Result<CommitReport, NostrStoreError> {
         let slot = self.slot_for(index)?;
         let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;

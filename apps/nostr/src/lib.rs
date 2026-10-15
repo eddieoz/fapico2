@@ -1539,7 +1539,7 @@ impl App for NostrApp {
         let Self { region, provider, .. } = self;
         let mut resp = HeaplessVec::new();
         if let Some(mut store) = attach_store(region, provider, &mut resp) {
-            use fapico2_platform::keyregion::nostr_store::Entry;
+            use fapico2_platform::keyregion::nostr_store::{Entry, PinEntry};
             for index in 0..fapico2_platform::keyregion::nostr_store::NOSTR_SLOTS as u16 {
                 // Best effort per slot — `factory_wipe` has no status-word
                 // channel, and a slot that will not commit is reported by
@@ -1560,7 +1560,28 @@ impl App for NostrApp {
                     _ => {}
                 }
             }
+            // US-1701: the PIN slot joins the wipe — a torn record dies
+            // the same death (the occupancy guard would refuse a stale
+            // PIN under a fresh key otherwise, and OATH's `reset_state`
+            // clears its PIN the same way). Best effort: `factory_wipe`
+            // has no status-word channel, and a slot that will not
+            // commit reports through the next read's honest answer.
+            match store.read_pin() {
+                Ok(PinEntry::Live(_)) | Ok(PinEntry::Undecodable) => {
+                    let _ = store.clear_pin();
+                }
+                _ => {}
+            }
         }
+        // Both RAM caches reset with the record: the running instance
+        // answers like the PIN-less board the next boot will report —
+        // the gate is gone, so a gated command runs, and VERIFY says
+        // [`SW_PIN_NOT_SET`]. Stale "set" would be the lie that hides
+        // the identities' absence behind a custody prompt; stale
+        // "unlocked" is never a state a wipe can leave (the gate it
+        // opens no longer protects anything).
+        self.pin_set = false;
+        self.pin_unlocked = false;
     }
 
     /// Dispatch the §2.2 wire table. Unimplemented arms are the US-1642

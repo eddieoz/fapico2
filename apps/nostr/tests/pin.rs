@@ -902,3 +902,77 @@ fn pin_gate_fires_before_touch_and_eats_the_grant() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1701: factory_wipe clears the PIN slot and the flag
+// ---------------------------------------------------------------------------
+
+/// **Management RESET takes the PIN with everything else.** The wipe is
+/// driven through `App::factory_wipe` — the dispatcher's route, the same
+/// call `NostrViaMutex` forwards through the shared mutex on the device
+/// (the F-A3 forward itself is pinned by
+/// `presence.rs::the_ccid_proxy_forwards_factory_wipe`; a new surface that
+/// skips that forward is a silent no-op on hardware while every test here
+/// still passes).
+///
+/// After the wipe the board is the PIN-less board a fresh boot would
+/// report: VERIFY answers [`SW_PIN_NOT_SET`], the gate is *gone* (a gated
+/// command runs instead of answering the gate word — on an emptied store
+/// it reaches the honest `6A82` of a missing identity, which a locked
+/// board can never say), GET_INFO's flags byte is the v0.2.0-compatible
+/// zero, the PIN slot reads back a tombstone, and the next boot derives a
+/// PIN-less board from the record, not from a RAM cache.
+#[test]
+fn factory_wipe_clears_pin_record_and_flag() {
+    use fapico2_nostr::{FLAG_PIN_SET, FLAG_SESSION_UNLOCKED};
+    use fapico2_platform::keyregion::nostr_store::PinEntry;
+
+    let path = region_path("wipe-pin");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    // Sanity: the board is PIN-set and unlocked before the wipe.
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED);
+
+    // The wipe, on the dispatcher's route.
+    app.factory_wipe();
+
+    // The cache and the record agree: no PIN.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_NOT_SET, "VERIFY on the wiped board says unset");
+    // The gate is gone: SIGN runs (and finds no identity — the wipe took
+    // those too), which is an answer a locked board can never give.
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(
+        sw, 0x6A82,
+        "the gate word is gone; the empty-store answer is what remains"
+    );
+    // GET_INFO reports the PIN-less board.
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7], 0x00, "flags are the v0.2.0-compatible zero again");
+
+    // The record itself: the PIN slot is a tombstone — reusable, and
+    // distinguishable from the virgin state only by the store.
+    assert!(
+        matches!(stored_pin(&path), PinEntry::Tombstone),
+        "the PIN slot is tombstoned, not erased silently"
+    );
+
+    // The next boot derives the same story from the record.
+    let mut app = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_NOT_SET, "the rebooted board is PIN-less");
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, 0x6A82, "and ungated");
+    // ...while the slot still admits a fresh PIN (a tombstoned slot is
+    // reusable by the writers, not dead).
+    let (_, sw) = call(&mut app, &set_pin(0x00, NEW_PIN));
+    assert_eq!(sw, SW_OK, "a wiped board can establish custody again");
+    std::fs::remove_file(&path).ok();
+}
