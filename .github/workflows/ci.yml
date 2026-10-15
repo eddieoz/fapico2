@@ -126,7 +126,14 @@ env:
   # projected ~25 KB of text, the real delta is +28.5 KB (US-1675), consuming
   # the headroom the pre-Nostr baseline left. Audit F-A6
   # (docs/nostr-presence-audit.md).
-  FIRMWARE_FLASH_BUDGET_KIB: 1680
+  # 2026-10-16 raised this from 1680 to 1696 KiB, on purpose, with the reason
+  # recorded here because the number is the layout's argument: the OTP custody
+  # ceremony arc (US-1710-1716): the custody-row primitive and three-way
+  # classifier, the two-population OTP probe, the reseat bulk migration,
+  # CEREMONY_START and the provider re-mint — the PIN-custody epic's device
+  # code, measured at +6 KiB over the ratchet the presence-fix series raised
+  # (F-A6)
+  FIRMWARE_FLASH_BUDGET_KIB: 1696
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
 # the largest exposure in the tree. Previously this file declared no

@@ -148,6 +148,16 @@ of which moved.
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
 
+**Date: 2026-10-16 (flash ratchet raised 1680 → 1696 KiB, by `raise_flash_budget.py`).**
+
+Reason recorded with the number: the OTP custody ceremony arc (US-1710-1716): the custody-row primitive and three-way classifier, the two-population OTP probe, the reseat bulk migration, CEREMONY_START and the provider re-mint — the PIN-custody epic's device code, measured at +6 KiB over the ratchet the presence-fix series raised (F-A6)
+
+Shipping image at the raise: 1726976 B = 3373 blocks = 1686 KiB. Budget 1696 KiB = 1736704 B, which is 9728 B of headroom.
+Fresh ELF at the raise: `text` 895,428 B (+6,080 over the 2026-10-13 record — the ceremony's device code: the custody classifier, the probe and the reseat), Berkeley `.bss` 401,964 B (**32,212 B** RAM headroom). `check_size_report.py` green at these numbers.
+
+The ratchet is the only *near-term* bound on the shipping image: the 3.5 MiB text ceiling is ~2 MB above the current build and cannot fire on ordinary growth, and the flash-map geometry (`FIRMWARE_GROWTH_END`) is the hard limit past which the image would link over the trussed filesystem. Headroom here is deliberate and finite — the next raise is a decision, not an accident, which is why the reason is recorded next to the number in `.github/workflows/ci.yml` and in `platform/src/flashmap.rs`.
+
+
 **Date: 2026-10-12 (flash ratchet raised 1664 → 1680 KiB, by `raise_flash_budget.py`).**
 
 Reason recorded with the number: the Nostr applet arc (US-1630-1688): secp256kfun BIP-340 signing, the NIP-44 pair, the keyregion Nostr domain and the HID serve path — the ADR 0005 spike projected ~25 KB of text, the real delta is +28.5 KB (US-1675), consuming the headroom the pre-Nostr baseline left. Audit F-A6 (docs/nostr-presence-audit.md).

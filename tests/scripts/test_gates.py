@@ -259,7 +259,7 @@ _B_DEBUG_STRIP = Break(
 # variable and the window was a Rust literal, and nothing read both.
 _B_FLASH_BUDGET = Break(
     ".github/workflows/ci.yml",
-    "  FIRMWARE_FLASH_BUDGET_KIB: 1680",
+    "  FIRMWARE_FLASH_BUDGET_KIB: 1696",
     "  FIRMWARE_FLASH_BUDGET_KIB: 2200",
     "the flash-budget ratchet is raised to 2,200 KiB — past the 2,048 KiB "
     "growth boundary, so an image the ratchet accepts could link over the "
