@@ -81,7 +81,36 @@ Consent: the user approved this ceremony against the sacrificial board
 
 ### Extraction leg — v0.2.0 over a ceremony-completed board
 
-**PENDING HARDWARE SESSION.**
+`fapico2-release-alpha-v0.2.0` (commit `ddc3875`, built from a clean worktree
+via `build.sh`) flashed over the ceremony-completed board — the flash-resident
+records are the ceremony's, re-keyed to the custody secret; the v0.2.0 image
+derives its region key the legacy way, with no custody rows.
+
+Result: the v0.2.0 applet **cannot read a single record** — stronger than the
+per-record `Undecodable` the protocol anticipated. The AEAD authentication of
+every custody-keyed record fails under the legacy key, and the enumeration
+paths (which must open each record to report it) answer the store-fault word:
+
+```
+SELECT  AID F0 00 00 00 02        -> 9000   (applet selects; the fault is below the SELECT)
+GET_INFO (×3)                     -> 6F00  6F00  6F00
+LIST_KEYS (×3)                    -> 6F00  6F00  6F00
+GET_PUBKEY idx0 / idx1 / idx3     -> 6F00           EXPORT_KEY same indexes -> 6F00
+GET_PUBKEY idx2  (empty slot)     -> 6A82           EXPORT_KEY idx2        -> 6A82
+```
+
+The one non-`6F00` answer is reproducible and is the discriminating
+observation: `6A82` is the applet's own "no such identity at idx" word, and
+idx2 is an empty slot — reading it needs no record authentication, so the
+v0.2.0 store attaches and the in-band refusal answers. The same attach then
+fails on every **populated** record: the AEAD open under the legacy key
+refuses, the command ends `6F00`. No plaintext, no scalar, no enumeration.
+**Extraction closed.** No `EXPORT_KEY` ever returned key material,
+touch-gated or not.
+
+(The empty-slot `6A82` also shows the fault is per-record AEAD failure, not a
+wedged flash window: the old image's own refuse-empty path still answers in
+band on the same region.)
 
 ### Destruction leg — v0.1.x over the same board
 
