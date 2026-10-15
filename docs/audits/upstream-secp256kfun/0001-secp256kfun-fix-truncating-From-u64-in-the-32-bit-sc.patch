@@ -1,0 +1,89 @@
+From 14ca0789a7988931d071800a3db6f97e3ec3d9b4 Mon Sep 17 00:00:00 2001
+From: eddieoz <eddieoz@pm.me>
+Date: Thu, 15 Oct 2026 01:27:52 +0300
+Subject: [PATCH] secp256kfun: fix truncating From<u64> in the 32-bit scalar
+ backend
+
+Scalar8x32::from(u64) masked its input with 0xFFFF, dropping bits
+16-31 (e.g. From(0x1_0000) produced zero). The impl is inherited from
+RustCrypto/k256's scalar_8x32.rs, where the same mask appears in its
+final pre-removal state (9748fd9853); k256 deleted the backend in
+September 2021 (PR #409) when Scalar moved to U256. No code inside the
+crate calls the conversion (public integer conversions take the
+range-checked byte-array path and the vendor module is private), so
+this is a latent hazard rather than a live bug. The added unit test
+runs on the armv7 CI leg where the 32-bit backend compiles.
+---
+ CHANGELOG.md                                  |  8 +++++
+ .../src/vendor/k256/scalar/scalar_8x32.rs     | 32 ++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 43ff35e..d73496f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,14 @@
+ 
+ ## UNRELEASED
+ 
++- **32-bit scalar backend**: the vendored `Scalar8x32` `From<u64>`
++  conversion masked its input with `0xFFFF` instead of `0xFFFF_FFFF`,
++  silently dropping bits 16-31. The impl has no callers inside the crate
++  (the public integer conversions take the range-checked byte-array path
++  and the vendor module is private), so no released behaviour changes;
++  the fix removes a latent correctness hazard. Inherited from
++  RustCrypto/k256's pre-2021 `scalar_8x32.rs` (since deleted upstream).
++
+ ## schnorr_fun v0.13.0
+ 
+ A security audit of `chilldkg` produced a batch of fixes and an API rework.
+diff --git a/secp256kfun/src/vendor/k256/scalar/scalar_8x32.rs b/secp256kfun/src/vendor/k256/scalar/scalar_8x32.rs
+index e6b409c..dd57b39 100644
+--- a/secp256kfun/src/vendor/k256/scalar/scalar_8x32.rs
++++ b/secp256kfun/src/vendor/k256/scalar/scalar_8x32.rs
+@@ -596,7 +596,7 @@ impl From<u32> for Scalar8x32 {
+ 
+ impl From<u64> for Scalar8x32 {
+     fn from(k: u64) -> Self {
+-        Self([(k & 0xFFFF) as u32, (k >> 32) as u32, 0, 0, 0, 0, 0, 0])
++        Self([(k & 0xFFFF_FFFF) as u32, (k >> 32) as u32, 0, 0, 0, 0, 0, 0])
+     }
+ }
+ 
+@@ -795,3 +795,33 @@ impl WideScalar16x32 {
+         Scalar8x32::from_overflow(&[r0, r1, r2, r3, r4, r5, r6, r7], high_bit)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::Scalar8x32;
++
++    /// Bits 16..31 were dropped by the old `k & 0xFFFF` mask (an inheritance
++    /// from the pre-2021 k256 backend this file was vendored from): e.g.
++    /// `From(0x1_0000)` produced zero. The public integer conversions on the
++    /// API `Scalar` do not route through this impl, so the bug was latent,
++    /// not live. `From<u64>` is non-reducing by design, consistent with
++    /// `From<u32>` here and with `Scalar4x64::From<u64>`.
++    #[test]
++    fn from_u64_keeps_all_64_bits() {
++        for k in [
++            0u64,
++            0xFFFF,
++            0x1_0000,
++            0x1234_5678_9ABC_DEF0,
++            0xFFFF_FFFF_FFFF_FFFF,
++        ] {
++            let mut expected = [0u8; 32];
++            expected[24..32].copy_from_slice(&k.to_be_bytes());
++            assert_eq!(
++                Scalar8x32::from(k).to_bytes().as_slice(),
++                &expected[..],
++                "From<u64> dropped bits for k = {k:#018x}"
++            );
++        }
++    }
++}
+-- 
+2.43.0
+

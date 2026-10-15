@@ -1,0 +1,20 @@
+[package]
+name = "audit-secp256kfun"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Red-team audit probes for secp256kfun 0.12.1 as used by apps/nostr. Detached workspace (not a fapico2 member), mirroring spike-secp256kfun's exclusion precedent."
+
+[workspace]
+
+[dependencies]
+# Version set pinned to the fapico2 Cargo.lock (secp256kfun 0.12.1,
+# subtle-ng 2.5.0, sha2 0.10.x, hmac 0.12.x, chacha20 0.9.x).
+secp256kfun = { version = "0.12", default-features = false }
+# The vendored backend sources `use subtle::...`; subtle-ng's lib is named
+# `subtle`, so alias the dependency key to keep those includes compiling.
+subtle = { package = "subtle-ng", version = "2.5" }
+sha2 = "0.10"
+generic-array = "0.14"
+hmac = "0.12"
+chacha20 = "0.9"
