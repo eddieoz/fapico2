@@ -3,6 +3,7 @@
 **Status:** Accepted (2026-10-10)
 **Supersedes:** nothing
 **Superseded by:** nothing
+**Amended by:** [ADR 0006](0006-nostr-pin-custody.md) (2026-10-15) — the custody row, below
 **Context docs:** [`docs/tasks/nostr-applet-design.md`](../tasks/nostr-applet-design.md) §2.4–§2.5
 (the approved design; its Decision Log §9.1 D4 and D8 are the authority for the "why"),
 [`docs/tasks/EPIC-nostr-applet.md`](../tasks/EPIC-nostr-applet.md) US-1634, US-1637.
@@ -226,3 +227,44 @@ discipline to the decision itself: named, not silent.
 
 Until one of those fires, no code changes: the record of this decision is
 the mechanism.
+
+## Amendment (US-1718, 2026-10-15): the custody row — the stated property gains the burned OTP page
+
+**The stated property** — *"a Nostr identity is not extractable from flash
+without the OTP row and the chip-id"* — is **amended, not cited**: after the
+custody-migration ceremony ([ADR 0006](0006-nostr-pin-custody.md), US-1712..1715)
+the property reads
+
+> a Nostr identity is not extractable from flash without **the OTP row, the
+> chip-id, and the burned custody page's read-back contents** — and the
+> legacy constant-KDF, the key this ADR's decision 1 originally named, opens
+> **no record, including the PIN record**, once the reseat marker stands.
+
+What the ceremony adds to the derivation: the region key becomes
+`derive_nostr_payload_key(otp_key_1, chipid, custody_row_readback)` — the
+secret is the **read-back contents of a burned, page-locked OTP page**
+(`platform/src/custody.rs::assess`), contents-authoritative by design
+(US-1712): deterministic across boots and firmware generations, but existing
+nowhere in any flash image, so a flashed-back old firmware derives only the
+legacy key and opens nothing. Three properties carry the amendment:
+
+1. **The completeness assertion** (US-1713, host-tested in
+   `platform/tests/nostr_store.rs` and re-checked at every boot attach,
+   `firmware/src/boot.rs::nostr_custody_region`): once the marker stands,
+   no slot opens under the legacy KDF — the dual-KDF window exists only for
+   the marker-less interrupted state.
+2. **The consent gate** (US-1715): the burn never fires as a side effect —
+   no command but the explicit `CEREMONY_START` verb writes the OTP page,
+   and a declined migration leaves the board legacy-sealed and pending,
+   extractable by the old image by the user's own recorded choice.
+3. **The fail-closed fault** (`SW_SEALED_UNAVAILABLE`): a custody-row read
+   fault yields a non-latching, RAM-only refusal of every command — never a
+   guess at a key, never `fatal_boot`, destruction still management-`RESET`-only.
+
+The original device-bound derivation (decision 1) remains the pre-ceremony
+posture and the fallback for virgin/torn custody rows; the amendment does
+not re-key anything the ceremony has not consented to migrate. What the
+amendment deliberately does **not** claim: stop the custom-firmware
+adversary (that is O5's secure boot at the `-release` boundary), or stop a
+downgrade from destroying the sealed set (the destruction residual is
+recorded once in [ADR 0006's downgrade section](0006-nostr-pin-custody.md)).

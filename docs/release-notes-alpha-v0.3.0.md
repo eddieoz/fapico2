@@ -60,3 +60,32 @@ The vendor-HID arm of this matrix (byte `0x4B` on the old image, byte
 `0x48` on the new) is pinned by the firmware host tests — the emulator
 serves Nostr over CCID only ([AGENTS.md §8](../AGENTS.md)), so the HID arm
 does not run under the emulator by design.
+
+## The custody ceremony — one-time, consented, permanent
+
+On top of the PIN gate, this release adds the **custody ceremony**
+([ADR 0005 amendment](adr/0005-nostr-key-storage.md),
+[ADR 0006](adr/0006-nostr-pin-custody.md), US-1712..1716): the explicit
+`CEREMONY_START` verb (vendor byte `0x4E`, CCID INS `0x1E`) burns a
+page-locked OTP secret and reseats every sealed record under a key derived
+from its read-back contents. After the ceremony's completion marker stands,
+**no record — including the PIN record — opens under the old constant-KDF**,
+so a flashed-back v0.2.0 image finds nothing its `EXPORT_KEY` can extract
+and cannot re-enable export.
+
+The ceremony is **never a side effect**: no command but `CEREMONY_START`
+writes the OTP page, and the verb refuses (`6F02`) on a board without a PIN,
+without sealed identities, or already sealed. Declining leaves the board
+legacy-sealed and migration-pending — `GET_INFO`'s flags bit 2
+(`FLAG_MIGRATION_PENDING`), re-offered by the extension at every connect.
+A faulted custody-page read answers `6F01` (sealed-unavailable) to every
+command, RAM-only, non-latching — recovery is the extension's stepped
+ladder: power cycle, re-flash the current release over BOOTSEL, and only
+then management RESET.
+
+**Downgrade is destruction, not extraction** ([ADR 0006](adr/0006-nostr-pin-custody.md)
+— the residuals): a v0.1.x image over a ceremony-completed board destroys
+the identity set by its own ordinary write path; it cannot preserve or read
+it. The matrix transcript
+([`docs/audits/2026-10-15-nostr-downgrade-matrix.md`](audits/2026-10-15-nostr-downgrade-matrix.md))
+carries the hardware evidence for both legs.

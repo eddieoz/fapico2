@@ -411,8 +411,35 @@ exercises holds for the vendor-HID arm by construction; the emulator has no
 Nostr HID interface (above), and `scripts/nostr_probe.py --pin` is the
 hardware leg.
 
+**The custody ceremony is the one OTP-writing command, and it is consent-gated
+by construction (US-1712..1716, ADR 0005's custody-row amendment).** The
+vendor byte `0x4E` (→ INS `0x1E`, `CEREMONY_START`) burns the page-locked
+custody page and reseats every record off the legacy constant-KDF onto the
+custody key (`derive_nostr_payload_key(otp_key_1, chipid, custody_row_readback)`
+— contents-authoritative: the input is what the burned page reads back, never
+what was intended). No other command — VERIFY included — triggers a burn or a
+reseat; the verb refuses `SW_PIN_NOT_SET`, `SW_CEREMONY_NOT_NEEDED` (`0x6F02`:
+no PIN, no sealed records, or the marker already stands), and its response
+body is `migrated(2 BE) ‖ already(2 BE)`. `GET_INFO` advertises the offer
+with flags bit 2 (`FLAG_MIGRATION_PENDING = 0x04`, set iff
+`pin_set && !reseat_complete()`) and the capability with
+`CAP_CEREMONY = 0x0008` (`CAPS = 0x000F`). After the marker stands, **no
+record — including the PIN record — opens under the legacy KDF**
+(`no_record_opens_under_legacy_after_marker`, re-checked at every boot attach
+in `nostr_custody_region`: marker stands → the dual-KDF window closes). A
+faulted custody-page read answers `SW_SEALED_UNAVAILABLE` (`0x6F01`) to
+**every** command, RAM-only, judged once per boot, never latching, never
+tombstoning, never `fatal_boot` — the store cannot guess at a key, so it
+refuses. The boot-side derivation rule still applies: virgin/torn custody
+rows derive the **legacy** key (the ceremony resumes), sealed/complete rows
+derive the custody key, and a faulted assessment derives **no** key.
+Downgrade is destruction, not extraction — the residuals are recorded once in
+ADR 0006's downgrade section, and the matrix transcript is
+`docs/audits/2026-10-15-nostr-downgrade-matrix.md`.
+
 Tests: `apps/nostr/tests/` (wire, keymgmt + BIP-340 vectors, NIP-44 vectors,
-presence), `platform/tests/nostr_store.rs`, the emulator suites
+presence, ceremony — `ceremony.rs` holds the consent-gate and sealed-unavailable
+suite), `platform/tests/nostr_store.rs`, the emulator suites
 `tests/harness/test_nostr_select.py` / `test_nostr_keymgmt.py`, the CCID
 hardware probe `scripts/nostr_probe.py`, and the udev rule a Linux extension
 user needs — `platform/udev/70-fapico2-nostr.rules` (scoped to the VID;

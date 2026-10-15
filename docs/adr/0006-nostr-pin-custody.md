@@ -99,8 +99,54 @@ first:
 
 ### The downgrade section
 
-Deferred by design: it records the custody-migration ceremony's Decision Log
-(the downgrade review's R1–R7 dispositions) when the ceremony lands
-(US-1716..1718). The threat is named here so the deferral is visible: an old
-firmware image re-enables EXPORT; the migration marker and its refusal rules
-are Phase 10–11 work gated on US-1711.
+**Status:** recorded 2026-10-15 (US-1718); the matrix transcript itself lives in
+[`docs/audits/2026-10-15-nostr-downgrade-matrix.md`](../audits/2026-10-15-nostr-downgrade-matrix.md)
+and is the one piece of this section still gated on a hardware session.
+
+The threat: OTP burning is a firmware-level act, not an OTP-controller
+guarantee — an old image carries the old KDF and the old, retired
+`EXPORT_KEY`, so downgrade is an extraction attempt, and the ceremony's
+answer is **data sealing**, not image signing: after the ceremony, every
+record is sealed under a key derived from the burned custody page's
+read-back contents, and the legacy constant-KDF opens nothing. The
+ceremony itself is consent-gated (decision: the burn runs only on the
+explicit `CEREMONY_START` verb, never as a side effect — a declined
+migration leaves the board legacy-sealed and pending by the user's own
+recorded choice).
+
+#### The Decision Log of the downgrade review (R1–R7, binding on Phases 9–11)
+
+The multi-agent review of the downgrade-and-custody design closed
+**APPROVED-WITH-REVISIONS**; the dispositions, with the story that
+discharged each:
+
+| # | Revision | Discharged by |
+|---|---|---|
+| R1 | The OTP primitive must classify rows three-way — erased, valid, faulted — and a **faulted row is never classified as erased**, in either direction; a faulted read feeding the KDF fails closed before any record is touched. | US-1710 (`row_classifies_erased_valid_faulted`, `faulted_row_never_derives_a_key`) |
+| R2 | **No page constant is committed and no burn-capable code ships** until the two-population OTP probe closes: occupancy and lock rows dumped on both a pico-fido2-migrated board and a factory board, the register model reconciled, the page constant recorded with the transcript. | US-1711 (probe transcript; custody page 59) |
+| R3 | The one true brick vector — a burn word that verifies against neither intended nor erased — is **spent on nothing user-visible**: the ceremony aborts with no marker, and the torn burn resumes by refilling erased-class words only. | US-1712 (`verify_mismatch_aborts_with_no_marker`) |
+| R4 | **Consent precedes every irreversible operation**: VERIFY and every other command never trigger a burn or a re-seat; the ceremony runs only on the explicit start verb, refused without a PIN, without legacy records, or with the marker standing. | US-1715 (host tests) |
+| R5 | The legacy constant-KDF branch is **permanent behind one named seam** — no time-bombed expiry; the fleet-horizon question is a standing review item at the `-release` provisioning epic, not a timer. | `platform/src/keyregion/crypto.rs` `NostrKeySource::LegacyConstant` (single seam) |
+| R6 | The review's **residuals are recorded once each** in the docs, by the downgrade matrix (below). | US-1718 |
+| R7 | The completeness assertion — **after the marker, no record, including the PIN record, opens under the legacy KDF** — is host-tested and re-checked at every boot attach. | US-1713 (`no_record_opens_under_legacy_after_marker`), `nostr_custody_region` |
+
+#### The residuals (R6), stated once and only here
+
+- **Downgrade restores PIN-less destruction.** A v0.1.x image has neither the
+  PIN gate nor custody: flashing one over a ceremony-completed board destroys
+  the identity set by the *old* firmware's own ordinary write path (the range
+  is overwritten/tombstoned, not read). The matrix's second leg demonstrates
+  exactly this — destruction, not extraction — and that asymmetry is the
+  whole protection story: the sealed set is worthless to the old image, so
+  the old image cannot preserve it.
+- **The custom-firmware adversary is covered only by O5's secure boot** at
+  the `-release` boundary ([ADR 0002](0002-provisioning-policy.md)). The
+  custody seal stops an old *shipped* image, not a crafted one: code that
+  ignores the KDF entirely and reads the AEAD records as raw bytes stops
+  nothing, because it stops being an authenticator. O5 alone does not stop
+  downgrade; this data sealing alone does not stop a crafted image; the pair
+  is the boundary where the residual closes.
+- **FIDO, OATH, OpenPGP/PIV and PIN-less Nostr boards are outside this
+  protection.** The custody domain is Nostr's keyregion only; PIN-less
+  boards never migrate (nothing to protect — the gate does not exist), and
+  no other applet's records are re-seated by the ceremony.

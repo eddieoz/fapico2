@@ -7,6 +7,22 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.3.0] — 2026-10-15
+
+Full notes in [`docs/release-notes-alpha-v0.3.0.md`](docs/release-notes-alpha-v0.3.0.md).
+
+### Added — Nostr PIN custody
+
+- **The Nostr PIN gate**: import-only custody (`EXPORT_KEY` retired), a
+  session gate on every identity-touching command, the PIN custody verbs
+  `0x4B`/`0x4C`/`0x4D`, and the capability-gated extension flows
+  ([ADR 0006](docs/adr/0006-nostr-pin-custody.md)).
+- **The custody ceremony**: the consented `CEREMONY_START` verb burns a
+  page-locked OTP secret and reseats every record off the legacy KDF —
+  downgrade becomes destruction, not extraction. The residuals are recorded
+  once in ADR 0006's downgrade section; the downgrade-matrix transcript is
+  [`docs/audits/2026-10-15-nostr-downgrade-matrix.md`](docs/audits/2026-10-15-nostr-downgrade-matrix.md).
+
 ## [0.2.0] — 2026-10-14
 
 Released as [`fapico2-release-alpha-v0.2.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.2.0);
