@@ -14,7 +14,7 @@
 use fapico2_nostr::crypto::pin_verifier;
 use fapico2_nostr::NostrApp;
 use fapico2_nostr::{
-    INS_SET_PIN, INS_VERIFY_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED,
+    INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED,
     SW_PIN_NOT_SET, SW_STORE_FAULT, SW_WRONG_DATA,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
@@ -465,5 +465,64 @@ fn verify_on_an_unset_board_touches_nothing() {
     // And the board still sets afterwards — the refusal consumed nothing.
     let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
     assert_eq!(sw, SW_OK);
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1694: LOCK — explicit session close, idempotent, non-leaking
+// ---------------------------------------------------------------------------
+
+fn lock() -> HeaplessVec<u8, 300> {
+    let mut a = HeaplessVec::new();
+    a.extend_from_slice(&[0x00, INS_LOCK, 0x00, 0x00]).unwrap();
+    a
+}
+
+/// **`LOCK` answers `9000` whatever the state was and never leaks it** —
+/// on a no-PIN board, a locked board, an unlocked board, twice in a row.
+/// A `LOCK` that discriminated would tell a USB-side attacker whether a
+/// session was open, which is the fact custody exists to hide.
+///
+/// The flag *clearing* itself is not observable from this applet's wire
+/// until the custody gate exists (US-1697): `lock_clears_the_flag_across_
+/// transports` completes there, when a subsequent `SIGN` can refuse —
+/// unlock over CCID, lock through the vendor-HID arm, watch `SIGN`
+/// refuse. What this story pins is the verb's own contract: idempotent,
+/// payloadless, touch-free, one `9000` for every state.
+#[test]
+fn lock_answers_9000_in_every_state_and_leaks_nothing() {
+    // No PIN at all.
+    let (mut app, path) = booted_app("lock-unset");
+    let (_, sw) = call(&mut app, &lock());
+    assert_eq!(sw, SW_OK, "a no-PIN board locks idempotently");
+    std::fs::remove_file(&path).ok();
+
+    // PIN set but never verified, and a payload is refused on shape.
+    let (mut app, path) = booted_app("lock-set");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &lock());
+    assert_eq!(sw, SW_OK, "an unverified session locks fine");
+    std::fs::remove_file(&path).ok();
+
+    // Verified, then locked, then locked again.
+    let (mut app, path) = booted_app("lock-open");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &lock());
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &lock());
+    assert_eq!(sw, SW_OK, "the second lock is the same `9000` — no state leaked");
+
+    // A session that was closed by LOCK can be re-opened: the flag is the
+    // session, not a revocation.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK, "LOCK does not burn the budget");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, PIN_MAX_RETRIES),
+        other => panic!("expected the full record, got {other:?}"),
+    }
     std::fs::remove_file(&path).ok();
 }

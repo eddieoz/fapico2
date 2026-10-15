@@ -1433,6 +1433,32 @@ impl NostrApp {
         self.pin_set = pin_set;
         self.pin_unlocked = unlocked;
     }
+
+    /// US-1694: `LOCK` (INS `0x1D`, no payload) — close the custody session
+    /// explicitly, on **any** transport, because the flag it clears is
+    /// applet-global behind the shared `Mutex` (§8): the CCID task and the
+    /// vendor-HID task drive the same one applet instance, so there is no
+    /// per-connection session to be out of sync with.
+    ///
+    /// Idempotent by design, and the design has a security reason: a
+    /// `9000` whatever the state was — no PIN, locked, already locked —
+    /// must not leak which state it was in. A `LOCK` that discriminated
+    /// would tell a USB-side attacker whether a session was open, which is
+    /// exactly the fact custody exists to hide. Touch-free: locking is the
+    /// *retreat*, never the dangerous direction.
+    fn lock(
+        &mut self,
+        _p1: u8, // zeroes; the INS is the whole instruction
+        _p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        self.pin_unlocked = false;
+        write_sw(resp, SW_OK);
+    }
 }
 
 impl App for NostrApp {
@@ -1522,6 +1548,7 @@ impl App for NostrApp {
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
             INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
             INS_VERIFY_PIN => self.verify_pin(p1, p2, data, resp),
+            INS_LOCK => self.lock(p1, p2, data, resp),
             INS_SET_PIN => {
                 if p1 == 0x01 {
                     self.change_pin(p1, p2, data, resp)
