@@ -31,6 +31,17 @@ fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// The PIN verifier: `SHA256(salt ‖ pin)` — the OATH `PinRecord`
+/// derivation (`oath_core.rs:823-828`), salt first, exactly the same byte
+/// order. One derivation in one place: the applet's SET/CHANGE/VERIFY all
+/// go through this, so a byte-order mistake is one mistake, not three.
+pub fn pin_verifier(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(salt);
+    h.update(pin);
+    h.finalize().into()
+}
+
 fn mul_norm<S1, T2, S2>(
     s: &Scalar<S1, NonZero>,
     p: &Point<T2, S2, NonZero>,
