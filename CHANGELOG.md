@@ -9,7 +9,8 @@ and the project uses [semantic versioning](https://semver.org/).
 
 ## [0.3.0] — 2026-10-15
 
-Full notes in [`docs/release-notes-alpha-v0.3.0.md`](docs/release-notes-alpha-v0.3.0.md).
+Released as [`fapico2-release-alpha-v0.3.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.3.0);
+full notes in [`docs/release-notes-alpha-v0.3.0.md`](docs/release-notes-alpha-v0.3.0.md).
 
 ### Added — Nostr PIN custody
 
