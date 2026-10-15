@@ -28,6 +28,7 @@ from nostr_ccid import (
     SW_PIN_NOT_SET,
     SW_PIN_SESSION_REQUIRED,
     SW_WRONG_DATA,
+    FLAG_MIGRATION_PENDING,
     apdu,
 )
 
@@ -58,18 +59,19 @@ def change_payload(current, new):
 def test_get_info_flags_walk_the_three_states(emu):
     # No PIN: the v0.2.0-compatible zero.
     assert flags(emu) == 0x00
-    # SET alone: bit 0.
+    # SET alone: bit 0 — and bit 2 joins it (US-1714: PIN set without the
+    # marker is the migration-pending state).
     _, sw = emu.send(apdu(INS_SET_PIN, p1=0, data=PIN))
     assert sw == SW_OK
-    assert flags(emu) == 0x01
+    assert flags(emu) == 0x01 | FLAG_MIGRATION_PENDING
     # VERIFY: bit 1 joins.
     _, sw = emu.send(apdu(INS_VERIFY_PIN, data=PIN))
     assert sw == SW_OK
-    assert flags(emu) == 0x03
+    assert flags(emu) == 0x01 | 0x02 | FLAG_MIGRATION_PENDING
     # LOCK: bit 1 leaves, bit 0 stays.
     _, sw = emu.send(apdu(INS_LOCK))
     assert sw == SW_OK
-    assert flags(emu) == 0x01
+    assert flags(emu) == 0x01 | FLAG_MIGRATION_PENDING
 
 
 def test_verify_opens_the_gate_and_lock_closes_it(emu):

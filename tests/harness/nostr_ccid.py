@@ -80,6 +80,10 @@ SW_PIN_NOT_SET = 0x6A82
 SW_PIN_SESSION_REQUIRED = 0x6982
 SW_PIN_LOCKED = 0x63C0
 
+# GET_INFO flags (US-1714): bit 2 is the migration-pending state — PIN set,
+# the ceremony marker absent.
+FLAG_MIGRATION_PENDING = 0x04
+
 
 def apdu(ins: int, p1: int = 0, p2: int = 0, data: bytes = b"") -> bytes:
     """One short-form command APDU: `CLA INS P1 P2 [Lc data]`, no Le."""

@@ -49,9 +49,10 @@ def test_unregistered_aid_is_6a82(emu):
 
 def test_unknown_ins_is_6d00(emu):
     assert emu.select()[1] == SW_OK
-    # 0x1E is inside the §2.2 INS window but unassigned (0x1B grew a
-    # VERIFY_PIN in US-1691); 0x00 is outside it.
-    _, sw = emu.send(apdu(0x1E))
+    # 0x1F is inside the §2.2 INS window but unassigned (0x1B grew a
+    # VERIFY_PIN in US-1691; 0x1E grew CEREMONY_START in US-1715); 0x00 is
+    # outside it.
+    _, sw = emu.send(apdu(0x1F))
     assert sw == SW_INS_NOT_SUPPORTED
     _, sw = emu.send(apdu(0x00))
     assert sw == SW_INS_NOT_SUPPORTED
