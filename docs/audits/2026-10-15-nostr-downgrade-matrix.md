@@ -31,6 +31,54 @@ observing the identity set
 
 ## Results
 
+### Leg 0 — the custody ceremony itself (this branch, `d63256d`)
+
+The ceremony ran across three flashes of the ceremony build; the third
+completed. The two failures before it were themselves US-1718 findings and are
+recorded because they are the device path's signature of bugs the host suite
+cannot see:
+
+1. **PIN-cache desync** (`0cc8bec`): on device the applet boots with a lazily
+   attached region, so the PIN cache GET_INFO reports stayed `pin_set=false`
+   after every power cycle — the custody gate stood open on a PIN-set board.
+   A refused `SET_PIN` healed it fail-closed (flags walked `0x00` → `0x05`
+   across a reboot). Fixed in the `process` preamble; seen on this board.
+2. **Provider exhaustion** (`d63256d`): the ceremony's re-entry asks its
+   provider for the region a second time, and the device provider was
+   take-once — the second call got `None`, the applet answered `6F00` and
+   stayed store-dead until reboot. First run: `CEREMONY_START` burned the OTP
+   page (28 ms; 8 secret words + lock + marker) then died at the re-entry —
+   the flash reseat never ran, so `GET_INFO` kept the pending bit. Second run
+   on the burned page: 7 ms, idempotent-`Complete`, same `6F00`. The host
+   suite never caught it because the emulator's provider re-opens its file per
+   call; the device one could not re-mint. Fixed by staging a spare `FLASH`
+   singleton and minting fresh handles (`boot::nostr_key_region_fresh`),
+   take-then-mint in `main.rs::nostr_region`.
+
+**Completing run** (OTP page 59 already `Complete`; the run resumes at the
+re-entry and reseat):
+
+```
+[state] GET_INFO sw=9000 caps=0x000F n_identities=1 flags=0x05   (pin_set | pending)
+[pin]   PIN already set — skipping SET_PIN
+[pre]   LIST_KEYS sw=9000 n_identities=1
+[run]   CEREMONY_START sw=9000 body=00060000  migrated=6 already=0
+[run]   DURATION: 0.620 s
+[post]  GET_INFO sw=9000 flags=0x01            (pending bit CLEAR — the flash reseat marker landed)
+[post]  LIST_KEYS sw=9000 n_identities=1         (equals the pre count)
+[post]  GET_PUBKEY idx0 sw=9000 len=95
+```
+
+**Measured duration bound:** 0.62 s for the completing run, on a board whose
+OTP page was already burned (the idempotent-`Complete` path). A virgin-page
+ceremony adds the eight secret-word burns, the lock and the marker —
+sub-millisecond ECC writes each, bounded by the same run's shape. The
+extension's `CEREMONY_BOUND_SECONDS = 60` keeps ~96× headroom over the
+measured run and stands.
+
+Consent: the user approved this ceremony against the sacrificial board
+(in session); the OTP burn is irreversible, page 59 now reads `Complete`.
+
 ### Extraction leg — v0.2.0 over a ceremony-completed board
 
 **PENDING HARDWARE SESSION.**
