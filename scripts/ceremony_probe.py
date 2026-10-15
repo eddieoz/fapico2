@@ -67,19 +67,17 @@ def main():
     if not caps & CAP_CEREMONY:
         sys.exit("the board does not advertise CAP_CEREMONY — is this the ceremony build?")
     if flags(info) & FLAG_PIN_SET:
-        sys.exit("a PIN is already set — refusing to overwrite; run the ceremony on a fresh PIN state")
+        print("[pin]   PIN already set (flags bit 0) — skipping SET_PIN")
+    else:
+        sw, _ = apdu(c, INS_SET_PIN, p1=0, data=pin)
+        print(f"[pin]   SET_PIN sw={sw:04X}")
+        if sw != 0x9000:
+            sys.exit("SET_PIN refused")
+        sw, info = apdu(c, INS_GET_INFO)
+        print(f"[state] flags=0x{flags(info):02X}")
 
-    sw, _ = apdu(c, INS_SET_PIN, p1=0, data=pin)
-    print(f"[pin]   SET_PIN sw={sw:04X}")
-    if sw != 0x9000:
-        sys.exit("SET_PIN refused")
-
-    sw, info = apdu(c, INS_GET_INFO)
-    f = flags(info)
-    print(f"[state] flags=0x{f:02X} "
-          f"(pin_set={bool(f & FLAG_PIN_SET)} pending={bool(f & FLAG_MIGRATION_PENDING)})")
-    if not f & FLAG_MIGRATION_PENDING:
-        sys.exit("bit 2 did not stand after SET_PIN — nothing to migrate")
+    if not flags(info) & FLAG_MIGRATION_PENDING:
+        sys.exit("bit 2 does not stand — the ceremony has nothing to migrate")
 
     sw, keys = apdu(c, INS_LIST_KEYS)
     n = keys[0] if keys else -1

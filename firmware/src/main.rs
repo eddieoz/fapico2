@@ -296,7 +296,17 @@ fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
 /// text, so this comment does not spell the release call the way the source
 /// does — that is the gate's needle, not prose.)
 fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
-    let region = boot::take_nostr_key_region()?;
+    // The boot hand-over is take-once, and the custody ceremony re-enters
+    // through this provider after dropping its handle — the second call must
+    // mint a fresh region rather than read `None` (US-1718, the hardware
+    // 6F00 store-dead finding). `nostr_key_region_fresh` is gated on the
+    // same release flag and creates an independent handle over the same
+    // disjoint window; at most one is live at a time, because the applet
+    // drops its `region` before calling the provider again.
+    let region = match boot::take_nostr_key_region() {
+        Some(region) => region,
+        None => boot::nostr_key_region_fresh()?,
+    };
     // US-1714: the custody policy lives with the key derivation — this
     // provider is the one place in the process that derives Nostr key
     // material, and the applet re-enters through it after the ceremony.
@@ -1014,6 +1024,18 @@ async fn main(spawner: Spawner) -> ! {
             p.FLASH.clone_unchecked(),
         )))
     };
+
+    // US-1718: the ceremony's re-entry asks `nostr_region` a second time,
+    // after the take-once hand-over is spent — stage a spare `FLASH` singleton
+    // so the provider can mint fresh handles instead of answering `None`
+    // (the hardware 6F00 store-dead finding). Nothing reads the window here:
+    // `Flash::new_blocking` touches no QSPI register, and the stash is a
+    // `Peri` (a zero-sized singleton), not a driver.
+    //
+    // SAFETY: `stash_nostr_flash` — single-core boot path, before any task
+    // exists; the slot is written exactly once here and read only after
+    // `release_key_region` via `boot::nostr_key_region_fresh`.
+    unsafe { boot::stash_nostr_flash(p.FLASH.clone_unchecked()) };
 
     let flash: boot::DevFlash = Flash::new_blocking(p.FLASH);
     // S-701-3: hand the flash handle to the write-once static (single init,

@@ -582,6 +582,79 @@ pub fn take_nostr_key_region() -> Option<KeyRegionHandle> {
     unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION)).assume_init_mut().take() }
 }
 
+/// US-1718: a spare `FLASH` singleton, staged beside the boot hand-over, from
+/// which [`nostr_key_region_fresh`] mints **additional** Nostr region handles.
+///
+/// The custody ceremony's re-entry (`apps/nostr/src/lib.rs`,
+/// `ceremony_start`) drops its region handle and then asks its provider for
+/// the region **again**. [`take_nostr_key_region`] is take-once by design —
+/// the `Option` slot makes a double-take a read of `None`, not a double-move —
+/// so on device that second call got `None` and the applet answered
+/// `SW_STORE_FAULT`, store-dead until reboot. (The emulator's provider re-opens
+/// its file per call, which is why every host test passed.) This stash is the
+/// device path's way to answer that second call.
+///
+/// **Why a `Peri` and not a `Flash`.** `Flash` is neither `Copy` nor `Clone`,
+/// so a stashed handle could mint exactly one region — the bug again. The
+/// `Peri` is `Copy` at heart (`FLASH` is a zero-sized singleton and
+/// `PeripheralType: Copy`), and `clone_unchecked(&self)` mints a fresh owned
+/// clone from a shared reference on every call.
+///
+/// **Why this is sound.** `Flash::new_blocking` stores `Option::None` plus a
+/// `PhantomData` and touches no QSPI register
+/// (`embassy-rp-0.10.0/src/flash.rs:255-260`), so every minted handle is an
+/// independent value over the same disjoint window, exactly like the five
+/// boot-time handles above. The invariant that makes "many handles, one at a
+/// time" sound is the same one [`OATH_KEY_REGION`]'s doc states: at most one
+/// Nostr region handle is live at once. The applet holds its region behind a
+/// single `Option` field and the ceremony **drops** it before asking the
+/// provider again (`apps/nostr/src/lib.rs`: `*region = None;` then re-attach),
+/// single core, no region method ever yields.
+///
+/// Written exactly once on the boot path beside [`init_nostr_key_region`];
+/// read only after [`KEY_REGION_READY`], which [`nostr_key_region_fresh`]
+/// checks.
+pub static mut NOSTR_KEY_REGION_PERI: core::mem::MaybeUninit<Option<embassy_rp::Peri<'static, FLASH>>> =
+    core::mem::MaybeUninit::uninit();
+
+/// Stage the spare `FLASH` singleton. Single-core boot path, once, beside the
+/// other key-region staging calls — the [`init_nostr_key_region`] discipline.
+///
+/// # Safety
+///
+/// The caller must not keep using `peri` afterwards, and must call this
+/// exactly once, before any task exists — the same write-once-slot discipline
+/// as [`init_nostr_key_region`], which the same single-core boot-path argument
+/// covers.
+pub unsafe fn stash_nostr_flash(peri: embassy_rp::Peri<'static, FLASH>) {
+    unsafe { (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION_PERI)).write(Some(peri)) };
+}
+
+/// Mint a **fresh** Nostr key-region handle — the device provider's answer to
+/// the ceremony's re-entry.
+///
+/// Gated on [`KEY_REGION_READY`] like every other accessor here, so a caller
+/// arriving before [`release_key_region`] gets `None` and the S8/S9 guarantee
+/// holds for re-entry calls exactly as it does for the boot hand-over.
+pub fn nostr_key_region_fresh() -> Option<KeyRegionHandle> {
+    if !KEY_REGION_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: `stash_nostr_flash` wrote the slot exactly once on the boot path
+    // before any task existed, and `KEY_REGION_READY` is only set by
+    // `release_key_region` after that. The `Option` is *not* taken: the
+    // stashed `Peri` stays in place and each call clones it
+    // (`PeripheralType: Copy`; `clone_unchecked` mints a fresh owned value
+    // from a shared reference), so this is callable once per ceremony
+    // re-entry, not once per boot. At most one resulting region handle is
+    // live at a time — the invariant argued on `NOSTR_KEY_REGION_PERI` above.
+    let peri = unsafe {
+        (*core::ptr::addr_of_mut!(NOSTR_KEY_REGION_PERI)).assume_init_mut().as_ref()?
+    };
+    let flash = Flash::new_blocking(unsafe { peri.clone_unchecked() });
+    Some(KeyRegionHandle::new(flash))
+}
+
 /// US-1643: the key the Nostr region's records are sealed under.
 ///
 /// Same root as every other store key on the device, the same shape as
