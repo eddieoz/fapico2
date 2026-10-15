@@ -776,3 +776,63 @@ fn lock_clears_the_flag_across_transports() {
     assert_eq!(sw, SW_OK, "a reopened session signs");
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1696: session flag lifecycle — RAM-only, power-cycle-cleared, deselect-blind
+// ---------------------------------------------------------------------------
+
+/// **The session survives deselect and spans transports, and dies only with
+/// power.** The four lifecycle claims, in the story's order:
+///
+/// (a) *cleared by construction* — a freshly booted applet is locked, and
+/// VERIFY is the only setter to `true`; (c) *deselect-blind* — `deselect`
+/// and a fresh `select` on the applet touch nothing, because the flag is
+/// applet-global behind the shared `Mutex` (§8: one applet instance per
+/// transport pair), not per-connection state; (d) *spans transports* —
+/// "unlock on HID, sign over CCID" is one `process` call away at the
+/// applet level, since both interfaces drive the same instance; the review
+/// note that keeps the device arm honest is that `firmware/src/
+/// nostr_shared.rs` forwards every `App` method through the proxy and no
+/// `deselect` path anywhere assigns the flag (grep: `pin_unlocked` is
+/// written only in `verify_pin`, `lock` and the constructors). (b) *power
+/// cycle* — a fresh boot over the same region re-derives a closed
+/// session: the flag lives in RAM and the record never learned it.
+#[test]
+fn session_survives_deselect_and_spans_transports() {
+    use fapico2_nostr::SW_PIN_SESSION_REQUIRED;
+
+    let path = region_path("session-lifecycle");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+
+    // (a) cleared by construction: a boot with a PIN is a locked boot —
+    // VERIFY is the only setter to `true`, and this instance has not had
+    // one.
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "a set-PIN boot is locked");
+
+    // Unlock ("over the vendor HID"), then deselect and re-select ("the
+    // CCID leg reconnects"). The session is the applet's, not the
+    // connection's.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    app.deselect();
+    assert_eq!(app.select(false), SW_OK);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_OK, "deselect did not close the session");
+
+    // (b) power cycle: the same region, a new boot, a closed gate. The
+    // PIN record is untouched — only the session died.
+    let mut app = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "a power cycle closed the session");
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK, "the PIN survived the power cycle");
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_OK);
+    std::fs::remove_file(&path).ok();
+}
