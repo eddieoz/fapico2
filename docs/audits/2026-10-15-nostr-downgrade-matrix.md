@@ -118,7 +118,23 @@ band on the same region.)
 
 ### Endpoint — ceremony build re-flash
 
-**PENDING HARDWARE SESSION.**
+The ceremony build (`d63256d`) flashed back over the extraction-leg flash.
+Everything the two downgrades could not touch survived intact — read back on
+first boot, no re-ceremony needed:
+
+```
+GET_INFO   sw=9000 body=0002 000F 0700 01 01
+           -> version 0x0002, caps 0x000F, MAX_PLAINTEXT 1792,
+              n_identities=1, flags=0x01 (pin_set | !pending)
+LIST_KEYS  sw=9000 n=1, idx0 npub=fa042f8f… (opens clean)
+GET_PUBKEY idx0 sw=9000 len=95 (npub + bech32)
+```
+
+The PIN record survived the v0.2.0 session (which read nothing and wrote
+nothing) and the records opened under the custody key on the first mount.
+The extraction leg's residual is therefore extraction alone; whether an old
+image's ordinary **write** path is as blind is the destruction leg's
+question, below.
 
 ## Where the residuals live
 
