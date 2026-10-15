@@ -172,6 +172,10 @@ pub mod store_v3;
 pub mod fused_key;
 pub mod otp_cus;
 
+/// The Nostr custody ceremony over page 59 — US-1712. Consumes
+/// [`otp_cus`]'s primitive and US-1711's page constant.
+pub mod custody;
+
 pub mod cflash;
 pub mod cfs;
 
