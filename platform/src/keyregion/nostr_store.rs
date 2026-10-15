@@ -854,6 +854,18 @@ impl<'r> NostrStore<'r> {
         self.commit_body_at(reseat_marker_slot(), RESEAT_MARKER)?;
         Ok(report)
     }
+
+    /// US-1714: the reseat whose migration leg is this store's own dual-KDF
+    /// read window — the [`Option<&PayloadKey>`] is `Copy`, so naming it
+    /// costs nothing and borrows nothing away from `self`. The region form
+    /// ([`NostrRegion::reseat_via_window`]) is the entry point the ceremony
+    /// verb uses; this half exists because the migration leg lives here.
+    pub fn reseat_via_window(&mut self) -> Result<ReseatReport, NostrStoreError> {
+        match self.legacy {
+            Some(legacy) => self.reseat(legacy),
+            None => Err(NostrStoreError::Fault(E_NO_RESEAT_WINDOW)),
+        }
+    }
 }
 
 /// The scratchpad could not be named — impossible on this geometry, and named
@@ -869,6 +881,10 @@ const E_SHORT_REGION: &str =
 /// and named rather than `unwrap`ed for the same reason as
 /// [`E_NO_SCRATCHPAD`].
 const E_NO_MARKER_SLOT: &str = "key region: the reseat marker slot is outside the slot range";
+
+/// The reseat-through-window was asked of a region that carries no window —
+/// the caller is in the wrong world (see [`NostrRegion::reseat_via_window`]).
+const E_NO_RESEAT_WINDOW: &str = "key region: the reseat window is not open";
 
 /// The PIN slot could not be named — impossible on this geometry (the carve's
 /// assertions in `mod.rs` pin it inside the region), and named rather than
@@ -1013,9 +1029,38 @@ impl NostrRegion {
         Ok(report)
     }
 
+    /// US-1714: the reseat whose migration leg is this region's own dual-KDF
+    /// window. The ceremony verb runs it on the region the *provider* just
+    /// opened — the provider attaches the legacy window exactly when the
+    /// marker is absent, so the window is the legacy key without the
+    /// applet ever holding key material: the region's maker is the only
+    /// place in the process that derives one. On the `Ok` path the window
+    /// closes, the same structural G1 assertion [`NostrRegion::reseat`]
+    /// makes.
+    ///
+    /// A region without a window refuses: a custody-keyed region with the
+    /// marker standing needs no migration, and a legacy-keyed one has no
+    /// custody key to migrate *to* — the caller re-attaches instead of
+    /// guessing which world it is in.
+    pub fn reseat_via_window(&mut self) -> Result<ReseatReport, NostrStoreError> {
+        match self.legacy {
+            Some(_) => self.store().reseat_via_window(),
+            None => Err(NostrStoreError::Fault(E_NO_RESEAT_WINDOW)),
+        }
+    }
+
     /// Whether the dual-KDF read window is open.
     pub fn legacy_window_open(&self) -> bool {
         self.legacy.is_some()
+    }
+
+    /// Close the window without touching the medium (US-1714). The region
+    /// provider's attach policy uses it: the window goes on when the
+    /// marker might be absent and comes off the moment the marker
+    /// provably stands — the same predicate [`NostrRegion::reseat`]'s
+    /// `Ok` path enforces, applied at every attach instead of once.
+    pub fn close_legacy_window(&mut self) {
+        self.legacy = None;
     }
 
     /// The region alone — for a caller that has to inspect or repair the

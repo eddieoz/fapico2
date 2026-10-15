@@ -104,7 +104,7 @@ pub enum CeremonyError {
 /// `None` when the page is irregular (a faulted row, or a valid word with
 /// an erased word *before* it: the ceremony fills in order, so a hole is
 /// not ours).
-fn word_prefix<A: OtpAccess>(otp: &A) -> Option<usize> {
+fn word_prefix<A: OtpAccess + ?Sized>(otp: &A) -> Option<usize> {
     let mut prefix = 0usize;
     for i in 0..SECRET_WORDS {
         match classify_row(otp, FIRST_SECRET_ROW + i) {
@@ -120,7 +120,7 @@ fn word_prefix<A: OtpAccess>(otp: &A) -> Option<usize> {
 /// Classify the page. Decides **only** from what the rows read back — the
 /// same property that makes `burned+locked+complete` distinguishable from
 /// every partial state.
-pub fn assess<A: OtpAccess>(otp: &A) -> CeremonyState {
+pub fn assess<A: OtpAccess + ?Sized>(otp: &A) -> CeremonyState {
     let Some(prefix) = word_prefix(otp) else {
         return CeremonyState::Abort;
     };
@@ -155,7 +155,7 @@ pub fn assess<A: OtpAccess>(otp: &A) -> CeremonyState {
 /// word "erased" was indistinguishable from "refused", which is what made
 /// this rule unsatisfiable there; US-1711's zero-bytes measurement is what
 /// makes it expressible now.
-fn erased_consistently<A: OtpAccess>(otp: &A, row: usize) -> Result<(), CeremonyError> {
+fn erased_consistently<A: OtpAccess + ?Sized>(otp: &A, row: usize) -> Result<(), CeremonyError> {
     for _ in 0..REFILL_ERASED_READS {
         if classify_row(otp, row) != RowClass::Erased {
             return Err(CeremonyError::NotErased(row));
@@ -167,7 +167,7 @@ fn erased_consistently<A: OtpAccess>(otp: &A, row: usize) -> Result<(), Ceremony
 /// Write one word and hold it to the intended-or-erased rule: the read-back
 /// must be exactly what was written, or erased (a word that did not stick —
 /// the torn state, resumable). Anything else is the abort.
-fn write_verified<A: OtpAccess>(
+fn write_verified<A: OtpAccess + ?Sized>(
     otp: &A,
     row: usize,
     word: u16,
@@ -188,7 +188,7 @@ fn write_verified<A: OtpAccess>(
 /// The returned state is what the page reads as **after** the run; on the
 /// torn path (a word that read back erased after its write) the state is
 /// the resumable [`CeremonyState::Torn`], and the caller retries.
-pub fn burn<A: OtpAccess, W: FnMut() -> u16>(
+pub fn burn<A: OtpAccess + ?Sized, W: FnMut() -> u16>(
     otp: &A,
     mut word_entropy: W,
 ) -> Result<CeremonyState, CeremonyError> {
@@ -242,7 +242,7 @@ pub fn burn<A: OtpAccess, W: FnMut() -> u16>(
 /// across boots and firmware generations because it is the silicon's
 /// answer, never the intended one. Fails closed: erased and faulted rows
 /// yield `None` (see [`RowClass::contents`]).
-pub fn custody_words<A: OtpAccess>(otp: &A) -> Option<[u16; SECRET_WORDS]> {
+pub fn custody_words<A: OtpAccess + ?Sized>(otp: &A) -> Option<[u16; SECRET_WORDS]> {
     let mut out = [0u16; SECRET_WORDS];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = classify_row(otp, FIRST_SECRET_ROW + i).contents()?;
@@ -251,7 +251,7 @@ pub fn custody_words<A: OtpAccess>(otp: &A) -> Option<[u16; SECRET_WORDS]> {
 }
 
 /// The secret as the 16 bytes the KDF consumes, big-endian per word.
-pub fn custody_secret_bytes<A: OtpAccess>(otp: &A) -> Option<[u8; 16]> {
+pub fn custody_secret_bytes<A: OtpAccess + ?Sized>(otp: &A) -> Option<[u8; 16]> {
     let words = custody_words(otp)?;
     let mut bytes = [0u8; 16];
     for (i, w) in words.iter().enumerate() {

@@ -924,7 +924,7 @@ fn pin_gate_fires_before_touch_and_eats_the_grant() {
 /// PIN-less board from the record, not from a RAM cache.
 #[test]
 fn factory_wipe_clears_pin_record_and_flag() {
-    use fapico2_nostr::{FLAG_PIN_SET, FLAG_SESSION_UNLOCKED};
+    use fapico2_nostr::{FLAG_MIGRATION_PENDING, FLAG_PIN_SET, FLAG_SESSION_UNLOCKED};
     use fapico2_platform::keyregion::nostr_store::PinEntry;
 
     let path = region_path("wipe-pin");
@@ -934,10 +934,13 @@ fn factory_wipe_clears_pin_record_and_flag() {
     assert_eq!(sw, SW_OK);
     let (_, sw) = call(&mut app, &verify_pin(PIN));
     assert_eq!(sw, SW_OK);
-    // Sanity: the board is PIN-set and unlocked before the wipe.
+    // Sanity: the board is PIN-set and unlocked before the wipe. A PIN-set
+    // board that has not run the custody ceremony (US-1714) also reports
+    // the migration as pending — bit 2, derived from the same completeness
+    // predicate the ceremony consults.
     let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED);
+    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED | FLAG_MIGRATION_PENDING);
 
     // The wipe, on the dispatcher's route.
     app.factory_wipe();

@@ -503,7 +503,8 @@ const WRONG: &[u8] = b"000000";
 #[test]
 fn getinfo_advertises_pin_capability_and_state() {
     use fapico2_nostr::{
-        CAP_PIN_MGMT, FLAG_PIN_SET, FLAG_SESSION_UNLOCKED, INS_SIGN, SW_PIN_SESSION_REQUIRED,
+        CAP_PIN_MGMT, FLAG_MIGRATION_PENDING, FLAG_PIN_SET, FLAG_SESSION_UNLOCKED, INS_SIGN,
+        SW_PIN_SESSION_REQUIRED,
     };
 
     // No PIN: caps carry the new bit, flags are the v0.2.0-compatible zero.
@@ -523,7 +524,13 @@ fn getinfo_advertises_pin_capability_and_state() {
     assert_eq!(sw, SW_OK);
     let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(data[7], FLAG_PIN_SET, "locked board: PIN set, session closed");
+    // A PIN-set board that has not run the ceremony also reports the
+    // migration pending (US-1714, bit 2).
+    assert_eq!(
+        data[7],
+        FLAG_PIN_SET | FLAG_MIGRATION_PENDING,
+        "locked board: PIN set, session closed, migration pending"
+    );
     // The advertisement agrees with the command paths: a gated command on
     // this exact state is refused, which is what bit 0 without bit 1 says.
     let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, 0, &[0x42; 32]));
@@ -540,7 +547,7 @@ fn getinfo_advertises_pin_capability_and_state() {
     assert_eq!(sw, SW_OK);
     let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, 0, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED);
+    assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED | FLAG_MIGRATION_PENDING);
     std::fs::remove_file(&path).ok();
 }
 

@@ -74,6 +74,11 @@ pub const NOSTR_CMD_VERIFY_PIN: u8 = 0x4B;
 pub const NOSTR_CMD_SET_PIN: u8 = 0x4C;
 /// §2.2 `LOCK` — closes the custody session, idempotent, non-leaking.
 pub const NOSTR_CMD_LOCK: u8 = 0x4D;
+/// §2.2 `CEREMONY_START` (US-1714) — the explicit custody-migration
+/// ceremony. No `[idx, arg]` envelope: the INS is the whole instruction.
+/// The extension's consent dialog (US-1716) gates the request client-side;
+/// the device's own gates live in the verb.
+pub const NOSTR_CMD_CEREMONY_START: u8 = 0x4E;
 
 /// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
 /// above the applet's `MAX_REQUEST_ARG` is decodable, so every vendor arm
@@ -115,9 +120,9 @@ pub fn is_vendor_command(cmd: u8) -> bool {
 /// SW_INS_NOT_SUPPORTED`] — the D20 refusal — rather than a framing fault.
 pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
     use fapico2_nostr::{
-        INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY, INS_IMPORT_KEY,
-        INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_LABEL,
-        INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN,
+        INS_CEREMONY_START, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
+        INS_IMPORT_KEY, INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT,
+        INS_SET_LABEL, INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN,
     };
     let ins = match cmd {
         NOSTR_CMD_PING => INS_GET_INFO,
@@ -133,6 +138,7 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
         NOSTR_CMD_VERIFY_PIN => INS_VERIFY_PIN,
         NOSTR_CMD_SET_PIN => INS_SET_PIN,
         NOSTR_CMD_LOCK => INS_LOCK,
+        NOSTR_CMD_CEREMONY_START => INS_CEREMONY_START,
         _ => return None,
     };
     Some(ins)
@@ -461,6 +467,22 @@ mod tests {
         );
         // And the retired byte stays retired.
         assert_eq!(vendor_to_ins(NOSTR_CMD_EXPORT_KEY), None);
+    }
+
+    /// US-1715: the ceremony rides the vendor channel as `0x4E`, mapped to
+    /// the applet's `INS_CEREMONY_START` like every other §2.2 verb — the
+    /// request has no argument (the verb *is* the consent, delivered by the
+    /// extension's dialog), and the empty-`arg` ping form decodes clean.
+    #[test]
+    fn ceremony_start_maps_to_the_ceremony_ins() {
+        use fapico2_nostr::INS_CEREMONY_START;
+        assert_eq!(vendor_to_ins(NOSTR_CMD_CEREMONY_START), Some(INS_CEREMONY_START));
+        let req = [0x82, 0x00, 0x40]; // array(2) [0, bytes ""] — the ping form
+        assert_eq!(
+            decode_request_inner(&req),
+            Some((0x00, &req[3..])),
+            "the ceremony request is argument-free, idx intact"
+        );
     }
 
     /// US-1699: the retired `EXPORT_KEY` vendor byte is an **unsupported

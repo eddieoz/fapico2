@@ -589,15 +589,97 @@ pub fn take_nostr_key_region() -> Option<KeyRegionHandle> {
 /// [`fatal_boot`]** reasoning: a missing OTP row or chipid degrades Nostr to
 /// an applet that answers APDUs and refuses its reads with the store-fault
 /// status word rather than reporting a fiction about what is on the device.
+///
+/// US-1714 makes the source a policy, not a constant: the custody rows
+/// decide, through [`fapico2_platform::custody::assess`]. Virgin and torn
+/// pages yield the legacy constant-KDF key (a torn burn has produced no
+/// readable secret and no reseat has run); burned pages yield the custody
+/// key over the read-back rows; a faulted page yields `None` — the applet
+/// answers the sealed-unavailable word, never a wrong key.
 #[inline(never)]
 pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
     let otp_key_1 = read_otp_key_1()?;
     let chipid = embassy_rp::otp::get_chipid().ok()?;
-    fapico2_platform::keyregion::crypto::derive_payload_key(
-        &otp_key_1,
-        &chipid.to_be_bytes(),
-        &fapico2_platform::keyregion::crypto::NOSTR_PAYLOAD_SECRET,
-    )
+    let otp = fapico2_platform::otp_cus::RealOtp;
+    use fapico2_platform::custody::CeremonyState;
+    use fapico2_platform::keyregion::crypto::NostrKeySource;
+    match fapico2_platform::custody::assess(&otp) {
+        CeremonyState::Virgin | CeremonyState::Torn => {
+            fapico2_platform::keyregion::crypto::derive_nostr_payload_key(
+                &otp_key_1,
+                &chipid.to_be_bytes(),
+                NostrKeySource::LegacyConstant,
+            )
+        }
+        // Burned (with or without the OTP marker word): the secret is the
+        // read-back row contents. A page that classifies burned but cannot
+        // produce its secret is a fault — `None`, not a guess.
+        _ => {
+            let secret = fapico2_platform::custody::custody_secret_bytes(&otp)?;
+            fapico2_platform::keyregion::crypto::derive_nostr_payload_key(
+                &otp_key_1,
+                &chipid.to_be_bytes(),
+                NostrKeySource::Custody(&secret),
+            )
+        }
+    }
+}
+
+/// US-1714: the Nostr region view the applet's provider hands over, custody
+/// policy included — the one function in the process that both derives a
+/// key and decides which one.
+///
+/// The policy, per [`fapico2_platform::custody::assess`]:
+///
+/// * **Virgin or torn** — the legacy key, no window. A torn burn has
+///   migrated nothing; the ceremony resumes it.
+/// * **Burned** — the custody key, plus the legacy window exactly when the
+///   reseat marker does not stand: the interrupted state the dual-KDF
+///   window exists for. A marker that stands closes the window again, so
+///   the post-ceremony region carries no legacy leg at all (the G1
+///   assertion, applied at every attach).
+/// * **Faulted** — `None`: no key can exist, and the provider returning
+///   `None` is what the applet's sealed-unavailable state is made of.
+pub fn nostr_custody_region(
+    region: KeyRegionHandle,
+) -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
+    use fapico2_platform::custody::{assess, custody_secret_bytes, CeremonyState};
+    use fapico2_platform::keyregion::crypto::{derive_nostr_payload_key, NostrKeySource};
+    let otp_key_1 = read_otp_key_1()?;
+    let chipid = embassy_rp::otp::get_chipid().ok()?.to_be_bytes();
+    let otp = fapico2_platform::otp_cus::RealOtp;
+    match assess(&otp) {
+        CeremonyState::Abort => None,
+        CeremonyState::Virgin | CeremonyState::Torn => {
+            let key = derive_nostr_payload_key(&otp_key_1, &chipid, NostrKeySource::LegacyConstant)?;
+            Some(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
+                ::alloc::boxed::Box::new(region),
+                key,
+            ))
+        }
+        CeremonyState::Sealed | CeremonyState::Complete => {
+            let secret = custody_secret_bytes(&otp)?;
+            let key = derive_nostr_payload_key(
+                &otp_key_1,
+                &chipid,
+                NostrKeySource::Custody(&secret),
+            )?;
+            let legacy =
+                derive_nostr_payload_key(&otp_key_1, &chipid, NostrKeySource::LegacyConstant)?;
+            let mut region = fapico2_platform::keyregion::nostr_store::NostrRegion::
+                with_legacy_window(::alloc::boxed::Box::new(region), key, legacy);
+            // A marker that stands closes the window: the completeness
+            // check is the same predicate the reseat and GET_INFO's
+            // pending bit derive from, so the attach policy cannot drift
+            // from them. A faulted marker read keeps the window open —
+            // readable either way, and harmless once every record is
+            // custody-sealed.
+            if region.store().reseat_complete().unwrap_or(false) {
+                region.close_legacy_window();
+            }
+            Some(region)
+        }
+    }
 }
 
 /// US-1644: the Nostr applet's boot-time randomness pool, and its drain

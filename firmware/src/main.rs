@@ -296,12 +296,11 @@ fn oath_region() -> Option<fapico2_oath::oath_core::OathRegion> {
 /// text, so this comment does not spell the release call the way the source
 /// does — that is the gate's needle, not prose.)
 fn nostr_region() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion> {
-    let key = boot::derive_nostr_payload_key()?;
     let region = boot::take_nostr_key_region()?;
-    Some(fapico2_platform::keyregion::nostr_store::NostrRegion::new(
-        ::alloc::boxed::Box::new(region),
-        key,
-    ))
+    // US-1714: the custody policy lives with the key derivation — this
+    // provider is the one place in the process that derives Nostr key
+    // material, and the applet re-enters through it after the ceremony.
+    boot::nostr_custody_region(region)
 }
 
 /// US-1644: the Nostr applet's randomness — the boot pool filled from the

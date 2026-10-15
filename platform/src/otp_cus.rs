@@ -101,7 +101,7 @@ pub trait OtpAccess {
 ///   `Faulted` unconditionally.
 /// * Otherwise both views must agree on the same 16-bit word, or the row is
 ///   `Faulted`. A raw view that itself bus-faults is `Faulted` outright.
-pub fn classify_row<A: OtpAccess>(otp: &A, row: usize) -> RowClass {
+pub fn classify_row<A: OtpAccess + ?Sized>(otp: &A, row: usize) -> RowClass {
     match otp.raw_word(row) {
         // The measured blank-check: zero bytes mean never-written. The ECC
         // view must agree with 0 — if it faults or opens with data, the two
@@ -137,7 +137,7 @@ pub fn classify_row<A: OtpAccess>(otp: &A, row: usize) -> RowClass {
 /// returned as success. Whether the read-back matches the *intended* value is
 /// the caller's comparison — a mismatch is the ceremony's abort-with-no-marker
 /// case, and this primitive returns the evidence either way.
-pub fn burn_ecc_word<A: OtpAccess>(
+pub fn burn_ecc_word<A: OtpAccess + ?Sized>(
     otp: &A,
     row: usize,
     data: u16,
