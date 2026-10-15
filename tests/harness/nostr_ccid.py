@@ -144,7 +144,11 @@ class NostrEmu:
         tmp_path: Path,
         log_path: Path | None = None,
         presence: str = "auto",
+        binary: Path | None = None,
     ):
+        # `binary` overrides the repo's current build — the cross-generation
+        # matrix (US-1708) drives the v0.2.0 image the same harness.
+        self.binary = binary
         if key not in PORTS:
             raise ValueError(
                 f"no ports reserved for {key!r}; add them to PORTS "
@@ -204,11 +208,14 @@ class NostrEmu:
         self.emulator = subprocess.Popen(
             [
                 str(
-                    REPO
-                    / "target"
-                    / "x86_64-unknown-linux-gnu"
-                    / "debug"
-                    / "fapico2-emulation"
+                    self.binary
+                    or (
+                        REPO
+                        / "target"
+                        / "x86_64-unknown-linux-gnu"
+                        / "debug"
+                        / "fapico2-emulation"
+                    )
                 )
             ],
             env=env,
