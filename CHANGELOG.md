@@ -36,6 +36,20 @@ Full notes in [`docs/release-notes-alpha-v0.3.0.md`](docs/release-notes-alpha-v0
   would, fail-closed
   (`tests/pin.rs::the_device_path_derives_the_pin_cache_at_first_attach`).
 
+### Fixed — the device provider is no longer consumed by the first hand-over
+
+- **The custody ceremony's re-entry can re-mint the region.** The device
+  provider was take-once (`boot::take_nostr_key_region` empties its
+  `Option` slot), and the ceremony re-enters it after dropping the applet's
+  handle — so on hardware the second call got `None`, the applet answered
+  `SW_STORE_FAULT` and stayed store-dead until reboot, after the OTP page
+  had already burned. Reproduced twice on the sacrificial board; every host
+  test passed because the emulator's provider re-opens its file per call. A
+  spare `FLASH` singleton is now staged beside the boot hand-over
+  (`boot::nostr_key_region_fresh`), and `nostr_region` is take-then-mint:
+  each re-entry gets an independent handle over the same disjoint window,
+  with at most one live at a time. The completing ceremony ran 0.62 s.
+
 ## [0.2.0] — 2026-10-14
 
 Released as [`fapico2-release-alpha-v0.2.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.2.0);
