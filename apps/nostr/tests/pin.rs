@@ -14,8 +14,8 @@
 use fapico2_nostr::crypto::pin_verifier;
 use fapico2_nostr::NostrApp;
 use fapico2_nostr::{
-    INS_SET_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED, SW_PIN_NOT_SET,
-    SW_STORE_FAULT, SW_WRONG_DATA,
+    INS_SET_PIN, INS_VERIFY_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED,
+    SW_PIN_NOT_SET, SW_STORE_FAULT, SW_WRONG_DATA,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -346,5 +346,124 @@ fn change_pin_shape_refusal_precedes_any_state_read() {
         PinEntry::Live(record) => assert_eq!(record.counter, PIN_MAX_RETRIES),
         other => panic!("expected a full budget, got {other:?}"),
     }
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1693: VERIFY_PIN — the 63CX vocabulary, the session, the lockout
+// ---------------------------------------------------------------------------
+
+/// The VERIFY apdu: bare PIN payload on INS 0x1B.
+fn verify_pin(pin: &[u8]) -> HeaplessVec<u8, 300> {
+    let mut a = HeaplessVec::new();
+    a.extend_from_slice(&[0x00, INS_VERIFY_PIN, 0x00, 0x00]).unwrap();
+    a.push(pin.len() as u8).unwrap();
+    a.extend_from_slice(pin).unwrap();
+    a
+}
+
+/// **A correct verify answers `9000` and rewrites the budget full** — the
+/// success reset is a durable record write, so a verify that follows a
+/// burned attempt leaves the counter at [`PIN_MAX_RETRIES`] on the medium,
+/// not just in RAM.
+#[test]
+fn verify_pin_sets_the_session_flag() {
+    let (mut app, path) = booted_app("verify-ok");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+
+    // Burn one, then verify: the durable counter returns to full.
+    let (_, sw) = call(&mut app, &verify_pin(b"999999"));
+    assert_eq!(sw, 0x63C2);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK, "the correct PIN verifies");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => {
+            assert_eq!(record.counter, PIN_MAX_RETRIES, "the success reset is durable");
+            assert_eq!(record.verifier, pin_verifier(PIN, &record.salt));
+        }
+        other => panic!("expected the reset record, got {other:?}"),
+    }
+
+    // Verify is idempotent: a session that is open stays open, and the
+    // budget stays full.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, PIN_MAX_RETRIES),
+        other => panic!("expected the full record, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A wrong verify decrements the durable counter and answers `63C<rx>`**
+/// — the same vocabulary CHANGE burns, one verb earlier.
+#[test]
+fn wrong_pin_decrements_and_reports_63Cx() {
+    let (mut app, path) = booted_app("verify-wrong");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &verify_pin(b"999999"));
+    assert_eq!(sw, 0x63C2, "one failure from 3");
+    let (_, sw) = call(&mut app, &verify_pin(b"999999"));
+    assert_eq!(sw, 0x63C1, "two failures from 3");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, 1),
+        other => panic!("expected the decremented record, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The exhausted counter locks the board until factory reset** — the
+/// correct PIN stops verifying once the budget is spent, the counter is
+/// never decremented below zero, and the lock survives a **simulated power
+/// cycle**: a fresh applet boot over the same region reads the same
+/// exhausted record, because the budget was durable record writes all
+/// along. Recovery is management `RESET` only (US-1701's wipe) — no verb
+/// on this applet refills the budget.
+#[test]
+fn exhausted_counter_locks_until_factory_reset() {
+    let (mut app, path) = booted_app("verify-locked");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    for expected in [0x63C2, 0x63C1, SW_PIN_LOCKED] {
+        let (_, sw) = call(&mut app, &verify_pin(b"999999"));
+        assert_eq!(sw, expected, "the 63CX progression reaches 63C0");
+    }
+
+    // The correct PIN is not a way back in: the budget, not the secret,
+    // is spent.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_LOCKED, "the correct PIN does not verify on a locked board");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, 0, "never below zero"),
+        other => panic!("expected the exhausted record, got {other:?}"),
+    }
+
+    // Power cycle: the applet is rebuilt over the same region, session
+    // flag gone, budget intact.
+    let mut app2 = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app2, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_LOCKED, "the lock is durable — a reboot does not refund it");
+    match stored_pin(&path) {
+        PinEntry::Live(record) => assert_eq!(record.counter, 0),
+        other => panic!("expected the exhausted record, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **VERIFY on a board with no PIN is `SW_PIN_NOT_SET`, touching nothing** —
+/// the no-PIN state is the ungated state, and a verify against a record
+/// that does not exist must not write one, tombstone one, or learn a
+/// cache that says otherwise.
+#[test]
+fn verify_on_an_unset_board_touches_nothing() {
+    let (mut app, path) = booted_app("verify-unset");
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_PIN_NOT_SET);
+    assert!(matches!(stored_pin(&path), PinEntry::Empty), "the pin slot is untouched");
+    // And the board still sets afterwards — the refusal consumed nothing.
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
     std::fs::remove_file(&path).ok();
 }

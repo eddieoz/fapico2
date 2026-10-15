@@ -1378,6 +1378,61 @@ impl NostrApp {
         write_sw(resp, sw.unwrap_or(SW_OK));
         self.pin_set = pin_set;
     }
+
+    /// US-1693: `VERIFY_PIN` (INS `0x1B`, payload `pin(6..64)`) — check a
+    /// PIN against the record and open the custody session. Touch-free:
+    /// the PIN is the consent, and the button consents to *operations*, a
+    /// different thing (§8).
+    ///
+    /// The mechanics are [`Self::check_pin`]'s: constant-time compare,
+    /// durable reset on success, durable decrement on failure, `63CX`
+    /// answers with [`SW_PIN_LOCKED`] (`63C0`) at the bottom of the range.
+    /// What this verb adds is the session flag: **success is the only
+    /// setter to `true`**, and it is applet-global behind the shared
+    /// `Mutex` (§8), RAM-only — a power cycle closes every session. On a
+    /// board with no PIN the answer is [`SW_PIN_NOT_SET`] and nothing is
+    /// touched: the no-PIN state is the ungated state, and VERIFY must
+    /// not be able to create it.
+    fn verify_pin(
+        &mut self,
+        _p1: u8, // the INS is the selector; P1/P2 are zeroes or the command is malformed
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        use fapico2_platform::keyregion::nostr_store::PinEntry;
+        if p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if data.len() < PIN_MIN_LEN || data.len() > PIN_MAX_LEN {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        // (status word, pin_set, the session flag's next value).
+        let outcome = {
+            let Some(mut store) = self.store(resp) else { return };
+            match store.read_pin() {
+                Ok(PinEntry::Empty) | Ok(PinEntry::Tombstone) => {
+                    // Nothing touched: no verify leg runs, no counter is
+                    // read, and the cache learns only what it knew.
+                    (Some(SW_PIN_NOT_SET), false, false)
+                }
+                Ok(PinEntry::Undecodable) | Ok(PinEntry::Foreign) => {
+                    (Some(SW_STORE_FAULT), true, false)
+                }
+                Err(_) => (Some(SW_STORE_FAULT), true, false),
+                Ok(PinEntry::Live(record)) => match Self::check_pin(&mut store, record, data) {
+                    Ok(()) => (None, true, true),
+                    Err(sw) => (Some(sw), true, false),
+                },
+            }
+        };
+        let (sw, pin_set, unlocked) = outcome;
+        write_sw(resp, sw.unwrap_or(SW_OK));
+        self.pin_set = pin_set;
+        self.pin_unlocked = unlocked;
+    }
 }
 
 impl App for NostrApp {
@@ -1466,6 +1521,7 @@ impl App for NostrApp {
             INS_SET_LABEL => self.set_label(p1, p2, data, resp),
             INS_DELETE_KEY => self.delete_key(p1, p2, data, resp),
             INS_EXPORT_KEY => self.export_key(p1, p2, data, resp),
+            INS_VERIFY_PIN => self.verify_pin(p1, p2, data, resp),
             INS_SET_PIN => {
                 if p1 == 0x01 {
                     self.change_pin(p1, p2, data, resp)
