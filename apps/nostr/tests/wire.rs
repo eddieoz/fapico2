@@ -486,6 +486,10 @@ fn export_is_gone_on_ccid() {
 
 /// Six bytes, the PIN minimum — the PIN verbs' payload shape (US-1691).
 const PIN_BYTES: &[u8] = b"731742";
+/// A second six-byte PIN for the change ceremony rows.
+const NEWPIN_BYTES: &[u8] = b"246813";
+/// A wrong PIN — same shape, different bytes.
+const WRONG: &[u8] = b"000000";
 
 /// **GET_INFO advertises the PIN capability and the PIN state** (US-1700):
 /// caps gain `CAP_PIN_MGMT = 0x0004`, and the flags byte stops being a
@@ -538,4 +542,53 @@ fn getinfo_advertises_pin_capability_and_state() {
     assert_eq!(sw, SW_OK);
     assert_eq!(data[7], FLAG_PIN_SET | FLAG_SESSION_UNLOCKED);
     std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1702: the PIN custody verbs over the vendor wire (applet level)
+// ---------------------------------------------------------------------------
+
+/// **The PIN verbs answer the APDUs the vendor bridge builds.** The
+/// envelope is `[idx, arg]` with idx riding P1 (F-A8), so over the vendor
+/// channel SET is `[0, pin]` → `[00, 0x1C, 0, 00, 6, pin…]` and CHANGE is
+/// `[1, lc ‖ current ‖ new]` → the same frame at P1 1. This test is the
+/// applet half of `nostr_wire.rs::verify_set_lock_map_to_pin_ins`: the
+/// mapping arms and the envelope decode live there; here the response
+/// vocabulary these frames produce is pinned, because the vendor layer
+/// wraps it into `{1: sw}` on the HID channel verbatim.
+#[test]
+fn verify_set_lock_map_to_pin_ins() {
+    use fapico2_nostr::{INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN, SW_PIN_LOCKED, SW_PIN_NOT_SET};
+
+    let path = region_path("vendor-pin-verbs");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+
+    // SET over the vendor shape: `[0, pin]`.
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK, "SET is the idx-0 arm");
+    // CHANGE over the vendor shape: `[1, lc ‖ current ‖ new]`. A wrong
+    // current PIN burns a retry, and the 63CX answer rides the vendor
+    // channel verbatim — the CBOR `sw` field carries 63C2, two left.
+    let mut change: HeaplessVec<u8, 64> = HeaplessVec::new();
+    change.push(WRONG.len() as u8).unwrap();
+    change.extend_from_slice(WRONG).unwrap();
+    change.extend_from_slice(NEWPIN_BYTES).unwrap();
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 1, 0, &change));
+    assert_eq!(sw, SW_PIN_LOCKED | 0x02, "63C2 rides the vendor channel verbatim");
+    // VERIFY opens the session (pin is the consent — no touch).
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK);
+    // And LOCK closes it on the same channel.
+    let (_, sw) = call(&mut app, &apdu(INS_LOCK, 0, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    // VERIFY on a PIN-less board is the unset answer, the vocabulary a
+    // fresh-emulator client sees.
+    let path2 = region_path("vendor-pin-unset");
+    std::fs::remove_file(&path2).ok();
+    let mut app = NostrApp::boot(fixture_region(&path2));
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_PIN_NOT_SET);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&path2).ok();
 }
