@@ -99,9 +99,16 @@ first:
 
 ### The downgrade section
 
-**Status:** recorded 2026-10-15 (US-1718); the matrix transcript itself lives in
+**Status:** recorded 2026-10-15 (US-1718); the matrix transcript lives in
 [`docs/audits/2026-10-15-nostr-downgrade-matrix.md`](../audits/2026-10-15-nostr-downgrade-matrix.md)
-and is the one piece of this section still gated on a hardware session.
+and **is now complete** — the ceremony, extraction, destruction and endpoint
+legs all ran on the sacrificial board that day. One amendment the session
+earned: the destruction residual is **narrower than "downgrade restores
+PIN-less destruction" reads** — the v0.1.2 image's ordinary destructive
+command (factory `RESET`) and its compaction never touch the range, and its
+ordinary writes cannot reach it at real occupancy; destruction by downgrade
+requires the store deliberately filled to the top sector or an out-of-band
+erase. The threat sentence below stands for exactly those two paths.
 
 The threat: OTP burning is a firmware-level act, not an OTP-controller
 guarantee — an old image carries the old KDF and the old, retired
