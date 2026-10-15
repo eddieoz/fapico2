@@ -390,6 +390,27 @@ decisions, and ADR 0005's amendment records the accepted RAM lifetime of the
 scalar. Reset semantics: management `RESET` wipes Nostr (the proxy forwards
 `factory_wipe`); CTAP2 `authenticatorReset` spares it.
 
+**PIN custody rides the same two transports (US-1689..1706, ADR 0006).** The
+vendor bytes `0x4B` (VERIFY_PIN), `0x4C` (SET_PIN — the envelope idx selects
+SET `0` / CHANGE `1`; the CHANGE payload is `lc(1) ‖ current ‖ new`) and
+`0x4D` (LOCK) map to INS `0x1B`/`0x1C`/`0x1D`; `0x48`/INS `0x1A` (EXPORT) is
+retired and answers `6D00` **in band** on both transports. Custody is
+import-only: there is no export command at all, in any dialect. On a PIN-set
+board every identity-touching command (SIGN, NIP44 ENC/DEC, IMPORT, GENERATE,
+DELETE, SET_LABEL) answers `SW_PIN_SESSION_REQUIRED` (`0x6982`) until VERIFY
+opens a session; the refusal sits **after the shape checks and before the
+state reads and the touch** — armed grants are consumed by refusals, never by
+signatures. The session is a RAM flag behind the applet mutex: cleared by the
+power cycle, NOT by deselect/re-select, spanning both transports. Setting is
+not unlocking — VERIFY is the only setter. A wrong PIN answers `63C0|remaining`
+(durable through record rewrite; `0x63C0` itself is the lockout floor — same
+range, and the undecodable-slot image fails closed on it). The honest
+sentence about test coverage: **a CCID unlock covers the HID arm** — the
+session flag is applet-global, so every gate behavior the CCID emulator
+exercises holds for the vendor-HID arm by construction; the emulator has no
+Nostr HID interface (above), and `scripts/nostr_probe.py --pin` is the
+hardware leg.
+
 Tests: `apps/nostr/tests/` (wire, keymgmt + BIP-340 vectors, NIP-44 vectors,
 presence), `platform/tests/nostr_store.rs`, the emulator suites
 `tests/harness/test_nostr_select.py` / `test_nostr_keymgmt.py`, the CCID

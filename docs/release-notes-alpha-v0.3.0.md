@@ -20,6 +20,23 @@ recovery is a factory reset, which destroys every identity), `6982` and the
 dual-reading `6A82`. A wrong PIN has a durable budget of three; the lockout
 is the floor of the same range the wrong-PIN answers live in.
 
+## Upgrading from v0.2.0 — the transition warning
+
+**EXPORT_KEY is gone — export before flashing.** Custody is import-only: the
+export command (`0x48` over the vendor HID, INS `0x1A` over CCID) answers
+`6D00` on this firmware, on every board, with no grandfathering. Any key you
+still want a host copy of must be exported from a v0.2.0 image *before* you
+flash this one ([ADR 0006](adr/0006-nostr-pin-custody.md)).
+
+## The session rule
+
+A verified session is a **RAM flag, cleared by the power cycle** — unlocking
+again after a restart is normal, not a fault. The flag is applet-global: it
+survives deselect and re-select and spans the CCID and vendor-HID transports;
+`LOCK` (vendor `0x4D`) closes it early. Management `RESET` wipes the PIN along
+with everything else; CTAP2 `authenticatorReset` still spares the Nostr
+applet entirely.
+
 ## Generation cross-tolerance matrix (US-1708)
 
 Alpha users will hit new client ↔ old firmware and old client ↔ new
