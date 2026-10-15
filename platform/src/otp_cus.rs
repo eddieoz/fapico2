@@ -13,9 +13,20 @@
 //! > API "reads back erased" and "read refused" are the same return value.
 //!
 //! (review fact F1, `embassy-rp-0.10.0/src/otp.rs:50-77`). The classifier
-//! reads the **raw view first** — the raw view is contents-authoritative and
-//! *answers* (`0xFFFF_FFFF` is an erased row, not a refusal) — and only then
-//! consults the ECC view, whose refusal now means one thing instead of two.
+//! reads the **raw view first** and consults the ECC view second, because the
+//! ECC view cannot be asked to explain a refusal.
+//!
+//! **What erased looks like is measured, not assumed** — US-1711's
+//! two-population probe
+//! (`docs/evidence/otp-probe-us1711.md`, conclusions, measured over BOOTSEL)
+//! settled the register model: **an erased OTP row reads 0x000000 in the raw
+//! view** (the same zero-bytes blank-check `is_empty_buffer` applies in
+//! pico-fido2), because the ECC metadata of a burned word always sets raw
+//! bits. All-ones in the raw view is the **debug-attachment artifact** — the
+//! `OTP_DATA_RAW`-under-a-debugger pathology AGENTS.md records — and this
+//! module classifies it `Faulted`, never `Erased`. The classifier is therefore
+//! contents-authoritative in both directions: a faulted read is never read as
+//! emptiness, and an erased row is never read as data.
 //!
 //! **No page constant lives here.** US-1711's two-population probe is the gate
 //! that chooses the custody page; until that transcript exists, every caller
@@ -39,8 +50,8 @@ pub enum OtpError {
 /// construction, in [`classify_row`], in either direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowClass {
-    /// The raw view is all-ones **and** the ECC view refuses with the
-    /// permission error: the row has never been written.
+    /// The raw view reads zero bytes **and** the ECC view agrees with `0`:
+    /// the row has never been written (US-1711's measured blank-check).
     Erased,
     /// The ECC view opens; the corrected 16-bit word.
     Valid(u16),
@@ -66,11 +77,12 @@ impl RowClass {
 /// The OTP access seam. Three operations, because the classifier needs all
 /// three views and embassy's ECC read cannot be asked to explain itself.
 pub trait OtpAccess {
-    /// The raw 24-bit view of one row (`0xFFFF_FFFF` when erased — the raw
-    /// view answers, it does not refuse emptiness).
+    /// The raw 24-bit view of one row. Zero bytes are the erased mark
+    /// (US-1711); an all-ones answer is the debug artifact, which
+    /// [`classify_row`] reads as a fault.
     fn raw_word(&self, row: usize) -> Result<u32, OtpError>;
-    /// The ECC-corrected 16-bit view. [`OtpError::Refused`] is the same
-    /// permission refusal embassy raises for an erased row's pre-check.
+    /// The ECC-corrected 16-bit view. [`OtpError::Refused`] is the
+    /// permission refusal embassy raises for a locked or debug-attached row.
     fn ecc_word(&self, row: usize) -> Result<u16, OtpError>;
     /// Burn one ECC word. Once.
     fn write_ecc_word(&self, row: usize, data: u16) -> Result<(), OtpError>;
@@ -78,26 +90,33 @@ pub trait OtpAccess {
 
 /// Classify one row, raw view first.
 ///
-/// The load-bearing asymmetry: an all-ones **raw** view is necessary for
-/// `Erased` but not sufficient — the ECC view must refuse *with the
-/// permission error*, and any other answer from the ECC view (a bus fault, or
-/// worse, an open read) demotes the row to [`RowClass::Faulted`]. A row whose
-/// raw view bus-faults is `Faulted` outright; through embassy's public API
-/// that state is indistinguishable from erased, which is exactly why the
-/// raw view is read directly.
+/// The measured rules (US-1711's transcript is the authority for all three):
+///
+/// * **Zero raw bytes are the erased mark.** The ECC metadata of any burned
+///   word sets raw bits, so an all-zero 24-bit raw row is never-written — the
+///   ECC view must agree with `0`, and any other answer demotes the row to
+///   [`RowClass::Faulted`] (a fault is never read as emptiness).
+/// * **All-ones raw is the debug artifact, never a content answer** —
+///   AGENTS.md's `OTP_DATA_RAW`-under-a-debugger pathology — and classifies
+///   `Faulted` unconditionally.
+/// * Otherwise both views must agree on the same 16-bit word, or the row is
+///   `Faulted`. A raw view that itself bus-faults is `Faulted` outright.
 pub fn classify_row<A: OtpAccess>(otp: &A, row: usize) -> RowClass {
     match otp.raw_word(row) {
-        Ok(0xFFFF_FFFF) => match otp.ecc_word(row) {
-            // The erased confirmation: ECC refuses because the permission
-            // pre-check saw the all-ones raw view.
-            Err(OtpError::Refused) => RowClass::Erased,
-            // Raw says erased but the ECC view faults or *opens* — the two
-            // views disagree, and disagreement is a fault, never emptiness.
+        // The measured blank-check: zero bytes mean never-written. The ECC
+        // view must agree with 0 — if it faults or opens with data, the two
+        // views disagree, and disagreement is a fault, never emptiness.
+        Ok(0) => match otp.ecc_word(row) {
+            Ok(0) => RowClass::Erased,
             _ => RowClass::Faulted,
         },
+        // All-ones is the debug-refusal artifact, not data and not emptiness.
+        Ok(0xFFFF_FFFF) => RowClass::Faulted,
         Ok(raw) => match otp.ecc_word(row) {
             // Both views agree on the data: the raw low bits carry the same
-            // 16-bit word the ECC view corrected.
+            // 16-bit word the ECC view corrected. (A burned 0x0000 word has
+            // non-zero ECC metadata, so this leg still distinguishes it from
+            // the erased zero-row above.)
             Ok(word) if (raw as u16) == word => RowClass::Valid(word),
             // The ECC view opens but disagrees with the raw view —
             // uncorrectable or inconsistent metadata.
@@ -142,10 +161,10 @@ mod real {
     use super::{OtpAccess, OtpError};
 
     /// The arm OTP, through embassy's driver. The mapping is the whole point
-    /// of the seam: embassy's single `InvalidPermissions` is mapped to
-    /// [`OtpError::Refused`] only where the *raw* view raised it (there it
-    /// means all-ones — erased), and an ECC-view `UnexpectedFailure` stays a
-    /// [`OtpError::Bus`].
+    /// of the seam: embassy's single `InvalidPermissions` on the raw view is
+    /// surfaced as the all-ones answer ([`classify_row`] reads that as a
+    /// fault — the debug artifact, never emptiness), and an ECC-view
+    /// `UnexpectedFailure` stays a [`OtpError::Bus`].
     use embassy_rp::otp::Error as E;
 
     pub struct RealOtp;
@@ -154,8 +173,10 @@ mod real {
         fn raw_word(&self, row: usize) -> Result<u32, OtpError> {
             match embassy_rp::otp::read_raw_word(row) {
                 Ok(v) => Ok(v),
-                // The raw view reading all-ones is a *content* answer, not a
-                // refusal — this mapping is the one public-API fact F1 turns on.
+                // A raw-view permission refusal is the debug-attachment /
+                // lock state. Surfacing it as all-ones keeps the classifier's
+                // fault path (never `Erased`) the single place the artifact
+                // is interpreted.
                 Err(E::InvalidPermissions) => Ok(0xFFFF_FFFF),
                 Err(E::InvalidIndex) => Err(OtpError::OutOfRange),
                 Err(E::UnexpectedFailure(code)) => Err(OtpError::Bus(code)),
