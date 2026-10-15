@@ -600,11 +600,7 @@ impl NostrApp {
                 region_source: None,
             };
         }
-        let pin_set = !matches!(
-            region.store().read_pin(),
-            Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Empty)
-                | Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Tombstone)
-        );
+        let pin_set = pin_boot_classification(region.store().read_pin());
         NostrApp {
             region: Some(region),
             provider: None,
@@ -1916,9 +1912,29 @@ impl App for NostrApp {
         // force-tombstone paths below are unreachable in this state), and
         // destruction stays management-`RESET`-only. RAM-only: the next
         // boot re-derives from the rows, so a power cycle clears it.
+        // First: nothing attaches here — the faulted provider is never
+        // called, the same "no region opens on a dead custody page" fact
+        // the boot path holds.
         if self.custody_faulted() {
             write_sw(resp, SW_SEALED_UNAVAILABLE);
             return;
+        }
+        // US-1718: the device path never runs [`Self::boot`] — the region is
+        // a lazy provider (`main.rs` asks it on demand), and the cache
+        // `Self::new` starts with would stand in for the store's state until
+        // a PIN verb ran. The first process call is the boot substitute:
+        // derive the cache from the store exactly as a boot would, before
+        // any command logic — the gate, GET_INFO and the ceremony's first
+        // gate all read it, and any command may be the first thing this
+        // applet ever runs. Silent on purpose: a store that will not mount
+        // writes its own word through the dispatch below, and the cache
+        // stays where the fail-closed construction left it.
+        if self.region.is_none() {
+            let Self { region, provider, pin_set, pin_unlocked, .. } = self;
+            if let Some(mut store) = try_attach(region, provider) {
+                *pin_set = pin_boot_classification(store.read_pin());
+                *pin_unlocked = false;
+            }
         }
         // Header guard first: a sub-4-byte APDU would index `apdu[2]`/
         // `apdu[3]` out of bounds (the US-701 panic class, `apps/mgmt`).
@@ -2083,10 +2099,45 @@ fn read_identity(
 /// `&mut self` method call would not). A recovery failure keeps the
 /// provider: the next read retries the mount rather than pinning a
 /// transient fault onto the applet for good.
+/// The `pin_set` half of the PIN cache, derived from the store — the one
+/// derivation [`NostrApp::boot`] and the device path's one-shot attach
+/// share, so the two entry points cannot drift. `Empty` and `Tombstone`
+/// are the two honest PIN-less states; everything else — a live record, an
+/// undecodable slot, a faulted read — counts as a PIN present, fail-closed
+/// (US-1695's contract, applied at every derivation point).
+fn pin_boot_classification(
+    entry: Result<
+        fapico2_platform::keyregion::nostr_store::PinEntry,
+        fapico2_platform::keyregion::nostr_store::NostrStoreError,
+    >,
+) -> bool {
+    !matches!(
+        entry,
+        Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Empty)
+            | Ok(fapico2_platform::keyregion::nostr_store::PinEntry::Tombstone)
+    )
+}
+
 fn attach_store<'region>(
     region: &'region mut Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
     provider: &mut Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
     resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'region>> {
+    let store = try_attach(region, provider);
+    if store.is_none() {
+        write_sw(resp, SW_STORE_FAULT);
+    }
+    store
+}
+
+/// The one-shot mount, silent: `Some` when a store view exists afterwards —
+/// previously attached or mounted now. The status word's writer is
+/// separate because the US-1718 cache derivation runs where no status word
+/// may be written (the `process` preamble, before any command logic owns
+/// `resp`).
+fn try_attach<'region>(
+    region: &'region mut Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
+    provider: &mut Option<fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>>,
 ) -> Option<fapico2_platform::keyregion::nostr_store::NostrStore<'region>> {
     if region.is_none() {
         if let Some(attach) = provider {
@@ -2098,13 +2149,7 @@ fn attach_store<'region>(
             }
         }
     }
-    match region.as_mut() {
-        Some(region) => Some(region.store()),
-        None => {
-            write_sw(resp, SW_STORE_FAULT);
-            None
-        }
-    }
+    region.as_mut().map(|region| region.store())
 }
 
 /// Draw from the applet's randomness source. `None` when there is none —

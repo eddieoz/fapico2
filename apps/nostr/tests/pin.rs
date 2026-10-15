@@ -979,3 +979,71 @@ fn factory_wipe_clears_pin_record_and_flag() {
     assert_eq!(sw, SW_OK, "a wiped board can establish custody again");
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1718: the device path derives the PIN cache at the one-shot attach
+// ---------------------------------------------------------------------------
+
+/// The device wiring is `NostrApp::new()` plus a lazy `fn()` provider
+/// (`main.rs` — the region handle cannot be taken before the boot's
+/// release gate), so the cache [`NostrApp::boot`] derives has no eager call
+/// site on hardware. The static below is the test's stand-in for
+/// `main.rs`'s provider: one path per test process, opened lazily.
+static LAZY_DEVICE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn lazy_device_region() -> Option<NostrRegion> {
+    let region = FileKeyRegion::open(LAZY_DEVICE_PATH.get()?).ok()?;
+    Some(fixture_key(region))
+}
+
+fn device_random(out: &mut [u8]) {
+    out.fill(0x5A);
+}
+
+fn device_grant(_tag: u32) -> bool {
+    false
+}
+
+/// **A rebooted PIN-set board must not answer as PIN-less.** On hardware
+/// the applet is constructed bare and the region arrives lazily, so the
+/// cache that GET_INFO reports and the gate consults must derive from the
+/// store at the one-shot attach — before any PIN verb can run, because no
+/// PIN verb will run: the gate is what stands between an attacker and the
+/// secrets. Before the US-1718 fix, the first command after a power cycle
+/// saw the constructor's `pin_set: false` — the gate open and GET_INFO
+/// lying PIN-less — and only a refused `SET_PIN` healed the cache, which
+/// is exactly what the hardware ceremony probe hit (flags `0x00`, then
+/// `0x05` after the refusal).
+#[test]
+fn the_device_path_derives_the_pin_cache_at_first_attach() {
+    // A region that already holds a live PIN record — the state a power
+    // cycle leaves a PIN-set board's store in.
+    let path = region_path("device-cache");
+    {
+        let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+        let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+        assert_eq!(sw, SW_OK);
+    }
+    LAZY_DEVICE_PATH
+        .set(path.clone())
+        .expect("one device-shape test per process");
+
+    let mut app = NostrApp::new();
+    app.install_providers(lazy_device_region, device_random, device_grant, None);
+
+    // First command, GET_INFO: the cache reads the store, not the
+    // constructor default.
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7] & 0x01, 0x01, "GET_INFO must report the PIN the store holds");
+
+    // And the gate — the first secret command must hear 6982, not the
+    // touch refusal an open gate would degrade into (`device_grant` is
+    // false: a passed gate answers 6985 here, never 6982).
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(
+        sw, SW_PIN_SESSION_REQUIRED,
+        "the gate must stand before any PIN verb runs"
+    );
+    std::fs::remove_file(&path).ok();
+}

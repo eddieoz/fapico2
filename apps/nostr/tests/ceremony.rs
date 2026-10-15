@@ -476,11 +476,14 @@ fn ceremony_start_refuses_without_pin() {
     let (_, sw) = call(&mut app, &apdu(INS_CEREMONY_START, 0, &[]));
     assert_eq!(sw, SW_PIN_NOT_SET);
 
-    // The refusal precedes the burn: the page is untouched, and no region
-    // was opened either — the gate is a cache read (pin_set is false), the
-    // cheapest gate there is.
+    // The refusal precedes the burn: the page is untouched. The one attach
+    // is US-1718's boot substitute, not the gate — the cache the gate
+    // consults derives from the store at the one-shot attach (the device
+    // path has no eager `boot`), and on a PIN-less board the derivation
+    // reads Empty. Everything after it — the gate, the OTP gate, the
+    // identity walk — is a cache read and a refusal.
     assert_eq!(world_assess(), CeremonyState::Virgin);
-    assert_eq!(attaches(), 0, "the pin gate refused before any store attach");
+    assert_eq!(attaches(), 1, "one attach: the boot substitute, never the gate's own");
     std::fs::remove_file(&path).ok();
 }
 
