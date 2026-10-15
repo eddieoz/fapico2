@@ -56,7 +56,12 @@ INS_IMPORT_KEY = 0x14
 INS_SIGN = 0x15
 INS_SET_LABEL = 0x18
 INS_DELETE_KEY = 0x19
-INS_EXPORT_KEY = 0x1A
+INS_EXPORT_KEY = 0x1A  # retired by US-1699 — refused 6D00 on every channel
+#: The PIN custody dialect (US-1691..1694, US-1702). Touch-free by design:
+#: the PIN is the consent.
+INS_VERIFY_PIN = 0x1B
+INS_SET_PIN = 0x1C  # P1 0 = SET, P1 1 = CHANGE
+INS_LOCK = 0x1D
 
 #: §2.2.0 status words — the vocabulary the host renders.
 SW_OK = 0x9000
@@ -67,6 +72,13 @@ SW_INDEX_OCCUPIED = 0x6A84
 SW_KEY_SET_FULL = 0x6A88
 SW_TOUCH_REQUIRED = 0x6985
 SW_INS_NOT_SUPPORTED = 0x6D00
+#: The PIN custody vocabulary (US-1691). SW_PIN_NOT_SET and
+#: SW_PIN_ALREADY_SET share 6A82 (the file-not-found state word);
+#: SW_PIN_SESSION_REQUIRED is 6982, OpenPGP's CHV-not-verified; the wrong-
+#: PIN rows are 63C0|remaining and 63C0 itself is the lockout.
+SW_PIN_NOT_SET = 0x6A82
+SW_PIN_SESSION_REQUIRED = 0x6982
+SW_PIN_LOCKED = 0x63C0
 
 
 def apdu(ins: int, p1: int = 0, p2: int = 0, data: bytes = b"") -> bytes:
