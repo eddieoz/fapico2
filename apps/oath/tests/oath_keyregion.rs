@@ -735,14 +735,15 @@ fn fido_and_oath_at_capacity_coexist() {
 fn the_two_reservations_tile_the_region_without_touching() {
     assert_eq!(
         FIDO_FIRST_SLOT + FIDO_CAPACITY,
-        fapico2_platform::keyregion::NOSTR_FIRST_SLOT,
-        "Nostr's reservation must start exactly where FIDO's range ends"
+        fapico2_platform::keyregion::NOSTR_PIN_FIRST_SLOT,
+        "the PIN carve (US-1689) must start exactly where FIDO's range ends"
     );
     assert_eq!(
         fapico2_platform::keyregion::NOSTR_FIRST_SLOT
             + fapico2_platform::keyregion::NOSTR_CAPACITY,
         TOTAL_SLOTS - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT,
-        "OATH + scratchpad + FIDO + Nostr + index must tile the region exactly once"
+        "OATH + scratchpad + FIDO + the PIN carve + Nostr + index must tile the region exactly \
+         once"
     );
     assert!(
         oath_store::SCRATCHPAD_FIRST_SLOT.is_multiple_of(

@@ -45,12 +45,16 @@ const fn derive_fido_capacity() -> u32 {
     // credentials" does not expect to see it — and leaving it out is how a
     // capacity becomes one sector optimistic. The Nostr term (US-1639) is the
     // same class of easy-to-leave-out: eight slots carved from the top of
-    // FIDO's range.
+    // FIDO's range. The PIN carve (US-1689) is the third of its class, and it
+    // is sector-granular: the carve takes FIDO's whole tail sector because the
+    // scoped erase and the commit are sector-granular too (mod.rs,
+    // NOSTR_PIN_CARVE_SLOTS, carries the argument).
     (KEY_REGION_BYTES / kr::FIDO_SLOT_BYTES)
         - kr::OATH_CAPACITY
         - kr::SCRATCHPAD_SLOTS
         - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
         - kr::NOSTR_CAPACITY
+        - kr::NOSTR_PIN_CARVE_SLOTS
 }
 
 #[test]
@@ -65,7 +69,8 @@ fn the_capacities_are_the_region_arithmetic() {
             + kr::OATH_CAPACITY
             + kr::SCRATCHPAD_SLOTS
             + fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
-            + kr::NOSTR_CAPACITY,
+            + kr::NOSTR_CAPACITY
+            + kr::NOSTR_PIN_CARVE_SLOTS,
         kr::TOTAL_SLOTS
     );
 }
@@ -84,11 +89,33 @@ fn nostr_is_carved_from_the_top_of_fidos_range() {
         "FIDO's range no longer begins right above the scratchpad — existing records' \
          addresses would move"
     );
-    assert_eq!(kr::FIDO_CAPACITY, 848, "FIDO falls 856 -> 848: the eight slots are Nostr's");
+    assert_eq!(
+        kr::FIDO_CAPACITY,
+        844,
+        "FIDO falls 856 -> 848 (the eight Nostr identity slots, US-1639) and then 848 -> 844 \
+         (the PIN carve, US-1689) — one whole sector at the top each time, because the erase \
+         is sector-granular and a one-slot carve would put the PIN record in the path of \
+         FIDO's scoped wipe"
+    );
+    // US-1689: the pin carve is FIDO's whole tail sector, and the record slot
+    // is its last slot — immediately below the identity range, so
+    // NOSTR_FIRST_SLOT keeps the numeric value it had before the pin carve
+    // (72 + 848 = 920), which is the address-stability argument in one line.
+    assert_eq!(
+        kr::NOSTR_PIN_FIRST_SLOT,
+        kr::FIDO_FIRST_SLOT + kr::FIDO_CAPACITY,
+        "the pin carve does not begin where FIDO's range ends"
+    );
+    assert_eq!(
+        kr::NOSTR_PIN_SLOT,
+        kr::NOSTR_FIRST_SLOT - 1,
+        "the pin record slot is not immediately below the identity range"
+    );
     assert_eq!(
         kr::NOSTR_FIRST_SLOT,
-        kr::FIDO_FIRST_SLOT + kr::FIDO_CAPACITY,
-        "Nostr's range does not begin where FIDO's ends"
+        920,
+        "NOSTR_FIRST_SLOT moved: every identity record on a deployed board would be stranded \
+         at its old address"
     );
     assert_eq!(
         fapico2_platform::keyregion::index::INDEX_FIRST_SLOT,
@@ -101,11 +128,17 @@ fn nostr_is_carved_from_the_top_of_fidos_range() {
     // paths can ignore.
     let first = kr::Slot::new(kr::NOSTR_FIRST_SLOT as u16).expect("Nostr's first slot");
     let last = kr::Slot::new((kr::NOSTR_SLOT_LIMIT - 1) as u16).expect("Nostr's last slot");
-    let below = kr::Slot::new((kr::NOSTR_FIRST_SLOT - 1) as u16).expect("FIDO's last slot");
+    let pin = kr::Slot::new(kr::NOSTR_PIN_SLOT as u16).expect("the pin slot");
+    let pad = kr::Slot::new(kr::NOSTR_PIN_FIRST_SLOT as u16).expect("the carve's head");
     let index_first =
         kr::Slot::new(fapico2_platform::keyregion::index::INDEX_FIRST_SLOT as u16).expect("index");
     assert!(kr::is_nostr_slot(first) && kr::is_nostr_slot(last));
-    assert!(!kr::is_nostr_slot(below), "the slot below the carve is still FIDO's");
+    assert!(!kr::is_nostr_slot(pin), "the pin slot is Nostr's but not an identity slot");
+    assert!(kr::is_nostr_pin_slot(pin));
+    assert!(
+        !kr::is_nostr_pin_slot(pad) && !kr::is_nostr_pin_slot(first) && !kr::is_nostr_pin_slot(index_first),
+        "the carve's padding is not the record slot"
+    );
     assert!(!kr::is_nostr_slot(index_first), "the index is not Nostr's");
 }
 
@@ -149,7 +182,8 @@ fn the_region_holds_far_more_than_the_reported_ceiling() {
         - kr::OATH_CAPACITY
         - kr::SCRATCHPAD_SLOTS
         - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
-        - kr::NOSTR_CAPACITY;
+        - kr::NOSTR_CAPACITY
+        - kr::NOSTR_PIN_CARVE_SLOTS;
     assert!(
         claimed >= 256,
         "FIDO capacity is {claimed}, below the 256 floor the acceptance criteria name"
@@ -246,4 +280,147 @@ fn the_region_is_where_the_linker_script_says_it_is() {
         0,
         "the region must be a whole number of NOR sectors; the commit unit is the sector"
     );
+}
+
+// ---------------------------------------------------------------------------
+// US-1689: the pin carve, read across the new geometry
+// ---------------------------------------------------------------------------
+
+/// **The pin slot is the ninth Nostr slot and nothing else moved** — US-1689's
+/// acceptance, in three parts:
+///
+/// (a) the module's compile-time tiling and alignment assertions hold (this
+///     test compiling is that evidence; the `const _` blocks are evaluated in
+///     the same build);
+/// (b) a fixture region carries a FIDO record at FIDO's *last* slot, all eight
+///     identity records, and an index slot across the new geometry, and every
+///     one of them reads back — and the ninth identity index is refused, so
+///     the pin slot is not reachable as an identity;
+/// (c) `FIDO_CAPACITY` shrank by exactly the carve — one whole sector, not one
+///     slot. The EPIC's first draft carved a single slot and asked for "−1";
+///     the geometry refuses that: FIDO's range must end on a sector boundary
+///     (`fido_store.rs`'s scoped-erase assertions) and the pin record must not
+///     share a sector with FIDO records (`wipe_fido_range` erases raw sectors
+///     with no key to spare a neighbour), so the carve takes the whole tail
+///     sector. The Gherkin's pinned outcome — *nothing moves* — is what this
+///     test holds, and it holds with the sector-granular carve.
+#[test]
+fn pin_slot_is_the_ninth_nostr_slot_and_nothing_else_moved() {
+    use fapico2_platform::ckey;
+    use fapico2_platform::keyregion::crypto::{self, PayloadKey};
+    use fapico2_platform::keyregion::host::FileKeyRegion;
+    use fapico2_platform::keyregion::nostr_store::{Entry, NostrIdentity, NostrStore, NostrStoreError};
+    use fapico2_platform::keyregion::record::{self, Domain, RecordHeader};
+    use fapico2_platform::keyregion::{KeyRegion, Slot, SlotRead};
+
+    // (c) The capacity fell by exactly the carve, from the pre-carve 848.
+    assert_eq!(kr::FIDO_CAPACITY, 848 - kr::NOSTR_PIN_CARVE_SLOTS);
+    assert_eq!(kr::NOSTR_PIN_CARVE_SLOTS, kr::SLOTS_PER_SECTOR);
+
+    let dir = std::env::temp_dir().join(format!("fapico2-pin-carve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let region = FileKeyRegion::create(dir.join("region.bin"), kr::TOTAL_SLOTS)
+        .expect("a full-size region file");
+    let mut region = region;
+
+    fn otp_row() -> [u8; 32] {
+        let mut row = [0u8; 32];
+        for (i, b) in row.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(0x23);
+        }
+        row
+    }
+    fn chip_id() -> [u8; 8] {
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+    }
+    fn nostr_payload_key() -> PayloadKey {
+        crypto::derive_payload_key(&otp_row(), &chip_id(), &crypto::NOSTR_PAYLOAD_SECRET)
+            .expect("a provisioned OTP row derives the Nostr payload key")
+    }
+    // The key a FIDO record in this device's region is sealed under — the
+    // stale-passkey shape, so the FIDO leg of the read-back is a record the
+    // way a deployed board would hold one.
+    fn fido_payload_key() -> PayloadKey {
+        let serial = ckey::serial_hash(b"fapico2 pin carve test");
+        let kbase = ckey::derive_kbase(&otp_row(), &serial, 0x0BAD_F00D, Some(&[0x5a; 32]))
+            .expect("a provisioned OTP row derives a kbase");
+        let kver = ckey::derive_kver(&kbase, b"123456");
+        let session = ckey::pin_session(&serial, &kver);
+        crypto::derive_payload_key(&otp_row(), &chip_id(), &session).expect("fido payload key")
+    }
+    fn identity(n: u8) -> NostrIdentity {
+        let mut scalar = [0u8; 32];
+        let mut npub = [0u8; 32];
+        for (i, b) in scalar.iter_mut().enumerate() {
+            *b = n.wrapping_mul(7).wrapping_add(i as u8).wrapping_add(1);
+        }
+        for (i, b) in npub.iter_mut().enumerate() {
+            *b = n.wrapping_mul(11).wrapping_add(i as u8).wrapping_add(3);
+        }
+        NostrIdentity::new(scalar, npub, b"alice", 0x01).expect("a short utf-8 label")
+    }
+    fn slot_of(index: u32) -> Slot {
+        Slot::new(index as u16).expect("the carve's slots are inside the region")
+    }
+
+    // The FIDO leg: a FIDO-domain record at FIDO's **last** slot — the slot
+    // just below the pin carve — reads back where it always was.
+    let fido_slot = slot_of(kr::FIDO_SLOT_LIMIT - 1);
+    let header = RecordHeader::new(Domain::Fido, fido_slot, 1);
+    let mut nonce = [0u8; record::NONCE_LEN];
+    nonce[..4].copy_from_slice(&1u32.to_le_bytes());
+    nonce[4..].copy_from_slice(b"pincarve");
+    let body = vec![0xA5u8; 128];
+    let sealed = record::seal(&header, fido_payload_key().as_bytes(), &nonce, &body)
+        .expect("seal a FIDO record");
+    let image = record::encode(&header, &sealed).expect("encode the FIDO record");
+    KeyRegion::program(&mut region, fido_slot, 0, image.as_bytes())
+        .expect("a whole slot image programs");
+
+    let raw = KeyRegion::read_slot(&mut region, fido_slot).expect("read FIDO's last slot back");
+    match record::decode(fido_slot, &raw) {
+        SlotRead::Present(decoded) => {
+            assert_eq!(decoded.header().domain(), Domain::Fido);
+            assert_eq!(decoded.header().generation(), 1);
+        }
+        other => panic!("the FIDO record below the carve did not read back: {other:?}"),
+    }
+
+    // The identity leg: all eight carve slots take their first write and read
+    // back live — and the ninth identity index is refused, because the pin
+    // slot is the ninth Nostr slot and it is not an identity.
+    let key = nostr_payload_key();
+    {
+        let mut store = NostrStore::new(&mut region, &key);
+        for i in 0..8u16 {
+            store.write(i, &identity(i as u8)).expect("a virgin carved slot is writable");
+        }
+        for i in 0..8u16 {
+            assert!(
+                matches!(store.read(i), Ok(Entry::Live(_))),
+                "identity {i} did not read back live"
+            );
+        }
+        assert!(
+            matches!(store.write(8, &identity(8)), Err(NostrStoreError::IndexOutOfRange { index: 8 })),
+            "the ninth identity must be refused by the geometry, not wrap onto the pin slot"
+        );
+    }
+
+    // The index leg: the index's first slot — where US-1639 left it, and
+    // where the pin carve was forbidden to move it — programs and reads back
+    // byte-identically.
+    let index_slot = slot_of(fapico2_platform::keyregion::index::INDEX_FIRST_SLOT);
+    assert_eq!(
+        fapico2_platform::keyregion::index::INDEX_FIRST_SLOT,
+        928,
+        "the index moved: every FIDO credential's lookup entry would be stranded"
+    );
+    let mut index_image = [0xFFu8; kr::FIDO_SLOT_BYTES as usize];
+    index_image[..32].copy_from_slice(&[0x42u8; 32]);
+    KeyRegion::program(&mut region, index_slot, 0, &index_image).expect("program an index slot");
+    let index_raw = KeyRegion::read_slot(&mut region, index_slot).expect("read the index back");
+    assert_eq!(index_raw, index_image, "the index slot did not read back byte-identically");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

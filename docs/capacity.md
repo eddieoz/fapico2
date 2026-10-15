@@ -89,7 +89,7 @@ The layout and every assertion about it are in
 | OATH **reservation** | 68 slots | `oath_core::MAX_CREDS`, a `heapless` **table** bound — it sizes the applet's RAM array, and `keyregion::OATH_CAPACITY` charges the same 68 slots to the region because a store that accepted more would refuse on a RAM bound it never mentions |
 | commit scratchpad | 4 | one whole NOR sector, staged through (US-1544) |
 | index reservation | 32 | `index::INDEX_SLOT_COUNT` — one entry per slot in the region, rounded up to whole sectors |
-| **FIDO resident credentials** | **848** | 960 − 68 − 4 − 32 − 8 (the Nostr reservation, US-1639), and **measured** below |
+| **FIDO resident credentials** | **844** | 960 − 68 − 4 − 32 − 8 − 4 (the Nostr reservation, US-1639; the PIN carve, US-1689 — one whole sector of it, because the erase is sector-granular and a one-slot carve would put the PIN record in the path of FIDO's scoped wipe), and **measured** below |
 
 Raising either reservation requires a region that fits it; the compile-time
 assertions in `keyregion/mod.rs` stop the build otherwise. That is the whole
@@ -139,17 +139,19 @@ to hold both generations of a double-buffered rewrite, which is exactly the
 cost this design removes. Capacity runs 3.3× the acceptance floor instead, and
 acceptance criterion 2's "≥500 KB spare" is therefore **not met, deliberately**.
 
-## The 848 is measured, not asserted (US-1563; re-derivation US-1639)
+## The capacity is measured, not asserted (US-1563; re-derivations US-1639, US-1689)
 
 US-1639 carved eight Nostr slots from the top of FIDO's range, so the derived
-number moved 856 → 848; the boundary run below is the US-1563 measurement at
-the pre-carve geometry, and **the US-1675 re-run at the carved geometry is
-done: the boundary test re-run at Phase-3 HEAD (b22d750) enrols 848, refuses
-the 849th with `RegionCredentialError::Full` → CTAP2 `0x28`, and leaves
-nothing partial — 6/6 tests green, `cargo test -p fapico2-fido --test
-capacity_boundary` on 2026-10-10.** The table
+number moved 856 → 848; US-1689 carved the Nostr PIN slot from FIDO's tail
+**sector** (one whole sector, not one slot — the scoped erase and the commit
+are sector-granular, and a record sharing FIDO's last sector would die to
+`authenticatorReset`'s wipe), so it moved again 848 → 844. The boundary run
+below is the US-1563 measurement at the pre-carve geometry, re-run at the
+carved geometry by US-1675, and the boundary test derives its target from
+`FIDO_CAPACITY` — so the 844 geometry is exercised by the same run every time
+the suite executes. The table
 above is a **derivation**. It says the region is 960 slots and the
-five reservations tile it — and the compile-time assertions in
+six reservations tile it — and the compile-time assertions in
 `keyregion/mod.rs` check that the tiling is exact. What it does *not* say is
 that one enrolment really consumes one slot: a commit could strand a slot, a
 delete could leak one, an index write could fail and orphan a record.
@@ -160,12 +162,12 @@ enrols credentials until the first refusal and checks four things:
 
 | claim | check |
 |---|---|
-| the device enrols 848 | each one is written **and read back byte-identically**, with its private key and RP compared |
-| the 857th is refused | `RegionCredentialError::Full` → CTAP2 `0x28` (`KEY_STORE_FULL`) |
-| the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the five terms sum to `TOTAL_SLOTS` |
-| nothing partial is left | exactly 848 slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
+| the device enrols `FIDO_CAPACITY` | each one is written **and read back byte-identically**, with its private key and RP compared |
+| the next one is refused | `RegionCredentialError::Full` → CTAP2 `0x28` (`KEY_STORE_FULL`) |
+| the count matches the derivation | the measured run equals `FIDO_CAPACITY`, and the six terms sum to `TOTAL_SLOTS` |
+| nothing partial is left | exactly `FIDO_CAPACITY` slots occupied, each at generation 1; every slot outside FIDO's range and the whole scratchpad erased |
 
-**Measured: 856 at the pre-carve geometry (US-1563); 848 derived after US-1639's carve and re-measured at the carved geometry (US-1675, 2026-10-10).** Every record in that run is a real `DeviceCredential`
+**Measured: 856 at the pre-carve geometry (US-1563); 848 derived after US-1639's carve and re-measured at the carved geometry (US-1675, 2026-10-10); 844 derived after US-1689's pin carve, with the same boundary test — which derives its target from `FIDO_CAPACITY` — now running against the 844 geometry on every execution.** Every record in that run is a real `DeviceCredential`
 encoded by the applet's own codec at its maximum field sizes (63-byte RP ID,
 58-byte `user.name`, 43-byte `displayName`, 64-byte `user.id`, 32-byte
 `credBlob`, `largeBlobKey`, `hmac-secret`) — 596 bytes sealed, against the

@@ -181,7 +181,8 @@ pub const FIDO_CAPACITY: u32 = TOTAL_SLOTS
     - OATH_CAPACITY
     - SCRATCHPAD_SLOTS
     - crate::keyregion::index::INDEX_SLOT_COUNT
-    - NOSTR_CAPACITY;
+    - NOSTR_CAPACITY
+    - NOSTR_PIN_CARVE_SLOTS;
 
 /// Resident OATH credentials the region holds.
 ///
@@ -199,6 +200,47 @@ pub const OATH_CAPACITY: u32 = 68;
 /// a couple, and §2.2 of the design caps `idx` and `n_identities` at `u8`
 /// anyway. The region cost is 8 KiB of 960 KiB.
 pub const NOSTR_CAPACITY: u32 = 8;
+
+/// Resident Nostr **PIN** slots (US-1689): exactly one, holding the
+/// `NostrPinRecord` (US-1690). The slot count inside the carve — the carve
+/// itself is [`NOSTR_PIN_CARVE_SLOTS`] wide, because the erase granularity
+/// makes it so.
+pub const NOSTR_PIN_SLOTS: u32 = 1;
+
+/// Slots the Nostr PIN carve takes (US-1689): **one whole sector**, not one
+/// slot.
+///
+/// The EPIC's first draft carved exactly one slot from FIDO's top, and the
+/// geometry refuses it for a reason the erase story owns: **the sector is the
+/// unit of erasure and of commit** (`commit.rs`, "The problem the hardware
+/// creates"), and two invariants follow from that which a one-slot carve
+/// breaks at compile time:
+///
+/// * FIDO's range must end on a sector boundary, or `wipe_fido_range`'s
+///   scoped erase — the erase CTAP2 `authenticatorReset` issues — reaches
+///   past FIDO's records into whatever moved in next to them
+///   (`fido_store.rs`, "FIDO's range must end on a sector boundary");
+/// * a record that shares a sector with FIDO's records is destroyed by that
+///   erase, no matter which domain owns it, because a raw sector erase has no
+///   key and no codec — it cannot spare the pin record it erases.
+///
+/// A pin slot taken one below the identity range sits in FIDO's last sector:
+/// either the reset erases it (the PIN record dies to a FIDO reset) or the
+/// wipe must under-cover its own tail (credentials survive a reset). Both are
+/// the failure the assertions name. The carve therefore takes FIDO's whole
+/// tail sector: the record slot is its last slot, immediately below the
+/// identity range, and the [`NOSTR_PIN_PAD_SLOTS`] slots below it are
+/// sector-alignment padding that no writer addresses. FIDO's capacity falls
+/// by the sector, and the scoped erase stays exactly scoped.
+pub const NOSTR_PIN_CARVE_SLOTS: u32 = SLOTS_PER_SECTOR;
+
+/// Sector-alignment padding inside the pin carve (US-1689): never written by
+/// any store, and the reason the carve costs a sector rather than a slot.
+/// A board that carried FIDO credentials here before the carve keeps them as
+/// orphans — unreachable by FIDO's allocator, which stops at
+/// [`FIDO_SLOT_LIMIT`], and overwritten by nothing, which is the same
+/// fate US-1639's carve gave the credentials above its own cut.
+pub const NOSTR_PIN_PAD_SLOTS: u32 = NOSTR_PIN_CARVE_SLOTS - NOSTR_PIN_SLOTS;
 
 // ---------------------------------------------------------------------------
 // The partition — one owner, because two applets share one region
@@ -231,7 +273,15 @@ pub const FIDO_FIRST_SLOT: u32 = SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS;
 /// The exclusive end of FIDO's range.
 pub const FIDO_SLOT_LIMIT: u32 = FIDO_FIRST_SLOT + FIDO_CAPACITY;
 
-/// First slot of Nostr's range: the **top** of what was FIDO's range (US-1639).
+/// First slot of the Nostr **PIN** carve (US-1689): FIDO's new end, and the
+/// head of the whole sector the carve takes.
+///
+/// See [`NOSTR_PIN_CARVE_SLOTS`] for why the carve is sector-granular. The
+/// record itself lives at [`NOSTR_PIN_SLOT`], the carve's last slot.
+pub const NOSTR_PIN_FIRST_SLOT: u32 = FIDO_SLOT_LIMIT;
+
+/// First slot of Nostr's identity range: the **top** of what was FIDO's range
+/// (US-1639), one slot above the PIN slot since US-1689.
 ///
 /// Carved from the top, not the bottom, and that is not a free choice — it is
 /// what keeps every existing FIDO record where it is. `FidoAllocator::alloc`
@@ -239,7 +289,18 @@ pub const FIDO_SLOT_LIMIT: u32 = FIDO_FIRST_SLOT + FIDO_CAPACITY;
 /// FIDO's range from its **end** leaves the address of every record below the
 /// cut unchanged; carving from the bottom would shift every FIDO record above
 /// the cut and strand deployed boards' credentials.
-pub const NOSTR_FIRST_SLOT: u32 = FIDO_SLOT_LIMIT;
+///
+/// The pin carve keeps the property that made US-1639's carve safe in its
+/// strongest form: `NOSTR_FIRST_SLOT` is the sum of the pin carve and FIDO's
+/// shrunken range, which is the *same numeric value* `FIDO_SLOT_LIMIT` had
+/// before US-1689 (72 + 848 = 920). No identity slot's address moves, and
+/// neither does an index slot's — the argument, on record here where the
+/// geometry is owned.
+pub const NOSTR_FIRST_SLOT: u32 = NOSTR_PIN_FIRST_SLOT + NOSTR_PIN_CARVE_SLOTS;
+
+/// The Nostr **PIN** record slot (US-1689): the carve's last slot,
+/// immediately below [`NOSTR_FIRST_SLOT`].
+pub const NOSTR_PIN_SLOT: u32 = NOSTR_FIRST_SLOT - 1;
 
 /// The exclusive end of Nostr's range.
 ///
@@ -266,17 +327,32 @@ pub const fn is_fido_slot(slot: Slot) -> bool {
     i >= FIDO_FIRST_SLOT && i < FIDO_SLOT_LIMIT
 }
 
-/// Is this slot inside Nostr's range? (US-1639)
+/// Is this slot inside Nostr's identity range? (US-1639)
 ///
 /// Published beside `is_oath_slot`/`is_fido_slot` for the reason
 /// `oath_store.rs:276` states: **a reservation nothing can ask about is a
 /// reservation nothing will respect.** This is the predicate the FIDO guard
 /// sites consult (US-1640) and the Nostr store is bounded by; a carve that
 /// existed only as two constants in this file would be a carve every write
-/// path could ignore.
+/// path could ignore. The PIN slot (US-1689) is **not** covered — it is
+/// Nostr's, but it is not an identity slot, and the identity accessors must
+/// never reach it; see [`is_nostr_pin_slot`].
 pub const fn is_nostr_slot(slot: Slot) -> bool {
     let i = slot.index() as u32;
     i >= NOSTR_FIRST_SLOT && i < NOSTR_SLOT_LIMIT
+}
+
+/// Is this slot the Nostr PIN record slot? (US-1689)
+///
+/// The PIN record lives in the last slot of the pin carve — the sector
+/// immediately below the identity range, taken whole so FIDO's scoped erase
+/// never reaches it and no identity accessor reaches it. FIDO's own allocator
+/// stops at `FIDO_SLOT_LIMIT` == [`NOSTR_PIN_FIRST_SLOT`], so the carve needs
+/// no FIDO-side guard change; this predicate exists for the same reason
+/// `is_nostr_slot` does — a reservation nothing can ask about is a reservation
+/// nothing will respect.
+pub const fn is_nostr_pin_slot(slot: Slot) -> bool {
+    slot.index() as u32 == NOSTR_PIN_SLOT
 }
 
 /// Is this slot reserved — the scratchpad or the index?
@@ -378,8 +454,10 @@ const _: () = {
                 + OATH_CAPACITY
                 + SCRATCHPAD_SLOTS
                 + crate::keyregion::index::INDEX_SLOT_COUNT
-                + NOSTR_CAPACITY,
-        "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index + Nostr"
+                + NOSTR_CAPACITY
+                + NOSTR_PIN_CARVE_SLOTS,
+        "every slot must be claimed exactly once: FIDO + OATH + commit scratchpad + index + \
+         Nostr identities + the Nostr PIN carve"
     );
     // …and the ranges must be *contiguous*, in the order the constants above
     // build them. Two applet adapters each described this layout independently
@@ -387,18 +465,42 @@ const _: () = {
     // asserted here where the owners are declared rather than in either
     // consumer. Nostr (US-1639) is the fifth reservation, taken from the top of
     // FIDO's range: FIDO's limit *is* Nostr's first slot, which is why the
-    // carve cannot shift any existing FIDO record's address.
+    // carve cannot shift any existing FIDO record's address. The PIN carve
+    // (US-1689) is the sixth, taken from the top of FIDO's range again — one
+    // whole sector of it (see NOSTR_PIN_CARVE_SLOTS for why a slot would not
+    // do), with the record slot immediately below the identity range.
+    // NOSTR_FIRST_SLOT keeps the numeric value it had before the pin carve, so
+    // neither an identity slot's address nor an index slot's moves — the
+    // address-stability argument, on record here where the geometry is owned.
     assert!(
         OATH_FIRST_SLOT == 0
             && SCRATCHPAD_FIRST_SLOT == OATH_FIRST_SLOT + OATH_CAPACITY
             && FIDO_FIRST_SLOT == SCRATCHPAD_FIRST_SLOT + SCRATCHPAD_SLOTS
             && FIDO_SLOT_LIMIT == FIDO_FIRST_SLOT + FIDO_CAPACITY
-            && NOSTR_FIRST_SLOT == FIDO_SLOT_LIMIT
+            && NOSTR_PIN_FIRST_SLOT == FIDO_SLOT_LIMIT
+            && NOSTR_FIRST_SLOT == NOSTR_PIN_FIRST_SLOT + NOSTR_PIN_CARVE_SLOTS
+            && NOSTR_PIN_SLOT == NOSTR_FIRST_SLOT - 1
             && NOSTR_SLOT_LIMIT == NOSTR_FIRST_SLOT + NOSTR_CAPACITY
             && crate::keyregion::index::INDEX_FIRST_SLOT == NOSTR_SLOT_LIMIT
             && NOSTR_SLOT_LIMIT + crate::keyregion::index::INDEX_SLOT_COUNT == TOTAL_SLOTS,
-        "the five reservations must tile the region contiguously: OATH, scratchpad, FIDO, Nostr, \
-         index"
+        "the six reservations must tile the region contiguously: OATH, scratchpad, FIDO, the \
+         Nostr PIN carve, Nostr identities, index"
+    );
+    // The pin carve is sector-granular so that every scoped erase stays exact:
+    // FIDO's range ends on a sector boundary (`fido_store.rs`'s wipe
+    // assertions), the pin record's sector contains no FIDO record a reset
+    // would reach, and the identity range starts on one. A carve that broke
+    // any of these would put the PIN record in the path of
+    // `wipe_fido_range`'s raw sector erases or leave a FIDO record stranded
+    // mid-sector — which is precisely why the carve costs a sector and not a
+    // slot.
+    assert!(
+        FIDO_SLOT_LIMIT.is_multiple_of(SLOTS_PER_SECTOR)
+            && NOSTR_PIN_FIRST_SLOT.is_multiple_of(SLOTS_PER_SECTOR)
+            && NOSTR_FIRST_SLOT.is_multiple_of(SLOTS_PER_SECTOR)
+            && NOSTR_SLOT_LIMIT.is_multiple_of(SLOTS_PER_SECTOR),
+        "the pin carve is a whole sector and every range it touches ends on a sector boundary, \
+         or a scoped erase crosses a domain boundary"
     );
     // The scratchpad is a whole sector, and a commit stages into it — a
     // scratchpad that is not sector-aligned is a staging area with no

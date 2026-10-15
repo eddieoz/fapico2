@@ -80,12 +80,15 @@ pub const KEYSTORE_SLOT: &[u8] = b"fido.keystore.v1";
 
 /// **The capacity: how many FIDO credentials this device can hold.**
 ///
-/// [`fapico2_platform::keyregion::FIDO_CAPACITY`] — **848** at the shipping
+/// [`fapico2_platform::keyregion::FIDO_CAPACITY`] — **844** at the shipping
 /// geometry, and derived rather than asserted: `keyregion/mod.rs` computes it
 /// as `TOTAL_SLOTS − OATH_CAPACITY − SCRATCHPAD_SLOTS − INDEX_SLOT_COUNT −
-/// NOSTR_CAPACITY` and has a compile-time assertion that the five terms claim every slot exactly
-/// once. Change the region's size, the measured record size, the commit
-/// protocol or the index reservation and this number moves with them.
+/// NOSTR_CAPACITY − NOSTR_PIN_CARVE_SLOTS` and has a compile-time assertion
+/// that the six terms claim every slot exactly once. (The pin carve, US-1689,
+/// is sector-granular — `NOSTR_PIN_CARVE_SLOTS` — because the scoped erase
+/// and the commit are; see the constant for the argument.) Change the region's
+/// size, the measured record size, the commit protocol or the index
+/// reservation and this number moves with them.
 ///
 /// The `12` this replaced was the *resident* bound ([`SNAPSHOT_MAX_CREDS`])
 /// being read as a capacity. On the board it was not even reachable: a soak

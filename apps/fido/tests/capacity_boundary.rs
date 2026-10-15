@@ -502,8 +502,10 @@ fn the_derivation_sums_to_the_measured_boundary() {
             - fapico2_platform::keyregion::OATH_CAPACITY
             - fapico2_platform::keyregion::SCRATCHPAD_SLOTS
             - fapico2_platform::keyregion::index::INDEX_SLOT_COUNT
-            - fapico2_platform::keyregion::NOSTR_CAPACITY,
-        "the capacity is five terms — Nostr's carve (US-1639) is the fifth — and they must          claim every slot exactly once"
+            - fapico2_platform::keyregion::NOSTR_CAPACITY
+            - fapico2_platform::keyregion::NOSTR_PIN_CARVE_SLOTS,
+        "the capacity is six terms — Nostr's carve (US-1639) is the fifth, the PIN carve \
+         (US-1689) the sixth — and they must claim every slot exactly once"
     );
     // The range FIDO actually writes is the capacity, at the derived offset —
     // the two numbers a caller could confuse, pinned together.
