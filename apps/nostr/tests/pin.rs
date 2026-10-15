@@ -14,8 +14,10 @@
 use fapico2_nostr::crypto::pin_verifier;
 use fapico2_nostr::NostrApp;
 use fapico2_nostr::{
-    INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED,
-    SW_PIN_NOT_SET, SW_STORE_FAULT, SW_WRONG_DATA,
+    INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY, INS_IMPORT_KEY, INS_LIST_KEYS,
+    INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_LABEL, INS_SET_PIN, INS_SIGN,
+    INS_VERIFY_PIN, PIN_MAX_RETRIES, SW_PIN_ALREADY_SET, SW_PIN_LOCKED, SW_PIN_NOT_SET,
+    SW_PIN_SESSION_REQUIRED, SW_STORE_FAULT, SW_WRONG_DATA,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -605,5 +607,172 @@ fn torn_pin_record_fails_closed() {
     let mut app = NostrApp::boot(open_region(&path)).with_rng_provider(pinned_salt);
     let (_, sw) = call(&mut app, &verify_pin(PIN));
     assert_eq!(sw, SW_PIN_LOCKED, "a flipped bit is the same locked posture");
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1697: the gate matrix
+// ---------------------------------------------------------------------------
+
+/// A valid signing digest — any 32 bytes; the SIGN shape check is length-only.
+const DIGEST: [u8; 32] = [0x42; 32];
+/// A valid scalar for IMPORT_KEY: non-zero, below the curve order.
+const IMPORTED_SCALAR: [u8; 32] = [0x01; 32];
+/// The secp256k1 generator's x-coordinate — a peer key that always lifts,
+/// so the NIP-44 rows reach the gate instead of `6A87`.
+const G_X: [u8; 32] = [
+    0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+    0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+];
+
+fn apdu(ins: u8, p1: u8, data: &[u8]) -> HeaplessVec<u8, 300> {
+    let mut a: HeaplessVec<u8, 300> = HeaplessVec::new();
+    a.extend_from_slice(&[0x00, ins, p1, 0x00]).unwrap();
+    if !data.is_empty() {
+        a.push(data.len() as u8).unwrap();
+        a.extend_from_slice(data).unwrap();
+    }
+    a
+}
+
+/// The ten matrix rows, run in order against one app. Rows 0–6 are the
+/// gated (secret) commands; rows 7–9 are the open reads. The store state
+/// at the read rows is designed to be identical across all three columns:
+/// row 0 imports `idx 1`, row 5 deletes it again — so by row 7 the only
+/// identity is the `idx 0` one the setup imported before the PIN existed.
+fn gate_rows(app: &mut NostrApp) -> [Sw; 10] {
+    let mut enc_req: HeaplessVec<u8, 64> = HeaplessVec::new();
+    enc_req.extend_from_slice(&G_X).unwrap();
+    enc_req.extend_from_slice(b"hi").unwrap();
+    let mut dec_req: HeaplessVec<u8, 192> = HeaplessVec::new();
+    dec_req.extend_from_slice(&G_X).unwrap();
+    dec_req.extend_from_slice(&[0u8; 99]).unwrap();
+    let rows: [HeaplessVec<u8, 300>; 10] = [
+        apdu(INS_IMPORT_KEY, 1, &IMPORTED_SCALAR),
+        apdu(INS_SIGN, 0, &DIGEST),
+        apdu(INS_NIP44_ENCRYPT, 0, &enc_req),
+        apdu(INS_NIP44_DECRYPT, 0, &dec_req),
+        apdu(INS_GENERATE_KEY, 1, &[]),
+        apdu(INS_DELETE_KEY, 1, &[]),
+        apdu(INS_SET_LABEL, 1, b"lbl"),
+        apdu(INS_GET_INFO, 0, &[]),
+        apdu(INS_LIST_KEYS, 0, &[]),
+        apdu(INS_GET_PUBKEY, 0, &[]),
+    ];
+    rows.map(|a| call(app, &a).1)
+}
+
+/// **The gate matrix**: every command in all three states, one row each.
+///
+/// - *no PIN*: every row behaves as it did before the gate existed — the
+///   compatibility property, asserted per command. The gated rows run to
+///   their real answers (the host's default presence is "present", so
+///   touch-gated commands execute).
+/// - *PIN + locked*: all seven secret commands answer
+///   [`SW_PIN_SESSION_REQUIRED`] — and the three open reads answer exactly
+///   what the no-PIN board answered, because a locked board still proves
+///   which identities exist (the NPUB-on-a-poster argument, §2.2).
+/// - *PIN + unlocked*: every row equals the no-PIN column, status words
+///   included. Unlocked custody is the ungated state, byte for byte.
+///
+/// Status words are compared, not bodies: the NIP-44 nonce and the BIP-340
+/// aux draw come from the per-draw counter RNG, so ciphertexts differ
+/// between boards by construction. A wrong SW would differ too, and it is
+/// the SW the gate story is about.
+#[test]
+fn gate_matrix() {
+    // Column A — no PIN.
+    let path = region_path("gate-nopin");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK, "setup: the identity imports on a fresh board");
+    let no_pin = gate_rows(&mut app);
+    std::fs::remove_file(&path).ok();
+
+    // Column B — PIN set, session closed.
+    let path = region_path("gate-locked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK, "setup: import while the gate is unborn");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK, "setup: the PIN sets");
+    let locked = gate_rows(&mut app);
+    std::fs::remove_file(&path).ok();
+
+    // Column C — PIN set, session open.
+    let path = region_path("gate-unlocked");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK, "setup: import while the gate is unborn");
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    let unlocked = gate_rows(&mut app);
+    std::fs::remove_file(&path).ok();
+
+    // The gated rows refuse with the gate word in the locked column…
+    for (i, sw) in locked.iter().enumerate().take(7) {
+        assert_eq!(*sw, SW_PIN_SESSION_REQUIRED, "row {i} must be gated on a locked board");
+    }
+    // …the open reads never consult the gate…
+    for i in 7..10 {
+        assert_eq!(locked[i], no_pin[i], "read row {i} is the same on a locked board");
+        assert_eq!(unlocked[i], no_pin[i], "read row {i} is the same unlocked");
+    }
+    // …and the unlocked column is the no-PIN column, whole.
+    for i in 0..7 {
+        assert_eq!(
+            unlocked[i], no_pin[i],
+            "row {i} unlocked must equal the no-PIN behaviour"
+        );
+    }
+    // The no-PIN column itself is today's behaviour, spot-checked: the
+    // gated rows really ran (import/sign/delete succeeded at their
+    // pre-gate answers), not silently refused.
+    assert_eq!(no_pin[0], SW_OK, "IMPORT on a no-PIN board succeeds");
+    assert_eq!(no_pin[1], SW_OK, "SIGN on a no-PIN board succeeds");
+    assert_eq!(no_pin[5], SW_OK, "DELETE on a no-PIN board succeeds");
+    assert_eq!(no_pin[4], 0x6A84, "GENERATE over an occupied index is 6A84");
+    assert_eq!(no_pin[6], 0x6A82, "SET_LABEL on a deleted index is 6A82");
+}
+
+/// US-1694's deferred acceptance, completed by the gate's existence:
+/// `LOCK` clears the session flag wherever it was opened, because the flag
+/// it clears is applet-global behind the shared `Mutex` (§8) — the CCID
+/// task and the vendor-HID task drive the same one applet instance, so
+/// there is no per-connection session to be out of sync with. At the
+/// applet level both transports are the same `process` call; the wire
+/// framing that distinguishes them arrives with US-1702, and the proxy
+/// check (`nostr_shared.rs` forwards every `App` method) is the review
+/// note that keeps the device arm honest.
+#[test]
+fn lock_clears_the_flag_across_transports() {
+    let path = region_path("lock-clears");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path)).with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(INS_IMPORT_KEY, 0, &IMPORTED_SCALAR));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &set_pin(0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+
+    // Unlocked: SIGN runs (9000 — the signature path completes).
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_OK, "an open session signs");
+    // LOCK, on "the other transport" — the same applet: the gate closes.
+    let (_, sw) = call(&mut app, &lock());
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "the lock closed the session");
+    // VERIFY reopens it, and signing works again.
+    let (_, sw) = call(&mut app, &verify_pin(PIN));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 0, &DIGEST));
+    assert_eq!(sw, SW_OK, "a reopened session signs");
     std::fs::remove_file(&path).ok();
 }

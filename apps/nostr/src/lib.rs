@@ -682,6 +682,9 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         // Destructure once: the store borrow must coexist with the RNG pool
         // draw, and disjoint field borrows compose where a `&mut self`
         // method call would not.
@@ -778,6 +781,9 @@ impl NostrApp {
             write_sw(resp, SW_WRONG_DATA);
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         // IMPORT_KEY draws nothing: the scalar is the host's, and its
         // validity is checked above.
         let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _ } = self;
@@ -823,6 +829,9 @@ impl NostrApp {
             write_sw(resp, SW_WRONG_DATA);
             return;
         };
+        if self.gate_refuses(resp) {
+            return;
+        }
         let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
@@ -887,6 +896,9 @@ impl NostrApp {
         }
         if let Some(sw) = validate_peer_key(peer_x) {
             write_sw(resp, sw);
+            return;
+        }
+        if self.gate_refuses(resp) {
             return;
         }
         let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _ } = self;
@@ -991,6 +1003,9 @@ impl NostrApp {
             write_sw(resp, SW_ECC_UNSUPPORTED);
             return;
         }
+        if self.gate_refuses(resp) {
+            return;
+        }
         let Self { region, provider, presence_grant, .. } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
@@ -1049,6 +1064,9 @@ impl NostrApp {
         }
         if data.len() > NOSTR_LABEL_MAX {
             write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
+        if self.gate_refuses(resp) {
             return;
         }
         let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _ } = self;
@@ -1116,6 +1134,9 @@ impl NostrApp {
             return;
         }
         if !refuse_payload(data, resp) {
+            return;
+        }
+        if self.gate_refuses(resp) {
             return;
         }
         let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _ } = self;
@@ -1467,6 +1488,28 @@ impl NostrApp {
         }
         self.pin_unlocked = false;
         write_sw(resp, SW_OK);
+    }
+
+    /// US-1697: the custody gate, as the one expression the story names.
+    /// Called by every secret operation **after its shape checks and before
+    /// its state reads and touch check** — the standing refusal order gains
+    /// a gate row between shape and state, so a locked board answers
+    /// [`SW_PIN_SESSION_REQUIRED`] for any well-formed payload and never
+    /// enters a press path. The gate is a pure cache read: `pin_set` comes
+    /// from boot/the PIN verbs, `pin_unlocked` from `VERIFY_PIN`/`LOCK`, and
+    /// a no-PIN board fails the conjunction trivially, which is the
+    /// compatibility property — every command on such a board runs exactly
+    /// the code it ran before this gate existed.
+    ///
+    /// Returns `true` when the caller must stop (the refusal is already
+    /// written).
+    fn gate_refuses(&self, resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> bool {
+        if self.pin_set && !self.pin_unlocked {
+            write_sw(resp, SW_PIN_SESSION_REQUIRED);
+            true
+        } else {
+            false
+        }
     }
 }
 
