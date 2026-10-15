@@ -114,7 +114,46 @@ band on the same region.)
 
 ### Destruction leg — v0.1.x over the same board
 
-**PENDING HARDWARE SESSION.**
+`fapico2-release-alpha-v0.1.2` (release commit `b943a8b`, clean-worktree
+`build.sh`) flashed over the ceremony-completed board. v0.1.2 predates the
+Nostr applet entirely: the applet's AID selects nothing (`6A82`), and the
+records live in what that image considers the tail of FIDO's own 856-slot
+range.
+
+**Result: the range survived — the old image's ordinary paths do not reach
+it.** Three paths were checked, one on the board and two in the image's
+source:
+
+1. **Factory `RESET`** (`INS 0x1E`, touch-granted — `sw=9000` after the
+   button press, 198 polling attempts over 49.9 s): the v0.1.2 handler
+   (`boot.rs::DeviceFactoryResetHandler`) wipes the secure-store slots and
+   formats the trussed FS, and **never touches the keyregion** — the range is
+   invisible to an image that predates the applet. The board's FIDO/OATH
+   secure-store state was destroyed by this reset (the consented cost of the
+   leg); the Nostr records were not.
+2. **Compaction** (source read, `fido_store.rs::compact`): a slot this build
+   cannot open is `SlotShape::Keep` — "a slot that is not a FIDO record is
+   left alone", copied verbatim on every sector rewrite.
+3. **Ordinary writes**: `put` allocates from the low free slots; reaching the
+   carved range needs ~900 resident credentials — unreachable at any real
+   occupancy.
+
+Read-back on the ceremony build after all of it:
+
+```
+GET_INFO   sw=9000 n_identities=1 flags=0x01 (pin_set | !pending)
+LIST_KEYS  sw=9000 n=1, idx0 npub=fa042f8f… (unchanged)
+GET_PUBKEY idx0 sw=9000 len=95
+```
+
+The protocol expected "the range does not survive — the old firmware's
+ordinary write path overwrites/tombstones it". The board said otherwise, in
+the direction of **more** protection: destruction by downgrade needs the
+store deliberately filled to the top sector or an out-of-band erase
+(`nuke_universal`), not anything an old image does by accident or by its
+ordinary destructive command. ADR 0006's destruction residual stands
+**bounded** to those two paths; the sentence there ("downgrade restores
+PIN-less destruction") should be read with this matrix beside it.
 
 ### Endpoint — ceremony build re-flash
 
