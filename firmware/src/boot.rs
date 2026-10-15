@@ -655,49 +655,6 @@ pub fn nostr_key_region_fresh() -> Option<KeyRegionHandle> {
     Some(KeyRegionHandle::new(flash))
 }
 
-/// US-1643: the key the Nostr region's records are sealed under.
-///
-/// Same root as every other store key on the device, the same shape as
-/// [`derive_oath_payload_key`] — and the same **`Option`, never
-/// [`fatal_boot`]** reasoning: a missing OTP row or chipid degrades Nostr to
-/// an applet that answers APDUs and refuses its reads with the store-fault
-/// status word rather than reporting a fiction about what is on the device.
-///
-/// US-1714 makes the source a policy, not a constant: the custody rows
-/// decide, through [`fapico2_platform::custody::assess`]. Virgin and torn
-/// pages yield the legacy constant-KDF key (a torn burn has produced no
-/// readable secret and no reseat has run); burned pages yield the custody
-/// key over the read-back rows; a faulted page yields `None` — the applet
-/// answers the sealed-unavailable word, never a wrong key.
-#[inline(never)]
-pub fn derive_nostr_payload_key() -> Option<fapico2_platform::keyregion::crypto::PayloadKey> {
-    let otp_key_1 = read_otp_key_1()?;
-    let chipid = embassy_rp::otp::get_chipid().ok()?;
-    let otp = fapico2_platform::otp_cus::RealOtp;
-    use fapico2_platform::custody::CeremonyState;
-    use fapico2_platform::keyregion::crypto::NostrKeySource;
-    match fapico2_platform::custody::assess(&otp) {
-        CeremonyState::Virgin | CeremonyState::Torn => {
-            fapico2_platform::keyregion::crypto::derive_nostr_payload_key(
-                &otp_key_1,
-                &chipid.to_be_bytes(),
-                NostrKeySource::LegacyConstant,
-            )
-        }
-        // Burned (with or without the OTP marker word): the secret is the
-        // read-back row contents. A page that classifies burned but cannot
-        // produce its secret is a fault — `None`, not a guess.
-        _ => {
-            let secret = fapico2_platform::custody::custody_secret_bytes(&otp)?;
-            fapico2_platform::keyregion::crypto::derive_nostr_payload_key(
-                &otp_key_1,
-                &chipid.to_be_bytes(),
-                NostrKeySource::Custody(&secret),
-            )
-        }
-    }
-}
-
 /// US-1714: the Nostr region view the applet's provider hands over, custody
 /// policy included — the one function in the process that both derives a
 /// key and decides which one.
