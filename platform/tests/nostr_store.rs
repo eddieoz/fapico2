@@ -24,11 +24,12 @@ use fapico2_platform::ckey;
 use fapico2_platform::keyregion::crypto::{self, PayloadKey};
 use fapico2_platform::keyregion::host::FileKeyRegion;
 use fapico2_platform::keyregion::nostr_store::{
-    NostrIdentity, NostrStore, NostrStoreError, Entry, TOMBSTONE, NOSTR_BODY_LEN,
+    nostr_pin_slot, nostr_slot, Entry, NostrIdentity, NostrPinRecord, NostrStore, NostrStoreError,
+    PinEntry, TOMBSTONE, NOSTR_BODY_LEN, NOSTR_PIN_BODY_LEN,
 };
 use fapico2_platform::keyregion::record::{self, Domain, RecordHeader};
 use fapico2_platform::keyregion::{
-    Slot, NOSTR_FIRST_SLOT, NOSTR_RECORD_MAX, TOTAL_SLOTS,
+    KeyRegion, Slot, NOSTR_FIRST_SLOT, NOSTR_PIN_SLOT, NOSTR_RECORD_MAX, TOTAL_SLOTS,
 };
 
 /// The whole region: a short stand-in would move what the carve's slots are.
@@ -358,4 +359,157 @@ fn a_misaddressed_record_is_a_typed_refusal_not_a_panic() {
         .write(0, &identity(7))
         .expect_err("a misaddressed occupant is refused, typed");
     assert!(matches!(err, NostrStoreError::OccupiedForeign { .. }), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// US-1690: the PIN custody record
+// ---------------------------------------------------------------------------
+
+/// A PIN record with deterministic salt and verifier — the fields' *values*
+/// are the applet's business (the OATH `PinRecord` derivation); the store's
+/// is that the same 49 bytes come back out.
+fn pin_record(counter: u8) -> NostrPinRecord {
+    let mut salt = [0u8; 16];
+    let mut verifier = [0u8; 32];
+    for (i, b) in salt.iter_mut().enumerate() {
+        *b = counter.wrapping_mul(5).wrapping_add(i as u8).wrapping_add(0x40);
+    }
+    for (i, b) in verifier.iter_mut().enumerate() {
+        *b = counter.wrapping_mul(17).wrapping_add(i as u8).wrapping_add(0x80);
+    }
+    NostrPinRecord { counter, salt, verifier }
+}
+
+/// The raw slot bytes of a record with an arbitrary body, sealed under `key`
+/// at `slot` — the PIN-slot edition of [`foreign_record`], which is bound to
+/// the identity body's width.
+fn pin_slot_record(key: &PayloadKey, slot: Slot, generation: u32, body: &[u8]) -> Vec<u8> {
+    let header = RecordHeader::new(Domain::Nostr, slot, generation);
+    let mut nonce = [0u8; record::NONCE_LEN];
+    nonce[..4].copy_from_slice(&generation.to_le_bytes());
+    nonce[4..].copy_from_slice(b"nostrst!");
+    let sealed = record::seal(&header, key.as_bytes(), &nonce, body).expect("seal");
+    let image = record::encode(&header, &sealed).expect("a 49-byte body fits the slot");
+    image.as_bytes().to_vec()
+}
+
+/// **The round trip preserves all 49 bytes, and a rewrite goes through the
+/// guard.** US-1690's green path: the virgin PIN slot is the no-PIN state,
+/// `write_pin` commits through the same admission/seal machinery an identity
+/// uses, and the record reads back field-for-field — the verifier included,
+/// because a codec that mangles it cannot be caught by a shape check.
+#[test]
+fn pin_record_round_trip_and_admission() {
+    let tmp = TempRegion::new("pin-record");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let key = nostr_payload_key();
+    let mut store = NostrStore::new(&mut region, &key);
+
+    assert!(
+        matches!(store.read_pin(), Ok(PinEntry::Empty)),
+        "the virgin PIN slot reads as the no-PIN state"
+    );
+    store.write_pin(&pin_record(0)).expect("the virgin PIN slot is writable");
+    match store.read_pin() {
+        Ok(PinEntry::Live(read)) => {
+            assert_eq!(read, pin_record(0), "the round trip preserves all 49 bytes");
+        }
+        other => panic!("expected a live PIN record, got {other:?}"),
+    }
+
+    // Rewriting the live slot is the guard's own path (it opens as ours), so
+    // a rotation commits at the advanced generation — US-1692's change-PIN
+    // write stands on this.
+    store.write_pin(&pin_record(1)).expect("a live PIN slot is rewritable");
+    match store.read_pin() {
+        Ok(PinEntry::Live(read)) => assert_eq!(read, pin_record(1)),
+        other => panic!("expected the rotated record, got {other:?}"),
+    }
+}
+
+/// **The PIN slot is typed apart from the identity range.** US-1690's
+/// reachability clause: `nostr_slot` cannot name the PIN slot (it sits below
+/// [`NOSTR_FIRST_SLOT`]) and `nostr_pin_slot` takes no index — the two
+/// accessor families are disjoint by construction, so an identity read never
+/// decodes the PIN record and a PIN write never lands in an identity slot.
+#[test]
+fn the_pin_slot_is_typed_apart_from_the_identity_range() {
+    let pin = nostr_pin_slot().expect("the carve's geometry names the PIN slot");
+    assert_eq!(pin.index() as u32, NOSTR_PIN_SLOT);
+    assert!(
+        pin.index() < NOSTR_FIRST_SLOT as u16,
+        "the PIN slot must sit below the identity range, or nostr_slot reaches it"
+    );
+    for i in 0..fapico2_platform::keyregion::NOSTR_CAPACITY as u16 {
+        assert_ne!(
+            nostr_slot(i),
+            Some(pin),
+            "identity index {i} must not alias the PIN slot"
+        );
+    }
+}
+
+/// **A foreign or torn PIN record is refused or reads Undecodable — never a
+/// wrong verifier.** US-1690's admission and torn-body clauses, both halves
+/// of "fail closed": a stale FIDO record in the PIN slot is
+/// `OccupiedForeign`, never a silent overwrite; a record that opens as ours
+/// but does not decode to a PIN body reads `Undecodable` (US-1695's
+/// fail-closed state); and a record with one flipped ciphertext byte fails
+/// the AEAD, so no verifier can be synthesized from damaged bytes.
+#[test]
+fn a_foreign_or_torn_pin_record_refuses_and_never_yields_a_verifier() {
+    let tmp = TempRegion::new("pin-torn");
+    let mut region = FileKeyRegion::create(tmp.path(), REGION_SLOTS).expect("create");
+    let key = nostr_payload_key();
+    let pin = nostr_pin_slot().expect("the carve's geometry names the PIN slot");
+
+    // Half 1: the stale FIDO occupant. The occupancy guard refuses the
+    // write; the read reports Foreign, not a PIN.
+    let stale = foreign_record(Domain::Fido, &fido_payload_key(), pin, 1);
+    program_record(&mut region, pin, &stale);
+    {
+        let mut store = NostrStore::new(&mut region, &key);
+        assert!(matches!(store.read_pin(), Ok(PinEntry::Foreign)));
+        let err = store
+            .write_pin(&pin_record(0))
+            .expect_err("a foreign occupant is refused, never overwritten");
+        assert!(matches!(err, NostrStoreError::OccupiedForeign { .. }), "got {err:?}");
+    }
+
+    // Half 2: a body that opens as ours but is not a PIN body — a record
+    // sealed under this device's own key with a 50-byte body. The AEAD is
+    // satisfied; the codec is not. It reads Undecodable, never a verifier.
+    // The slot is erased first — NOR cannot program over live bytes — and
+    // erasing the pin slot's sector can spare nothing: the pad slots
+    // (US-1689) are never written, which is part of the carve's point.
+    region.erase_sector(pin).expect("the pad slot's sector erases cleanly");
+    let torn_wide = pin_slot_record(&key, pin, 2, &[0x7F; 50]);
+    program_record(&mut region, pin, &torn_wide);
+    {
+        let mut store = NostrStore::new(&mut region, &key);
+        assert!(
+            matches!(store.read_pin(), Ok(PinEntry::Undecodable)),
+            "a wrong-width body is Undecodable, not a PIN"
+        );
+    }
+
+    // Half 3: a valid PIN body with one flipped byte inside the sealed
+    // region — the first ciphertext byte after the nonce (the image's tail
+    // is erased padding, not part of the record). The AEAD refuses the
+    // open; nothing decodes.
+    let mut good = [0u8; NOSTR_PIN_BODY_LEN];
+    pin_record(3).encode(&mut good);
+    let mut image = pin_slot_record(&key, pin, 3, &good);
+    let first_ciphertext =
+        record::RECORD_HEADER_LEN + record::NONCE_LEN;
+    image[first_ciphertext] ^= 0x01;
+    region.erase_sector(pin).expect("erase before the flipped-byte program");
+    program_record(&mut region, pin, &image);
+    {
+        let mut store = NostrStore::new(&mut region, &key);
+        assert!(
+            matches!(store.read_pin(), Ok(PinEntry::Undecodable)),
+            "a flipped ciphertext byte must fail closed, never decode to a verifier"
+        );
+    }
 }

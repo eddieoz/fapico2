@@ -67,7 +67,10 @@ use super::commit::{self, CommitError, CommitPlan, CommitReport, Recovery};
 use super::crypto::{KeyDomain, PayloadKey, RecordAad, RECORD_OVERHEAD};
 use super::record::{self, Domain, RecordOccupancy};
 use super::slotmap::Occupancy;
-use super::{KeyRegion, NOSTR_CAPACITY, NOSTR_FIRST_SLOT, NOSTR_RECORD_MAX, Sealed, Slot, SlotRead, TOTAL_SLOTS};
+use super::{
+    KeyRegion, NOSTR_CAPACITY, NOSTR_FIRST_SLOT, NOSTR_PIN_SLOT, NOSTR_RECORD_MAX, Sealed, Slot,
+    SlotRead, TOTAL_SLOTS,
+};
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -191,6 +194,86 @@ impl fmt::Debug for NostrIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// The PIN custody record
+// ---------------------------------------------------------------------------
+
+/// The PIN record body's exact width: `counter(1) ‖ salt(16) ‖ verifier(32)`
+/// (US-1690). Fixed for the same reason as [`NOSTR_BODY_LEN`] — and strictly
+/// narrower than it, so the slot bound sized for the identity body needs no
+/// re-derivation for the PIN record.
+pub const NOSTR_PIN_BODY_LEN: usize = 1 + 16 + 32;
+
+/// The PIN verifier record: everything custody needs to check a PIN and count
+/// its retries, and nothing more.
+///
+/// `verifier` is `SHA256(salt ‖ pin)` over a TRNG `salt` — the OATH
+/// `PinRecord` pattern (`apps/oath/src/oath_core.rs`), not a second design.
+/// None of the three fields is a secret in the AEAD sense — the record is
+/// sealed anyway, under the same device key and the same AAD shape as an
+/// identity, because consistency is the security property here: one record
+/// format, one key hierarchy.
+///
+/// `Copy` because it is 49 bytes read and written once per operation. The
+/// `Debug` prints the counter and redacts the verifier: a hash of a low-
+/// entropy secret in a log buffer is an offline guess the user paid for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct NostrPinRecord {
+    /// Consecutive failed verifications, 0–15 with 15 the lockout. The
+    /// applet owns the vocabulary; the store only carries the byte.
+    pub counter: u8,
+    /// The TRNG salt the verifier was derived over. Rotated on every
+    /// successful set or change.
+    pub salt: [u8; 16],
+    /// `SHA256(salt ‖ pin)` — the thing a VERIFY_PIN compares against.
+    pub verifier: [u8; 32],
+}
+
+impl NostrPinRecord {
+    /// Encode into `out` ([`NOSTR_PIN_BODY_LEN`] bytes). Returns the length
+    /// written, always [`NOSTR_PIN_BODY_LEN`].
+    pub fn encode(&self, out: &mut [u8; NOSTR_PIN_BODY_LEN]) -> usize {
+        out[0] = self.counter;
+        out[1..17].copy_from_slice(&self.salt);
+        out[17..49].copy_from_slice(&self.verifier);
+        NOSTR_PIN_BODY_LEN
+    }
+
+    /// Decode a PIN record body. `None` on any other length — including
+    /// [`TOMBSTONE`], which is how a cleared PIN reads as something other
+    /// than garbage.
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != NOSTR_PIN_BODY_LEN {
+            return None;
+        }
+        let mut record = NostrPinRecord {
+            counter: body[0],
+            salt: [0u8; 16],
+            verifier: [0u8; 32],
+        };
+        record.salt.copy_from_slice(&body[1..17]);
+        record.verifier.copy_from_slice(&body[17..49]);
+        Some(record)
+    }
+
+    /// Whether this body is the tombstone a PIN clear commits — the same
+    /// one-byte body an identity delete commits, because a second tombstone
+    /// shape would be a second thing every reader must rule out.
+    pub fn is_tombstone(body: &[u8]) -> bool {
+        body == TOMBSTONE
+    }
+}
+
+impl fmt::Debug for NostrPinRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NostrPinRecord")
+            .field("counter", &self.counter)
+            .field("salt", &"<16 bytes>")
+            .field("verifier", &"<redacted>")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors and read outcomes
 // ---------------------------------------------------------------------------
 
@@ -275,6 +358,27 @@ pub enum Entry {
     Foreign,
 }
 
+/// What the PIN slot holds, as [`NostrStore::read_pin`] reports it.
+///
+/// The same five-way split as [`Entry`], with two differences the record's
+/// role dictates: there is exactly one PIN slot, so no index is taken, and a
+/// tombstone here means "PIN cleared" rather than "identity deleted".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinEntry {
+    /// The slot is erased or its header failed its CRC — the no-PIN state.
+    Empty,
+    /// The slot holds a PIN record this device's key opens.
+    Live(NostrPinRecord),
+    /// The slot holds a committed delete — the PIN was cleared.
+    Tombstone,
+    /// The slot opens as ours but will not decode to a [`NostrPinRecord`].
+    /// US-1695's fail-closed case: the applet must treat this as
+    /// `pin_set` + locked, never as "no PIN".
+    Undecodable,
+    /// The slot holds a record some *other* domain wrote.
+    Foreign,
+}
+
 // ---------------------------------------------------------------------------
 // The store view
 // ---------------------------------------------------------------------------
@@ -342,6 +446,68 @@ impl<'r> NostrStore<'r> {
             Some(id) => Ok(Entry::Live(id)),
             None => Ok(Entry::Undecodable),
         }
+    }
+
+    /// The PIN slot's [`Slot`], refused when this *region* is too short to
+    /// hold it — the same short-region guard [`Self::slot_for`] applies, for
+    /// the same reason: the geometry is a claim about the shipping region.
+    ///
+    /// There is exactly one PIN slot and it takes no applet-side index; that
+    /// is the typed-apartness US-1690 asks for. Identity accessors go through
+    /// [`nostr_slot`], which cannot reach [`NOSTR_PIN_SLOT`] — it sits below
+    /// [`NOSTR_FIRST_SLOT`] — and this accessor never takes an index, so
+    /// `read_pin` on an identity index and `read` on the PIN slot are both
+    /// unreachable by construction.
+    fn pin_slot(&self) -> Result<Slot, NostrStoreError> {
+        let slot = nostr_pin_slot().ok_or(NostrStoreError::Fault(E_NO_PIN_SLOT))?;
+        if !holds_slot(self.region, slot) {
+            return Err(NostrStoreError::Fault(E_SHORT_REGION));
+        }
+        Ok(slot)
+    }
+
+    /// Read the PIN slot and open it, as a [`PinEntry`].
+    ///
+    /// The same open flow as [`Self::read`] — decode, domain check, AEAD
+    /// open, then the record's own codec — because the PIN record earns
+    /// nothing from a second code path and could lose the audit's fixes to
+    /// one. The AAD binds this slot's own index, so a PIN record replayed
+    /// into an identity slot (or the reverse) fails the AEAD, not just the
+    /// codec.
+    pub fn read_pin(&mut self) -> Result<PinEntry, NostrStoreError> {
+        let slot = self.pin_slot()?;
+        let raw = self.region.read_slot(slot).map_err(NostrStoreError::Fault)?;
+        let decoded = match record::decode(slot, &raw) {
+            SlotRead::Present(d) => d,
+            SlotRead::Absent => return Ok(PinEntry::Empty),
+            SlotRead::Fault(reason) => return Err(NostrStoreError::Fault(reason)),
+        };
+        if decoded.header().domain() != Domain::Nostr {
+            return Ok(PinEntry::Foreign);
+        }
+        let opened = match record::open(decoded.header(), self.key.as_bytes(), decoded.body()) {
+            SlotRead::Present(pt) => pt,
+            SlotRead::Absent | SlotRead::Fault(_) => return Ok(PinEntry::Undecodable),
+        };
+        let body = opened.as_slice();
+        if NostrPinRecord::is_tombstone(body) {
+            return Ok(PinEntry::Tombstone);
+        }
+        match NostrPinRecord::decode(body) {
+            Some(record) => Ok(PinEntry::Live(record)),
+            None => Ok(PinEntry::Undecodable),
+        }
+    }
+
+    /// Commit one [`NostrPinRecord`] to the PIN slot, through the same
+    /// occupancy guard [`Self::write`] uses. The guard's refusals carry over
+    /// unchanged: a foreign occupant in the PIN slot is
+    /// [`NostrStoreError::OccupiedForeign`], never a silent overwrite — the
+    /// stale-passkey lesson, applied to the slot custody lives in.
+    pub fn write_pin(&mut self, record: &NostrPinRecord) -> Result<CommitReport, NostrStoreError> {
+        let mut body = [0u8; NOSTR_PIN_BODY_LEN];
+        let n = record.encode(&mut body);
+        self.commit_body_at(self.pin_slot()?, &body[..n])
     }
 
     /// The occupancy guard (US-1641), in the design's fixed order, returning
@@ -462,7 +628,18 @@ impl<'r> NostrStore<'r> {
 
     /// The shared commit path: guard, seal, commit.
     fn commit_body(&mut self, index: u16, body: &[u8]) -> Result<CommitReport, NostrStoreError> {
-        let slot = self.slot_for(index)?;
+        self.commit_body_at(self.slot_for(index)?, body)
+    }
+
+    /// The shared commit path for an already-resolved slot: guard, seal,
+    /// commit. [`Self::commit_body`] is identity-indexed; [`Self::write_pin`]
+    /// reaches the PIN slot here, through the same guard, seal, and commit —
+    /// one commit path, not two.
+    fn commit_body_at(
+        &mut self,
+        slot: Slot,
+        body: &[u8],
+    ) -> Result<CommitReport, NostrStoreError> {
         let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
         let generation = self.admission(slot)?;
         let sealed = self.seal(slot, generation, body)?;
@@ -479,6 +656,11 @@ const E_NO_SCRATCHPAD: &str =
 /// The region handed to a [`NostrStore`] is shorter than the geometry.
 const E_SHORT_REGION: &str =
     "key region: the region is shorter than the slot the Nostr geometry names";
+
+/// The PIN slot could not be named — impossible on this geometry (the carve's
+/// assertions in `mod.rs` pin it inside the region), and named rather than
+/// `unwrap`ed for the same reason as [`E_NO_SCRATCHPAD`].
+const E_NO_PIN_SLOT: &str = "key region: the Nostr PIN slot is outside the region geometry";
 
 /// Whether `slot` is inside the region this view was handed.
 ///
@@ -502,6 +684,15 @@ pub const fn nostr_slot(index: u16) -> Option<Slot> {
     } else {
         None
     }
+}
+
+/// The PIN slot's [`Slot`], refusing nothing because there is nothing to
+/// refuse: the slot is a constant of the carve (US-1689), not a parameter of
+/// the call. That is the typed-apartness itself — an identity index cannot
+/// name this slot through [`nostr_slot`] (it sits below [`NOSTR_FIRST_SLOT`]),
+/// and a PIN access cannot name an identity slot because this takes no index.
+pub const fn nostr_pin_slot() -> Option<Slot> {
+    Slot::new(NOSTR_PIN_SLOT as u16)
 }
 
 /// The scratchpad slot commits stage through: the region's **shared** one,
@@ -535,6 +726,20 @@ const _: () = {
     assert!(
         NOSTR_FIRST_SLOT + NOSTR_SLOTS <= TOTAL_SLOTS,
         "Nostr's reservation must sit inside the region"
+    );
+    // The PIN record is strictly narrower than the identity body, so the slot
+    // bound sized from the identity needs no re-derivation for the PIN —
+    // assert rather than assume, the same rule as the identity body's own.
+    assert!(
+        NOSTR_PIN_BODY_LEN + RECORD_OVERHEAD <= NOSTR_RECORD_MAX as usize,
+        "the PIN record must fit the slot the region addresses without widening it"
+    );
+    // The typed-apartness: the PIN slot sits below the identity range, so
+    // `nostr_slot` cannot reach it and the two accessor families are disjoint
+    // by construction, not by discipline.
+    assert!(
+        NOSTR_PIN_SLOT < NOSTR_FIRST_SLOT,
+        "the PIN slot must sit below the identity range or the accessors overlap"
     );
 };
 
