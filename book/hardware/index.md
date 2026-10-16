@@ -8,7 +8,7 @@ The firmware pins four things, and a board on the market must match all of them:
 
 | Requirement | Why |
 |---|---|
-| **RP2350 microcontroller** | The whole security story — the OTP-derived store key, the bootrom's signed-boot support, the hardware TRNG — lives in the RP2350. An RP2040 (Pico 1, Pico 1 W) does not have any of it and cannot run this firmware. |
+| [**RP2350 microcontroller**](https://s.click.aliexpress.com/e/_c37D3YYz) | The whole security story — the OTP-derived store key, the bootrom's signed-boot support, the hardware TRNG — lives in the RP2350. An RP2040 (Pico 1, Pico 1 W) does not have any of it and cannot run this firmware. |
 | **4 MiB QSPI flash** | The flash map — app, keystore partition, dual-slot store — is laid out for 4096 KiB and the linker script is generated from that number. A different flash size means a different board file, not a tweak. |
 | **BOOTSEL wired the Pico 2 way** | Flashing happens through the bootrom's USB mass-storage bootloader; the button read as GPIO1 is what the device's own button input expects. |
 | **Activity LED on GPIO25** | The Pico 2's default LED pin — the touch prompts and status blinks drive it. |
@@ -25,7 +25,7 @@ Anything on the market with an RP2350 and 4 MiB flash is a candidate, not a prom
 
 ## Buying checklist
 
-- **RP2350**, not RP2040 — the Pico 2 family, or an RP2350 board from another maker that exposes BOOTSEL.
+- **RP2350**, not RP2040 — the Pico 2 family, or an RP2350 board from another maker that exposes BOOTSEL. Ref: [Buy in AliExpress](https://s.click.aliexpress.com/e/_c37D3YYz)
 - **4 MiB flash** on board.
 - A **BOOTSEL button** you can hold while plugging in.
 - USB-C or micro-USB, whatever the board carries — the firmware is transport-agnostic.
