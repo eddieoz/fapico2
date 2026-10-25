@@ -865,6 +865,14 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        // A bad index is wrong data (`6A80`, §2.2.0) — the same mapping
+        // `read_identity` gives every other idx-taking command — not an
+        // occupancy dispute, which would tell the user a nonexistent slot
+        // is "taken".
+        if p1 as u16 >= NOSTR_SLOTS as u16 {
+            write_sw(resp, SW_WRONG_DATA);
+            return;
+        }
         if self.gate_refuses(resp) {
             return;
         }
@@ -1293,9 +1301,6 @@ impl NostrApp {
         write_sw(resp, SW_OK);
     }
 
-    /// `DELETE_KEY` — P1 = idx; answers `npub(32)` naming what was
-    /// destroyed (§2.2: the host and the user learn *which* identity is
-    /// gone). Touch-gated; the slot becomes reusable (our own tombstone).
     /// `DELETE_KEY` — P1 = idx; a live slot answers the destroyed
     /// identity's `npub(32)` naming what was destroyed (D12), an
     /// undecodable slot answers with no body. The request carries no
@@ -1566,13 +1571,13 @@ impl NostrApp {
     /// fiction of "no PIN", with management `RESET` as the only recovery.
     fn verify_pin(
         &mut self,
-        _p1: u8, // the INS is the selector; P1/P2 are zeroes or the command is malformed
+        p1: u8, // the INS is the selector; P1/P2 are zeroes or the command is malformed
         p2: u8,
         data: &[u8],
         resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
     ) {
         use fapico2_platform::keyregion::nostr_store::PinEntry;
-        if p2 != 0x00 {
+        if p1 != 0x00 || p2 != 0x00 {
             write_sw(resp, SW_WRONG_P1_P2);
             return;
         }
@@ -1626,11 +1631,15 @@ impl NostrApp {
     /// *retreat*, never the dangerous direction.
     fn lock(
         &mut self,
-        _p1: u8, // zeroes; the INS is the whole instruction
-        _p2: u8,
+        p1: u8, // zeroes; the INS is the whole instruction
+        p2: u8,
         data: &[u8],
         resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
     ) {
+        if p1 != 0x00 || p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
         if !refuse_payload(data, resp) {
             return;
         }

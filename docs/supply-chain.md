@@ -20,14 +20,14 @@ Measured 2026-09-29, on `feat/rskey-adopt` at `288b682`.
 | | count | share |
 |---|---:|---:|
 | third-party crates cargo-vet sees | **377** | 100% |
-| carrying a third-party audit | **62** | **16.4%** |
+| carrying a third-party audit | **66** | **17.5%** |
 | partially audited | **1** | 0.3% |
-| self-declared exemptions | **314** | **83.3%** |
-| of the RP2350 device closure (278 third-party crates), audited | **41** | **14.7%** |
-| of the RP2350 device closure, exempt | **237** | 85.3% |
+| self-declared exemptions | **310** | **82.2%** |
+| of the RP2350 device closure (278 third-party crates), audited | **43** | **15.5%** |
+| of the RP2350 device closure, exempt | **235** | 84.5% |
 | SBOM components | **386** | the `cargo cyclonedx` component set for `fapico2-firmware`, cross-checked both ways against the locked graph |
 
-**None of the 314 exemptions has been read by a human on this project.** They
+**None of the 310 exemptions has been read by a human on this project.** They
 exist because `cargo vet init` wrote them, and that is the entire basis.
 
 16.6% is close to RS-Key's own figure (~17%, 243 self-granted exemptions

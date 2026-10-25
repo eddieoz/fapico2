@@ -909,7 +909,7 @@ fn complete_captured_openpgp<K: SecureStore>(
     let kenc = Zeroizing::new(ckey::pin_kenc2(sh, kbase_c, &session));
     let mut blob = Zeroizing::new([0u8; 76]);
     blob.copy_from_slice(&wrapper[1..]);
-    ckey::gcm_unwrap_serial_aad_pub(&kenc, sh, &mut blob[..])?;
+    ckey::gcm_unwrap_serial_aad(&kenc, sh, &mut blob[..])?;
     // US-917: the rewrite site — the decrypted C DEK is re-wrapped into
     // the AEAD record format before it is persisted. The legacy C record
     // shapes stay open-only (see the `ckey` module docs); the AAD binds
@@ -925,8 +925,13 @@ fn complete_captured_openpgp<K: SecureStore>(
 }
 
 fn is_openpgp_capture_fid(fid: u16) -> bool {
+    // The extras over `is_openpgp_migration_fid` are the C-side OpenPGP
+    // records that are re-seeded but carry no identity the applet serves
+    // from the classification: the PIN/PUK hash chain and the low admin
+    // DOs. The DEK set (0x1099..=0x109d) lives in the classification
+    // itself, so the PWPIV wrapper migrates with the rest.
     crate::cfs::is_openpgp_migration_fid(fid)
-        || matches!(fid, 0x1080..=0x1084 | 0x109d | 0x00e8..=0x00ed)
+        || matches!(fid, 0x1080..=0x1084 | 0x00e8..=0x00ed)
 }
 
 /// Detect + re-seed. Runs once on the boot path, before app spawn; every

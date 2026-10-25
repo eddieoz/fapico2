@@ -1140,7 +1140,7 @@ mod us1524_tests {
     fn the_emulator_builds_its_hid_state_from_the_shared_seam() {
         fn assert_shared(_: &HidServe<'_>, _: &PendingUp) {}
         let mut out = HeaplessVec::<u8, CTAP2_MAX_MSG>::new();
-        let mut srv = HidServe::new(emul_now_ms, &mut out);
+        let srv = HidServe::new(emul_now_ms, &mut out);
         assert_shared(&srv, &PendingUp::<{ fapico2_firmware::pending_up::PENDING_UP_PAYLOAD_MAX }>::new());
     }
 

@@ -1955,11 +1955,6 @@ pub(crate) mod tests {
             self.bus.lock().unwrap().sent.clone()
         }
 
-        /// The first message the device sent on `channel`, if any.
-        fn first_on(&self, channel: [u8; 4]) -> Option<Sent> {
-            self.sent().into_iter().find(|s| s.channel == channel)
-        }
-
         /// US-1506: the exact `(cmd, payload)` sequence a host reads on one
         /// channel. The frames, not a summary of them.
         fn frames_on(&self, channel: [u8; 4]) -> Vec<(u8, Vec<u8>)> {
@@ -3130,7 +3125,7 @@ pub(crate) mod tests {
         let chan_a = [0x00, 0x00, 0x00, 0x01];
         // One byte of CTAP2 opcode plus a body above the 1024 B static.
         let mut over = vec![0x01u8];
-        over.extend(core::iter::repeat(0x5A).take(PENDING_UP_PAYLOAD_MAX));
+        over.extend(core::iter::repeat_n(0x5A, PENDING_UP_PAYLOAD_MAX));
         assert!(
             over.len() > PENDING_UP_PAYLOAD_MAX,
             "the request must actually exceed the pinned bound"
@@ -3351,6 +3346,10 @@ pub(crate) mod tests {
             );
         }
 
+        /// What [`run`](Self::run) hands back: the frames the host read, the
+        /// gap before each KEEPALIVE, and whether the press was granted.
+        type Trace = (Vec<(u8, Vec<u8>)>, Vec<StdDuration>, bool);
+
         /// Drive a window open on `chan_a` with a `MakeCredential`, optionally
         /// grant it part way through, and return what the host saw.
         ///
@@ -3362,7 +3361,7 @@ pub(crate) mod tests {
             inject_after_open: Vec<(StdDuration, Vec<[u8; HID_REPORT_SIZE]>)>,
             grant_at: Option<StdDuration>,
             total: StdDuration,
-        ) -> (Vec<(u8, Vec<u8>)>, Vec<StdDuration>, bool) {
+        ) -> Trace {
             let bus = Arc::new(Mutex::new(Bus::default()));
             // Never granted up front: a grant before the window opens would mean
             // no window at all, which is not the sequence under test.

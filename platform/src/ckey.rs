@@ -466,6 +466,17 @@ impl OathSeal {
     ///
     /// `fid` is bound in so two credentials sealed at the same generation
     /// (one allocation pass covers the whole table) never share a nonce.
+    ///
+    /// **Recorded residual — the torn-record path can re-spend a nonce.**
+    /// `oath_store::current_generation` reads a corrupt or faulted record as
+    /// generation 0 (deliberately: refusing to write would strand the slot
+    /// forever), so the next write after corruption seals at generation 1 —
+    /// the same `(fid, 1)` nonce this key issued before, under the same
+    /// `kenc`, with a different plaintext: the GCM forbidden pair. Turning
+    /// that into an attack needs an earlier physical image of the slot plus
+    /// a later torn record on the same fid, which is why it is recorded
+    /// rather than fixed; the fix, if ever judged live, is a tombstone that
+    /// carries the generation forward instead of resetting it.
     pub fn nonce_for(&self, fid: u16, generation: u64) -> [u8; WRAP_NONCE_LEN] {
         let mut info = [0u8; OATH_NONCE_INFO_LEN];
         info[..OATH_NONCE_LABEL.len()].copy_from_slice(OATH_NONCE_LABEL);
@@ -643,19 +654,10 @@ fn aes256_cbc_decrypt(key: &[u8; KEY_LEN], iv: &[u8; IV_LEN], ct: &mut [u8]) {
     }
 }
 
-/// Public wrapper for [`gcm_unwrap_serial_aad`] (S-413-6 OpenPGP DEK flow).
-pub fn gcm_unwrap_serial_aad_pub(
-    kenc: &[u8; KEY_LEN],
-    serial_hash: &[u8; SERIAL_HASH_LEN],
-    blob: &mut [u8],
-) -> Result<(), CKeyError> {
-    gcm_unwrap_serial_aad(kenc, serial_hash, blob)
-}
-
 /// Unwrap a `decrypt_with_aad` payload (`[12 B nonce | ct | 16 B tag]`,
 /// AES-256-GCM, AAD = `pico_serial_hash`, `crypto_utils.c:117-148`).
 /// `version` selects PIN_KDF_V1/V2 kenc derivation.
-fn gcm_unwrap_serial_aad(
+pub fn gcm_unwrap_serial_aad(
     kenc: &[u8; KEY_LEN],
     serial_hash: &[u8; SERIAL_HASH_LEN],
     blob: &mut [u8],

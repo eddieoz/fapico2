@@ -539,17 +539,6 @@ impl Rig {
         self.write_at(StdDuration::ZERO, frames)
     }
 
-    /// Latch one press edge `at` after the drive started — a BOOTSEL
-    /// press on the board, `presence::emul_inject_press` on the host.
-    fn press_at(&mut self, at: StdDuration) -> &mut Rig {
-        let due = self.t0 + at;
-        self.scripters.push(std::thread::spawn(move || {
-            sleep_until(due);
-            presence::emul_inject_press();
-        }));
-        self
-    }
-
     /// Latch one press edge now.
     fn press_now(&mut self) -> &mut Rig {
         presence::emul_inject_press();

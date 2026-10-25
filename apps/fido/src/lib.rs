@@ -241,9 +241,6 @@ pub const CTAP1_VERSION: &str = "U2F_V2";
 /// Default max credential blob length (bytes).
 pub const DEFAULT_MAX_CRED_BLOB_LENGTH: usize = 32;
 
-/// Default max large blob size (bytes).
-pub const DEFAULT_MAX_LARGE_BLOB: usize = 1024 - 64;
-
 /// Default max number of credentials in list.
 pub const DEFAULT_MAX_CREDS_IN_LIST: usize = 19;
 

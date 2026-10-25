@@ -82,29 +82,6 @@ impl WindowedImageSource for StoreImageSource<'_> {
     }
 }
 
-/// [`WindowedImageSource`] over a borrowed byte slice — the loaded-image
-/// compare side (the host seam fns and the test harnesses).
-pub struct BufferImageSource<'a> {
-    img: &'a [u8],
-}
-
-impl<'a> BufferImageSource<'a> {
-    pub fn new(img: &'a [u8]) -> Self {
-        Self { img }
-    }
-}
-
-impl WindowedImageSource for BufferImageSource<'_> {
-    fn image_len(&self) -> usize {
-        self.img.len()
-    }
-    fn image_window(&self, off: usize, buf: &mut [u8]) -> usize {
-        let n = buf.len().min(self.img.len().saturating_sub(off));
-        buf[..n].copy_from_slice(&self.img[off..off + n]);
-        n
-    }
-}
-
 /// Materialize a windowed image (host / test only): pulls the whole image
 /// through bounded windows into a heap `Vec`. The device never calls this —
 /// it is the test-sink convenience that replaces the old whole-image

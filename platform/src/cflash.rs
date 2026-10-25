@@ -101,10 +101,15 @@ pub fn validate(start: u32, end: u32) -> Option<DataPartition> {
 }
 
 /// Apply the C 8 KB tail reservation to a validated region.
+///
+/// A partition that went through `validate` always has room
+/// (`MIN_DATA_REGION` is 16 KiB against the 8 KiB reservation); the
+/// saturating form is for a hand-built `DataPartition` with pub fields,
+/// where a wrapped `end` would name flash the reservation exists to protect.
 pub fn reserved(part: DataPartition) -> DataPartition {
     DataPartition {
         start: part.start,
-        end: part.end - TAIL_RESERVATION_BYTES,
+        end: part.end.saturating_sub(TAIL_RESERVATION_BYTES),
     }
 }
 
@@ -142,7 +147,7 @@ pub fn partition_location_word(flash: &[u8], partition: usize) -> Option<u32> {
         u32::from_le_bytes([flash[i * 4], flash[i * 4 + 1], flash[i * 4 + 2], flash[i * 4 + 3]])
     };
     let nwords = flash.len() / 4;
-    for i in 0..nwords {
+    'scan: for i in 0..nwords {
         if word(i) != PICOBIN_BLOCK_MARKER_START {
             continue;
         }
@@ -166,7 +171,10 @@ pub fn partition_location_word(flash: &[u8], partition: usize) -> Option<u32> {
         let mut j = i + 3;
         for p in 0..count {
             if j + 1 >= item_end {
-                break; // truncated block
+                // Truncated entry list: the requested index may have been in
+                // the cut-off tail, so this block proves nothing — skip it
+                // and keep scanning, same as the malformed-size case above.
+                continue 'scan;
             }
             let permissions_locations = word(j);
             let flags = word(j + 1);

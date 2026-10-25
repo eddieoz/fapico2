@@ -106,6 +106,21 @@ ignore = [
   # expansion), so it is not linked into the image, but it *is* in the graph
   # and is therefore declared rather than omitted.
   "RUSTSEC-2026-0173",
+  # RUSTSEC-2026-0387: `crypto-bigint` constant-time branches (subtraction,
+  # zero counting, division, Montgomery multiplication), fixed upstream only
+  # in 0.7.6+. The 0.7 line in our lock is bumped past it (0.7.9, which also
+  # carries the fixed `ctutils` per RUSTSEC-2026-0385). The two OLDER locked
+  # versions have no patched release in their own lines: 0.2.5 rides
+  # `der 0.4` / `elliptic-curve 0.10` and 0.5.5 rides `elliptic-curve 0.13`
+  # — three RustCrypto generations the workspace spans for trussed/opcard
+  # compatibility (see the `multiple-versions` note in [bans] below), and
+  # moving either is a cross-generation dependency migration, not a version
+  # bump. Accepted with eyes open like the `rsa` entry above: the exposed
+  # operations sit inside third-party curve arithmetic we do not call on
+  # secrets across a timing-observable boundary beyond what that stack
+  # already carries, but the honest label is "no patch exists for the
+  # versions we are pinned to", not "not affected".
+  "RUSTSEC-2026-0387",
 ]
 
 # ---------------------------------------------------------------------------

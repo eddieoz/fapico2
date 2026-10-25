@@ -240,6 +240,16 @@ pub const NOSTR_PIN_CARVE_SLOTS: u32 = SLOTS_PER_SECTOR;
 /// orphans — unreachable by FIDO's allocator, which stops at
 /// [`FIDO_SLOT_LIMIT`], and overwritten by nothing, which is the same
 /// fate US-1639's carve gave the credentials above its own cut.
+///
+/// **Recorded residual — an orphan can block the custody ceremony.** The
+/// reseat completion marker is written at the carve's first padding slot
+/// through the ordinary commit path, whose occupancy guard refuses a
+/// foreign record. A pre-carve FIDO orphan sitting exactly there makes the
+/// marker unwritable, so the ceremony migrates every identity and then can
+/// never complete — fail-closed, no silent overwrite, but permanent until
+/// the board is reset. Reachable only on an intermediate dev board that
+/// wrote its 849th passkey into the slot the marker now owns (the pre-carve
+/// range reached past it); no release image carries that layout.
 pub const NOSTR_PIN_PAD_SLOTS: u32 = NOSTR_PIN_CARVE_SLOTS - NOSTR_PIN_SLOTS;
 
 // ---------------------------------------------------------------------------
@@ -574,11 +584,9 @@ impl Slot {
     /// `pub(crate)` on purpose: address arithmetic is this module's business.
     /// An applet holding a `Slot` can compare it, order it and store it; it
     /// cannot turn it into an address without coming here.
-    // US-1573/US-1574 land the type before its first caller: the allocator
-    // (US-1543) and the host region (US-1541) are what turn a `Slot` into an
-    // address. `allow(dead_code)` is here so the shape can be committed and
-    // reviewed on its own — the alternative is a `#[allow]` added and removed
-    // by the same author who wrote the code it hides.
+    // `allow(dead_code)` because the only caller is arm-gated
+    // (`device_region.rs`); a host build would otherwise flag it. When a
+    // host caller ever appears, drop the allow — not before.
     #[allow(dead_code)]
     pub(crate) const fn offset(self) -> u32 {
         KEY_REGION_OFFSET + self.0 as u32 * FIDO_SLOT_BYTES

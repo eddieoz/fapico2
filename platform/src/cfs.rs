@@ -128,7 +128,7 @@ impl<'a, S: CFlashSource + ?Sized> Cfs<'a, S> {
     pub fn state(&self) -> CState {
         let r1 = self.read_u32_le(self.bounds.end_rom_pool);
         let r2 = self.read_u32_le(self.bounds.end_rom_pool + 4);
-        // C `file.c:365-380`: either word still erased/sentinel-valued means
+        // C `file.c:365-380`: both words still erased/sentinel-valued means
         // the persistent region was never initialized (or is corrupted) —
         // the "first initialization" case.
         if (r1 == 0xFFFF_FFFF || r1 == 0xEFEF_EFEF) && (r2 == 0xFFFF_FFFF || r2 == 0xEFEF_EFEF) {
@@ -246,9 +246,12 @@ impl CFlashSource for XipFlash {
 /// Physical roles come from authenticated PKOC descriptors, not prefixes:
 /// EB is both the slot-0 public and slot-1 private prefix. Preserve both
 /// generations, restricting physical containers to OpenPGP key IDs D1..D3.
+/// `0x1099..=0x109d` is the C `src/openpgp/files.h:40-44` DEK set in full —
+/// the legacy `EF_DEK` wrapper plus one per-PW variant (PW1, RC, PW3, PIV)
+/// — so a C board's PIV-PIN-wrapped DEK migrates with the rest of them.
 pub fn is_openpgp_migration_fid(fid: u16) -> bool {
     matches!(fid,
-        0x1081..=0x1083 | 0x1099..=0x109c |
+        0x1081..=0x1083 | 0x1099..=0x109d |
         0x10c1..=0x10c5 | 0x10d1..=0x10d6 |
         0x004f | 0x005b | 0x005e | 0x0093 | 0x0101..=0x0104 |
         0x00c1..=0x00c3 |
@@ -276,10 +279,13 @@ pub fn is_migratable_fid(fid: u16) -> bool {
         // Management EF_DEV_CONF.
         0x1122 => true,
         // OpenPGP PIN hashes (PW1/RC/PW3 + PIV PIN/PUK), admin data.
-        0x1080 | 0x1081 | 0x1082 | 0x1083 | 0x1184 | 0x1185 | 0xFF00 => true,
+        // 0x1081..=0x1083 are already covered by is_openpgp_migration_fid
+        // above; only the non-overlapping ids are listed here.
+        0x1080 | 0x1184 | 0x1185 | 0xFF00 => true,
         // OpenPGP public keys, binding signatures, DEK wrappers (legacy +
-        // per-PW), DO blobs.
-        0x10D1..=0x10D6 | 0x1099 | 0x109A..=0x109D => true,
+        // per-PW), DO blobs. 0x10D1..=0x10D6 and the whole DEK set
+        // (0x1099..=0x109D) are already covered by
+        // is_openpgp_migration_fid above.
         0x00E8..=0x00ED => true,
         // PIV certificates / retired key material (re-seed only; serving is
         // post-cutover).

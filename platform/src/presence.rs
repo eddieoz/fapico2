@@ -29,23 +29,13 @@ pub const PRESENCE_WINDOW_MS: u64 = 10_000;
 
 /// Source of physical user-presence presses. The device implementation
 /// (US-921) is the BOOTSEL button edge latch polled by the button task;
-/// host/emulation builds inject an auto-acking source (or, as mgmt does
-/// today, an `fn() -> bool` press poll) so existing suites stay green.
+/// host/emulation builds inject their own source (the emulator wires a
+/// closure that auto-acks inside the touch window; mgmt uses an
+/// `fn() -> bool` press poll) so existing suites stay green.
 pub trait PresenceSource {
     /// One poll: returns whether a press edge occurred since the last poll.
     /// Sources must not report a press for a poll that was already consumed.
     fn poll_press(&mut self) -> bool;
-}
-
-/// Host/emulation default source: auto-acks (reports a press whenever
-/// polled) — matches the pre-US-906 host behavior where presence was always
-/// granted outside the device build.
-pub struct AutoPresence;
-
-impl PresenceSource for AutoPresence {
-    fn poll_press(&mut self) -> bool {
-        true
-    }
 }
 
 /// An opaque presence grant: proof that a user pressed while *this* command

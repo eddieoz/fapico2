@@ -59,7 +59,6 @@ bespoke_required = [
   "opcard@1.8.0",
   "paste@1.0.15",
   "rand@0.8.8",
-  "rand_core@0.10.1",
   "rand_core@0.5.1",
   "rsa@0.9.10",
   "trussed-auth-backend@0.2.0",
@@ -120,17 +119,16 @@ bespoke_required = [
 "cosey@0.4.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers cosey 0.4.0. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "cpubits@0.1.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers cpubits 0.1.1. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "cpufeatures@0.2.17" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers cpufeatures 0.2.17. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
-"cpufeatures@0.3.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers cpufeatures 0.3.1. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "crc-any@2.5.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crc-any 2.5.1. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "critical-section@1.2.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers critical-section 1.2.0. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "crypto-bigint@0.2.5" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-bigint 0.2.5. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "crypto-bigint@0.5.5" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-bigint 0.5.5. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
-"crypto-bigint@0.7.5" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-bigint 0.7.5. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
+"crypto-bigint@0.7.9" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-bigint 0.7.9. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "crypto-common@0.1.7" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-common 0.1.7. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "crypto-common@0.2.2" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-common 0.2.2. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "crypto-mac@0.11.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers crypto-mac 0.11.0. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "ctr@0.9.2" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers ctr 0.9.2. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
-"ctutils@0.4.2" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers ctutils 0.4.2. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
+"ctutils@0.4.5" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers ctutils 0.4.5. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "curve25519-dalek-derive@0.1.1" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers curve25519-dalek-derive 0.1.1. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "curve25519-dalek@4.1.3" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers curve25519-dalek 4.1.3. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "darling@0.20.11" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers darling 0.20.11. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
@@ -193,7 +191,6 @@ bespoke_required = [
 "fixedbitset@0.5.7" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers fixedbitset 0.5.7. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "flexiber@0.2.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers flexiber 0.2.0. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "flexiber_derive@0.1.3" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers flexiber_derive 0.1.3. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
-"futures-core@0.3.34" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers futures-core 0.3.34. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "futures-sink@0.3.34" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers futures-sink 0.3.34. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "generator@0.7.5" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers generator 0.7.5. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "generic-array@0.14.7" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers generic-array 0.14.7. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
@@ -286,7 +283,6 @@ bespoke_required = [
 "pure-rust-locales@0.8.2" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers pure-rust-locales 0.8.2. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "r-efi@6.0.0" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers r-efi 6.0.0. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "rand@0.8.8" = "SELF-DECLARED, not human-reviewed. Reached by the shipped image only through host/test paths. The DEVICE RNG path is platform::trng (US-1005/US-1006), and check_rng_path.py enforces that no transport draws from the peripheral directly — again structural, not an audit of `rand` itself."
-"rand_core@0.10.1" = "SELF-DECLARED, not human-reviewed. rand_core 0.10, a fourth generation in the lock (see deny-graph.toml duplicate_crates)."
 "rand_core@0.5.1" = "SELF-DECLARED, not human-reviewed. rand_core 0.5 is the trait generation older ecosystem crates (curve25519-dalek, ctr) still expect; host/test paths only."
 "redox_syscall@0.5.18" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers redox_syscall 0.5.18. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "regex-automata@0.4.18" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers regex-automata 0.4.18. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
@@ -356,7 +352,6 @@ bespoke_required = [
 "thiserror@2.0.20" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers thiserror 2.0.20. It IS in the RP2350 device closure, so it is linked into the shipped image and is worth a human audit. See docs/supply-chain.md."
 "thread_local@1.1.10" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers thread_local 1.1.10. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "tracing-attributes@0.1.31" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers tracing-attributes 0.1.31. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
-"tracing-core@0.1.36" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers tracing-core 0.1.36. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "tracing-subscriber@0.3.23" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers tracing-subscriber 0.3.23. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "tracing@0.1.44" = "SELF-DECLARED, not human-reviewed: no imported third-party audit covers tracing 0.1.44. It is NOT in the RP2350 device closure (host / dev / build edges only), so it does not reach the shipped image. See docs/supply-chain.md."
 "trussed-auth-backend@0.2.0" = "SELF-DECLARED, not human-reviewed. The auth backend trussed-auth dispatches to; reached by the shipped image."

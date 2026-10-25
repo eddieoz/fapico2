@@ -871,7 +871,7 @@ impl Default for Ctap2Info {
             // S-701-1: the HID seam now really serves CTAPHID_MAX_MSG.
             max_msg_size: 7609,
             pin_protocols,
-            max_creds_in_list: Some(19),
+            max_creds_in_list: Some(crate::DEFAULT_MAX_CREDS_IN_LIST),
             max_cred_id_len: Some(128),
             transports,
             algorithms,
