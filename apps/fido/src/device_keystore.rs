@@ -1519,6 +1519,13 @@ pub struct DeviceKeystore {
     /// it the same question), and the other one's window is simply unused — which
     /// is what keeps the applet from needing a second field to choose between
     /// them.
+    ///
+    /// **No mutable accessor on purpose (US-1562).** One would let a caller
+    /// record a pending value the store never learned about, and the next bump
+    /// would then sign *above* a value that was never written — a counter that
+    /// skips rather than repeats, which passes every test and is wrong in the
+    /// only direction FIDO cares about once the window is spent. Every mutation
+    /// goes through [`Self::bump_credential_counter`].
     pub(crate) counter_window: CounterWindow,
 }
 
@@ -2631,19 +2638,6 @@ impl DeviceKeystore {
         self.counter_unpersisted = 0;
     }
 
-    /// US-1562: this device's batched signature-counter window over the key
-    /// region.
-    ///
-    /// **Read-only on purpose.** A mutable accessor would let a caller record a
-    /// pending value the store never learned about, and the next bump would then
-    /// sign *above* a value that was never written — which is a counter that
-    /// skips rather than repeats, so it would pass every test here and be wrong
-    /// in the only direction FIDO cares about once the window is spent. Every
-    /// mutation goes through [`RegionCredentials::bump_credential_counter`].
-    pub fn region_counter_window(&self) -> &CounterWindow {
-        &self.counter_window
-    }
-
     pub fn get_credential(&self, id: &[u8]) -> Option<&DeviceCredential> {
         self.credentials.iter().find(|c| c.credential_id.as_slice() == id)
     }
@@ -3115,11 +3109,6 @@ impl CounterWindow {
     /// saturation is not a deployment.
     pub const fn resume_from(durable: u32) -> u32 {
         durable.saturating_add(Self::RESTORE_SLACK)
-    }
-
-    /// Did this session begin as a restore from the durable image?
-    pub const fn is_restore(&self) -> bool {
-        self.restore
     }
 
     /// US-1012's "grant" half, applied **here** rather than left to the caller.
@@ -4364,13 +4353,6 @@ pub enum MigrationOutcome {
     /// from the snapshot and every command keeps working.
     Deferred(&'static str),
 }
-
-/// The reason string for "there is no region to migrate into".
-///
-/// A named constant so a log line and a test can match it, and so the
-/// unreachable-region case is distinguishable from a flash that is failing.
-pub const E_MIGRATION_NO_REGION: &str =
-    "fido: no key region to migrate the snapshot into (not installed, or not yet released)";
 
 /// The reason string for "there is no store to migrate out of".
 ///

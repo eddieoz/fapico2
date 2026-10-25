@@ -879,19 +879,6 @@ pub trait RescueDeviceHandler {
     fn set_secure_boot(&mut self, key_index: u8, lock: bool) -> Sw;
 }
 
-/// The `0x0B` enabled-interface mask, or the value the applet reports for a
-/// record that has none.
-///
-/// A device that has never been written has no mask, and the honest report for
-/// "no mask configured" is **not** `0x00` — a zero mask is the value
-/// `vendor41` refuses unconditionally (`apps/fido/src/vendor41.rs:1409-1415`)
-/// and the one §7 of the threat model is about. Reporting `USB_ITF_CCID` for an
-/// unconfigured record says "CCID is on", which is both true on this firmware
-/// (the CCID interface is compiled in and enumerated today) and the only value
-/// that keeps the client's read-modify-write writing a mask the device will
-/// then accept.
-pub const UNCONFIGURED_USB_ITF: u8 = USB_ITF_CCID;
-
 /// The tags a Rescue `WRITE` can apply, ascending — and the only records
 /// `READ PhyConfig` emits.
 ///

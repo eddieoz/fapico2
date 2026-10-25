@@ -498,14 +498,16 @@ mod tests {
         // The load-bearing relationship: a ladder pulse must stay far below the
         // 500 ms heartbeat on-time, or "parked before USB" and "alive but
         // USB-dead" stop being one glance apart.
-        assert!(
-            PULSE_ON_US < 500_000,
-            "a pulse must not be mistakable for the heartbeat's 500 ms on-time"
-        );
-        assert!(
-            PULSE_ON_US * 4 < 500_000,
-            "and must stay well clear of it, not merely under it"
-        );
+        const {
+            assert!(
+                PULSE_ON_US < 500_000,
+                "a pulse must not be mistakable for the heartbeat's 500 ms on-time"
+            );
+            assert!(
+                PULSE_ON_US * 4 < 500_000,
+                "and must stay well clear of it, not merely under it"
+            );
+        }
     }
 
     /// The frozen-board readings the docs promise, as an executable table.

@@ -346,9 +346,11 @@ pub mod heap {
         rebuild_v2(&entries)
     }
 
-    /// The v2→v3 migration (US-915 boot rule): seal a CRC-valid v2 image
+    /// The v2→v3 migration shape behind US-915: seal a CRC-valid v2 image
     /// into v3. Refuses anything that does not validate as v2 — a forged
-    /// slot never re-seeds into the new format.
+    /// slot never re-seeds into the new format. Host tests are the caller
+    /// today; the boot path enforces the same rule through the streaming
+    /// reader, not through this whole-image form.
     pub fn migrate_v2_image(v2: &[u8], key: &[u8; 32]) -> AeadResult<Vec<u8>> {
         crate::secure_store::partition_image_len(v2).ok_or(SecureStoreError::Corrupt)?;
         seal_image(v2, key)

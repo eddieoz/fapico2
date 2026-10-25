@@ -307,11 +307,6 @@ impl ManagementApp {
         self
     }
 
-    /// US-702: whether the stored config carries the config lock.
-    pub fn is_config_locked(&self) -> bool {
-        self.locked
-    }
-
     /// Boot (US-388): load the persisted `EF_DEV_CONF` from the platform
     /// secure store (the RP2350 secure partition on device). A fresh or
     /// corrupt partition boots to the factory-default configuration. There

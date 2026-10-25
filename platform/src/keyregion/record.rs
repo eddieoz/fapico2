@@ -758,11 +758,6 @@ impl DecodedRecord {
         &self.body
     }
 
-    /// Take the sealed body, for handing to [`open`].
-    pub fn into_body(self) -> Sealed {
-        self.body
-    }
-
     /// Header + body length; where this record's padding begins.
     pub fn len(&self) -> usize {
         self.len

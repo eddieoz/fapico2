@@ -218,6 +218,14 @@ fn generate_refuses_an_occupied_index() {
     let (data, _) = call(&mut app, &apdu(fapico2_nostr::INS_GET_INFO, 0, 0, &[]));
     assert_eq!(data[6], 1);
 
+    // An out-of-range index is wrong data (`6A80`) — `read_identity`'s
+    // mapping for every other idx-taking command, not an occupancy dispute
+    // that would call a nonexistent slot "taken".
+    let (_, sw) = call(&mut app, &apdu(INS_GENERATE_KEY, 8, 0, &[]));
+    assert_eq!(sw, 0x6A80, "one past the set is bad data");
+    let (_, sw) = call(&mut app, &apdu(INS_GENERATE_KEY, 0xFF, 0, &[]));
+    assert_eq!(sw, 0x6A80, "the one-byte idx ceiling too");
+
     let (_, sw) = call(&mut app, &apdu(INS_GENERATE_KEY, 5, 0, &[]));
     assert_eq!(sw, SW_OK, "a free index still generates");
     std::fs::remove_file(path).ok();

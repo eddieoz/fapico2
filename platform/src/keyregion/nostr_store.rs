@@ -664,6 +664,16 @@ impl<'r> NostrStore<'r> {
         self.commit_body(index, TOMBSTONE)
     }
 
+    /// US-1701: the PIN record's destination on a factory wipe — a
+    /// tombstone through the same durable commit path a delete uses
+    /// (OATH's `self.pin = None` in `reset_state`, made durable). Reads
+    /// back as [`PinEntry::Tombstone`]: the board is PIN-less, and the
+    /// slot is reusable by `write_pin` like any committed record.
+    pub fn clear_pin(&mut self) -> Result<CommitReport, NostrStoreError> {
+        let slot = self.pin_slot()?;
+        self.commit_body_at(slot, TOMBSTONE)
+    }
+
     /// Tombstone `index` bypassing the occupancy guard — the repair path
     /// for a slot whose record carries our domain tag but will not open
     /// (`Entry::Undecodable`, F-A5 in `docs/nostr-presence-audit.md`). The
@@ -676,16 +686,6 @@ impl<'r> NostrStore<'r> {
     /// decode leaves nothing to advance past and the tombstone commits at
     /// generation 1. A fault-class decode (the region itself is failing)
     /// is refused, never papered over.
-    /// US-1701: the PIN record's destination on a factory wipe — a
-    /// tombstone through the same durable commit path a delete uses
-    /// (OATH's `self.pin = None` in `reset_state`, made durable). Reads
-    /// back as [`PinEntry::Tombstone`]: the board is PIN-less, and the
-    /// slot is reusable by `write_pin` like any committed record.
-    pub fn clear_pin(&mut self) -> Result<CommitReport, NostrStoreError> {
-        let slot = self.pin_slot()?;
-        self.commit_body_at(slot, TOMBSTONE)
-    }
-
     pub fn force_tombstone(&mut self, index: u16) -> Result<CommitReport, NostrStoreError> {
         let slot = self.slot_for(index)?;
         let scratchpad = scratchpad_slot().ok_or(NostrStoreError::Fault(E_NO_SCRATCHPAD))?;
@@ -1047,11 +1047,6 @@ impl NostrRegion {
             Some(_) => self.store().reseat_via_window(),
             None => Err(NostrStoreError::Fault(E_NO_RESEAT_WINDOW)),
         }
-    }
-
-    /// Whether the dual-KDF read window is open.
-    pub fn legacy_window_open(&self) -> bool {
-        self.legacy.is_some()
     }
 
     /// Close the window without touching the medium (US-1714). The region

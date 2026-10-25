@@ -66,9 +66,6 @@ const SW_INCORRECT_P1P2: Sw = 0x6A86;
 const SW_REFERENCE_NOT_FOUND: Sw = 0x6A88;
 const SW_PIN_BLOCKED: Sw = 0x6983;
 const SW_DATA_INVALID: Sw = 0x6984;
-// Data-object format errors (US-373+); part of the C `apdu.h` SW set.
-#[allow(dead_code)]
-const SW_CONDITIONS_NOT_SATISFIED: Sw = 0x6985;
 const SW_SECURITY_STATUS_NOT_SATISFIED: Sw = 0x6982;
 
 // PIV algorithm ids (C `piv.c` — note the pico numbering: AES128 = 0x08,

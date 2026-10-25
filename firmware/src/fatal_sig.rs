@@ -363,10 +363,12 @@ mod tests {
             assert_eq!(pulses[1], Pulse { on: !LIT, us: PREAMBLE_GAP_US });
             let longest = pulses.iter().map(|p| p.us).max().unwrap();
             assert_eq!(longest, PREAMBLE_US, "{reason:?} preamble is not the longest pulse");
-            assert!(
-                PREAMBLE_US > 3 * BIT_LIT_US,
-                "the preamble must be unmistakably longer than a bit"
-            );
+            const {
+                assert!(
+                    PREAMBLE_US > 3 * BIT_LIT_US,
+                    "the preamble must be unmistakably longer than a bit"
+                );
+            }
         }
     }
 

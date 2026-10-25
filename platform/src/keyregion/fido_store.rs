@@ -97,18 +97,16 @@
 //! [`FidoAllocator`] exists for that one reason and is otherwise
 //! [`record::RecordOccupancy`] plus a bound: there is exactly **one** occupancy
 //! rule in this store — the codec's, which reads the generation out of the
-//! header, so per-slot monotonicity survives a power cycle — and this type only
-//! adds `slot.index() < FIDO_SLOT_LIMIT` to it.
+//! header, so a rewrite of a *readable* record is monotonic across a power
+//! cycle — and this type only adds `slot.index() < FIDO_SLOT_LIMIT` to it.
+//! A slot whose header was destroyed (torn commit, abandoned erase) re-enters
+//! at generation 1; see [`FidoAllocator::alloc`] for that residual.
 //!
 //! # Footprint
 //!
 //! One [`SlotImage`](super::slotmap::SlotImage) (1 KiB) at a time while writing
 //! an index page, plus the caller's [`CredentialWindow`] (838 B) on a read.
 //! **Zero `.bss`**: [`FidoRecordStore`] has one field, the region borrow.
-
-extern crate alloc;
-
-use alloc::vec;
 
 use super::commit::{self, CommitError, CommitPlan, CommitReport, Recovery};
 use super::crypto::{IndexKey, KeyDomain, PayloadKey};
@@ -434,26 +432,37 @@ impl core::fmt::Display for FidoStoreError {
 // The allocator
 // ---------------------------------------------------------------------------
 
-/// Lowest free FIDO slot, at the next generation for it.
+/// Lowest free FIDO slot, at generation 1.
 ///
 /// The bound is the whole reason this is not [`SlotAllocator`](super::slotmap::SlotAllocator)
-/// — see the module docs. The generation rule is **not** reimplemented: it reads
-/// the record header through [`record::RecordOccupancy`], the same rule the read
-/// path uses, so "occupied" and "at what generation" cannot come to mean two
-/// different things inside one store.
+/// — see the module docs. Occupancy is [`record::RecordOccupancy`], the same
+/// rule the read path uses, so "occupied" cannot come to mean two different
+/// things inside one store.
 ///
-/// **The high-water table is not cached across operations.** Caching it would
-/// mean holding it across calls on a `&mut dyn KeyRegion`, and this store is
-/// deliberately stateless — that is what buys "never latching dirty state". The
-/// cost is a bounded re-scan per allocation: at most [`FIDO_SLOT_LIMIT`] header
-/// reads, and a *slot image* read is what `KeyRegion::read_slot` returns, so
-/// this is [`FIDO_SLOT_LIMIT`] × 1 KiB of reads on a full region (848 KiB). It
-/// is paid once per enrolment, off the boot path (S8/S9).
+/// **This allocator is stateless, so it cannot remember a generation for a
+/// slot whose header no longer parses.** A free slot issues generation 1 —
+/// virgin or destroyed-header alike. Monotonicity holds where the header is
+/// readable: rewrites and deletes go through `record_generation`, which reads
+/// the header and adds 1, and that survives a power cycle. The residual is the
+/// torn path: a slot that served generation N and then lost its header
+/// (abandoned commit, interrupted erase) is re-allocated at generation 1, and
+/// an attacker holding an earlier physical image of that slot could replay the
+/// generation-N record into it. The recorded backstop is the index —
+/// [`IndexEntry::generation`] is MAC-bound over `(domain, slot, generation)` —
+/// but no call path reads that field to decide anything today (see the
+/// "Named honestly" note in this module's docs). Seeding the floor from the
+/// index is the fix if that residual is ever judged live; it is not done here,
+/// because it is a mechanism and `AGENTS.md` §5 asks for the attack to be
+/// measured before one is added.
+///
+/// The cost is a bounded scan per allocation: at most [`FIDO_SLOT_LIMIT`]
+/// header reads, and a *slot image* read is what `KeyRegion::read_slot`
+/// returns, so this is [`FIDO_SLOT_LIMIT`] × 1 KiB of reads on a full region
+/// (848 KiB). It is paid once per enrolment, off the boot path (S8/S9).
 pub struct FidoAllocator;
 
 impl FidoAllocator {
-    /// The lowest free slot in `[0, FIDO_SLOT_LIMIT)`, and the generation its
-    /// record must carry.
+    /// The lowest free slot in `[0, FIDO_SLOT_LIMIT)`, at generation 1.
     ///
     /// Generation `0` never appears: a virgin slot's first write is generation 1,
     /// so a record claiming 0 is one this allocator did not issue — and
@@ -466,22 +475,14 @@ impl FidoAllocator {
     /// US-1573's hazard in its most expensive form, and `slotmap.rs` refuses it
     /// for the same reason.
     pub fn alloc(region: &mut dyn KeyRegion) -> Result<Allocation, FidoStoreError> {
-        let mut high_water = vec![0u32; FIDO_SLOT_LIMIT as usize];
         let mut index = FIDO_FIRST_SLOT;
         while index < FIDO_SLOT_LIMIT {
             let slot = fido_slot_at(index)?;
             let raw = region
                 .read_slot(slot)
                 .map_err(FidoStoreError::RegionUnreadable)?;
-            if RecordOccupancy.occupied(&raw) {
-                if let Some(g) = RecordOccupancy.generation(&raw) {
-                    high_water[index as usize] = g;
-                }
-            } else {
-                let generation = high_water[index as usize]
-                    .checked_add(1)
-                    .ok_or(FidoStoreError::Full)?;
-                return Ok(Allocation { slot, generation });
+            if !RecordOccupancy.occupied(&raw) {
+                return Ok(Allocation { slot, generation: 1 });
             }
             index += 1;
         }

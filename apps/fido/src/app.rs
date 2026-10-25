@@ -333,6 +333,12 @@ struct GaState {
     large_blob_key: bool,
 }
 
+/// The host twin's credMgmt enumeration page size (FX-411): how many
+/// credentials one `enumerateCredentials` begin..next walk serves before
+/// the state is dropped. Deliberately not the advertised `maxCredsInList`
+/// ([`crate::DEFAULT_MAX_CREDS_IN_LIST`], 19) — that CTAP 2.1 field bounds
+/// a getAssertion allowList, not this pagination, and no reachable store
+/// comes near either number.
 const MAX_CREDENTIAL_COUNT_IN_LIST: usize = 64;
 
 /// Maximum size of the committed large-blob array (FX-414; matches the
@@ -3120,7 +3126,12 @@ impl<K: Keystore> FidoApp<K> {
         if creds.is_empty() {
             return vec![Ctap2Response::NoCredentials.code()];
         }
-        // Cap the response batch at maxCredsInList (FX-411 pagination).
+        // Cap the enumeration page (FX-411 pagination). This is the host
+        // twin's internal page size, NOT the getInfo-advertised
+        // `maxCredsInList` (DEFAULT_MAX_CREDS_IN_LIST, 19) — that field is
+        // CTAP 2.1's bound on a getAssertion allowList, a different thing,
+        // and the two numbers are deliberately not synced. The cap is a
+        // belt: no reachable store holds more credentials than pages here.
         creds.truncate(MAX_CREDENTIAL_COUNT_IN_LIST);
         let total = creds.len();
         let cred = &creds[0];

@@ -946,7 +946,7 @@ mod tests {
         let answer: Option<Vec<u8>> = wire
             .iter()
             .find(|r| r[..4] == b && r[4] == CTAP_HID_CBOR | 0x80)
-            .map(|r| payload_of(r));
+            .map(payload_of);
         assert_eq!(
             answer,
             Some(vec![0xBB]),
@@ -1139,7 +1139,7 @@ mod tests {
         let init_answer: Vec<u8> = dev
             .iter()
             .find(|r| r[..4] == BROADCAST && r[4] == CTAP_HID_INIT | 0x80)
-            .map(|r| payload_of(r))
+            .map(payload_of)
             .unwrap_or_else(|| {
                 panic!("the broadcast INIT was not answered; wire was {}", describe(&dev))
             });
@@ -1152,14 +1152,14 @@ mod tests {
         assert_eq!(
             dev.iter()
                 .find(|r| r[..4] == b && r[4] == CTAP_HID_CBOR | 0x80)
-                .map(|r| payload_of(r)),
+                .map(payload_of),
             Some(vec![0xBB]),
             "the cross-channel getInfo must be answered on its own channel"
         );
         assert_eq!(
             dev.iter()
                 .find(|r| r[..4] == a && r[4] == CTAP_HID_CBOR | 0x80)
-                .map(|r| payload_of(r)),
+                .map(payload_of),
             Some(vec![0xAA, 0x01]),
             "the latched press completes the parked command on the parked \
              command's channel"

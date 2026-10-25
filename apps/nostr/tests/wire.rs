@@ -599,3 +599,39 @@ fn verify_set_lock_map_to_pin_ins() {
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&path2).ok();
 }
+
+/// The PIN verbs' P1/P2 shape is zeroes-or-malformed, **enforced**: a
+/// nonzero parameter byte answers `6A86` before anything is read or
+/// consumed. The malformed VERIFY below carries the *correct* PIN — a
+/// shape refusal that had run the verify leg would burn a retry and answer
+/// `63CX` instead — and the closing row proves the budget is intact.
+#[test]
+fn pin_verbs_refuse_nonzero_p1_p2() {
+    use fapico2_nostr::{INS_LOCK, INS_SET_PIN, INS_VERIFY_PIN, SW_WRONG_P1_P2};
+
+    let path = region_path("pin-verb-shape");
+    std::fs::remove_file(&path).ok();
+    let mut app = NostrApp::boot(fixture_region(&path));
+
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK);
+
+    // Malformed VERIFY: P1 is idx on this wire (F-A8) and these verbs take
+    // no index, so a nonzero one is malformed — correct PIN notwithstanding.
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 1, 0, PIN_BYTES));
+    assert_eq!(sw, SW_WRONG_P1_P2, "a nonzero P1 is malformed, not an index");
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0xFF, PIN_BYTES));
+    assert_eq!(sw, SW_WRONG_P1_P2);
+
+    // LOCK is the whole instruction: any parameter byte is malformed.
+    let (_, sw) = call(&mut app, &apdu(INS_LOCK, 1, 0, &[]));
+    assert_eq!(sw, SW_WRONG_P1_P2);
+    let (_, sw) = call(&mut app, &apdu(INS_LOCK, 0, 1, &[]));
+    assert_eq!(sw, SW_WRONG_P1_P2);
+
+    // Nothing was consumed: the well-formed verify still opens the session
+    // with the full retry budget intact.
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0, 0, PIN_BYTES));
+    assert_eq!(sw, SW_OK, "the shape refusals burned no retry");
+    std::fs::remove_file(&path).ok();
+}
