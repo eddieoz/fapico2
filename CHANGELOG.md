@@ -7,6 +7,28 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.3.1] — 2026-10-25
+
+Released as [`fapico2-release-alpha-v0.3.1`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.3.1);
+full notes in [`docs/release-notes-alpha-v0.3.1.md`](docs/release-notes-alpha-v0.3.1.md).
+
+### Fixed — the code-review hardening (PR #20)
+
+- **The FIDO allocator's inert generation table deleted**; the docs now state
+  the honest generation rule, and the torn-record re-entry residual is
+  recorded with its backstop.
+- **Wire-shape corrections**: `GENERATE_KEY` answers an out-of-range index
+  `6A80` (not `6A84`), and `VERIFY_PIN`/`LOCK` enforce P1 = P2 = 0 as their
+  dialect docs specified — both verified against every sender in
+  fapico2-nostr-extension before tightening.
+- **RUSTSEC-2026-0385/0387 cleared** where a patch exists
+  (`crypto-bigint` 0.7.9, `ctutils` 0.4.5); the unpatchable older
+  generations accepted in `deny.toml` with the reason written out.
+- Dead code removed across `platform/`, `apps/` and `firmware/`; two latent
+  boot-path bugs fixed (`cflash::reserved` underflow, the partition-table
+  scan aborting on a truncated block); comment rot corrected; three security
+  residuals recorded next to the code they describe.
+
 ## [0.3.0] — 2026-10-15
 
 Released as [`fapico2-release-alpha-v0.3.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.3.0);
