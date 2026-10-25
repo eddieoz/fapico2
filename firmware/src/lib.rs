@@ -89,7 +89,7 @@ pub const TASK_ARENA_DEMAND_B: usize = 14_344;
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "a04e0f41eddc8ade157a236e687608cae9d7a80b90b4ab455b6b96ce9ae81402";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "ffbad0e8d69c6d44437e86ece27df7ac049c3103ab736e99e8cee3f06496cc76";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).
