@@ -281,6 +281,92 @@ fn re_allocated_slot_starts_its_counter_clean() {
     );
 }
 
+/// **A reset clears the whole window — a wiped region owns no pending counters.**
+///
+/// `authenticatorReset` (`device_core.rs::handle_reset` →
+/// `wipe_region_credentials`) erases every FIDO record, but until this story it
+/// never touched the applet's [`CounterWindow`]. A reset that catches pending
+/// batched entries leaves stale `(slot, counter)` pairs for slots the wiped
+/// region no longer has. US-1728's clear-on-reuse only retires the entry of the
+/// slot the *next enrolment re-uses*; an entry for any other slot survives, and
+/// `flush_counters` `?`-propagates `write_counter`'s `NoSuchCredential` on it —
+/// so every later flush fails, every bump past the batch budget rolls back, and
+/// the reply repeats a counter the RP has already seen.
+///
+/// The fixture is the DEVICE TWIN (`region_boot::Device` driving
+/// `process_ctap2` over `HostTrng`/`HostSecureStore`), because the window lives
+/// in the applet's keystore and the defect is in the reset command path, not in
+/// `RegionCredentials`. The batching shape is
+/// `region_assertion_counter.rs`'s: the first assertion of a session is the
+/// durable write (the restore slack is spent there), later ones batch.
+#[test]
+fn reset_clears_pending_counters_so_later_flushes_do_not_wedge() {
+    let _guard = region_boot::lock();
+    let _region_file = region_boot::install("us1728-reset");
+    let mut device = region_boot::Device::boot(region_boot::keyed_store());
+    device.grant_presence_always();
+    device.set_pin(b"123456");
+    assert!(device.persist(), "the PIN write must reach the secure store");
+
+    // Two credentials on two RPs — two slots, so a post-reset enrolment (which
+    // re-uses only the lowest freed slot) cannot clear both stale entries.
+    for (rp, user) in [("reset-a.test", &b"user-1"[..]), ("reset-b.test", b"user-2")] {
+        let (status, cbor) = device.make_cred(rp, user);
+        assert_eq!(status, 0x00, "makeCredential into the region for {rp}: {cbor:02x?}");
+    }
+
+    // First assertion of the session is the durable write; every later one
+    // batches into the window. Two per RP leave a pending `(slot, counter)`
+    // entry for BOTH slots when the reset lands.
+    for rp in ["reset-a.test", "reset-b.test"] {
+        let (status, body) = device.get_assertion(rp, None);
+        assert_eq!(status, 0x00, "the first assertion on {rp} must be served: {body:02x?}");
+        let (status, body) = device.get_assertion(rp, None);
+        assert_eq!(status, 0x00, "the batched assertion on {rp} must be served: {body:02x?}");
+    }
+
+    // authenticatorReset (0x07) — with both entries pending.
+    let (status, body) = device.call(0x07, &[]);
+    assert_eq!(status, 0x00, "authenticatorReset must succeed: {body:02x?}");
+
+    // The reset cleared the PIN; re-establish a session for the new enrolment.
+    device.set_pin(b"87654321");
+    let (status, cbor) = device.make_cred("reset-c.test", b"user-3");
+    assert_eq!(status, 0x00, "a fresh enrolment after a reset: {cbor:02x?}");
+
+    // **The observed RED failure mode**: the enrolment above is refused with
+    // `CTAP2_ERR_KEY_STORE_FULL`. A resident makeCredential runs
+    // `delete_all_by_id` as its overwrite pre-pass, and that helper flushes the
+    // window FIRST — the stale entry fails `write_counter` with
+    // `NoSuchCredential`, the flush maps to `Unreachable`, the pre-pass sets
+    // `overwrite_ok = false`, and the enrolment is refused on a wiped,
+    // half-empty device. (The GA loop below is the second half of the same
+    // wedge: had the enrolment gone through, every later flush would fail the
+    // same way and each bump would roll back onto a counter the RP has seen.)
+    //
+    // After the fix the enrolment goes through and the counters advance
+    // monotonically across the batching boundary.
+    let mut last = 0u32;
+    for i in 0..48 {
+        let (status, assertion) = device.get_assertion("reset-c.test", None);
+        assert_eq!(status, 0x00, "post-reset assertion {i} must be served: {assertion:02x?}");
+        let auth_data =
+            region_boot::bstr_at(&assertion, 2).expect("a getAssertion reply carries authData");
+        assert!(auth_data.len() >= 37, "authData must carry rpIdHash + flags + signCount");
+        let counter =
+            u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+        assert!(
+            counter > last,
+            "the signCount must advance monotonically across the batching boundary after a reset; \
+             assertion {i} repeated {counter} (the previous assertion signed {last}). A repeat is \
+             the wedged flush: a stale pending entry for a slot the wiped region no longer holds \
+             fails every later `flush_counters`, and the bump rolls back onto a value the RP has \
+             already seen"
+        );
+        last = counter;
+    }
+}
+
 /// **The clear is per-slot, and the batching contract survives it.**
 ///
 /// Two tenants are in flight when one slot is reused: the reused slot's entry
