@@ -37,11 +37,23 @@ const CTAP2_ERR_INVALID_COMMAND: u8 = 0x01;
 /// Minimal no_std FIDO authenticator: TRNG-derived P-256 `hkey` + a real
 /// `getInfo`. All command handlers return the matching error byte until the
 /// US-387/US-388 keystore lands.
-/// Pending getAssertion enumeration state (S-701-4): remaining credential
-/// IDs served one-per-getNextAssertion on the same channel.
+/// Pending getAssertion enumeration state (S-701-4): remaining credentials
+/// served one-per-getNextAssertion on the same channel.
 pub struct DeviceGaState {
-    pub(crate) remaining: heapless::Vec<heapless::Vec<u8, 64>, { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
+    /// US-1723: each entry carries **the slot its record was resolved from**
+    /// alongside the ID. The first assertion and every `getNextAssertion` open
+    /// that slot directly (`device_core.rs::build_assertion`), so the record
+    /// that signs is the record the match step / discovery enumeration found —
+    /// never a by-ID re-fetch, which with duplicate same-ID records can answer
+    /// a different record (analysis §2/O2) and past 16 FIDO entries cannot
+    /// answer the matched one at all (analysis §5 hazard 2). `None` for a
+    /// snapshot credential — the snapshot arm has no slots.
+    pub(crate) remaining: heapless::Vec<(heapless::Vec<u8, 64>, Option<fapico2_platform::keyregion::Slot>), { crate::device_keystore::MAX_PENDING_CREDENTIAL_IDS }>,
     pub(crate) client_data_hash: [u8; 32],
+    /// US-1723: the request's `rp_id_hash`, carried so the pending
+    /// assertions re-verify the opened record against the *request* before
+    /// signing — the fail-closed invariant restated at every signing site.
+    pub(crate) rp_id_hash: [u8; 32],
     pub(crate) uv: bool,
     pub(crate) do_up: bool,
     pub(crate) total: usize,
