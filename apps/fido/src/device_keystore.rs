@@ -4230,9 +4230,14 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
             // credential forever. Re-enrolment, not migration, is what reclaims
             // a tombstoned slot.
             //
-            // The slot itself is discarded: the answer is a yes/no, and the
-            // migration never overwrites an existing slot — it lets the
-            // allocator choose, so a first run and a re-run take one path.
+            // The slot itself is discarded: the answer is a yes/no. US-1727
+            // changed what the caller does with "yes" — the migration now
+            // follows a `true` with `load_by_id_at` over the same locator and
+            // compares the record's key with the snapshot's, retiring only
+            // when they are identical and replacing the record when they are
+            // not — but the probe's own contract is unchanged: it answers
+            // whether a live record with this ID is durable, and never
+            // overwrites anything itself.
             SlotRead::Present(_) => SlotRead::Present(!is_deleted_body(window.as_slice())),
             SlotRead::Absent => SlotRead::Present(false),
             SlotRead::Fault(why) => SlotRead::Fault(why),
@@ -4259,6 +4264,11 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
     /// delete never needs the plaintext and the private key never sits in a
     /// buffer across a sector erase.
     fn find_slot(&mut self, credential_id: &[u8]) -> Result<Slot, RegionCredentialError> {
+        // None-RP is deliberate (US-1725 fold-in): the credential ID derives
+        // from (rp_id_hash, user_handle), so a same-ID record under a
+        // different RP would be a hash collision no getAssertion could serve
+        // for this RP either — the same argument device_core's MC overwrite
+        // carries for its RP-qualified carry.
         let probe = CredentialIdProbe { credential_id };
         let mut locator = fido_store::CredentialIdLocator::new(
             &self.keys.index,
@@ -4371,7 +4381,10 @@ pub enum MigrationOutcome {
     Retired {
         /// Records written by *this* run.
         migrated: u32,
-        /// Credentials that were already durable — the re-run case, below.
+        /// Credentials whose **identical copy** was already durable — the
+        /// re-run case. US-1727: a same-ID record bound to a different key is
+        /// not this; it is a collision, and the migration replaces it
+        /// (counting under `migrated`) rather than retiring against it.
         already_present: u32,
         /// Credentials removed from the snapshot. Equal to
         /// `migrated + already_present` when the retirement landed.
@@ -4458,6 +4471,23 @@ pub const E_MIGRATION_STORE_FAILED: &str =
 /// migration idempotent in the one sense that matters, and it needs no
 /// per-credential progress marker: the region is the progress marker.
 ///
+/// # US-1727 — "already present" is not the whole answer
+///
+/// The probe asks about an **ID**, and an ID in the region can name either the
+/// identical copy a previous run made durable or — the pre-epic drift shape
+/// (`docs/audits/2026-10-30-wrong-key-assertion-drift.md` §5.3) — a record
+/// sealed under a different key. Retiring the snapshot copy against the second
+/// kind destroyed a credential that had never been copied; the analysis calls
+/// that answer *correct for idempotence and catastrophic for drift*. So a
+/// `true` from the probe is now only half the decision: the record the probe
+/// resolved is opened and its key compared with the snapshot's. Equal ⇒ retire,
+/// exactly as before. Different ⇒ the snapshot credential never made it, and
+/// the run writes it over the colliding record
+/// ([`RegionCredentials::update_credential`], in place — one record and one
+/// index entry still name the ID) before retiring it. The counter of the
+/// surviving record is `max(snapshot, region)` — US-1722's carry rule — so the
+/// replace cannot move the RP's observed sequence backwards.
+///
 /// The cost is `SNAPSHOT_MAX_CREDS × entries` AEAD operations on a device that
 /// is mid-migration, and **nothing at all** afterwards, because the steady
 /// state is [`MigrationOutcome::AlreadyMigrated`] and returns before a region
@@ -4490,6 +4520,54 @@ pub const E_MIGRATION_STORE_FAILED: &str =
 /// `boot::release_key_region()` runs — the region is not even reachable there.
 /// The device calls it from `process_ctap2_with_store`, which is by
 /// construction after `RUNG_USB`.
+/// The record US-1727's drift arm writes over the colliding one: the snapshot
+/// credential itself, with one field taken from the record it supersedes — a
+/// counter that must not regress.
+///
+/// [`DeviceCredential`] has no `Clone` (US-1550: a `Clone` of a credential is
+/// a `Clone` of a key), so the copy is spelled out. Every field comes from
+/// `snapshot` — the pre-region source of truth, per the epic's newest-wins
+/// rule — because the record being replaced is, by that same ruling, the
+/// artifact and none of its content is authoritative. The one exception is the
+/// counter, which is `max(snapshot, existing)`: US-1722's carry rule, taken
+/// over intact. The carry exists because a signCount that moves backwards is
+/// the clone-detection signal whatever the reason for the replace, and the RP
+/// may have accepted counters from either record.
+///
+/// The scalar goes through [`PrivateScalar::copy_out`] — the sanctioned
+/// duplication, whose result clears itself when this value drops.
+///
+/// `existing` is `None` when the region's record would not decode as a
+/// credential: a body that opens but is not a credential has no counter to
+/// carry, so the snapshot's own stands.
+fn replacement_record(
+    existing: Option<&DeviceCredential>,
+    snapshot: &DeviceCredential,
+) -> DeviceCredential {
+    let counter = existing.map_or(snapshot.counter, |e| e.counter.max(snapshot.counter));
+    DeviceCredential {
+        credential_id: snapshot.credential_id.clone(),
+        public_key: snapshot.public_key,
+        private_key: snapshot.private_key.copy_out(),
+        rp_id_hash: snapshot.rp_id_hash,
+        rp_id: snapshot.rp_id.clone(),
+        user_handle: snapshot.user_handle.clone(),
+        user_name: snapshot.user_name.clone(),
+        user_display_name: snapshot.user_display_name.clone(),
+        cred_protect: snapshot.cred_protect,
+        large_blob_key: snapshot.large_blob_key,
+        hmac_secret: snapshot.hmac_secret.clone(),
+        cred_blob: snapshot.cred_blob.clone(),
+        third_party_payment: snapshot.third_party_payment,
+        pin_complexity_policy: snapshot.pin_complexity_policy,
+        resident: snapshot.resident,
+        algorithm: snapshot.algorithm,
+        counter,
+        revoked: snapshot.revoked,
+        expires_at: snapshot.expires_at,
+    }
+}
+
 pub fn migrate_snapshot_to_region(
     region: &mut dyn KeyRegion,
     keys: &RegionKeys,
@@ -4523,9 +4601,87 @@ pub fn migrate_snapshot_to_region(
             // absent, and re-write it).
             let rp_id_hash = ks.credentials[i].rp_id_hash;
             match creds.contains_credential(&rp_id_hash, &credential_id) {
-                // Found: a previous, interrupted run already made this one
-                // durable. Counting it is what makes a re-run idempotent.
-                SlotRead::Present(true) => already_present += 1,
+                // Found: a record with this ID is durable. US-1727 — that is
+                // not yet "already migrated", because the answer cannot tell
+                // WHICH credential the record is.
+                //
+                // The analysis (`docs/audits/2026-10-30-wrong-key-assertion-drift.md`
+                // §5.3) records why: the `already_present` answer was **correct
+                // for idempotence and catastrophic for drift**. Same ID, same
+                // key ⇒ the identical copy a previous, interrupted run made
+                // durable — retiring the snapshot copy is what makes a re-run
+                // idempotent. Same ID, DIFFERENT key ⇒ the pre-epic drift
+                // shape: the ID is deterministic, the region's record was
+                // sealed under a different random key, so the snapshot
+                // credential has never been copied — and retiring it without a
+                // copy destroys the only one the user has. The private key is
+                // the whole distinction.
+                //
+                // The discrimination re-opens the record the probe resolved
+                // (the same `CredentialIdLocator`, so the same newest-wins
+                // choice US-1724 made binding) and compares identity:
+                // rp_id_hash, credential_id, user_handle and the private key.
+                // The counter is deliberately not compared — it is mutable (a
+                // deferred run's retirement can be interrupted by an
+                // assertion against the region copy, which bumps only the
+                // region's counter), and a counter difference is not a
+                // different credential.
+                SlotRead::Present(true) => {
+                    let mut window = CredentialWindow::new();
+                    match creds.load_by_id_at(Some(&rp_id_hash), &credential_id, &mut window) {
+                        SlotRead::Present(slot) => {
+                            let existing = credential_from_record_body(window.as_slice());
+                            let same_identity = existing.as_ref().is_some_and(|existing| {
+                                existing.credential_id == ks.credentials[i].credential_id
+                                    && existing.rp_id_hash == ks.credentials[i].rp_id_hash
+                                    && existing.user_handle == ks.credentials[i].user_handle
+                                    && existing.private_key == ks.credentials[i].private_key
+                            });
+                            if same_identity {
+                                already_present += 1;
+                            } else {
+                                // The snapshot record never made it.
+                                // Copy-with-replace over the resolved record:
+                                // `update_credential` rewrites the slot in
+                                // place, so no second record and no second
+                                // index entry ever names this ID. The body is
+                                // the snapshot credential — the pre-region
+                                // source of truth, newest-wins, the same rule
+                                // the rest of the epic runs on — with one
+                                // field taken from the record it supersedes:
+                                // a counter that must not regress
+                                // (`replacement_record`, US-1722's carry
+                                // rule).
+                                let replacement = replacement_record(
+                                    existing.as_ref(),
+                                    &ks.credentials[i],
+                                );
+                                if creds.update_credential(&nonce(), slot, &replacement).is_err()
+                                {
+                                    // **No retirement, and no partial
+                                    // application** — the same discipline as
+                                    // the `put` arm below. The snapshot is
+                                    // untouched, so every credential on it is
+                                    // still the store.
+                                    return MigrationOutcome::Deferred(E_MIGRATION_STORE_FAILED);
+                                }
+                                migrated += 1;
+                            }
+                        }
+                        // The probe answered "present" and this walk cannot
+                        // resolve the record. Same locator machinery, so this
+                        // is the region moving under the run — fail closed
+                        // exactly as the probe's own fault arm does.
+                        SlotRead::Absent | SlotRead::Fault(_) => {
+                            return MigrationOutcome::Deferred(E_MIGRATION_STORE_FAILED);
+                        }
+                    }
+                }
+                // Not found — or found as a tombstone, which `contains_credential`
+                // maps here (its comment carries the reason a tombstone must read
+                // as absent and not strand the snapshot's copy). The write is a
+                // fresh `put`: the allocator chooses, so a first run and a re-run
+                // take one path.
                 SlotRead::Present(false) => {
                     if creds.put(&nonce(), &ks.credentials[i]).is_err() {
                         // **No retirement, and no partial application.** The
