@@ -24,14 +24,16 @@
 //! and asserts `backend() == KeyRegion` first, because a snapshot-backed run
 //! would mask the defect by construction.
 //!
-//! # Why two scenarios are `#[ignore]`
+//! # The two re-registration scenarios
 //!
-//! They are the diagnosis pinned as code, not failures awaiting a fix in this
-//! story: US-1719 is forbidden from fixing anything. They must stay red until
-//! US-1721/US-1722 land, and the pinned-assertion failure is *the defect
-//! itself* — the signature verifies under K1, the oldest record. The ignore
-//! message names the stories that will turn them green; run them with
-//! `--ignored` to see the reproduction.
+//! They were `#[ignore]`d as the diagnosis pinned as code — US-1719 was
+//! forbidden from fixing anything, and the pinned-assertion failure *was* the
+//! defect itself. US-1721 (deterministic resident keys — either duplicate
+//! signs identically) and US-1722 (CTAP 2.1 §6.1.3 overwrite — the
+//! re-registration replaces the same-ID record, so credMgmt lists exactly
+//! one) landed the fix, and both scenarios now run un-ignored as the
+//! standing regression guard: both request shapes must keep serving the
+//! newest (and only) record.
 //!
 //! # The signed message
 //!
@@ -244,21 +246,19 @@ fn boot_pinned_device(tag: &str) -> (MutexGuardOf, InstalledRegion, Device) {
 /// readable (the guard must be bound, not dropped, for the whole test body).
 type MutexGuardOf = std::sync::MutexGuard<'static, ()>;
 
-/// **US-1719 scenario 1 — RED until US-1721/US-1722.**
+/// **US-1719 scenario 1 — the pinned contract, now enforced.**
 ///
 /// Two registrations for the same (rp, user.id) mint K1 and K2 under the same
 /// derived credential ID; a getAssertion pinned to that ID must sign under
 /// **K2** (the newest registration — CTAP 2.1 §6.1.3 overwrite semantics,
-/// which the region backend does not implement) and credMgmt must list
-/// **exactly one** credential for the RP.
+/// US-1722) and credMgmt must list **exactly one** credential for the RP.
 ///
-/// Today the signature verifies under **K1** — the oldest same-ID record wins
-/// the first-match lookup — and credMgmt lists two. That failure *is* the
-/// diagnosed defect (`docs/audits/2026-10-30-wrong-key-assertion-drift.md`
-/// §1), reproduced without hardware; the panic message says so in those
-/// words.
+/// With US-1721's deterministic keys K1 and K2 are the same key, so the
+/// signature check alone cannot discriminate the records — the load-bearing
+/// half here is the `totalCredentials == 1` assertion, which is what the
+/// overwrite (US-1722) delivers. If the signature ever verifies under neither
+/// key the scenario fails loudly rather than guessing.
 #[test]
-#[ignore = "RED until US-1721/US-1722 (EPIC FIDO-RESIDENT-DRIFT)"]
 fn pinned_assertion_after_reregistration_signs_with_the_newest_registrations_key() {
     let (_guard, _region, mut device) = boot_pinned_device("us1719-pinned");
 
@@ -285,12 +285,10 @@ fn pinned_assertion_after_reregistration_signs_with_the_newest_registrations_key
         // the capacity half of the contract still has to hold.
     } else if verifies_under(k1x, k1y, &signed, &sig_der) {
         panic!(
-            "RED — the diagnosed defect \
-             (docs/audits/2026-10-30-wrong-key-assertion-drift.md §1): the pinned \
-             assertion verified under registration #1's key (K1, the OLDEST same-ID \
-             record), not under the newest registration's key (K2). Re-registration \
-             is shadowed by the first-match index lookup, and a key the RP never \
-             registered for this credential ID is signing."
+            "the pinned assertion verified under registration #1's key (K1, the OLDEST \
+             same-ID record), not under the newest registration's key (K2): the overwrite \
+             (US-1722) must replace the same-ID record so only K2's record survives \
+             (docs/audits/2026-10-30-wrong-key-assertion-drift.md §1)"
         );
     } else {
         panic!(
@@ -314,18 +312,15 @@ fn pinned_assertion_after_reregistration_signs_with_the_newest_registrations_key
     );
 }
 
-/// **US-1719 scenario 2 — part of the pinned contract; may be green today.**
+/// **US-1719 scenario 2 — part of the pinned contract.**
 ///
 /// The same two registrations, but the getAssertion carries an **empty**
 /// allowList (discovery). Discovery enumerates the RP's credentials
-/// newest-first (`device_core.rs:1750-1755`), so this may already verify
-/// under K2 — the analysis §2/O1 explains why the app saw a *correct* key on
-/// its immediate post-registration probe while every pinned probe drifted.
-/// It is pinned anyway, ignored on the same schedule: the story's contract is
-/// that *both* request shapes serve the newest record, and if it is green
-/// today it must stay green through the fix.
+/// newest-first (`device_core.rs:1750-1755`), so this could already verify
+/// under K2 pre-fix (analysis §2/O1) — the story's contract is that *both*
+/// request shapes serve the newest record, and it is pinned for both. It runs
+/// un-ignored since US-1721/US-1722, as the standing guard.
 #[test]
-#[ignore = "RED until US-1721/US-1722 (EPIC FIDO-RESIDENT-DRIFT)"]
 fn discovery_after_reregistration_also_serves_the_newest_record() {
     let (_guard, _region, mut device) = boot_pinned_device("us1719-discovery");
 
@@ -343,15 +338,13 @@ fn discovery_after_reregistration_also_serves_the_newest_record() {
     signed.extend_from_slice(&CHALLENGE);
 
     if verifies_under(k2x, k2y, &signed, &sig_der) {
-        // Newest-first discovery — the observed behaviour today (analysis
-        // §2/O1) and the required behaviour after the fix.
+        // Newest-first discovery and the post-fix overwrite agree: the
+        // newest — and only — record serves.
     } else if verifies_under(k1x, k1y, &signed, &sig_der) {
         panic!(
-            "RED — discovery served the OLDEST registration's key (K1). Discovery \
-             *selects* newest-first (device_core.rs:1750-1755), but build_assertion's \
-             by-ID re-fetch (device_core.rs:1859) re-resolves that ID to the first \
-             index-order match — the oldest same-ID record — so both request shapes \
-             collapse onto K1. See docs/audits/2026-10-30-wrong-key-assertion-drift.md §2."
+            "discovery served the OLDEST registration's key (K1). The overwrite \
+             (US-1722) must replace the same-ID record so only the newest survives; \
+             see docs/audits/2026-10-30-wrong-key-assertion-drift.md §2."
         );
     } else {
         panic!(

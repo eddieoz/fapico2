@@ -1555,13 +1555,30 @@ impl FidoApp {
         // SOAK-FINDING-1: transactional capacity — with the store bound, the
         // registration (counter bump included, per FX-409 the persisted
         // counter covers it) commits only if the resulting snapshot still
-        // SOAK-FINDING-1: transactional capacity — with the store bound, the
-        // registration (counter bump included, per FX-409 the persisted
-        // counter covers it) commits only if the resulting snapshot still
-        // persists; on failure everything rolls back and the command answers
-        // CTAP2_ERR_KEY_STORE_FULL with zero side effects.
+        // persists; on failure the snapshot mutation is rolled back and the
+        // command answers CTAP2_ERR_KEY_STORE_FULL. US-1722's overwrite is
+        // the one exception to "zero side effects": on the region path a put
+        // that fails after the overwrite's tombstones committed leaves the
+        // old same-ID records deleted (compacted away) and no new one
+        // written — bounded, reviewed, and preferred over the inverse
+        // ordering, which would re-create the duplicate on a delete failure
+        // after a successful put.
         let counter_before = self.keystore.cred_counter;
         self.keystore.cred_counter = counter_before.wrapping_add(1);
+
+        // US-1722: the signCount the RESPONSE reports. On a plain registration
+        // this is the fresh global counter, exactly as before; when the
+        // registration REPLACES an existing same-ID record (below), it becomes
+        // the carried counter and the response's authData is patched after the
+        // store arm. A signCount below values the RP has already accepted for
+        // this ID is the clone-detection signal — on the very operation that
+        // was supposed to remove the duplicate — so the replacement reports
+        // the counter it carried, and the first assertion after it signs
+        // carried + 1. The host twin's `app.rs` carries the same way — it
+        // captures the prior counter at its own MC call site and patches its
+        // response's authData before signing (`the_host_twin_also_carries_
+        // the_counter_on_a_resident_replace` in `tests/mc_overwrite.rs`).
+        let mut reported_count = sign_count;
 
         // US-1563: **the region is the credential store when one is reachable**,
         // and this is the line that makes the measured boundary reachable at
@@ -1576,16 +1593,74 @@ impl FidoApp {
         // bounded pool draw, which can fail and is therefore mapped rather than
         // assumed. Twelve bytes is a counter's worth of entropy against a
         // birthday bound nobody will reach in 848 writes.
-        let stored: Result<(), ()> = if rkeys.is_some() {
-            let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
-            self.draw_random(&mut nonce);
-            self.with_region(rkeys.as_ref(), |creds| creds.put(&nonce, &cred).map(|_| ()))
-                .map(|r| r.map_err(|_| ()))
-                .unwrap_or(Err(()))
+        let stored: Result<(), ()> = if let Some(keys) = rkeys.as_ref() {
+            // US-1722 — CTAP 2.1 §6.1.3: a makeCredential for a DISCOVERABLE
+            // credential replaces the existing same-ID record. US-1721 made
+            // the duplicates harmless signature-wise; this is the half that
+            // stops them accumulating (one slot per re-registration, of 844)
+            // and stops credMgmt enumerating them. The delete runs HERE —
+            // strictly after the exclude, UP/UV and token gates above, so it
+            // inherits them by construction — and strictly before the `put`,
+            // so the replacement takes the reclaimed slot. RP-qualified
+            // lookup is correct for the carry: the ID derives from
+            // (rp_id_hash, user_handle), so any same-ID record for THIS RP is
+            // found; a same-ID record under a different RP would be a hash
+            // collision no getAssertion could serve for this RP either, and
+            // the delete itself is by-ID (the same machinery credMgmt
+            // deleteCredential uses). See `delete_all_by_id` — the one
+            // "delete this credential" primitive, shared with credMgmt so
+            // the two can never diverge on what that means.
+            let mut overwrite_ok = true;
+            if resident {
+                match self.delete_all_by_id(keys, Some(&rp_id_hash), &cred_id) {
+                    Ok((removed, carried)) if removed > 0 => {
+                        // The carried counter replaces the fresh one this
+                        // registration started from: the surviving ID signs
+                        // carried + 1 next, continuing the sequence the RP
+                        // has already accepted.
+                        cred.counter = carried;
+                        reported_count = carried;
+                    }
+                    Ok(_no_live_match) => {}
+                    Err(_refused) => {
+                        // Fail closed: an overwrite that could not complete
+                        // must not fall through to `put`, or a sick region
+                        // that later resurfaces the old record leaves the
+                        // duplicate this story exists to remove.
+                        overwrite_ok = false;
+                    }
+                }
+            }
+            if overwrite_ok {
+                let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+                self.draw_random(&mut nonce);
+                self.with_region(Some(keys), |creds| creds.put(&nonce, &cred).map(|_| ()))
+                    .map(|r| r.map_err(|_| ()))
+                    .unwrap_or(Err(()))
+            } else {
+                Err(())
+            }
         } else {
-            match store {
-                Some(store) => self.keystore.store_credential_checked(cred, store),
-                None => self.keystore.store_credential(cred),
+            // The snapshot twins (`store_credential`/`store_credential_checked`
+            // here, the host twin's `MemoryKeystore` behind the trait) replace
+            // by ID in place. The device snapshot carry lives at this call
+            // site (read before the store, applied to the record and the
+            // response below); the host twin mirrors it at its own MC call
+            // site in `app.rs`. The first assertion after a replace signs
+            // carried + 1.
+            let prior_counter =
+                self.keystore.get_credential(cred_id.as_slice()).map(|c| c.counter);
+            let replaced = match store {
+                Some(store) => self.keystore.store_credential_checked(cred, store).is_ok(),
+                None => self.keystore.store_credential(cred).is_ok(),
+            };
+            if replaced {
+                if let Some(carried) = prior_counter {
+                    reported_count = carried;
+                }
+                Ok(())
+            } else {
+                Err(())
             }
         };
         if stored.is_err() {
@@ -1597,6 +1672,14 @@ impl FidoApp {
             // nothing readable as a credential.
             self.keystore.cred_counter = counter_before;
             return Err(err(Ctap2Response::KeyStoreFull));
+        }
+        // US-1722: a replace registration reports the carried counter in its
+        // own authData (bytes 33..37 — rpIdHash(32) + flags(1) precede the
+        // fixed-width BE counter), so the RP's stored value continues the
+        // sequence instead of jumping to the fresh global one and then
+        // dropping back on the first assertion.
+        if reported_count != sign_count {
+            auth_data[33..37].copy_from_slice(&reported_count.to_be_bytes());
         }
 
         // Response: {1: "packed", 2: authData, 3: {alg, sig}} — packed
@@ -3051,6 +3134,21 @@ const CM_ENUMERATE_CREDS_NEXT: u8 = 0x05;
 const CM_DELETE_CRED: u8 = 0x06;
 const CM_UPDATE_USER: u8 = 0x07;
 
+/// Why [`FidoApp::delete_all_by_id`] refused to finish (US-1722).
+///
+/// Both arms mean "fail closed" at the makeCredential overwrite call site —
+/// CTAP2_ERR_KEY_STORE_FULL — but they are named apart so the next consumer
+/// (credMgmt deleteCredential, US-1726) can map them differently without
+/// unwinding the shared helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteAllByIdError {
+    /// More live duplicates than the store can hold — a delete that reported
+    /// success without removing, the loop's pathological-image guard.
+    Overrun,
+    /// The region could not be read or written.
+    Unreachable,
+}
+
 /// Identify the dialect of a credentialManagement request body.
 ///
 /// A pre-scan of the top-level map's *types* only. PicoForge's key `0x02` is
@@ -3945,6 +4043,107 @@ impl FidoApp {
                 Ok(())
             }
             _ => Err(err(Ctap2Response::InvalidCommand)),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // US-1722: the one "delete this credential" primitive
+    // ------------------------------------------------------------------
+
+    /// Deletes every live region record carrying `credential_id`. Returns
+    /// `(removed, carried)` — how many records were removed, and the highest
+    /// signature counter any of them carried (`0` when none).
+    ///
+    /// Used by makeCredential's overwrite (US-1722, CTAP 2.1 §6.1.3) and by
+    /// credMgmt deleteCredential (US-1726) so the two can never diverge on
+    /// what "delete this credential" means. The shape is the nonce-supplier
+    /// adaptation of the brief's sketch: a delete loop commits one tombstone
+    /// record per duplicate, and `record::seal` requires a unique nonce per
+    /// write (GCM nonce reuse is catastrophic), so a single
+    /// `[u8; NONCE_LEN]` cannot serve a loop — the helper draws per iteration
+    /// from the applet's bounded pool (`take_random`) instead of taking one
+    /// nonce.
+    ///
+    /// # The counter carry
+    ///
+    /// `carried` is the max of the *effective* counters across the deleted
+    /// duplicates, effective meaning pending-window-aware
+    /// ([`RegionCredentials::counter_value`]): the batched window
+    /// ([`CounterWindow`]) holds values the RP has already seen that are not
+    /// durable yet, and carrying only the durable counter would regress the
+    /// surviving ID to a value below what was signed. The window is flushed
+    /// FIRST — every signed counter made durable before any record that
+    /// carries it is removed — which also means no stale pending entry
+    /// outlives its record: an entry left pointing at a deleted slot would
+    /// wedge the next flush on the tombstone (or, after compaction, on the
+    /// erased slot) and could overwrite whichever credential occupies the
+    /// slot next.
+    ///
+    /// # Bound and failure
+    ///
+    /// The loop is capped just past `DEVICE_MAX_CREDS` iterations; each
+    /// iteration removes one record or the loop returns, so exceeding the cap
+    /// means a delete that reports success without removing — fail closed
+    /// ([`DeleteAllByIdError::Overrun`]) rather than spin. A region read or
+    /// write fault is [`DeleteAllByIdError::Unreachable`]. Both map to
+    /// CTAP2_ERR_KEY_STORE_FULL at the makeCredential call site; they are
+    /// named apart so the next consumer (US-1726) can map them differently
+    /// without unwinding the shared helper. Compaction runs per deleted
+    /// record's sector through [`RegionCredentials::compact`], which checks
+    /// both of `is_fido_slot`'s bounds (the 3cf0b56 lesson: a one-bound test
+    /// once cost an OATH credential).
+    pub(crate) fn delete_all_by_id(
+        &mut self,
+        keys: &crate::device_keystore::RegionKeys,
+        rp_id_hash: Option<&[u8; 32]>,
+        credential_id: &[u8],
+    ) -> Result<(usize, u32), DeleteAllByIdError> {
+        use fapico2_platform::keyregion::{on_demand, SlotRead};
+        let Self { keystore, rng_pool, rng_cursor, .. } = self;
+        // The nonce closure holds the pool while the region store holds the
+        // window — the borrow discipline `bump_sign_counter` documents: a
+        // method call taking `&mut self` would claim the whole app and forbid
+        // exactly this.
+        let mut next_nonce = || {
+            let mut n = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
+            take_random(rng_pool, rng_cursor, &mut n);
+            n
+        };
+        let region = crate::device_app::key_region().ok_or(DeleteAllByIdError::Unreachable)?;
+        let mut creds = crate::device_keystore::RegionCredentials::new(region, keys);
+        // Signed counters become durable before any record carrying them is
+        // removed (see the counter-carry note above).
+        creds
+            .flush_counters(&mut keystore.counter_window, &mut next_nonce)
+            .map_err(|_| DeleteAllByIdError::Unreachable)?;
+        let mut window = on_demand::CredentialWindow::new();
+        let mut removed = 0usize;
+        let mut carried = 0u32;
+        loop {
+            if removed > crate::device_keystore::DEVICE_MAX_CREDS {
+                return Err(DeleteAllByIdError::Overrun);
+            }
+            match creds.load_by_id_at(rp_id_hash, credential_id, &mut window) {
+                SlotRead::Present(slot) => {
+                    let effective = creds
+                        .counter_value(&keystore.counter_window, slot)
+                        .map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    carried = carried.max(effective);
+                    let report = creds
+                        .delete(&next_nonce(), credential_id)
+                        .map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    // The compaction half — a tombstone is a record, so its
+                    // slot stays off the free list until its sector is
+                    // rewritten without it. Skipping it here would leak one
+                    // slot per overwrite (AGENTS.md §5: capacity is a
+                    // security property).
+                    let sector = fapico2_platform::keyregion::commit::sector_base(report.slot);
+                    creds.compact(sector).map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    removed += 1;
+                }
+                SlotRead::Absent => return Ok((removed, carried)),
+                SlotRead::Fault(_) => return Err(DeleteAllByIdError::Unreachable),
+            }
         }
     }
 
