@@ -192,23 +192,29 @@ rather than fixed, for the same reason.
 when a design choice trades simplicity for protection, take the simpler one —
 unless you can name the attack the complexity stops.**
 
-The device's storage is where this bites hardest, and it has already cost real
-capability. Keys for FIDO and OATH share one 24-entry `Rp2350SecureStore`
-(`secure_store.rs`, `DEV_MAX_ENTRIES = 24`), so each applet gets roughly half
-what it needs: **4 resident FIDO credentials** on a device whose `text` is 800 KB
-of a 4 MiB chip. Every credential write rewrites every credential, one corrupt
-byte costs the whole set, and `DEVICE_MAX_CREDS = 12` was never reachable —
-`other_slots + 2 × parts ≤ 24`, not the 5,952 B payload the constant's own
-comment cites. None of that was a security decision. It was three storage
-backends accreted without a common shape.
+The device's storage is where this bit hardest, and it cost real capability
+before it was replaced. FIDO and OATH once shared one 24-entry
+`Rp2350SecureStore` (`secure_store.rs`, `DEV_MAX_ENTRIES = 24`), so each
+applet got roughly half what it needed: **4 resident FIDO credentials** on a
+device whose `text` is 800 KB of a 4 MiB chip. Every credential write rewrote
+every credential, one corrupt byte cost the whole set, and
+`DEVICE_MAX_CREDS = 12` was never reachable — `other_slots + 2 × parts ≤ 24`,
+not the 5,952 B payload the constant's own comment cites. None of that was a
+security decision. It was three storage backends accreted without a common
+shape. The keyregion (`platform/src/keyregion/`) is the replacement: per-record
+flash storage, one AEAD record per credential with an AAD binding slot,
+generation and identity — FIDO derives 844 resident credentials from the
+region's geometry, OATH holds 68, Nostr 8 — and the snapshot store survives
+only as the no-region fallback and migration source. The capacity story is
+written up in `docs/capacity.md`.
 
 What the complexity bought, concretely: nothing — and it is not even consistent.
-`Rp2350SecureStore` seals its image under an OTP-derived root
+The old snapshot image was sealed under an OTP-derived root
 (`store_v3::derive_store_key(otp_key_1, chipid)`); the trussed littlefs2 at `0x102_000` is an
 **unencrypted** filesystem whose key wrapping is each applet's own affair; and the RAM
 `EFS`/`VFS` are formatted on every boot. Three backends, three protection stories, one of them
 already the thing the other two were built to avoid. One hierarchy was available
-from the start.
+from the start — the keyregion is it, which is why the accreted shape had to go.
 
 **How to apply it, in order:**
 
