@@ -984,10 +984,13 @@ impl FidoApp {
     ///   match step had in hand (analysis §5 hazard 2).
     ///
     /// Removing the re-fetch from GA removes the 16-bound **from GA**: the
-    /// walk itself remains in the platform for the genuinely RP-less callers
-    /// that still use it (the makeCredential exclude loop — US-1725's turf,
-    /// not touched here — and the migration's `contains_credential`), and
-    /// US-1724 owns its ordering rule.
+    /// walk itself remains in the platform for the callers that still use it.
+    /// US-1725 then removed the last two RP-known callers — the makeCredential
+    /// exclude loop and the migration's `contains_credential` — so the only
+    /// `rp_id_hash: None` callers left are the two U2F sites
+    /// ([`Self::u2f_inner`]: the check-only probe and the legacy-handle
+    /// load), each commented at its site. US-1724 owns the walk's ordering
+    /// rule.
     ///
     /// `None` for the same three reasons [`Self::region_credential_at`]
     /// answers `None` — no keys, no region, and "not there / could not be
@@ -1298,6 +1301,19 @@ impl FidoApp {
             return Err(err(Ctap2Response::PuatRequired));
         }
 
+        // US-1725: the exclude check resolves each ID through the
+        // **RP-qualified** locator — `Some(&rp_id_hash)` — because the caller
+        // knows the RP. The None-RP walk this replaces is bounded at
+        // `MAX_RP_CREDENTIALS` (16) FIDO entries *whatever RP they belong to*
+        // (`fido_store.rs:756-779`), so with more than 16 credentials on the
+        // device an exclusion naming one past the window read `Absent` and
+        // the registration silently proceeded (analysis §5.2,
+        // `docs/audits/2026-10-30-wrong-key-assertion-drift.md`). The
+        // qualified branch's own window is per-RP (`lookup_all` matches only
+        // entries whose tag authenticates this hash), so the bound that
+        // blinded the check does not exist here.
+        let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
+
         // Exclude list.
         //
         // US-1554: on the region path each ID costs one on-demand load instead
@@ -1308,7 +1324,7 @@ impl FidoApp {
         for id in &req.exclude {
             let owned;
             let cred = if rkeys.is_some() {
-                owned = self.region_credential(rkeys.as_ref(), None, id);
+                owned = self.region_credential(rkeys.as_ref(), Some(&rp_id_hash), id);
                 owned.as_ref()
             } else {
                 self.keystore.get_credential(id)
@@ -1412,8 +1428,9 @@ impl FidoApp {
         // SHA-256("fapico2-resident-id" ‖ rp_id_hash ‖ user_handle) digest,
         // resident → derived (C parity), else random — only its position
         // moved, from after the keygen to before it, because the keygen now
-        // branches on it.
-        let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
+        // branches on it. (`rp_id_hash` itself is computed above the exclude
+        // list — US-1725 moved it there because the exclude check needs it
+        // first; this is the same value, not a second computation.)
         let resident = req.rk == Some(true);
         let cred_id: HeaplessVec<u8, 64> = if resident {
             use sha2::Digest;
@@ -4033,12 +4050,15 @@ impl FidoApp {
                 }
                 let total = ordered.len();
                 let first = ordered.remove(0);
-                self.cm_cred_state = Some(CmCredState { creds: ordered, total, channel: self.current_channel, dialect: self.cm_dialect });
-                self.cm_cred_response(rkeys.as_ref(), &first, total, out)
+                self.cm_cred_state = Some(CmCredState { creds: ordered, total, channel: self.current_channel, dialect: self.cm_dialect, rp_id_hash: hash });
+                // US-1725: the Begin's own response is built through the
+                // RP-qualified re-fetch — the hash this enumeration was
+                // asked about, not the RP-blind walk.
+                self.cm_cred_response(rkeys.as_ref(), Some(&hash), &first, total, out)
             }
             CM_ENUMERATE_CREDS_NEXT => {
                 // enumerateCredsGetNext
-                let result = (|| -> Result<(heapless::Vec<u8, 64>, usize, CmDialect), Err> {
+                let result = (|| -> Result<(heapless::Vec<u8, 64>, usize, CmDialect, [u8; 32]), Err> {
                     let Some(state) = self.cm_cred_state.as_mut() else {
                         return Err(err(Ctap2Response::NotAllowed));
                     };
@@ -4049,9 +4069,12 @@ impl FidoApp {
                         self.cm_cred_state = None;
                         return Err(err(Ctap2Response::NotAllowed));
                     }
-                    Ok((state.creds.remove(0), state.total, state.dialect))
+                    // US-1725: the enumeration's RP hash rides along, so the
+                    // per-credential response re-fetch is RP-qualified on the
+                    // Next leg too — the request itself carries no hash.
+                    Ok((state.creds.remove(0), state.total, state.dialect, state.rp_id_hash))
                 })();
-                let (id, total, dialect) = result?;
+                let (id, total, dialect, rp_hash) = result?;
                 // PicoForge sends `{1: 0x05}` for this sub-command and CTAP2
                 // sends `{1: 0x05}` too — identical bytes, so the request
                 // cannot be classified. The enumeration it continues can:
@@ -4067,7 +4090,7 @@ impl FidoApp {
                 {
                     self.cm_cred_state = None;
                 }
-                self.cm_cred_response(rkeys.as_ref(), &id, total, out)
+                self.cm_cred_response(rkeys.as_ref(), Some(&rp_hash), &id, total, out)
             }
             CM_DELETE_CRED => {
                 // deleteCredential
@@ -4292,14 +4315,28 @@ impl FidoApp {
     /// response describes is opened from its record rather than found in the
     /// resident array. `&mut self` follows from that — an on-demand load needs
     /// the region, and the region is reached through the app.
+    ///
+    /// US-1725: `rp_id_hash` is the hash of the `enumerateCredsBegin` this
+    /// response belongs to, and the re-fetch is **RP-qualified** with it. The
+    /// enumeration that produced `cred_id` already resolved this RP's records
+    /// through `slots_for_rp` — the hash is in hand — and the None-RP re-fetch
+    /// this replaces was a second walk bounded at `MAX_RP_CREDENTIALS` (16)
+    /// FIDO entries whatever RP they belong to: with more than 16 credentials
+    /// on the device it answered `CTAP2_ERR_NO_CREDENTIALS` for a credential
+    /// the enumeration itself had just listed, and on a legacy duplicate set
+    /// it could describe a different same-ID record than the one enumerated
+    /// (analysis §5.2). The qualified window is per-RP, so the bound that
+    /// blinded the response does not exist here; a genuine miss still fails
+    /// closed exactly as before.
     fn cm_cred_response(
         &mut self,
         rkeys: Option<&crate::device_keystore::RegionKeys>,
+        rp_id_hash: Option<&[u8; 32]>,
         cred_id: &[u8],
         total: usize,
         out: &mut HeaplessVec<u8, { crate::CTAP2_MAX_MSG }>,
     ) -> Result<(), Err> {
-        let region_owned = self.region_credential(rkeys, None, cred_id);
+        let region_owned = self.region_credential(rkeys, rp_id_hash, cred_id);
         let snapshot = self.keystore.get_credential(cred_id);
         let cred = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {
             (true, Some(c), _) => c,
@@ -5257,6 +5294,13 @@ impl FidoApp {
 
         if p1 == 0x07 {
             // Check-only: CONDITIONS_NOT_SATISFIED when valid.
+            // US-1725 survivor: this stays the None-RP walk. `app_param` IS
+            // the RP hash and could qualify it, but the walk's answer is only
+            // a handle-existence probe whose result is re-checked against
+            // `app_param` on the opened record two lines down — the
+            // qualification would be wire-equivalent here, and this story's
+            // tests do not cover U2F. Flagged for a follow-up, not changed
+            // untested.
             let legacy_owned = self.region_credential(rkeys.as_ref(), None, key_handle);
             let legacy_valid = legacy_owned
                 .as_ref()
@@ -5320,6 +5364,13 @@ impl FidoApp {
             // bump below is addressed by slot, and CTAP1 is the surface a
             // pre-US-714 authenticator uses exclusively, so the defect this fixes
             // would have been *most* visible here.
+            //
+            // US-1725 survivor: this stays the None-RP walk for the same
+            // reason the check-only probe above does — `app_param` could
+            // qualify it, but the record's own `rp_id_hash` is verified
+            // against `app_param` below before anything signs, so the
+            // qualification is wire-equivalent and this story's tests do not
+            // cover U2F. Flagged for a follow-up, not changed untested.
             let region_owned = self.region_credential_at(rkeys.as_ref(), None, key_handle);
             let snapshot = self.keystore.get_credential(key_handle);
             let (cred, slot) = match (rkeys.is_some(), region_owned.as_ref(), snapshot) {

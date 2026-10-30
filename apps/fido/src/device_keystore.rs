@@ -4180,13 +4180,30 @@ impl<'a, 'k> RegionCredentials<'a, 'k> {
     /// could not be read, and writing over it could destroy a credential that
     /// is really there, so it must **not** be read as `false`
     /// (`mod.rs`'s [`SlotRead`]).
-    pub fn contains_credential(&mut self, credential_id: &[u8]) -> SlotRead<bool> {
+    ///
+    /// US-1725: the probe is **RP-qualified** — `rp_id_hash` is the migrating
+    /// record's own, which the caller has in hand. The None-RP walk this
+    /// replaces is bounded at `MAX_RP_CREDENTIALS` (16) FIDO entries whatever
+    /// RP they belong to, so with more than 16 credentials on the device an
+    /// already-migrated credential past the window read `Absent`, and the
+    /// migration would have written a second copy of it (analysis §5.2). The
+    /// qualified branch's window is per-RP (`lookup_all` matches only entries
+    /// whose tag authenticates this hash), so the bound that blinded the
+    /// probe does not exist here. The hash is not a narrowing the caller
+    /// could get wrong: the record it names carries this exact hash, so any
+    /// candidate that fails the tag check is by definition not the record
+    /// this probe asks about.
+    pub fn contains_credential(
+        &mut self,
+        rp_id_hash: &[u8; 32],
+        credential_id: &[u8],
+    ) -> SlotRead<bool> {
         let probe = CredentialIdProbe { credential_id };
         let mut locator =
             fido_store::CredentialIdLocator::new(
                 &self.keys.index,
                 &self.keys.payload,
-                None,
+                Some(RpIdHash::from_bytes(*rp_id_hash)),
                 credential_id,
                 &probe,
             );
@@ -4500,7 +4517,12 @@ pub fn migrate_snapshot_to_region(
             // only because `contains_credential` borrows it while `ks` is
             // borrowed again by `put` — 32 B, not 720.
             let credential_id = ks.credentials[i].credential_id.clone();
-            match creds.contains_credential(&credential_id) {
+            // US-1725: the collision probe is RP-qualified — the migrating
+            // record's own hash, not a device-wide walk (whose 16-ordinal
+            // window would misreport an already-migrated credential as
+            // absent, and re-write it).
+            let rp_id_hash = ks.credentials[i].rp_id_hash;
+            match creds.contains_credential(&rp_id_hash, &credential_id) {
                 // Found: a previous, interrupted run already made this one
                 // durable. Counting it is what makes a re-run idempotent.
                 SlotRead::Present(true) => already_present += 1,
