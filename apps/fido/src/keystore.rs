@@ -314,6 +314,16 @@ impl Keystore for MemoryKeystore {
             .iter()
             .position(|c| c.credential_id == cred.credential_id)
         {
+            // Deliberately NO US-1722 counter carry here, unlike the device
+            // snapshot twins: this store is also the host twin's GA-persist
+            // mechanism (`app.rs::get_assertion` writes the already-bumped
+            // record back through it), and a store-level carry would undo
+            // every assertion's bump. The carry is the makeCredential
+            // overwrite's concern and lives at that call site in `app.rs`
+            // (capture the prior counter via [`Keystore::get_credential`],
+            // apply it to the record being stored, patch the response's
+            // signCount) — the same pre-capture pattern `device_core.rs`
+            // uses for its snapshot arm.
             self.credentials[pos] = cred;
         } else {
             if self.credentials.len() >= self.max_creds {

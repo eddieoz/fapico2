@@ -2538,6 +2538,17 @@ impl DeviceKeystore {
             .iter_mut()
             .position(|c| c.credential_id == cred.credential_id)
         {
+            // US-1722 (CTAP 2.1 §6.1.3): a replace keeps the replaced
+            // record's counter. The snapshot bump mutates the RAM record
+            // immediately (`bump_credential_counter_checked`), so the old
+            // entry's counter is the effective one the RP has already seen —
+            // resetting to the fresh registration's global counter would
+            // make the first assertion after the replace sign a value below
+            // it, the clone-detection signal. The region twin carries the
+            // same way (`device_core.rs::delete_all_by_id`); the host twin's
+            // `MemoryKeystore` mirrors this.
+            let mut cred = cred;
+            cred.counter = self.credentials[slot].counter;
             self.credentials[slot] = cred;
         } else {
             self.credentials.push(cred).map_err(|_| ())?;
@@ -2571,6 +2582,12 @@ impl DeviceKeystore {
             .position(|c| c.credential_id == cred.credential_id)
         {
             Some(slot) => {
+                // US-1722 (CTAP 2.1 §6.1.3): counter carry on replace — the
+                // same rule `store_credential` and the region twin apply. The
+                // rollback below restores `old` byte-for-byte, so a failed
+                // persist still un-does the carry with everything else.
+                let mut cred = cred;
+                cred.counter = self.credentials[slot].counter;
                 let old = core::mem::replace(&mut self.credentials[slot], cred);
                 self.dirty = true;
                 if self.persist(store).is_ok() {

@@ -1810,11 +1810,40 @@ impl<K: Keystore> FidoApp<K> {
             let s = self.keystore.get_auth_state_mut();
             s.cred_counter = s.cred_counter.wrapping_add(1);
         }
+        // US-1722 (CTAP 2.1 §6.1.3): the counter carry on a resident
+        // replace, and the response patch that goes with it. Capture the
+        // replaced record's counter BEFORE the store call — the same
+        // pre-capture pattern the device twin's snapshot arm uses
+        // (`device_core.rs`) — then (a) apply it to the record being stored,
+        // so the surviving ID's next assertion signs carried + 1 instead of
+        // resetting to the fresh global counter, and (b) after a successful
+        // store, patch the response authData's signCount (bytes 33..37 —
+        // rpIdHash(32) + flags(1) precede the fixed-width BE counter) to the
+        // carried value before the attestation below signs it. Either half
+        // missing makes the client observe signCount drop below values it
+        // already accepted for this ID — the clone-detection signal — on the
+        // very operation that removed the duplicate.
+        //
+        // The carry deliberately does NOT live inside
+        // `MemoryKeystore::store_credential`: the twin's GA persists its
+        // already-bumped record through the same method, and a store-level
+        // carry would undo every assertion's bump. `prior_counter` is `Some`
+        // exactly when an existing same-ID record is about to be replaced —
+        // a non-resident ID is random and cannot collide — so no `resident`
+        // gate is needed (the device twin's snapshot arm is the same shape).
+        let prior_counter = self.keystore.get_credential(&cred_id).map(|c| c.counter);
+        let mut cred = cred;
+        if let Some(carried) = prior_counter {
+            cred.counter = carried;
+        }
         if let Err(e) = self.keystore.store_credential(cred) {
             return vec![match e {
                 crate::keystore::KeystoreError::Full => Ctap2Response::KeyStoreFull.code(),
                 _ => Ctap2Response::NotAllowed.code(),
             }];
+        }
+        if let Some(carried) = prior_counter {
+            auth_data[33..37].copy_from_slice(&carried.to_be_bytes());
         }
 
         // Enterprise attestation (CTAP2.1 §8.4 / FX-408): the EP flag (0x02)
