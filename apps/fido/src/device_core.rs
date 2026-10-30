@@ -1347,35 +1347,13 @@ impl FidoApp {
             return Err(err(Ctap2Response::UpRequired));
         }
 
-        // Generate the credential keypair (ES256) from the TRNG pool.
-        // US-1007: this was a bare `loop { draw_random(..); if valid break }`
-        // — an unbounded rejection sampler over a draw that cannot report
-        // failure, so an exhausted pool spun forever and the request never
-        // came back. `try_fill_valid` caps the rejection and returns, which
-        // is what turns "the card stopped answering" into a status byte.
-        let mut scalar = Zeroizing::new([0u8; 32]);
-        // `try_fill_valid_with`, not `try_fill_valid`: the pool draw is not
-        // an `RngCore` and cannot report a refusal, so the attempt cap is
-        // the only thing bounding this. An exhausted pool serves the same
-        // bytes forever and used to spin on them forever.
-        crypto::try_fill_valid_with(
-            &mut |out: &mut [u8]| {
-                self.draw_random(out);
-                Ok(())
-            },
-            &mut *scalar,
-            |b| p256::SecretKey::from_slice(b).is_ok(),
-        )
-        .map_err(|_| err(Ctap2Response::Other))?;
-        let sk = p256::SecretKey::from_slice(&*scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
-        let pub_bytes = crypto::public_key_bytes(&sk.public_key());
-        let mut x = [0u8; 32];
-        let mut y = [0u8; 32];
-        x.copy_from_slice(&pub_bytes[1..33]);
-        y.copy_from_slice(&pub_bytes[33..65]);
-        let cose_key = DeviceCoseKey::es256(x, y);
-
-        // Credential ID: resident → derived (C parity), else random.
+        // Credential ID FIRST (US-1721 restructure): the resident branch
+        // derives its *key* from the ID, so the ID has to exist before the
+        // key does. The derivation itself is unchanged — the same
+        // SHA-256("fapico2-resident-id" ‖ rp_id_hash ‖ user_handle) digest,
+        // resident → derived (C parity), else random — only its position
+        // moved, from after the keygen to before it, because the keygen now
+        // branches on it.
         let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
         let resident = req.rk == Some(true);
         let cred_id: HeaplessVec<u8, 64> = if resident {
@@ -1394,6 +1372,59 @@ impl FidoApp {
             v.extend_from_slice(&id).ok();
             v
         };
+
+        // Generate the credential keypair (ES256). US-1721: a resident key is
+        // DERIVED from the resident ID — C parity (pico-fido
+        // `cbor_make_credential.c:521-526,672`: for `options.rk == ptrue` the
+        // key seed IS the resident ID, and `fido_load_key`'s `derive_key`
+        // (`fido.c:325`) keys the derivation with the device master key, the
+        // shape `hkey` repeats here). This closes the silent-foreign-key
+        // signature (analysis §7): with the key a function of the ID, a
+        // duplicate same-ID record is harmless — either record signs
+        // identically. The accepted cost: a resident re-registration no longer
+        // rotates the key (idempotent, exactly like pico-fido; key rotation
+        // for an identity is out of scope by design, documented in US-1730).
+        let scalar: Zeroizing<[u8; 32]> = if resident {
+            // `hkey` bytes in exactly the form the largeBlobKey derivation
+            // below passes them. `None` is not a reachable state (~2^-128 per
+            // re-hash round, 32-round cap); fail closed regardless — a
+            // derivation that cannot produce a key refuses the request and
+            // never loops (US-1007's lesson).
+            crypto::derive_resident_scalar(self.hkey.to_bytes().as_slice(), &cred_id)
+                .ok_or_else(|| err(Ctap2Response::KeyStoreFull))?
+        } else {
+            // Non-resident: the TRNG pool, unchanged. US-1007: this was a
+            // bare `loop { draw_random(..); if valid break }` — an unbounded
+            // rejection sampler over a draw that cannot report failure, so an
+            // exhausted pool spun forever and the request never came back.
+            // `try_fill_valid` caps the rejection and returns, which is what
+            // turns "the card stopped answering" into a status byte.
+            let mut scalar = Zeroizing::new([0u8; 32]);
+            // `try_fill_valid_with`, not `try_fill_valid`: the pool draw is
+            // not an `RngCore` and cannot report a refusal, so the attempt
+            // cap is the only thing bounding this. An exhausted pool serves
+            // the same bytes forever and used to spin on them forever.
+            crypto::try_fill_valid_with(
+                &mut |out: &mut [u8]| {
+                    self.draw_random(out);
+                    Ok(())
+                },
+                &mut *scalar,
+                |b| p256::SecretKey::from_slice(b).is_ok(),
+            )
+            .map_err(|_| err(Ctap2Response::Other))?;
+            scalar
+        };
+        // Both branches hand over a scalar the branch itself validated (the
+        // derivation's `SecretKey::from_slice`, the sampler's `accept`
+        // predicate); this reconstruction is the totality check.
+        let sk = p256::SecretKey::from_slice(&*scalar).map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+        let pub_bytes = crypto::public_key_bytes(&sk.public_key());
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x.copy_from_slice(&pub_bytes[1..33]);
+        y.copy_from_slice(&pub_bytes[33..65]);
+        let cose_key = DeviceCoseKey::es256(x, y);
 
         // largeBlobKey: resident-only (derived, C parity).
         if req.large_blob_key && !resident {

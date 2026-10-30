@@ -1588,28 +1588,64 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::UpRequired.code()];
         }
 
-        // 5) Generate a keypair for the requested algorithm.
-        // US-1007: a source that cannot produce entropy now answers here
-        // with a clean CTAP error instead of spinning in the curve crate's
-        // rejection sampler. `Other` (0x7F) rather than a policy-sounding
-        // code: nothing was denied and nothing was tampered with — the
-        // authenticator simply had no fresh bytes to give, and a client that
-        // retries on `Other` is the behaviour a transient peripheral starve
-        // should provoke.
-        let (priv_bytes, cose_key) = match generate_alg_keypair(alg) {
-            Ok(kp) => kp,
-            Err(_) => return vec![Ctap2Response::Other.code()],
-        };
-        let cose_pubkey = encode_cose_pubkey(&cose_key);
-
-        // Credential ID. For resident keys, derive a stable id from rp+user+priv;
-        // for non-resident, use a random id.
+        // Credential ID first (US-1721 restructure): the resident branch
+        // derives its *key* from the ID, so the ID has to exist before the
+        // key does. Same derivation as before — resident → derived (C
+        // parity), else random — only its position moved, because the keygen
+        // below now branches on it.
         let rp_id_hash = crypto::sha256(req.rp_id.as_bytes());
-        let cred_id = if req.options.rk == Some(true) {
+        let resident = req.options.rk == Some(true);
+        let cred_id = if resident {
             credential_derive_resident_id(&rp_id_hash, &req.user_handle)
         } else {
             crypto::random_vec(32)
         };
+
+        // 5) Keypair for the requested algorithm. US-1721: a resident ES256
+        // key is DERIVED from the resident ID through the shared helper — the
+        // same derivation the device twin runs against its own `hkey`
+        // (C parity, pico-fido `cbor_make_credential.c:521-526,672`; the
+        // attack it closes and the accepted cost are written out on the
+        // device twin's copy of this branch in `device_core.rs`). ES256 (-7)
+        // and ESP256 (-9) are both P-256 here (`supports_algorithm`), so the
+        // derived 32-byte scalar is the key for either label, with the
+        // requested alg preserved in the COSE key exactly as the TRNG arm
+        // does. Every other algorithm — and every non-resident credential —
+        // keeps the TRNG keygen: the device twin serves ES256 only, so the
+        // deterministic property is pinned on the algorithm that ships, and
+        // the remaining arms are this twin's own curve coverage until the
+        // multi-alg work gives them a derivation.
+        let (priv_bytes, cose_key) = if resident && matches!(alg, -7 | -9) {
+            let Some(seed) =
+                crypto::derive_resident_scalar(self.hkey.to_bytes().as_ref(), &cred_id)
+            else {
+                // Unreachable (~2^-128 per re-hash round over a 32-round
+                // cap); fail closed, never loop (US-1007's lesson).
+                return vec![Ctap2Response::KeyStoreFull.code()];
+            };
+            let Some(sk) = crypto::secret_key_from_bytes(&*seed) else {
+                return vec![Ctap2Response::KeyStoreFull.code()];
+            };
+            let pub_bytes = crypto::public_key_bytes(&sk.public_key());
+            let mut x = [0u8; 32];
+            let mut y = [0u8; 32];
+            x.copy_from_slice(&pub_bytes[1..33]);
+            y.copy_from_slice(&pub_bytes[33..65]);
+            (seed.to_vec(), CosePublicKey::ec2(alg as i32, x, y))
+        } else {
+            // US-1007: a source that cannot produce entropy now answers here
+            // with a clean CTAP error instead of spinning in the curve crate's
+            // rejection sampler. `Other` (0x7F) rather than a policy-sounding
+            // code: nothing was denied and nothing was tampered with — the
+            // authenticator simply had no fresh bytes to give, and a client
+            // that retries on `Other` is the behaviour a transient peripheral
+            // starve should provoke.
+            match generate_alg_keypair(alg) {
+                Ok(kp) => kp,
+                Err(_) => return vec![Ctap2Response::Other.code()],
+            }
+        };
+        let cose_pubkey = encode_cose_pubkey(&cose_key);
 
         // largeBlobKey (FX-414): only meaningful for resident credentials
         // (the key is derived, not random, so it is stable across resets).

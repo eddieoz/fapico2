@@ -18,6 +18,7 @@ use p256::{
     ecdsa::{Signature, SigningKey, signature::Signer},
     PublicKey, SecretKey,
 };
+use zeroize::Zeroizing;
 
 /// The `rand_core` error a refused entropy draw reports, as
 /// [`RNG_ERR_RESEED_REFUSED`].
@@ -321,6 +322,94 @@ pub fn try_generate_p256_keypair_from_trng<R: Trng>(
     trng: &mut R,
 ) -> Result<(SecretKey, PublicKey), KeygenError> {
     try_generate_p256_keypair(&mut TrngAdapter(trng))
+}
+
+// ---------------------------------------------------------------------------
+// US-1721 — the deterministic resident credential key
+// ---------------------------------------------------------------------------
+
+/// The domain string of the **first** derivation round, HMAC-keyed by the
+/// device secret over the resident credential ID.
+pub const RESIDENT_KEY_DOMAIN: &[u8] = b"fapico2/resident-key/v1";
+
+/// The domain string of the **re-hash** rounds — same key, different message
+/// per attempt, so a round can never repeat a previous one.
+pub const RESIDENT_KEY_DOMAIN_REHASH: &[u8] = b"fapico2/resident-key/v1/rehash";
+
+/// The re-hash cap, in rounds. The same discipline US-1007 put on the TRNG
+/// sampler: the loop is bounded by construction, never by luck.
+pub const RESIDENT_DERIVE_MAX_ATTEMPTS: usize = 32;
+
+/// The widest `cred_id` the derivation accepts. Both call sites pass exactly
+/// 32 bytes (the resident digest); anything wider is refused rather than
+/// truncated, because a silent truncation would be a second, quieter
+/// derivation.
+pub const RESIDENT_CRED_ID_MAX: usize = 64;
+
+/// Derive a resident credential's P-256 scalar from the device secret and the
+/// resident credential ID (US-1721).
+///
+/// C parity (pico-fido `cbor_make_credential.c:521-526,672`): for
+/// `options.rk == ptrue` the reference sets `key_seed = cred_idr` — the
+/// resident ID derived from (rp, user) — and loads the signing key *from that
+/// seed* (`fido_load_key`, whose `derive_key` at `fido.c:325` HKDF-chains the
+/// seed through the **device master key**). The resident key is therefore a
+/// function of (device, rp, user), re-registration is idempotent, and a
+/// duplicate same-ID record can never sign with a foreign key — the
+/// silent-foreign-key signature US-1719 diagnosed. Here `cred_id` is public
+/// knowledge (it is handed to every client), so the device secret `hkey_bytes`
+/// — the largeBlobKey root, passed as bytes in exactly the form the
+/// largeBlobKey derivation at `device_core.rs` uses — is what makes the key
+/// unforgeable from `(rp, user)` alone.
+///
+/// # Input layout
+///
+/// Fixed here so a future story (US-1730's ADR) can cite it without reading
+/// the code:
+///
+/// ```text
+/// first round:  HMAC-SHA256(hkey_bytes, "fapico2/resident-key/v1" ‖ cred_id)
+/// rehash n:     HMAC-SHA256(hkey_bytes, "fapico2/resident-key/v1/rehash" ‖ [n as u8] ‖ cred_id)
+/// ```
+///
+/// (`hmac_sha256` takes one data slice, so the domain string and the
+/// credential ID are concatenated into it; the attempt byte is a single
+/// `u8`, which `RESIDENT_DERIVE_MAX_ATTEMPTS = 32` never overflows.)
+///
+/// # Validity
+///
+/// A 32-byte draw is a valid P-256 scalar unless it is zero or at or above the
+/// group order — the same `SecretKey::from_slice` rule the TRNG sampler's
+/// `accept` predicate applies (`try_generate_p256_keypair`) — so a rejected
+/// round is a ~2^-128 event and exhausting all
+/// [`RESIDENT_DERIVE_MAX_ATTEMPTS`] rounds is not a reachable state. The
+/// caller still fails closed on `None` (`KeyStoreFull`): a derivation that
+/// cannot produce a key must refuse the request, never loop.
+///
+/// The scalar is returned zeroized-on-drop: it is a private key, not scratch.
+pub fn derive_resident_scalar(hkey_bytes: &[u8], cred_id: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+    if cred_id.len() > RESIDENT_CRED_ID_MAX {
+        return None;
+    }
+    // One scratch buffer serves both rounds; the rehash round is the longer
+    // of the two (rehash domain + attempt byte + cred_id).
+    let mut input = [0u8; RESIDENT_KEY_DOMAIN_REHASH.len() + 1 + RESIDENT_CRED_ID_MAX];
+    input[..RESIDENT_KEY_DOMAIN.len()].copy_from_slice(RESIDENT_KEY_DOMAIN);
+    input[RESIDENT_KEY_DOMAIN.len()..][..cred_id.len()].copy_from_slice(cred_id);
+    let mut seed = hmac_sha256(hkey_bytes, &input[..RESIDENT_KEY_DOMAIN.len() + cred_id.len()]);
+    for attempt in 0..RESIDENT_DERIVE_MAX_ATTEMPTS {
+        if SecretKey::from_slice(&seed).is_ok() {
+            return Some(Zeroizing::new(seed));
+        }
+        input[..RESIDENT_KEY_DOMAIN_REHASH.len()].copy_from_slice(RESIDENT_KEY_DOMAIN_REHASH);
+        input[RESIDENT_KEY_DOMAIN_REHASH.len()] = attempt as u8;
+        input[RESIDENT_KEY_DOMAIN_REHASH.len() + 1..][..cred_id.len()].copy_from_slice(cred_id);
+        seed = hmac_sha256(
+            hkey_bytes,
+            &input[..RESIDENT_KEY_DOMAIN_REHASH.len() + 1 + cred_id.len()],
+        );
+    }
+    None
 }
 
 /// Sign data with P-256 ECDSA.
