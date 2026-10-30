@@ -294,28 +294,31 @@ fn get_assertion_pinned(device: &mut Device, rp: &str, id: &[u8]) -> (u8, Vec<u8
 /// | 2 | `S_new`: the target ID, the request's RP | `RP` | `K_NEW` |
 ///
 /// The allowList match step resolves the ID **RP-qualified**: its candidates
-/// are only the `RP` entries, so it finds `S_old` (first index-order match)
-/// and holds its slot. The contract under test: the signed record is the one
-/// the match step found — `K_OLD` signs, and authData's `rpIdHash` is the
-/// request's — with the opened record's `(rp_id_hash, credential_id)`
-/// re-verified against the request before signing.
+/// are only the `RP` entries, so it resolves the same-ID duplicate by the
+/// epic's one ordering rule — **last index-order match = newest written**
+/// (US-1724; before that story it found `S_old`, the first match) — and holds
+/// its slot. The contract under test is US-1723's and is unchanged: the
+/// signed record is the one the match step resolved — now `S_new`, so `K_NEW`
+/// signs and `K_OLD` must not — with the opened record's
+/// `(rp_id_hash, credential_id)` re-verified against the request before
+/// signing.
 ///
 /// What the decoy buys: it is precisely a record whose **ID matches but whose
-/// `rp_id_hash` does not**, sitting at an earlier index ordinal — the shape
-/// the None-RP re-fetch serves today (its structural walk takes the first 16
-/// Fido entries whatever their RP, opens the decoy, and signs with the
-/// decoy's key and the decoy's RP hash in authData). That makes the
-/// fail-closed re-check observable: this test fails if the implementation
-/// signs a record whose `(rp_id_hash, credential_id)` does not match the
-/// request.
+/// `rp_id_hash` does not**, sitting at an earlier index ordinal — a shape the
+/// old None-RP re-fetch served (its structural walk takes the first 16 Fido
+/// entries whatever their RP). That makes the fail-closed re-check
+/// observable: this test fails if the implementation signs a record whose
+/// `(rp_id_hash, credential_id)` does not match the request.
 ///
 /// What the test pins, precisely:
 /// 1. the assertion is served at all;
 /// 2. authData's `rpIdHash` (bytes 0..32) equals `SHA-256(RP)` — the
 ///    request's RP, i.e. the served record's RP was re-verified against the
 ///    request;
-/// 3. the signature verifies under `K_OLD` — the record the match step
-///    found — and NOT under `K_DECOY`;
+/// 3. the signature verifies under `K_NEW` — the record the match step
+///    resolved under US-1724's newest-wins ordering — and NOT under `K_OLD`
+///    (the oldest copy, which the pre-US-1724 first-match walk used to
+///    serve) nor `K_DECOY`;
 /// 4. the response's ID echo is byte-identical to the requested ID (wire
 ///    conventions frozen, `AGENTS.md` §2).
 ///
@@ -364,10 +367,16 @@ fn the_match_steps_slot_is_the_signed_slot() {
     let mut signed = auth_data.clone();
     signed.extend_from_slice(&CHALLENGE);
     assert!(
-        verifies_under(k_old, &signed, &sig_der),
+        verifies_under(k_new, &signed, &sig_der),
         "the assertion must sign with the key of the record the MATCH STEP \
-         found (S_old, K_old) — not with whichever record the by-ID re-fetch \
-         happens to walk to first"
+         resolved — under US-1724's ordering rule that is the NEWEST same-ID \
+         record (S_new, K_new), the same one discovery lists last and \
+         overwrite replaces"
+    );
+    assert!(
+        !verifies_under(k_old, &signed, &sig_der),
+        "the OLDEST same-ID copy (K_old) must never sign — the first-match \
+         resolution US-1724 replaced served exactly that"
     );
     assert!(
         !verifies_under(k_decoy, &signed, &sig_der),

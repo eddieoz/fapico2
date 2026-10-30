@@ -778,11 +778,43 @@ impl SlotLocator for CredentialIdLocator<'_> {
                 n
             }
         };
+        // **The last match in index order wins** (US-1724). Discovery enumerates
+        // every same-ID record, overwrite (US-1722) replaces the newest, and the
+        // by-ID probe used to stop at the **first** hit — the oldest copy on a
+        // legacy board carrying duplicates, the one reader in the store that
+        // disagreed about which record *is* the credential. So the walk
+        // continues past a hit and keeps the last one; index order on a fresh
+        // region is write order, so index-order last is the newest written.
+        //
+        // The honest residual: "newest" means **newest-within-window**. The
+        // candidate set is bounded (the RP-qualified branch by
+        // `MAX_RP_CREDENTIALS`, the structural walk by the same bound), and
+        // `index::lookup_all` reports only the first bound-many matches — a
+        // same-ID record beyond the window is invisible to this walk however it
+        // orders. Post-US-1722 that window never sees duplicates (overwrite
+        // collapses same-ID records in place), so the ordering below governs
+        // legacy boards mid-upgrade, which is exactly the population that can
+        // still carry them.
+        let mut found: Option<Slot> = None;
         for &slot in candidates.iter().take(count) {
             self.examined += 1;
             let raw = match region.read_slot(slot) {
                 Ok(raw) => raw,
-                Err(why) => return on_demand::Located::Fault(why),
+                Err(why) => {
+                    // A transport fault on a candidate with no hit yet is
+                    // today's meaning, preserved: `Fault`, never `None`
+                    // (US-1573 — a faulted read must not memoize as absent).
+                    // After a hit the answer is already **proven** — that
+                    // record was opened and its ID matched — so the walk
+                    // aborts there and returns the hit in hand rather than
+                    // discard a proven fact over a later candidate it can no
+                    // longer reach; `Found` is not a claim about the whole
+                    // index, only about the record it names.
+                    return match found {
+                        Some(hit) => on_demand::Located::Found(hit),
+                        None => on_demand::Located::Fault(why),
+                    };
+                }
             };
             // `record::read` is the whole read path (`record.rs`, "The whole
             // read path"), so an erased slot, a bad header CRC, a transplanted
@@ -793,14 +825,28 @@ impl SlotLocator for CredentialIdLocator<'_> {
             match record::read(slot, &raw, self.payload_key.as_bytes()) {
                 SlotRead::Present(plaintext) => {
                     if self.probe.matches(plaintext.as_slice(), self.credential_id) {
-                        return on_demand::Located::Found(slot);
+                        // Keep walking: a later candidate that matches is the
+                        // newer copy and supersedes this one (US-1724).
+                        found = Some(slot);
                     }
                 }
-                SlotRead::Fault(why) => return on_demand::Located::Fault(why),
+                SlotRead::Fault(why) => {
+                    // The same split as the `read_slot` arm above: no hit yet —
+                    // the fault propagates; a hit in hand — the walk aborts on
+                    // it. (A `record::read` `Fault` is a record that could not
+                    // even be decoded, not a "not this one".)
+                    return match found {
+                        Some(hit) => on_demand::Located::Found(hit),
+                        None => on_demand::Located::Fault(why),
+                    };
+                }
                 SlotRead::Absent => {}
             }
         }
-        on_demand::Located::None
+        match found {
+            Some(slot) => on_demand::Located::Found(slot),
+            None => on_demand::Located::None,
+        }
     }
 }
 
