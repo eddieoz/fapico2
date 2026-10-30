@@ -246,8 +246,9 @@ pub const FIDO_FIRST_SLOT: u32 = super::FIDO_FIRST_SLOT;
 /// `[FIDO_FIRST_SLOT, FIDO_SLOT_LIMIT)`.
 ///
 /// **The derived capacity, and the only number that decides how many passkeys
-/// this device holds.** It is [`FIDO_CAPACITY`](super::FIDO_CAPACITY) — **848**
-/// after the Nostr carve (ADR 0005: `FIDO_CAPACITY = TOTAL − 68 − 4 − 32 − 8`)
+/// this device holds.** It is [`FIDO_CAPACITY`](super::FIDO_CAPACITY) — **844**
+/// at the shipping geometry, after the Nostr carve (ADR 0005) and the Nostr-PIN
+/// carve (US-1689): `FIDO_CAPACITY = TOTAL − 68 − 4 − 32 − 8 − 4`
 /// — and it is a function of the region's size, the
 /// measured record size, the commit protocol and the index reservation
 /// (`mod.rs`, "Capacities — derived, never asserted"). The number the old store
@@ -464,7 +465,8 @@ impl core::fmt::Display for FidoStoreError {
 /// The cost is a bounded scan per allocation: at most [`FIDO_SLOT_LIMIT`]
 /// header reads, and a *slot image* read is what `KeyRegion::read_slot`
 /// returns, so this is [`FIDO_SLOT_LIMIT`] × 1 KiB of reads on a full region
-/// (848 KiB). It is paid once per enrolment, off the boot path (S8/S9).
+/// (916 KiB at the shipping geometry: 72 + 844 slots × 1 KiB). It is paid
+/// once per enrolment, off the boot path (S8/S9).
 pub struct FidoAllocator;
 
 impl FidoAllocator {

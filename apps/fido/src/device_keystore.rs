@@ -22,7 +22,7 @@
 //! neither:
 //!
 //! * **Capacity — [`DEVICE_MAX_CREDS`].** How many passkeys the device can
-//!   hold. This is [`fapico2_platform::keyregion::FIDO_CAPACITY`] (848 at the
+//!   hold. This is [`fapico2_platform::keyregion::FIDO_CAPACITY`] (844 at the
 //!   shipping geometry), which is a function of the region's size, the measured
 //!   record size, the commit protocol and the index reservation
 //!   (`keyregion/mod.rs`, "Capacities — derived, never asserted"). The old `12`
@@ -110,7 +110,7 @@ pub const DEVICE_MAX_CREDS: usize = FIDO_CAPACITY as usize;
 ///
 /// Left implicit, that is a divergence a reader cannot see and a test cannot
 /// state: the host twin's `MemoryKeystore::with_max_creds(4)` reports a total of
-/// 4, the device reports 848, and both numbers are correct answers to "how many
+/// 4, the device reports 844, and both numbers are correct answers to "how many
 /// credentials can this hold?". A parity assertion that just compared the two
 /// numbers would be asserting that they differ; one that skipped the number
 /// would be asserting nothing.
@@ -3581,8 +3581,8 @@ enum Raise {
 /// `DeviceKeystore::credentials` is a resident
 /// `HeaplessVec<DeviceCredential, 12>` — 12 × 720 B = **8,640 bytes of `.bss`**
 /// and a ceiling of twelve, against a derived region capacity of
-/// [`FIDO_CAPACITY`] (**848**). Resizing that array to the capacity is
-/// arithmetically impossible: 848 × 720 = 610 KB against 532 KB of RAM on the
+/// [`FIDO_CAPACITY`] (**844**). Resizing that array to the capacity is
+/// arithmetically impossible: 844 × 720 = 608 KB against 532 KB of RAM on the
 /// part. This type is the other shape — nothing resident, one credential
 /// decrypted at a time into the caller's [`CredentialWindow`] — and it is what
 /// makes the capacity reachable at all.

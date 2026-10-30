@@ -913,7 +913,7 @@ impl FidoApp {
     /// 720 B; the old path returned a `&` into a resident array of twelve, which
     /// is 8,640 B of `.bss` and a ceiling of twelve. Returning one by value costs
     /// 720 B of *stack* for the duration of one call and nothing at all between
-    /// calls, which is what makes 848 credentials fit in 532 KB of RAM.
+    /// calls, which is what makes 844 credentials fit in 532 KB of RAM.
     fn region_credential(
         &mut self,
         keys: Option<&crate::device_keystore::RegionKeys>,
@@ -2074,7 +2074,7 @@ impl FidoApp {
         // sealed record opened, copied into a local `DeviceCredential`, and
         // dropped — against the old shape, where the credential had to be
         // resident for the assertion to find it at all. That is why the region
-        // can hold 848: the 848 are in flash and this one is on the stack.
+        // can hold 844: the 844 are in flash and this one is on the stack.
         //
         // US-1562: the **slot** reaches the counter bump. The signature
         // counter lives in the record and is addressed by slot; before US-1562
@@ -3814,8 +3814,8 @@ impl FidoApp {
                 //
                 // US-1563: on the region path these come from the region's
                 // index, and **they are the number the measured boundary is
-                // made of** — `docs/capacity.md` reports 848 because this reply
-                // would answer 848, not because a constant says so.
+                // made of** — `docs/capacity.md` reports 844 because this reply
+                // would answer 844, not because a constant says so.
                 //
                 // The two arms are not the same question. `existing` counts
                 // index entries; `remaining` is `FIDO_CAPACITY` less that. A
@@ -3856,7 +3856,7 @@ impl FidoApp {
                 let region_backed_here = rkeys.is_some();
                 if region_backed_here {
                     // US-1555: enumerate **from the index**, which is what makes
-                    // this walk work at 848 rather than at twelve.
+                    // this walk work at 844 rather than at twelve.
                     //
                     // The index stores a truncated MAC of the `rp_id_hash` and
                     // nothing else — no RP name, no RP ID (`index.rs`, "That is
