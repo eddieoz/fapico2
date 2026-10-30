@@ -3261,6 +3261,35 @@ impl CounterWindow {
         self.pending.clear();
         self.unpersisted = 0;
     }
+
+    /// US-1728: retire the one pending entry `slot` holds, because the slot has
+    /// been handed to a new tenant.
+    ///
+    /// The window is keyed by slot alone, so a pending entry can outlive the
+    /// credential it was raised for: the slot is freed (tombstone + compaction,
+    /// a region wipe) while its value is still batched, and the next enrolment
+    /// is handed the same slot. From then on [`Self::pending_value`] answers for
+    /// the new tenant first (`RegionCredentials::counter_value`), so the new
+    /// credential would sign — and eventually persist — a counter raised for one
+    /// that no longer exists, and a pending entry left pointing at a tombstone
+    /// wedges every later flush on it. A pending counter for a freed slot must
+    /// not sign for the slot's next tenant: the put that re-allocates the slot
+    /// retires the entry.
+    ///
+    /// A slot with no pending entry is a no-op — the steady-state enrolment path
+    /// clears absent slots, and that must cost nothing. `unpersisted` falls by
+    /// one with the entry, [`Self::restore_pending`]'s accounting: the bump it
+    /// stood for will never become a durable write. The restore-grant memo
+    /// (`resumed`) is deliberately untouched — a slot already granted its
+    /// restore slack must not be granted it twice.
+    pub fn clear_slot(&mut self, slot: Slot) {
+        // `record` updates an existing entry in place, so a slot holds at most
+        // one — removing the first match removes the only one.
+        if let Some(at) = self.pending.iter().position(|(s, _)| *s == slot) {
+            self.pending.remove(at);
+            self.unpersisted = self.unpersisted.saturating_sub(1);
+        }
+    }
 }
 
 /// The record body one FIDO credential occupies, as a CBOR map.

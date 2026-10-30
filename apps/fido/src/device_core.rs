@@ -1710,9 +1710,18 @@ impl FidoApp {
             if overwrite_ok {
                 let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
                 self.draw_random(&mut nonce);
-                self.with_region(Some(keys), |creds| creds.put(&nonce, &cred).map(|_| ()))
-                    .map(|r| r.map_err(|_| ()))
-                    .unwrap_or(Err(()))
+                match self.with_region(Some(keys), |creds| creds.put(&nonce, &cred)) {
+                    // US-1728: the allocator just handed `report.slot` to a new
+                    // tenant, and a pending counter for a freed slot must not
+                    // sign for — or wedge the flush of — whatever occupies the
+                    // slot next. The borrow above has ended, so the window is
+                    // reachable here and nowhere earlier.
+                    Some(Ok(report)) => {
+                        self.keystore.counter_window.clear_slot(report.slot);
+                        Ok(())
+                    }
+                    Some(Err(_)) | None => Err(()),
+                }
             } else {
                 Err(())
             }
@@ -4347,6 +4356,13 @@ impl FidoApp {
                     let report = creds
                         .delete(&next_nonce(), credential_id)
                         .map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    // US-1728: the tombstone kills the slot's identity, and a
+                    // pending counter for a freed slot must not outlive it. A
+                    // no-op today — the flush above emptied the window — and
+                    // the defense stays at the point the slot dies, where a
+                    // future reorder of the flush would otherwise re-open the
+                    // wedge `delete_all_by_id`'s counter-carry note describes.
+                    keystore.counter_window.clear_slot(report.slot);
                     // The compaction half — a tombstone is a record, so its
                     // slot stays off the free list until its sector is
                     // rewritten without it. Skipping it here would leak one
