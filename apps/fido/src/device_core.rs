@@ -2857,6 +2857,16 @@ impl FidoApp {
         let mut seed = [0u8; 32];
         self.draw_random(&mut seed);
         self.keystore.reset_from_seed(seed);
+        // A wiped region owns no pending counters — reset clears the window, or
+        // one stale entry wedges every later flush: `flush_counters`
+        // `?`-propagates `write_counter`'s `NoSuchCredential` on a `(slot,
+        // counter)` pair whose record the wipe just erased, and the first
+        // post-reset makeCredential (whose overwrite pre-pass flushes the
+        // window) is refused `KeyStoreFull` on a half-empty device. The window
+        // is keyed by slot alone, so no entry here can outlive the region it
+        // pointed into — `CounterWindow::restored()` is the empty-window state
+        // `DeviceKeystore::fresh` boots with.
+        self.keystore.counter_window = crate::device_keystore::CounterWindow::restored();
         // Regenerate the persistent hkey from the pool (TRNG-derived).
         // US-1007: bounded for the same reason as the makeCredential arm —
         // this was a bare rejection loop over a draw that cannot report
