@@ -955,6 +955,65 @@ impl FidoApp {
         .flatten()
     }
 
+    /// US-1723: open the credential whose record lives in `slot`, addressed
+    /// directly — the load the GA path signs from.
+    ///
+    /// The allowList match step resolves an ID through the **RP-qualified**
+    /// locator ([`Self::region_credential_at`] with the request's
+    /// `rp_id_hash`) and the discovery enumeration lists the RP's slots
+    /// (`slots_for_rp`); both hold the slot each candidate occupies. This
+    /// opens exactly that slot, without consulting the index again — the same
+    /// inner step the discovery loop already runs (`load_slot` +
+    /// `credential_from_record_body`), lifted into a named accessor.
+    ///
+    /// **The by-ID re-fetch this replaces was a different walk.**
+    /// `build_assertion` used to re-resolve the ID with `rp_id_hash: None`,
+    /// which is `CredentialIdLocator`'s structural walk
+    /// (`fido_store.rs:756-779`): first-match-in-index-order over the first
+    /// `MAX_RP_CREDENTIALS` (16, `fido_store.rs:533`) Fido-domain entries
+    /// *whatever RP they belong to*. Two consequences, both observed in the
+    /// US-1719 analysis and both now closed by construction:
+    ///
+    /// * with duplicate same-ID records the re-fetch can serve a DIFFERENT
+    ///   record than the one the match step found — the match step's
+    ///   candidates are RP-qualified, the re-fetch's are not, so the two
+    ///   walks agree only when their candidate sets coincide (analysis
+    ///   §2/O2, the collapse mechanism);
+    /// * past 16 FIDO entries the re-fetch cannot find the matched record at
+    ///   all and answers `CTAP2_ERR_NO_CREDENTIALS` for a credential the
+    ///   match step had in hand (analysis §5 hazard 2).
+    ///
+    /// Removing the re-fetch from GA removes the 16-bound **from GA**: the
+    /// walk itself remains in the platform for the genuinely RP-less callers
+    /// that still use it (the makeCredential exclude loop — US-1725's turf,
+    /// not touched here — and the migration's `contains_credential`), and
+    /// US-1724 owns its ordering rule.
+    ///
+    /// `None` for the same three reasons [`Self::region_credential_at`]
+    /// answers `None` — no keys, no region, and "not there / could not be
+    /// read" — collapsed the same deliberate way: every caller answers
+    /// `CTAP2_ERR_NO_CREDENTIALS`. The slot itself is trusted only as far as
+    /// it can be checked: the caller re-verifies the opened record's
+    /// `credential_id` and `rp_id_hash` against the request before anything
+    /// signs (the fail-closed invariant, restated at the signing site).
+    fn region_credential_in_slot(
+        &mut self,
+        keys: Option<&crate::device_keystore::RegionKeys>,
+        slot: fapico2_platform::keyregion::Slot,
+    ) -> Option<DeviceCredential> {
+        let mut window = fapico2_platform::keyregion::on_demand::CredentialWindow::new();
+        self.with_region(keys, |creds| {
+            if !matches!(
+                creds.load_slot(slot, &mut window),
+                fapico2_platform::keyregion::SlotRead::Present(())
+            ) {
+                return None;
+            }
+            crate::device_keystore::credential_from_record_body(window.as_slice())
+        })
+        .flatten()
+    }
+
     /// US-1562: the signature counter an assertion or a U2F authenticate must
     /// sign, batched over whichever store holds the credential.
     ///
@@ -1776,24 +1835,39 @@ impl FidoApp {
             }
 
             let rp_id_hash = crypto::sha256(req.rp_id.as_slice());
-            let mut matched: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
-                HeaplessVec::new();
+            // US-1723: `matched` carries **the slot each entry was resolved
+            // from**, not the ID alone — allowList entries carry the slot the
+            // RP-qualified match step opened, discovery entries the slot the
+            // enumeration listed it from (both already in hand), snapshot
+            // entries `None`. `build_assertion` opens that slot directly, so
+            // the record that signs is the record the match step found. The
+            // old shape — IDs only, then a by-ID re-fetch with `rp_id_hash:
+            // None` inside `build_assertion` — let a different record than
+            // the one matched serve the signature (analysis §2/O2: the
+            // RP-qualified match walk and the None-RP re-fetch walk are
+            // different walks over different candidate sets), and made GA
+            // structurally dependent on the 16-candidate None-RP walk
+            // (analysis §5 hazard 2).
+            let mut matched: HeaplessVec<
+                (HeaplessVec<u8, 64>, Option<fapico2_platform::keyregion::Slot>),
+                MAX_PENDING_CREDENTIAL_IDS,
+            > = HeaplessVec::new();
             let rkeys = self.region_keys_for(store.as_deref());
             if !req.allow.is_empty() {
                 for id in &req.allow {
                     let owned;
-                    let cred = if rkeys.is_some() {
-                        owned = self.region_credential(rkeys.as_ref(), Some(&rp_id_hash), id);
-                        owned.as_ref()
+                    let found = if rkeys.is_some() {
+                        owned = self.region_credential_at(rkeys.as_ref(), Some(&rp_id_hash), id);
+                        owned.as_ref().map(|(cred, slot)| (cred, Some(*slot)))
                     } else {
-                        self.keystore.get_credential(id)
+                        self.keystore.get_credential(id).map(|cred| (cred, None))
                     };
-                    if let Some(cred) = cred {
+                    if let Some((cred, slot)) = found {
                         let (revoked, protect, rp) = (cred.revoked, cred.cred_protect, cred.rp_id_hash);
                         if revoked || (protect == 3 && !uv) || rp != rp_id_hash {
                             continue;
                         }
-                        if matched.push(id.clone()).is_err() {
+                        if matched.push((id.clone(), slot)).is_err() {
                             return Err(err(Ctap2Response::LimitExceeded));
                         }
                         // AllowList returns exactly one credential.
@@ -1839,8 +1913,10 @@ impl FidoApp {
                     // Refusing the assertion is the conservative answer.
                     None => return Err(err(Ctap2Response::NoCredentials)),
                 };
-                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
-                    HeaplessVec::new();
+                let mut ids: HeaplessVec<
+                    (HeaplessVec<u8, 64>, Option<fapico2_platform::keyregion::Slot>),
+                    MAX_PENDING_CREDENTIAL_IDS,
+                > = HeaplessVec::new();
                 for s in rp_slots.iter().take(found) {
                     let owned = self.with_region(rkeys.as_ref(), |creds| {
                         if !matches!(
@@ -1856,7 +1932,10 @@ impl FidoApp {
                         && !cred.revoked
                         && (uv || cred.cred_protect < 2)
                         && cred.rp_id_hash == rp_id_hash
-                        && ids.push(cred.credential_id.clone()).is_err()
+                        // US-1723: the slot is already in hand — the loop
+                        // variable — so it travels with the ID it was opened
+                        // from. No by-ID re-fetch downstream.
+                        && ids.push((cred.credential_id.clone(), Some(*s))).is_err()
                     {
                         return Err(err(Ctap2Response::LimitExceeded));
                     }
@@ -1864,39 +1943,49 @@ impl FidoApp {
                 // Reverse (newest first) — unchanged, and for the same reason:
                 // the index is in slot order and the RP's newest passkey is the
                 // one a browser expects first.
-                while let Some(id) = ids.pop() {
-                    let _ = matched.push(id);
+                while let Some((id, slot)) = ids.pop() {
+                    let _ = matched.push((id, slot));
                 }
             } else {
                 // Resident credentials for the RP, newest first; credProtect
                 // >= 2 withheld without UV.
-                let mut ids: HeaplessVec<HeaplessVec<u8, 64>, MAX_PENDING_CREDENTIAL_IDS> =
-                    HeaplessVec::new();
+                let mut ids: HeaplessVec<
+                    (HeaplessVec<u8, 64>, Option<fapico2_platform::keyregion::Slot>),
+                    MAX_PENDING_CREDENTIAL_IDS,
+                > = HeaplessVec::new();
                 for cred in &self.keystore.credentials {
                     if cred.resident
                         && !cred.revoked
                         && (uv || cred.cred_protect < 2)
                         && cred.rp_id_hash == rp_id_hash
-                        && ids.push(cred.credential_id.clone()).is_err()
+                        // Snapshot arm: no slots exist — the snapshot keystore
+                        // is an in-RAM array, and `build_assertion`'s snapshot
+                        // half addresses it by ID as before (US-1723 threads
+                        // slots on the region path only).
+                        && ids.push((cred.credential_id.clone(), None)).is_err()
                     {
                         return Err(err(Ctap2Response::LimitExceeded));
                     }
                 }
                 // Reverse (newest first).
-                while let Some(id) = ids.pop() {
-                    let _ = matched.push(id);
+                while let Some((id, slot)) = ids.pop() {
+                    let _ = matched.push((id, slot));
                 }
             }
             if matched.is_empty() {
                 return Err(err(Ctap2Response::NoCredentials));
             }
-            let first = matched.remove(0);
+            let (first, first_slot) = matched.remove(0);
             let total = if req.allow.is_empty() { matched.len() + 1 } else { 1 };
             let has_more = req.allow.is_empty() && !matched.is_empty();
             if has_more {
                 self.ga_pending = Some(crate::device_app::DeviceGaState {
                     remaining: matched,
                     client_data_hash: req.client_data_hash,
+                    // US-1723: the request's RP hash rides with the pending
+                    // state so every getNextAssertion re-verifies the opened
+                    // record against the same request.
+                    rp_id_hash,
                     uv,
                     do_up,
                     total,
@@ -1907,7 +1996,9 @@ impl FidoApp {
             }
             self.build_assertion(
                 rkeys.as_ref(),
+                first_slot,
                 &first,
+                &rp_id_hash,
                 &req.client_data_hash,
                 uv,
                 do_up,
@@ -1935,7 +2026,9 @@ impl FidoApp {
     fn build_assertion(
         &mut self,
         rkeys: Option<&crate::device_keystore::RegionKeys>,
+        region_slot: Option<fapico2_platform::keyregion::Slot>,
         cred_id: &[u8],
+        request_rp_id_hash: &[u8; 32],
         client_data_hash: &[u8; 32],
         uv: bool,
         do_up: bool,
@@ -1957,24 +2050,53 @@ impl FidoApp {
         // resident for the assertion to find it at all. That is why the region
         // can hold 848: the 848 are in flash and this one is on the stack.
         //
-        // US-1562: the **slot** comes out of the same load. The signature
-        // counter lives in the record and is addressed by slot, so before this
-        // story the bump below had to find it again — and it did not; it looked
-        // the credential ID up in the *snapshot's* resident array, found
-        // nothing (a region-backed credential is not in it), and answered
-        // `CTAP2_ERR_NO_CREDENTIALS` to every assertion on the very backend the
-        // epic exists to make work. The slot is carried out of the load instead
-        // of looked up again, which is both the fix and one walk of the index
-        // cheaper than the alternative.
+        // US-1562: the **slot** reaches the counter bump. The signature
+        // counter lives in the record and is addressed by slot; before US-1562
+        // the bump looked the credential ID up in the *snapshot's* resident
+        // array, found nothing (a region-backed credential is not in it), and
+        // answered `CTAP2_ERR_NO_CREDENTIALS` to every assertion on the very
+        // backend the epic exists to make work.
+        //
+        // US-1723: **the record opened here is the record the match step
+        // found.** `region_slot` is the slot the allowList match step opened
+        // or the discovery enumeration listed the ID from — carried in
+        // `matched`/`DeviceGaState` — and it is opened directly
+        // ([`Self::region_credential_in_slot`]). Before this story the load
+        // below was a by-ID re-fetch with `rp_id_hash: None`
+        // (`region_credential_at(rkeys, None, …)`), i.e.
+        // `CredentialIdLocator`'s structural walk: first-match-in-index-order
+        // over the first `MAX_RP_CREDENTIALS` (16, `fido_store.rs:533`) Fido
+        // entries *whatever RP they belong to* — a walk the match step (whose
+        // candidates are RP-qualified) does not take. With duplicate same-ID
+        // records the two walks could disagree and the re-fetch's answer — a
+        // record the match step never found, under a different RP or a
+        // different key — signed (analysis §2/O2, the collapse mechanism; the
+        // US-1719 RED suite reproduced it). Past 16 FIDO entries the re-fetch
+        // could not find the matched record at all (analysis §5 hazard 2).
+        // The re-fetch is gone from the GA path: the None-RP walk itself
+        // remains in the platform for genuinely RP-less callers (the
+        // makeCredential exclude loop — US-1725's turf — and the migration's
+        // `contains_credential`), so its 16-bound no longer bounds GA.
         //
         // The fields are copied out immediately because `self` is borrowed
         // mutably a few lines later for the counter bump, and the local is what
         // ends that borrow.
-        let region_owned = self.region_credential_at(rkeys, None, cred_id);
-        let region_slot = region_owned.as_ref().map(|(_cred, slot)| *slot);
+        let region_owned = if rkeys.is_some() {
+            // Every region arm of the match step carries the slot it resolved
+            // (`Some` by construction), so `None` here would mean the ID did
+            // not come from a region load. Falling back to the old by-ID
+            // re-fetch would reintroduce the collapse this story closes —
+            // fail closed instead.
+            match region_slot {
+                Some(slot) => self.region_credential_in_slot(rkeys, slot),
+                None => None,
+            }
+        } else {
+            None
+        };
         let cred = if rkeys.is_some() {
             match region_owned.as_ref() {
-                Some((c, _slot)) => c,
+                Some(c) => c,
                 None => return Err(err(Ctap2Response::NoCredentials)),
             }
         } else {
@@ -1983,6 +2105,17 @@ impl FidoApp {
                 None => return Err(err(Ctap2Response::NoCredentials)),
             }
         };
+        // US-1723: the fail-closed re-check, restated at the only place that
+        // matters. What was just opened is claimed to be the requested
+        // credential; before anything signs, the record has to say so itself —
+        // the ID byte-equal and the RP hash equal to the REQUEST's. A
+        // mismatch answers `CTAP2_ERR_NO_CREDENTIALS`: absence, not fault
+        // (US-1573's distinction) — a wrong record is treated exactly like a
+        // missing one, never signed, never reported as an error condition a
+        // client could retry into.
+        if cred.credential_id.as_slice() != cred_id || cred.rp_id_hash != *request_rp_id_hash {
+            return Err(err(Ctap2Response::NoCredentials));
+        }
         let rp_id_hash = cred.rp_id_hash;
         let cred_blob = if get_cred_blob { Some(cred.cred_blob.clone()) } else { None };
         let lbk = cred.large_blob_key;
@@ -2127,16 +2260,22 @@ impl FidoApp {
                 self.ga_pending = None;
                 return Err(err(Ctap2Response::NoCredentials));
             }
-            let id = state.remaining.remove(0);
+            let (id, slot) = state.remaining.remove(0);
             let total = state.total;
             let uv = state.uv;
             let do_up = state.do_up;
             let cdh = state.client_data_hash;
+            // US-1723: the request's RP hash rides in the pending state, and
+            // the slot the enumeration resolved this ID from rides with it —
+            // `build_assertion` opens that slot and re-verifies the record
+            // against this request before signing, exactly as the first
+            // assertion did.
+            let req_hash = state.rp_id_hash;
             let is_last = state.remaining.is_empty();
             if is_last {
                 self.ga_pending = None;
             }
-            self.build_assertion(rkeys.as_ref(), &id, &cdh, uv, do_up, total, !is_last, None, false, false, false, out, store)
+            self.build_assertion(rkeys.as_ref(), slot, &id, &req_hash, &cdh, uv, do_up, total, !is_last, None, false, false, false, out, store)
         })();
         match r {
             Ok(()) => {}
