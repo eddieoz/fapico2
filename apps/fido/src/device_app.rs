@@ -376,6 +376,15 @@ pub struct CmCredState {
     /// See [`CmRpState::dialect`] — `enumerateCredentialsGetNextCredential`
     /// is likewise `{1: 0x05}` and nothing else in both dialects.
     pub(crate) dialect: crate::device_core::CmDialect,
+    /// US-1725: the `rpIdHash` the `enumerateCredsBegin` that armed this
+    /// enumeration was asked about. The Begin and every GetNext it continues
+    /// build their per-credential response by re-opening the named record
+    /// through the **RP-qualified** locator, and a Next request cannot be
+    /// classified from its own bytes (`{1: 0x05}` in both dialects) — so the
+    /// hash has to ride with the enumeration. Without it the re-fetch fell
+    /// back to the None-RP walk, whose 16-ordinal window hid a credential
+    /// the enumeration itself had just listed.
+    pub(crate) rp_id_hash: [u8; 32],
 }
 
 /// largeBlobs fragment assembly state.
