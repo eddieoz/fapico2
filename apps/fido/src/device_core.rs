@@ -3292,10 +3292,12 @@ const CM_UPDATE_USER: u8 = 0x07;
 
 /// Why [`FidoApp::delete_all_by_id`] refused to finish (US-1722).
 ///
-/// Both arms mean "fail closed" at the makeCredential overwrite call site —
-/// CTAP2_ERR_KEY_STORE_FULL — but they are named apart so the next consumer
-/// (credMgmt deleteCredential, US-1726) can map them differently without
-/// unwinding the shared helper.
+/// Both arms mean "fail closed" — CTAP2_ERR_KEY_STORE_FULL — at both call
+/// sites: the makeCredential overwrite (US-1722) and credMgmt
+/// deleteCredential (US-1726, which mapped them the same way rather than
+/// differently, because a delete that could not finish is storage trouble
+/// whatever caused it, not "no such credential"). They stay named apart so a
+/// future consumer can still split them without unwinding the shared helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeleteAllByIdError {
     /// More live duplicates than the store can hold — a delete that reported
@@ -4108,23 +4110,51 @@ impl FidoApp {
                 // **And it is followed by a compaction of that slot's sector**,
                 // which is the half that makes the freed capacity reachable: a
                 // tombstone is a record, so the allocator will not hand the slot
-                // out again until the sector is rewritten without it. Doing it
-                // here rather than leaving it to the caller is the right place —
-                // the caller is a CTAP client that will never ask, and
-                // `remainingDiscoverableCredentialsCount` would go on promising
-                // capacity the device cannot serve. `AGENTS.md` §4: a wire claim
-                // the device does not honour is the defect.
-                if rkeys.is_some() {
-                    let mut nonce = [0u8; fapico2_platform::keyregion::record::NONCE_LEN];
-                    self.draw_random(&mut nonce);
-                    return match self.with_region(rkeys.as_ref(), |creds| {
-                        let report = creds.delete(&nonce, id.as_slice()).ok()?;
-                        let sector = fapico2_platform::keyregion::commit::sector_base(report.slot);
-                        creds.compact(sector).ok()?;
-                        Some(())
-                    }) {
-                        Some(Some(())) => Ok(()),
-                        _ => Err(err(Ctap2Response::NoCredentials)),
+                // out again until the sector is rewritten without it. The helper
+                // owns both halves (see `delete_all_by_id`).
+                //
+                // US-1726: routed through `delete_all_by_id` — the one "delete
+                // this credential" primitive makeCredential's overwrite
+                // (US-1722) already uses — so the two can never diverge on what
+                // "delete this credential" means. The old single
+                // `creds.delete` here killed only the first index-order match
+                // (newest-first since US-1724), so on a legacy duplicate set
+                // the surviving duplicates kept shadowing: the RP still
+                // enumerated the credential, a pinned getAssertion still
+                // served it, and the other slots stayed leaked.
+                //
+                // **The counter-window wedge this retires** (US-1722's review
+                // finding, reproduced by
+                // `tests/credmgmt_delete_all.rs::the_deleted_slot_leaves_no_
+                // stale_pending_counter_entry`): this arm used to tombstone
+                // WITHOUT flushing the `CounterWindow` first, so a batched
+                // counter for the deleted slot outlived its record — and
+                // `flush_counters` drops entries one at a time on success, so
+                // the stale entry (pointing at the tombstone, or at the slot
+                // compaction erased) failed every later flush at that entry.
+                // The first flush consumer to come along was makeCredential's
+                // overwrite, which answered CTAP2_ERR_KEY_STORE_FULL on a
+                // healthy region. The helper flushes FIRST (its counter-carry
+                // note), so no pending entry outlives its record; had the
+                // slot been re-allocated, the stale value would have been
+                // written into the slot's next tenant — also gone. A flush
+                // failure inside the helper returns BEFORE any tombstone
+                // commits, so the delete fails closed with nothing
+                // half-deleted and every pending entry still pointing at a
+                // live record: the retry is a plain retry, not a wedge.
+                if let Some(keys) = rkeys.as_ref() {
+                    return match self.delete_all_by_id(keys, rp_id_hash.as_ref(), id.as_slice()) {
+                        Ok((removed, _carried)) if removed > 0 => Ok(()),
+                        // A total miss — no live same-ID record — is today's
+                        // answer, unchanged.
+                        Ok(_no_live_match) => Err(err(Ctap2Response::NoCredentials)),
+                        // Overrun / Unreachable: fail closed with the honest
+                        // storage-trouble status, the helper's other
+                        // consumer's answer — not the "no such credential"
+                        // the old arm collapsed every internal fault into
+                        // (US-1573: a fault is not an absence). The enum was
+                        // named apart for exactly this mapping.
+                        Err(_refused) => Err(err(Ctap2Response::KeyStoreFull)),
                     };
                 }
                 match self.keystore.delete_credential(id.as_slice()) {
@@ -4248,12 +4278,15 @@ impl FidoApp {
     /// means a delete that reports success without removing — fail closed
     /// ([`DeleteAllByIdError::Overrun`]) rather than spin. A region read or
     /// write fault is [`DeleteAllByIdError::Unreachable`]. Both map to
-    /// CTAP2_ERR_KEY_STORE_FULL at the makeCredential call site; they are
-    /// named apart so the next consumer (US-1726) can map them differently
-    /// without unwinding the shared helper. Compaction runs per deleted
-    /// record's sector through [`RegionCredentials::compact`], which checks
-    /// both of `is_fido_slot`'s bounds (the 3cf0b56 lesson: a one-bound test
-    /// once cost an OATH credential).
+    /// CTAP2_ERR_KEY_STORE_FULL at both call sites (makeCredential US-1722,
+    /// credMgmt deleteCredential US-1726); they are named apart so a future
+    /// consumer can still split them without unwinding the shared helper.
+    /// Compaction runs once per affected
+    /// sector after the loop (US-1726: two duplicates sharing a sector — the
+    /// common shape — cost one rewrite, not one each), through
+    /// [`RegionCredentials::compact`], which checks both of `is_fido_slot`'s
+    /// bounds (the 3cf0b56 lesson: a one-bound test once cost an OATH
+    /// credential).
     pub(crate) fn delete_all_by_id(
         &mut self,
         keys: &crate::device_keystore::RegionKeys,
@@ -4281,6 +4314,26 @@ impl FidoApp {
         let mut window = on_demand::CredentialWindow::new();
         let mut removed = 0usize;
         let mut carried = 0u32;
+        // US-1726: the affected sectors, compacted **once each** after the
+        // loop. Two duplicates sharing a sector — the allocator's
+        // lowest-free-slot rule makes that the common shape — used to pay one
+        // sector rewrite per delete; credMgmt's deleteCredential (the caller
+        // that made this a loop) and makeCredential's overwrite (the other
+        // consumer) both take the cheaper path now. The tombstones themselves
+        // still commit inside the loop — `delete` is a commit, the loop's
+        // `load_by_id_at` must not see them again, and it does not: the ID
+        // probe matches live credential bodies only, and a tombstone's
+        // one-byte body matches nothing.
+        //
+        // The set's bound is FIDO's own sector span: every deleted record
+        // lives in FIDO's range and the range is sector-aligned (`mod.rs`'s
+        // const block asserts the carve keeps it so), so the distinct-sector
+        // set can never exceed it. A push that would exceed that means the
+        // walk found more distinct sectors than exist — fail closed.
+        const FIDO_SECTOR_SPAN: usize = fapico2_platform::keyregion::FIDO_CAPACITY as usize
+            / fapico2_platform::keyregion::SLOTS_PER_SECTOR as usize;
+        let mut sectors: heapless::Vec<fapico2_platform::keyregion::Slot, FIDO_SECTOR_SPAN> =
+            heapless::Vec::new();
         loop {
             if removed > crate::device_keystore::DEVICE_MAX_CREDS {
                 return Err(DeleteAllByIdError::Overrun);
@@ -4298,12 +4351,22 @@ impl FidoApp {
                     // slot stays off the free list until its sector is
                     // rewritten without it. Skipping it here would leak one
                     // slot per overwrite (AGENTS.md §5: capacity is a
-                    // security property).
+                    // security property). The rewrite itself is deferred to
+                    // after the loop — once per affected sector (above).
                     let sector = fapico2_platform::keyregion::commit::sector_base(report.slot);
-                    creds.compact(sector).map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    if !sectors.contains(&sector) && sectors.push(sector).is_err() {
+                        return Err(DeleteAllByIdError::Unreachable);
+                    }
                     removed += 1;
                 }
-                SlotRead::Absent => return Ok((removed, carried)),
+                SlotRead::Absent => {
+                    for sector in sectors.iter() {
+                        creds
+                            .compact(*sector)
+                            .map_err(|_| DeleteAllByIdError::Unreachable)?;
+                    }
+                    return Ok((removed, carried));
+                }
                 SlotRead::Fault(_) => return Err(DeleteAllByIdError::Unreachable),
             }
         }
