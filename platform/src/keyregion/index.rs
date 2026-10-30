@@ -945,6 +945,62 @@ pub fn lookup_all(
     }
 }
 
+/// One [`lookup_all`] match together with the generation its entry claims.
+///
+/// US-1729: an index entry only names a record it was written for, and the
+/// entry's `generation` field is the claim the locators check — after the named
+/// slot opens, its record header must carry this generation or the entry is
+/// stale and the candidate does not count. The comparison itself lives in the
+/// callers (`fido_store.rs`'s locators), because it needs the record codec and
+/// this module reads index slots only; what this type does is carry the claim
+/// out of the walk so the caller can make it.
+///
+/// The entry's own authentication is unchanged — `IndexEntry::verify` is
+/// device-rooted and PIN-free and binds the entry's own `(domain, slot,
+/// generation)`. Carrying the generation is not a second authentication; it is
+/// the input to the semantic check the record header answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexCandidate {
+    /// The slot the entry names.
+    pub slot: Slot,
+    /// The generation the entry says the record in that slot carries.
+    pub generation: u32,
+}
+
+/// Every slot whose index entry authenticates `rp_id_hash`, **with the
+/// generation each entry claims**, appended to `out`.
+///
+/// The pairing form of [`lookup_all`] — same walk, same properties (index slots
+/// only, no payload key, no decryption), same "total may exceed `out.len()`"
+/// contract — plus the one field US-1729's comparison needs. `lookup_all`
+/// itself is unchanged for its existing callers; new locator paths use this and
+/// compare `candidate.generation` against the record header's before serving
+/// the slot, so a stale entry left behind by a torn commit
+/// (`fido_store.rs`, the allocator's torn-path paragraph) stops naming a record
+/// that no longer exists in its slot.
+pub fn lookup_all_pairs(
+    key: &IndexKey,
+    region: &mut dyn KeyRegion,
+    domain: KeyDomain,
+    rp_id_hash: &RpIdHash,
+    out: &mut [IndexCandidate],
+) -> SlotRead<usize> {
+    let mut total = 0usize;
+    match walk_present(region, domain, |entry| {
+        if entry.verify(key, rp_id_hash) {
+            if let Some(cand) = out.get_mut(total) {
+                cand.slot = entry.slot();
+                cand.generation = entry.generation();
+            }
+            total += 1;
+        }
+        true
+    }) {
+        SlotRead::Fault(reason) => SlotRead::Fault(reason),
+        _ => SlotRead::Present(total),
+    }
+}
+
 /// Stream every present entry of one `domain`, in index order, stopping early
 /// when `visit` returns `false`.
 ///

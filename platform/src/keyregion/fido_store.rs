@@ -191,6 +191,12 @@ pub const INDEX_SECTOR_ERASES_PER_ENTRY_WRITE: u32 =
 /// the index maintains rather than an attack it stops, and `AGENTS.md` §5 asks
 /// for the attack to be named before a mechanism is added.
 ///
+/// *US-1729 postscript: this closed.* The locators (`IndexLocator::locate`,
+/// `CredentialIdLocator::locate`, `slots_for_rp`) now read
+/// [`IndexEntry::generation`] and compare it with the record header's before
+/// probing — the stale entry that authenticates but names a recycled slot is
+/// skipped as absent, never served.
+///
 /// The name is: **the index must not be able to disagree with the region about
 /// which generation is current.** The alternative is to leave the field stale and
 /// document it as stale, which turns a field every future reader will consult
@@ -595,29 +601,63 @@ impl SlotLocator for IndexLocator<'_> {
         region: &mut dyn KeyRegion,
         _want: &SlotQuery<'_>,
     ) -> on_demand::Located {
-        // **`index::lookup_all`, not `index::lookup`.** `lookup` matches on
+        // **`index::lookup_all_pairs`, not `index::lookup`.** `lookup` matches on
         // `(outcome, found)` and returns `Absent` for *both* "no match" and
         // "the index slot could not be read" — its own docs acknowledge the
         // collapse ("`Absent` means no entry in this domain authenticates the
-        // hash … but see `SlotRead::present`'s warning"). `lookup_all`
-        // propagates `Fault` instead, and this is a locator: `on_demand.rs`
+        // hash … but see `SlotRead::present`'s warning"). `lookup_all`/`lookup_all_pairs`
+        // propagate `Fault` instead, and this is a locator: `on_demand.rs`
         // names it as "the first component able to get wrong" US-1573's
         // distinction. A `Fault` that reached `on_demand::load` as `Absent`
         // would report a sick flash as "no such credential", which is the
         // precise shape of the bug the three states exist to prevent.
-        let mut first: [Slot; 1] = [first_slot()];
-        match index::lookup_all(
+        //
+        // **US-1729: the pairing form, and the generation check.** An index
+        // entry only names a record it was written for: the entry's stored
+        // generation must equal the record header's before this locator serves
+        // the slot. The torn-commit mechanics that leave a stale entry behind
+        // are documented at the allocator ("a slot that served generation N and
+        // then lost its header … is re-allocated at generation 1") — the entry
+        // still authenticates, because entry authentication is device-rooted
+        // and PIN-free and binds the entry's *own* `(domain, slot, generation)`,
+        // and that authentication is unchanged here. The comparison is a
+        // second, semantic check made after the slot opens; a mismatch means
+        // the entry names a record that no longer exists in that slot, so the
+        // candidate is **skipped as absent — never `Fault`** (US-1573's
+        // distinction: a stale entry is absence, not a fault). This changes
+        // whether a candidate counts, not which match wins (US-1724's
+        // last-match rule is untouched, and this locator keeps its own
+        // first-live-match semantics).
+        let mut candidates =
+            [index::IndexCandidate { slot: first_slot(), generation: 0 }; MAX_RP_CREDENTIALS];
+        let count = match index::lookup_all_pairs(
             self.index_key,
             region,
             KeyDomain::Fido,
             &self.rp_id_hash,
-            &mut first,
+            &mut candidates,
         ) {
-            SlotRead::Present(count) if count > 0 => on_demand::Located::Found(first[0]),
-            SlotRead::Present(_) => on_demand::Located::None,
-            SlotRead::Fault(why) => on_demand::Located::Fault(why),
-            SlotRead::Absent => on_demand::Located::None,
+            SlotRead::Present(n) => n.min(MAX_RP_CREDENTIALS),
+            SlotRead::Fault(why) => return on_demand::Located::Fault(why),
+            SlotRead::Absent => return on_demand::Located::None,
+        };
+        for cand in candidates.iter().take(count) {
+            let raw = match region.read_slot(cand.slot) {
+                Ok(raw) => raw,
+                // US-1573: the walk found no proven hit yet, so a transport
+                // fault on a named slot propagates rather than memoizing as
+                // absent.
+                Err(why) => return on_demand::Located::Fault(why),
+            };
+            // A header that does not parse (the torn-commit case) or names
+            // another slot reads `Absent` — the entry is stale for this slot.
+            if let SlotRead::Present(decoded) = record::decode(cand.slot, &raw) {
+                if decoded.header().generation() == cand.generation {
+                    return on_demand::Located::Found(cand.slot);
+                }
+            }
         }
+        on_demand::Located::None
     }
 }
 
@@ -717,7 +757,17 @@ impl SlotLocator for CredentialIdLocator<'_> {
         _want: &SlotQuery<'_>,
     ) -> on_demand::Located {
         self.examined = 0;
-        let mut candidates: [Slot; MAX_RP_CREDENTIALS] = [first_slot(); MAX_RP_CREDENTIALS];
+        // **US-1729: candidates carry the generation their entry claims.** An
+        // index entry only names a record it was written for; the probe loop
+        // below compares each candidate's generation against the record header
+        // before unsealing, so a stale entry left by a torn commit (the
+        // allocator's torn-path paragraph in this file) is skipped as absent —
+        // never `Fault` (US-1573), and never charged an AEAD. The entry's own
+        // authentication is unchanged; the comparison is a second, semantic
+        // check. This decides whether a candidate counts; US-1724's
+        // last-match-wins walk below is untouched.
+        let mut candidates: [index::IndexCandidate; MAX_RP_CREDENTIALS] =
+            [index::IndexCandidate { slot: first_slot(), generation: 0 }; MAX_RP_CREDENTIALS];
         // **`rp_id_hash: None` is a domain-wide walk, not a lookup with a zero
         // hash.** This used to call `index::lookup_all` with
         // `RpIdHash::from_bytes([0u8; 32])`, which is wrong in a way that read
@@ -742,7 +792,7 @@ impl SlotLocator for CredentialIdLocator<'_> {
         // probe compares the credential ID out of the opened plaintext. A forged
         // entry therefore buys an attacker one extra AEAD, not a credential.
         let count = match self.rp_id_hash {
-            Some(ref hash) => match index::lookup_all(
+            Some(ref hash) => match index::lookup_all_pairs(
                 self.index_key,
                 region,
                 KeyDomain::Fido,
@@ -769,7 +819,14 @@ impl SlotLocator for CredentialIdLocator<'_> {
                         IndexEntry::decode(&raw[at..at + index::INDEX_ENTRY_BYTES])
                     {
                         if entry.domain() == KeyDomain::Fido {
-                            candidates[n] = entry.slot();
+                            // The structural walk's candidate carries the
+                            // generation its own entry claims, same as the
+                            // RP-qualified branch's — the probe loop's
+                            // US-1729 comparison needs it.
+                            candidates[n] = index::IndexCandidate {
+                                slot: entry.slot(),
+                                generation: entry.generation(),
+                            };
                             n += 1;
                         }
                     }
@@ -796,9 +853,8 @@ impl SlotLocator for CredentialIdLocator<'_> {
         // legacy boards mid-upgrade, which is exactly the population that can
         // still carry them.
         let mut found: Option<Slot> = None;
-        for &slot in candidates.iter().take(count) {
-            self.examined += 1;
-            let raw = match region.read_slot(slot) {
+        for &cand in candidates.iter().take(count) {
+            let raw = match region.read_slot(cand.slot) {
                 Ok(raw) => raw,
                 Err(why) => {
                     // A transport fault on a candidate with no hit yet is
@@ -816,18 +872,51 @@ impl SlotLocator for CredentialIdLocator<'_> {
                     };
                 }
             };
-            // `record::read` is the whole read path (`record.rs`, "The whole
-            // read path"), so an erased slot, a bad header CRC, a transplanted
-            // header and a failed tag all arrive as `Absent` and one bad record
-            // costs itself alone — US-1549's fail-closed property, inherited
-            // rather than reimplemented. `Plaintext` zeroizes its own buffer on
-            // drop, so no candidate's plaintext outlives the comparison.
-            match record::read(slot, &raw, self.payload_key.as_bytes()) {
+            // `record::decode` is the read path's first half (`record.rs`), so
+            // an erased slot, a bad header CRC and a transplanted header all
+            // arrive as `Absent` and one bad record costs itself alone —
+            // US-1549's fail-closed property, inherited rather than
+            // reimplemented.
+            let decoded = match record::decode(cand.slot, &raw) {
+                SlotRead::Present(decoded) => decoded,
+                SlotRead::Fault(why) => {
+                    // The same split as the `read_slot` arm above: no hit yet —
+                    // the fault propagates; a hit in hand — the walk aborts on
+                    // it. (A decode `Fault` is a record that could not even be
+                    // framed, not a "not this one".)
+                    return match found {
+                        Some(hit) => on_demand::Located::Found(hit),
+                        None => on_demand::Located::Fault(why),
+                    };
+                }
+                // A header that does not parse names no record in this slot —
+                // the torn-commit shape itself. Skip the candidate.
+                SlotRead::Absent => continue,
+            };
+            // **US-1729: an index entry only names a record it was written
+            // for.** The entry's stored generation must equal the record
+            // header's, or the slot was recycled under the entry — the
+            // torn-commit state the allocator's paragraph in this file
+            // documents — and the candidate is skipped as **absent**, never
+            // `Fault` (US-1573) and never unsealed. The entry's own
+            // authentication is unchanged (device-rooted, PIN-free,
+            // `index.rs`); this is the second, semantic check. Whether a
+            // candidate counts is this story's concern; which match wins stays
+            // US-1724's.
+            if decoded.header().generation() != cand.generation {
+                continue;
+            }
+            self.examined += 1;
+            // The second half of the read path: the header just matched, so
+            // the open runs against the record the entry names. `Plaintext`
+            // zeroizes its own buffer on drop, so no candidate's plaintext
+            // outlives the comparison.
+            match record::open(decoded.header(), self.payload_key.as_bytes(), decoded.body()) {
                 SlotRead::Present(plaintext) => {
                     if self.probe.matches(plaintext.as_slice(), self.credential_id) {
                         // Keep walking: a later candidate that matches is the
                         // newer copy and supersedes this one (US-1724).
-                        found = Some(slot);
+                        found = Some(cand.slot);
                     }
                 }
                 SlotRead::Fault(why) => {
@@ -1247,13 +1336,26 @@ impl FidoRecordStore<'_> {
         )
     }
 
-    /// Every FIDO slot whose index entry authenticates `rp_id_hash`.
+    /// Every FIDO slot whose index entry authenticates `rp_id_hash` **and
+    /// names the record the slot actually holds**.
     ///
-    /// Index slots only — no payload key is in this signature, so there is
-    /// nowhere for one to arrive (`index.rs` makes the same argument about
-    /// `lookup`). This is the enumeration a credential-management
+    /// Index slots plus one header read per candidate — no payload key is in
+    /// this signature, so no plaintext can arrive (`index.rs` makes the same
+    /// argument about `lookup`). This is the enumeration a credential-management
     /// `enumerateRPsBegin` needs, and the one `getAssertion` builds its
     /// candidate list from without decrypting anything.
+    ///
+    /// **US-1729: an index entry only names a record it was written for.** Each
+    /// authenticating entry is compared against the record header in the slot
+    /// it names, and only a matching generation is listed. A stale entry — the
+    /// torn-commit state the allocator's paragraph in this file documents, where
+    /// a slot that served generation *N* lost its header and was re-issued at
+    /// generation 1 — still authenticates (entry authentication is
+    /// device-rooted, PIN-free, and binds the entry's *own* fields; that is
+    /// unchanged) but no longer names a record that exists in its slot, so it
+    /// is skipped: the candidate is absent, never `Fault` (US-1573). Without
+    /// this, discovery listed a recycled slot twice — once through the stale
+    /// entry, once through its own.
     ///
     /// Returns the **total** number of matches, which may exceed `out.len()`, so
     /// a caller can tell "that was all of them" from "that was all that fit".
@@ -1263,7 +1365,45 @@ impl FidoRecordStore<'_> {
         rp_id_hash: &RpIdHash,
         out: &mut [Slot],
     ) -> SlotRead<usize> {
-        index::lookup_all(index_key, self.region, KeyDomain::Fido, rp_id_hash, out)
+        let mut total = 0usize;
+        let mut ordinal = 0u32;
+        while ordinal < index::index_capacity() {
+            let index_slot = match index::entry_slot(ordinal) {
+                Some(s) => s,
+                None => return SlotRead::Fault(index::E_INDEX_SLOT_UNREADABLE),
+            };
+            let raw = match self.region.read_slot(index_slot) {
+                Ok(raw) => raw,
+                Err(why) => return SlotRead::Fault(why),
+            };
+            let at = index::entry_offset(ordinal) as usize;
+            if let SlotRead::Present(entry) =
+                IndexEntry::decode(&raw[at..at + index::INDEX_ENTRY_BYTES])
+            {
+                if entry.domain() == KeyDomain::Fido && entry.verify(index_key, rp_id_hash) {
+                    // The comparison: the record header must carry the
+                    // generation the entry claims. A header that does not
+                    // parse, or parses at another generation, means the entry
+                    // is stale for this slot — skip it, do not fault.
+                    let rec = match self.region.read_slot(entry.slot()) {
+                        Ok(rec) => rec,
+                        // US-1573: a transport fault on a named slot must not
+                        // memoize as "fewer credentials than there are".
+                        Err(why) => return SlotRead::Fault(why),
+                    };
+                    if let SlotRead::Present(decoded) = record::decode(entry.slot(), &rec) {
+                        if decoded.header().generation() == entry.generation() {
+                            if let Some(slot) = out.get_mut(total) {
+                                *slot = entry.slot();
+                            }
+                            total += 1;
+                        }
+                    }
+                }
+            }
+            ordinal += 1;
+        }
+        SlotRead::Present(total)
     }
 
     /// What the region's index holds, counted without a key.
