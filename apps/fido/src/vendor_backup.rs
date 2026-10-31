@@ -915,15 +915,18 @@ pub fn load(
     }
 
     // US-1737 (EPIC FIDO-SEED-ROOT), the reset-first gate, arm 1: a board
-    // with resident credentials and **no** seed would take a completely new
+    // holding FIDO records and **no** seed would take a completely new
     // derivation root — orphaning every resident key, whose stored scalars
     // the new root cannot reproduce. Refuse here, before the channel: an
     // unauthenticated caller learns only what `backup_auth` already told it,
-    // never whether residents exist. The reset (`authenticatorReset`) wipes
-    // the residents and makes the install legal — reset-first, the policy the
-    // host tool surfaces (US-1738).
-    let residents = ops.resident_credential_count();
-    if residents > 0 && ops.master_seed().is_none() {
+    // never whether records exist. The count is a tri-state on purpose:
+    // `None` — a backend holds records the count could not read — is NOT
+    // "no residents"; it refuses exactly like a positive count (the trait
+    // doc carries the reasoning; a fault is not evidence of an empty
+    // wallet). The reset (`authenticatorReset`) wipes the records and makes
+    // the install legal — reset-first, the policy the host tool surfaces
+    // (US-1738).
+    if ops.resident_credential_count() != Some(0) && ops.master_seed().is_none() {
         return Outcome::plain(Ctap2Response::NotAllowed);
     }
 
@@ -948,15 +951,17 @@ pub fn load(
     }
     let mut seed = [0u8; MASTER_SEED_LEN];
     seed.copy_from_slice(&plain);
-    // US-1737, arm 2: on a board that already has residents, only the
+    // US-1737, arm 2: on a board that already holds records, only the
     // **same** seed may be reinstalled (idempotent — it cannot orphan
     // anything, US-1734's froot is stable under it). A different seed on a
-    // resident board is the same orphaning move arm 1 refuses; the check
-    // could not run earlier because `incoming` is only known after the AEAD
-    // opened — and by then the caller authenticated, so there is nothing new
-    // for an outsider to learn. `master_seed()` is read again, not cached
-    // from arm 1: the trait is the state's only honest reader.
-    if residents > 0 && ops.master_seed() != Some(seed) {
+    // record-holding board is the same orphaning move arm 1 refuses; the
+    // check could not run earlier because `incoming` is only known after the
+    // AEAD opened — and by then the caller authenticated, so there is
+    // nothing new for an outsider to learn. Both the count and the seed are
+    // read **again** here, not cached from arm 1: the trait is the state's
+    // only honest reader, and an asymmetry between the two reads would be
+    // one more thing to explain to the next implementer.
+    if ops.resident_credential_count() != Some(0) && ops.master_seed() != Some(seed) {
         return Outcome::plain(Ctap2Response::NotAllowed);
     }
     // The trait is all-or-nothing, so an `Err` here means the state is

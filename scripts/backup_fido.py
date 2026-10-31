@@ -694,19 +694,30 @@ def cmd_restore(args) -> int:
         restore_seed(dev, seed, _touch_prompt_for(path))
     except BackupError as exc:
         if exc.status == 0x30:
-            # LOAD refuses 0x30 when resident credentials exist and the
-            # incoming seed differs from the installed one (US-1737): the
+            # LOAD refuses 0x30 while the board holds FIDO records and the
+            # incoming seed would change the derivation root — either no
+            # seed is installed yet, or a different one is (US-1737). The
             # policy is reset-first. The shared STATUS_HELP 0x30 entry stays
             # truthful for EXPORT, so the restore guidance lives here.
             _prose(
-                "the firmware refused the restore (LOAD answered 0x30): "
-                "resident passkeys exist and this seed does not match the "
-                "installed one. authenticatorReset (ykman fido reset) wipes "
-                "passkeys, then restore again."
+                "the firmware refused the restore (LOAD answered 0x30): the "
+                "board holds passkeys, and installing this seed would change "
+                "their derivation root. authenticatorReset (ykman fido "
+                "reset) wipes passkeys, then restore again."
             )
             return 1
         raise
     after = read_state(dev)
+    if not after["has_seed"]:
+        # LOAD answered OK but the board does not report a seed — do not
+        # report success, and with --generate do NOT print the phrase: a
+        # phrase on screen that is not on the board is exactly what the
+        # install-first contract exists to prevent.
+        _prose(
+            "error: the board answered OK but does not report a seed — "
+            "nothing to rely on. Check `status` and re-run the restore."
+        )
+        return 1
     _prose("Seed installed. Board now reports:")
     _prose(state_summary(after))
     if args.generate:

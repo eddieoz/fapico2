@@ -3987,24 +3987,38 @@ pub trait VendorOps {
 
     fn master_seed(&self) -> Option<[u8; 32]>;
 
-    /// How many resident credentials the state currently holds, across
-    /// **every** backend the implementation serves.
+    /// Whether the state holds FIDO credential records, and how many — or
+    /// `None` when that question **cannot be answered**, ever as "no".
     ///
     /// US-1737 (EPIC FIDO-SEED-ROOT): `LOAD`'s reset-first gate reads this —
-    /// installing a derivation root over residents orphans their keys, so
-    /// the count is the one fact the gate exists on. "Resident" is whatever
-    /// predicate the credMgmt discovery paths serve (the EPIC §2 rule: find
-    /// the existing one, never invent a second), and the implementations
-    /// count exactly what their credential store would enumerate:
-    /// `KeystoreVendorOps` counts the snapshot's resident array plus the key
-    /// region's index entries, `MemoryVendorOps` the host keystore's array.
+    /// installing a derivation root over existing records orphans the keys
+    /// of every *resident* one, so the count is the one fact the gate exists
+    /// on. The contract is deliberately **stricter than "residents"**: the
+    /// region backend counts its index entries unfiltered (`used()`), and
+    /// residency lives inside the sealed record — reading it out would cost
+    /// one AEAD open per record on a gate that runs before the channel. The
+    /// cost of the strictness is bounded and honest: a board holding only
+    /// non-resident records is refused too, and its recovery is the same
+    /// `authenticatorReset` the resident case requires — which wipes
+    /// non-resident records as well, so nothing is sacrificed that the
+    /// unstrict gate would have kept.
     ///
-    /// Best-effort by contract: a backend that cannot be read right now
-    /// contributes its count as `0` rather than an error, because the gate's
-    /// job is to protect records it can *see* — the orphan gate (US-1736) is
-    /// the belt-and-braces for what slips past. A store error is not
-    /// evidence that the wallet is empty.
-    fn resident_credential_count(&self) -> usize;
+    /// `None` is the fail-closed answer, and it is the whole point of the
+    /// Option: a **faulted** backend is not evidence of an empty wallet —
+    /// the sibling `RegionCredentials::remaining()` refuses to report `0` on
+    /// a fault for exactly this reason ("reporting 0 would refuse an
+    /// enrolment with a claim about capacity the device never established"),
+    /// and a count that collapses a fault into "no residents" would let
+    /// `LOAD` install a foreign root over records it never saw. The gate
+    /// treats `None` as "records may exist": refuse, with the same `0x30`
+    /// and the same reset-first remediation. The US-1736 orphan gate remains
+    /// the fail-closed layer *behind* this one for anything that slips past.
+    ///
+    /// Implementations count what their own credential store holds:
+    /// `KeystoreVendorOps` the snapshot's resident array plus the key
+    /// region's index entries (never `None` when no region is installed),
+    /// `MemoryVendorOps` the host keystore's array (always known).
+    fn resident_credential_count(&self) -> Option<usize>;
 
     /// Install a master seed, durably, or leave the state untouched.
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response>;

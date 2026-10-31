@@ -24,10 +24,12 @@
 //!    all-zero, because a seed of zeroes must still derive *something
 //!    deterministic*, not a refusal: the seed's entropy is the operator's
 //!    custody problem, not `derive_froot`'s).
-//! 2. The seedless arm of the twin accessors — `froot() == hkey.to_bytes()`
-//!    byte-for-byte on a device twin that never saw a seed (EPIC §2 C5: the
-//!    seedless path is frozen; changing the arm by one bit orphans every
-//!    deployed passkey).
+//! 2. The seedless arm of the twin accessors — pinned on the device twin in
+//!    `seed_root_restore.rs::seedless_froot_is_the_hkey_bytes`
+//!    (`froot() == hkey.to_bytes()` byte-for-byte on a twin that never saw a
+//!    seed; EPIC §2 C5: the seedless path is frozen; changing the arm by one
+//!    bit orphans every deployed passkey). This file pins the pure
+//!    `derive_froot` the seeded arm calls.
 //! 3. The seedless `derive_resident_scalar` vector — the US-1721 function
 //!    keyed by the seedless root, so the guard is explicit that the frozen
 //!    derivation survives the root's introduction unchanged (its scenario-3
