@@ -1461,12 +1461,14 @@ impl FidoApp {
         // rotates the key (idempotent, exactly like pico-fido; key rotation
         // for an identity is out of scope by design, documented in US-1730).
         let scalar: Zeroizing<[u8; 32]> = if resident {
-            // `hkey` bytes in exactly the form the largeBlobKey derivation
-            // below passes them. `None` is not a reachable state (~2^-128 per
-            // re-hash round, 32-round cap); fail closed regardless — a
-            // derivation that cannot produce a key refuses the request and
-            // never loops (US-1007's lesson).
-            crypto::derive_resident_scalar(self.hkey.to_bytes().as_slice(), &cred_id)
+            // US-1735 (EPIC FIDO-SEED-ROOT): the derivation key is `froot` —
+            // seed-governed when a master seed is installed, the raw `hkey`
+            // bytes otherwise (byte-identical seedless, EPIC §2 C5). `None`
+            // is not a reachable state (~2^-128 per re-hash round, 32-round
+            // cap); fail closed regardless — a derivation that cannot
+            // produce a key refuses the request and never loops (US-1007's
+            // lesson).
+            crypto::derive_resident_scalar(&self.froot(), &cred_id)
                 .ok_or_else(|| err(Ctap2Response::KeyStoreFull))?
         } else {
             // Non-resident: the TRNG pool, unchanged. US-1007: this was a
@@ -1507,8 +1509,10 @@ impl FidoApp {
             return Err(err(Ctap2Response::InvalidOption));
         }
         let large_blob_key = if req.large_blob_key {
+            // US-1735: keyed by `froot` — the same root the resident scalar
+            // uses, so the largeBlobKey follows the seed like the wallet key.
             let mut lbk = [0u8; 32];
-            crypto::hmac_sha256_into(self.hkey.to_bytes().as_slice(), &cred_id, &mut lbk);
+            crypto::hmac_sha256_into(&self.froot(), &cred_id, &mut lbk);
             Some(lbk)
         } else {
             None

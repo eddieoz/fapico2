@@ -174,11 +174,9 @@ fn verifies_under(x: [u8; 32], y: [u8; 32], signed: &[u8], sig_der: &[u8]) -> bo
     vk.verify(signed, &sig).is_ok()
 }
 
-/// US-1732 scenario 1 — RED until US-1734/US-1735.
+/// US-1732 scenario 1 — flipped green by US-1735 (the MC branch keys its
+/// derivation by `froot`): the same seed reproduces the same wallet.
 #[test]
-#[ignore = "RED until US-1734/US-1735 (EPIC FIDO-SEED-ROOT): the master seed is \
-            inert on today's code, so two same-seed boards still draw different \
-            TRNG hkeys and attest under different keys"]
 fn two_boards_with_the_same_seed_derive_the_same_credential_key() {
     let _guard = lock();
 
@@ -278,6 +276,68 @@ fn a_seed_install_does_not_touch_the_non_wallet_roles() {
     );
 }
 
+/// US-1735 scenario (largeBlobKey follows the same root): two seeded twins
+/// with the same seed return the **same** largeBlobKey for the same identity.
+#[test]
+fn large_blob_key_follows_the_same_root() {
+    let _guard = lock();
+
+    let region_a = install("us1735-lbk-a");
+    let mut a = Device::boot(keyed_store());
+    a.grant_presence_always();
+    a.set_pin(PIN);
+    a.seed_master(SEED_S);
+
+    let region_b = install("us1735-lbk-b");
+    let mut b = Device::boot(keyed_store());
+    b.grant_presence_always();
+    b.set_pin(PIN);
+    b.seed_master(SEED_S);
+
+    let (sa, cbor_a) = a.make_cred_lbk(RP, USER_ID);
+    let (sb, cbor_b) = b.make_cred_lbk(RP, USER_ID);
+    assert_eq!(sa, 0x00, "MC with largeBlobKey must succeed on board A");
+    assert_eq!(sb, 0x00, "MC with largeBlobKey must succeed on board B");
+    let lbk_a = bstr_at(&cbor_a, 5).expect("MC response carries largeBlobKey at key 5");
+    let lbk_b = bstr_at(&cbor_b, 5).expect("MC response carries largeBlobKey at key 5");
+    assert_eq!(lbk_a, lbk_b, "the same seed must reproduce the same largeBlobKey");
+    drop(a);
+    drop(b);
+    drop(region_a);
+    drop(region_b);
+}
+
+/// US-1735 scenario (US-1721 preserved): a re-registration on a seeded board
+/// is idempotent — same credential ID attests under the same key, and the
+/// drift epic's overwrite leaves exactly one record for the identity.
+#[test]
+fn reregistration_on_a_seeded_board_stays_idempotent() {
+    let _guard = lock();
+    let _region = install("us1735-idempotent");
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+    device.set_pin(PIN);
+    device.seed_master(SEED_S);
+
+    let (s1, c1) = device.make_cred(RP, USER_ID);
+    let (_, cred_id, x1, y1) = mc_parts(&c1);
+    let (s2, c2) = device.make_cred(RP, USER_ID);
+    let (_, cred_id_2, x2, y2) = mc_parts(&c2);
+    assert_eq!((s1, s2), (0x00, 0x00));
+    assert_eq!(cred_id, cred_id_2, "the resident ID derivation is frozen");
+    assert_eq!((x1, y1), (x2, y2), "the key is a function of (froot, cred_id) — idempotent");
+
+    // Exactly one record for the identity: credMgmt metadata's resident
+    // count is the applet's own answer (the drift epic's overwrite holds).
+    let (cm_status, cm_cbor) = device.cm_get_metadata();
+    assert_eq!(cm_status, 0x00, "credMgmt metadata must answer on a token'd twin");
+    assert_eq!(
+        uint_at(&cm_cbor, 1),
+        Some(1),
+        "exactly one resident record for the identity after re-registration"
+    );
+}
+
 /// The raw clientPIN `getKeyAgreement` (0x06 sub 0x02) response body — the
 /// device COSE key, byte-exact.
 fn key_agreement_bytes(device: &mut Device) -> Vec<u8> {
@@ -291,6 +351,7 @@ fn key_agreement_bytes(device: &mut Device) -> Vec<u8> {
     assert_eq!(status, 0x00, "getKeyAgreement must succeed");
     cbor
 }
+
 
 /// US-1732 scenario 3 — the seedless back-compat guard (EPIC §2 C5), a live
 /// regression guard from this story on (see the module docs for why it runs

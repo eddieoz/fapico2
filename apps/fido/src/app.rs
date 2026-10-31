@@ -1636,9 +1636,10 @@ impl<K: Keystore> FidoApp<K> {
         // the remaining arms are this twin's own curve coverage until the
         // multi-alg work gives them a derivation.
         let (priv_bytes, cose_key) = if resident && matches!(alg, -7 | -9) {
-            let Some(seed) =
-                crypto::derive_resident_scalar(self.hkey.to_bytes().as_ref(), &cred_id)
-            else {
+            // US-1735 (EPIC FIDO-SEED-ROOT): the derivation key is `froot` —
+            // the same seed-governed root the device twin's copy of this
+            // branch keys its derivation with, seedless byte-identical.
+            let Some(seed) = crypto::derive_resident_scalar(&self.froot(), &cred_id) else {
                 // Unreachable (~2^-128 per re-hash round over a 32-round
                 // cap); fail closed, never loop (US-1007's lesson).
                 return vec![Ctap2Response::KeyStoreFull.code()];
@@ -1673,7 +1674,9 @@ impl<K: Keystore> FidoApp<K> {
             return vec![Ctap2Response::InvalidOption.code()];
         }
         let large_blob_key = if req.extensions.large_blob_key {
-            Some(derive_large_blob_key(self.hkey.to_bytes().as_ref(), &cred_id))
+            // US-1735: keyed by `froot` — the same root the resident scalar
+            // uses, so the largeBlobKey follows the seed like the wallet key.
+            Some(derive_large_blob_key(&self.froot(), &cred_id))
         } else {
             None
         };

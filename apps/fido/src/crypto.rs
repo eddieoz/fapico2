@@ -375,8 +375,9 @@ pub fn derive_froot(seed: &[u8; 32]) -> [u8; 32] {
     hmac_sha256(seed, FIDO_ROOT_DOMAIN)
 }
 
-/// Derive a resident credential's P-256 scalar from the device secret and the
-/// resident credential ID (US-1721).
+/// Derive a resident credential's P-256 scalar from the derivation root and
+/// the resident credential ID (US-1721; root made seed-governed by US-1735,
+/// EPIC FIDO-SEED-ROOT).
 ///
 /// C parity (pico-fido `cbor_make_credential.c:521-526,672`): for
 /// `options.rk == ptrue` the reference sets `key_seed = cred_idr` — the
@@ -386,10 +387,11 @@ pub fn derive_froot(seed: &[u8; 32]) -> [u8; 32] {
 /// function of (device, rp, user), re-registration is idempotent, and a
 /// duplicate same-ID record can never sign with a foreign key — the
 /// silent-foreign-key signature US-1719 diagnosed. Here `cred_id` is public
-/// knowledge (it is handed to every client), so the device secret `hkey_bytes`
-/// — the largeBlobKey root, passed as bytes in exactly the form the
-/// largeBlobKey derivation at `device_core.rs` uses — is what makes the key
-/// unforgeable from `(rp, user)` alone.
+/// knowledge (it is handed to every client), so the root secret — US-1734's
+/// `froot`, the seed-governed derivation root both twins pass in exactly
+/// the form the largeBlobKey derivation at `device_core.rs` uses — is what
+/// makes the key unforgeable from `(rp, user)` alone. Seedless devices pass
+/// the raw `hkey` bytes, which is what every version before US-1735 did.
 ///
 /// # Input layout
 ///
@@ -397,8 +399,8 @@ pub fn derive_froot(seed: &[u8; 32]) -> [u8; 32] {
 /// the code:
 ///
 /// ```text
-/// first round:  HMAC-SHA256(hkey_bytes, "fapico2/resident-key/v1" ‖ cred_id)
-/// rehash n:     HMAC-SHA256(hkey_bytes, "fapico2/resident-key/v1/rehash" ‖ [n as u8] ‖ cred_id)
+/// first round:  HMAC-SHA256(root_bytes, "fapico2/resident-key/v1" ‖ cred_id)
+/// rehash n:     HMAC-SHA256(root_bytes, "fapico2/resident-key/v1/rehash" ‖ [n as u8] ‖ cred_id)
 /// ```
 ///
 /// (`hmac_sha256` takes one data slice, so the domain string and the
