@@ -333,12 +333,21 @@ class _Device:
         return self.emu.ctap(0x02, cbor_encode({1: "example.com", 2: b"\x5a" * 32}))
 
     def fido_make_credential(self):
+        # **rk=False on purpose, since US-1721.** The resident branch's key
+        # is derived from the device secret (`derive_resident_scalar`,
+        # ADR 0007: "no TRNG in the derivation"), so a starved *resident*
+        # makeCredential succeeding is the designed behaviour, not an inert
+        # seam — this probe used to send `{"rk": True}` and the US-1721
+        # change made the starved leg answer 0x00, breaking the
+        # differential. The non-resident keygen still draws fresh entropy
+        # (`try_generate_p256_keypair`), which is the request whose
+        # behaviour the seam is expected to change.
         return self.emu.ctap(0x01, cbor_encode({
             1: b"\x11" * 32,
             2: {"id": "example.com", "name": "RP"},
             3: {"id": b"user", "name": "A User"},
             4: [{"type": "public-key", "alg": -7}],
-            7: {"rk": True},
+            7: {"rk": False},
         }))
 
 
@@ -413,7 +422,9 @@ def test_the_injection_is_live(starve_file, relay, tmp_path):
     """Starvation changes what the device does. Without this, everything
     below would also pass against an inert seam.
 
-    The observable is a differential on one request, `makeCredential`: it
+    The observable is a differential on one request, `makeCredential`
+    (**non-resident** — see `fido_make_credential` for why `rk=False` is
+    the entropy-needing shape since US-1721): it
     succeeds when healthy and answers a CTAP error when starved. That is
     the only request in the suite whose *behaviour* the seam is expected to
     change (see the module docstring for why the OpenPGP path's is
@@ -574,7 +585,10 @@ def test_requests_succeed_again_after_entropy_recovers(
 def test_starved_fido_keygen_answers_a_clean_error(starve_file, relay, tmp_path):
     """The FIDO leg of the story: a request needing randomness must answer.
 
-    makeCredential is the FIDO request that genuinely needs fresh entropy.
+    makeCredential is the FIDO request that genuinely needs fresh entropy
+    (**non-resident** — since US-1721 the resident branch derives its key
+    from the device secret and needs none, which is why the probe sends
+    `rk=False`; see `fido_make_credential`).
     getAssertion over an existing credential signs with a key already in
     the keystore and consumes none — which is why the enumerability test
     above can assert through it and mean nothing about the seam.
