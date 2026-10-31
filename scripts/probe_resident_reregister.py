@@ -396,8 +396,14 @@ def credmgmt_report(ctap2, token, protocol, rp_id, expected_id):
     except ctap.CtapError as exc:
         print(f"  NOTE: enumerateCredsNext stopped early ({show_exc(exc)}).")
 
-    ids = [bytes(c.get(CredentialManagement.RESULT.CREDENTIAL_ID) or b"")
-           for c in creds]
+    # python-fido2 2.x parses the preview key 7 as a descriptor MAP
+    # ({'id': bytes, 'type': 'public-key'}), not raw bytes -- bytes(dict)
+    # is the TypeError that bit the first hardware run.
+    def _cred_id(c):
+        raw = c.get(CredentialManagement.RESULT.CREDENTIAL_ID) or b""
+        return bytes(raw.get("id")) if isinstance(raw, dict) else bytes(raw)
+
+    ids = [_cred_id(c) for c in creds]
     distinct = {i for i in ids}
     print(f"  enumerated {len(creds)} credential(s) for rp {rp_id!r}:")
     for i in ids:
@@ -425,8 +431,11 @@ def probe(args):
         print(f"=== board {path}")
         ctap2 = Ctap2(dev)
         print(f"  getInfo options: {ctap2.info.options}")
+        # python-fido2 names the field `pin_uv_protocols` (2.x); older sketches
+        # say `pin_uv_auth_protocols`, which is a wire-key name, not the attr.
+        protocols = getattr(ctap2.info, "pin_uv_protocols", None)
         print(f"  versions: {ctap2.info.versions}  "
-              f"pinUvAuthProtocols: {ctap2.info.pin_uv_auth_protocols}")
+              f"pinUvAuthProtocols: {protocols}")
 
         token, protocol = client_pin_token(ctap2, args.pin, args.rp)
 
@@ -496,11 +505,23 @@ def probe(args):
                 print(f"    ANOMALY: assertion {n} verified under NEITHER "
                       "registration's key -- inspect by hand.")
             # Newest registration is N_REGISTRATIONS; any older key serving
-            # the pinned assertion is the drift.  (If the assertion verified
-            # under both keys, the YES/YES lines above say so; the DRIFT
-            # line below is still printed -- a non-newest key served it.)
+            # the pinned assertion is the drift -- but only when the keys
+            # actually differ.  On post-epic firmware (US-1721) both
+            # registrations attest the SAME deterministic key, so "under
+            # registration 1's key" is trivially "under the newest
+            # registration's key" -- that is NO-DRIFT, and printing DRIFT
+            # would mislabel the fix as the bug.
+            keys_identical = len(reg_keys) == N_REGISTRATIONS and all(
+                bytes(reg_keys[0][-2]) == bytes(k[-2])
+                and bytes(reg_keys[0][-3]) == bytes(k[-3])
+                for k in reg_keys[1:]
+            )
+            if keys_identical and len(reg_keys) == 2 and verified_under:
+                print("    NOTE: both registrations attest the SAME key "
+                      "(deterministic derivation, US-1721) -- serving it "
+                      "under either registration is the same key.")
             for m in verified_under:
-                if m != N_REGISTRATIONS:
+                if m != N_REGISTRATIONS and not keys_identical:
                     print(f"  DRIFT: assertion {n} verified under "
                           f"registration {m}'s key")
                     drift = True
