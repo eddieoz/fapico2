@@ -1843,12 +1843,67 @@ pub fn ensure_boot_entropy(
             return;
         }
     }
-    if fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).is_err() {
-        fatal_boot("boot entropy: TRNG refused inside the budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
+    // The store came up without the record: say so on the LED before the
+    // first draw. One 400 ms lit pulse — a duration no other pre-release
+    // pin driver uses (ladder pulse 25 ms, signature bit 200 ms, heartbeat
+    // on-time 500 ms, signature preamble 1200 ms, and the heartbeat cannot
+    // run before the executor anyway). The 2026-10-31 dark boots decoded to
+    // `TrngRefused` from this function
+    // (docs/audits/2026-10-31-boot-dark-trng-refused.md), and the one reading
+    // the ladder alone cannot give is *why* the record was absent: a boot
+    // that shows this pulse reached the draw; a fatal that does not, died
+    // elsewhere. It fires once per boot, before the first attempt.
+    entropy_draw_notice();
+    // The draw is retried on the same stepped budget as the OTP reads (see
+    // [`read_otp_key_1`]): one missed per-block window — the generation tail
+    // the datasheet itself warns about, on a budget
+    // ([`fapico2_platform::trng::MAX_ENTROPY_WAIT_MS`]) derived from a
+    // datasheet average and never measured on silicon (D-8) — used to park
+    // the board on the spot. Each attempt is a full enable/wait/read cycle
+    // ([`fapico2_platform::trng::draw_blocks`]), so a retry is a fresh roll
+    // of the peripheral, not a prolongation of the failed one; a refusal
+    // scrubs the buffer (`try_fresh_bytes`'s contract), so no attempt
+    // inherits another's contents. Only a source that refuses across the
+    // whole budget is fatal, with the signature this site would have
+    // emitted on the first miss.
+    if fapico2_firmware::otp_retry::retry(
+        || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+    .is_none()
+    {
+        fatal_boot("boot entropy: TRNG refused across the whole retry budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
     }
+}
+
+/// One 400 ms lit pulse on the board LED: the store mounted without the
+/// boot-entropy record, and [`ensure_boot_entropy`] is about to draw.
+///
+/// Diagnostic, and deliberately *not* a rung: the boot ladder's pulse count
+/// is a monotone progress counter whose meaning would be corrupted by an
+/// extra pulse between [`bootphase`] boundaries, so this drives the pin
+/// directly under the same gate and discipline as [`emit_fatal_signature`].
+/// See the call site for why the duration is 400 ms.
+fn entropy_draw_notice() {
+    if !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: the `LED_OUT` slot is written exactly once at the top of `main`
+    // before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`; this is the
+    // pre-task boot path, single-core, so no heartbeat or trussed-UI driver
+    // shares the pin.
+    let led: &mut Output<'static> =
+        unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
+    // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303); park dark on exit, as
+    // every other pre-release driver of this pin does.
+    led.set_high();
+    busy_wait_us(400_000);
+    led.set_low();
 }
 
 // ---------------------------------------------------------------------------

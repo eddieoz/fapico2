@@ -17,12 +17,14 @@
 //! # How to read a signature
 //!
 //! A signature is a **preamble** followed by the reason's id in binary,
-//! most-significant bit first. `0` is a short gap, `1` a long one:
+//! most-significant bit first. A `0` bit's gap is the **long** one
+//! ([`ZERO_GAP_US`], 600 ms), a `1` bit's gap the short one
+//! ([`ONE_GAP_US`], 200 ms):
 //!
 //! ```text
-//!     ████████████░░░░░     preamble: one 1200 ms pulse, 600 ms gap
-//!     ██░░░  ██░░░  ██░░░  ████░░░░░  4 bits, MSB first
-//!     short  short  short  long          = 0b0001 = 1 = OTP key row
+//!     ████████████░░░░░░░░     preamble: one 1200 ms pulse, 600 ms gap
+//!     ████░░░░░░░░  ████░░░░░░░░  ████░░░░░░░░  ████░░░  4 bits, MSB first
+//!     long          long          long          short   = 0b0001 = 1 = OTP key row
 //! ```
 //!
 //! Everything is a *duration*, so the reading survives a board revision that
