@@ -332,6 +332,18 @@ pub fn try_generate_p256_keypair_from_trng<R: Trng>(
 /// device secret over the resident credential ID.
 pub const RESIDENT_KEY_DOMAIN: &[u8] = b"fapico2/resident-key/v1";
 
+/// The domain string of the **FIDO derivation root** (US-1734, EPIC
+/// FIDO-SEED-ROOT): when a vendor master seed governs the device, `froot` is
+/// `HMAC-SHA256(key = seed, data = FIDO_ROOT_DOMAIN)`, so the same phrase
+/// reproduces the same passkey wallet on another board; when no seed is
+/// present, `froot` is the `hkey` bytes themselves and this domain is never
+/// applied — the seedless arm is the old bytes, byte-identical (EPIC §2 C5).
+///
+/// Domain separation is the whole point: a seed must not be usable directly
+/// as a derivation key anywhere else, and a future root consumer must pick
+/// its own domain string, never this one.
+pub const FIDO_ROOT_DOMAIN: &[u8] = b"fapico2/fido-root/v1";
+
 /// The domain string of the **re-hash** rounds — same key, different message
 /// per attempt, so a round can never repeat a previous one.
 pub const RESIDENT_KEY_DOMAIN_REHASH: &[u8] = b"fapico2/resident-key/v1/rehash";
@@ -345,6 +357,23 @@ pub const RESIDENT_DERIVE_MAX_ATTEMPTS: usize = 32;
 /// truncated, because a silent truncation would be a second, quieter
 /// derivation.
 pub const RESIDENT_CRED_ID_MAX: usize = 64;
+
+/// Derive the FIDO derivation root from a master seed (US-1734, EPIC
+/// FIDO-SEED-ROOT): one `HMAC-SHA256` of the seed under
+/// [`FIDO_ROOT_DOMAIN`].
+///
+/// Boring by design (AGENTS.md §5 rule 3): the same `hmac_sha256` the crate
+/// already ships, no new KDF crate, no OTP row, no second key hierarchy. The
+/// RS-Key precedent (an HKDF-SHA512 ratchet over the seed) is deliberately
+/// not imported — fapico2 already has the shape it needs from US-1721.
+///
+/// Pure and allocation-free: the caller owns the 32 output bytes and decides
+/// the scope. The device's accessor (`device_app.rs` / `app.rs`) applies the
+/// seedless arm — `froot == hkey.to_bytes()`, byte-identical for every
+/// deployed seedless device — and only calls this when a seed governs.
+pub fn derive_froot(seed: &[u8; 32]) -> [u8; 32] {
+    hmac_sha256(seed, FIDO_ROOT_DOMAIN)
+}
 
 /// Derive a resident credential's P-256 scalar from the device secret and the
 /// resident credential ID (US-1721).

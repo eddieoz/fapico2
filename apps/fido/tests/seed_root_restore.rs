@@ -25,7 +25,9 @@
 //! `backend() == KeyRegion` before anything else, because a snapshot-backed
 //! run would prove nothing about the wallet.
 //!
-//! # The three scenarios
+//! # The scenarios
+//!
+//! US-1732's three:
 //!
 //! 1. **Same seed, same wallet** — `#[ignore]`d RED: on today's code the
 //!    seed is inert, so two boards that `seed_master` the same 32 bytes still
@@ -40,17 +42,27 @@
 //!    (EPIC §2 C5), un-ignored and green on today's code: the twin exposes
 //!    its `hkey()`, so the suite can derive the expected US-1721 scalar
 //!    independently and assert the attested key matches, byte for byte.
-//!    When US-1734 lands, this scenario keeps running unchanged — the
+//!    When US-1734 landed, this scenario kept running unchanged — the
 //!    seedless arm of `froot` *is* `hkey.to_bytes()`, so any deviation is a
 //!    break here first. (The EPIC's Step-2 note expected this scenario to be
 //!    RED until US-1734 exposed a `froot` accessor; the twin's existing
 //!    `hkey()` accessor makes the independent assertion expressible today,
 //!    so it runs as a live guard from this story on instead of being parked.)
+//!
+//! US-1734's two, landed with the accessor:
+//!
+//! 4. **Seedless `froot` is the `hkey` bytes** — the root itself, pinned
+//!    byte-for-byte, plus the seeded arm against the vectors suite's KAT.
+//! 5. **A seed install touches nothing but the root** — `hkey` and the
+//!    clientPIN `getKeyAgreement` device key (the pinUvAuth-P1 ECDH role)
+//!    are byte-identical across a `seed_master` (EPIC §2: "`hkey` keeps
+//!    every non-wallet role").
 
 mod region_boot;
 
-use fapico2_fido::cbor::no_heap::{Item, Parser};
+use fapico2_fido::cbor::no_heap::{self as nh, Item, Parser};
 use fapico2_fido::crypto;
+use heapless::Vec as HV;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use region_boot::*;
 
@@ -201,6 +213,83 @@ fn two_boards_with_different_seeds_derive_different_keys() {
         "different roots must derive different keys — the seed separates \
          wallets as surely as it unifies them"
     );
+}
+
+/// US-1734 scenario (seedless-froot guard): on a twin that never saw a
+/// seed, the `froot` accessor returns the `hkey` bytes **byte-for-byte** —
+/// the frozen seedless arm (EPIC §2 C5). US-1732's scenario 3 pins the
+/// derivation's *output* through the command path; this pins the root
+/// itself, so a change to the accessor fails here before anything signs.
+#[test]
+fn seedless_froot_is_the_hkey_bytes() {
+    let _guard = lock();
+    let _region = install("us1734-seedless-froot");
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+    assert_eq!(device.master_seed(), None);
+
+    let hkey_bytes = device.hkey().to_bytes();
+    assert_eq!(device.froot(), hkey_bytes.as_slice(), "seedless froot must be the hkey bytes");
+
+    // And installing a seed moves the root off the hkey bytes — the
+    // seed-governed arm, against the same fixed KAT the vectors suite pins
+    // for `derive_froot` (independently computed; see seed_root_vectors.rs).
+    device.seed_master(SEED_S);
+    assert_eq!(
+        device.froot(),
+        crypto::derive_froot(&SEED_S),
+        "seeded froot must be the domain-separated function of the seed"
+    );
+    assert_ne!(device.froot(), hkey_bytes.as_slice(), "a seed must move the root off hkey");
+}
+
+/// US-1734 scenario (the seed does not touch the non-wallet roles): a seed
+/// install leaves `hkey` itself, and every consumer keyed by it, unchanged
+/// (EPIC §2's "`hkey` keeps every non-wallet role").
+///
+/// The observable is the clientPIN `getKeyAgreement` response — it is a pure
+/// function of `self.hkey` on the device path (`device_core.rs` 0x02 arm,
+/// and the same `hkey` keys the pinUvAuth-P1 ECDH at `derive_shared`), so a
+/// byte-identical response before and after `seed_master` proves the ECDH
+/// role did not move. `hkey()`'s accessor is the direct half of the same
+/// proof.
+#[test]
+fn a_seed_install_does_not_touch_the_non_wallet_roles() {
+    let _guard = lock();
+    let _region = install("us1734-roles");
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+
+    let hkey_before = device.hkey();
+    let ka_before = key_agreement_bytes(&mut device);
+
+    device.seed_master(SEED_S);
+
+    assert_eq!(
+        device.hkey().to_bytes(),
+        hkey_before.to_bytes(),
+        "the seed install must not rotate hkey"
+    );
+    assert_eq!(
+        key_agreement_bytes(&mut device),
+        ka_before,
+        "the clientPIN getKeyAgreement device key must be unchanged — a seed \
+         LOAD must not break a PIN handshake mid-life"
+    );
+}
+
+/// The raw clientPIN `getKeyAgreement` (0x06 sub 0x02) response body — the
+/// device COSE key, byte-exact.
+fn key_agreement_bytes(device: &mut Device) -> Vec<u8> {
+    let mut req: HV<u8, 32> = HV::new();
+    nh::push_map_header(&mut req, 2).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 1).unwrap();
+    nh::push_uint(&mut req, 2).unwrap();
+    nh::push_uint(&mut req, 2).unwrap();
+    let (status, cbor) = device.call(0x06, req.as_slice());
+    assert_eq!(status, 0x00, "getKeyAgreement must succeed");
+    cbor
 }
 
 /// US-1732 scenario 3 — the seedless back-compat guard (EPIC §2 C5), a live

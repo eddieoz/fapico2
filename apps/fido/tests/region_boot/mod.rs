@@ -717,6 +717,15 @@ impl Device {
         self.app.hkey().clone()
     }
 
+    /// The FIDO derivation root (US-1734) — the applet's own accessor, read
+    /// through the fixture for the same reason [`Self::backend`] is: the
+    /// test's subject is what the applet *says*, and a second copy of the
+    /// seed-or-hkey decision in a test file is free to drift from the one
+    /// the command path uses.
+    pub fn froot(&self) -> [u8; 32] {
+        self.app.froot()
+    }
+
     /// The vendor master seed the keystore currently holds.
     ///
     /// A `&mut self` reader because the keystore accessor takes one — and
