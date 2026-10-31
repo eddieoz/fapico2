@@ -208,3 +208,47 @@ nuked store reaches the draw (the §3 trigger condition). Still to observe on
 hardware: a refused draw across the whole retry budget (400 ms flash → ~20 s
 pause → `0011` signature), and whether a sys-reset clears the autocorrelation
 wedge or only a VBUS power cycle does.
+
+## 7. Second incident, same day 14:16: the failure moved one site deeper
+
+The v0.3.2 board, unplugged for a while and plugged back, refused to boot
+again. Video-decoded (`20261031_141606_1.mp4`, 60 fps):
+
+| time | LED | decoded |
+|---|---|---|
+| 0.95–1.75 s | 10 pulses | ladder, cumulative 10 = through `RUNG_STORE` |
+| 1.82–3.03 s | 1.2 s lit | fatal preamble |
+| 3.62 / 4.42 / 4.82 / 5.62 s | 4× 200 ms bits, gaps 584/184/584/* | bits `0,1,0,?` |
+
+**No 400 ms draw notice fired** — the store was intact (unplugging does not
+erase flash), so `ensure_boot_entropy` skipped its draw entirely. The bits
+read `0100` = **`Reason::DrbgRefused`** (the fourth bit's gap is
+unobservable in the recording; `0101`/`UntrustedImage` is excluded by
+position — that refusal can only fire in `boot_slot_decision`, before the
+store-mount rung). The operator's "one new blink at the end" was the
+signature rhythm changing: `0011` ends fast-fast, `0100` ends slow.
+
+The site: **`FuseSeedSource::seed`** (`platform/src/drbg_seed.rs`) draws its
+own 32-byte nonce from the TRNG (`probe_bytes`, two EHR blocks) —
+**single-shot, fatal on one missed budget** via `DrbgTrng::try_new` →
+`init_drbg` → `DrbgRefused`. The same class as the site §4 fixed; the fix
+moved the finish line. The trigger — *after some time unplugged* — fits the
+cold-boot settling behaviour this board's OTP reads already exhibit
+(errata E16 precedent): the first peripheral draws of a cold power episode
+are the marginal ones, and on an established store the boot's **first
+fatal-eligible** draw is this one, not `ensure_boot_entropy`'s.
+
+Fix (same treatment, same budget): `init_drbg` now retries the whole
+`DrbgTrng::try_new` construction on the `otp_retry` budget. Each attempt
+rebuilds the source over the same write-once slots (the prior attempt's
+source was consumed and dropped inside `try_new`, so the re-derived borrows
+never alias) and takes a fresh draw; the record read and the deterministic
+seed derivation re-run per attempt, so success changes no seed content.
+With this, **every boot-fatal entropy touch is retried** — the remaining
+peripheral draws (the non-fatal sanity draw; the migration nonce inside a
+CCID request; DRBG re-seeds inside requests) refuse their request, not the
+boot, by design (S10 degrade, never halt).
+
+Still honest: `MAX_ENTROPY_WAIT_MS` itself remains reasoned, not measured
+(D-8/US-1007), and a wedge that outlasts 20 s of retries still parks — but
+it names itself on the LED either way.

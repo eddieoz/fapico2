@@ -65,6 +65,7 @@ Read the four bits left to right as a binary number, most-significant bit first.
 | 1 | `0001` | OTP key row unreadable | power cycle (off **≥ 5 s**) and retry; recovery is a power cycle, not a reset button |
 | 2 | `0010` | chip identity row unreadable | power cycle as above |
 | 3 | `0011` | TRNG refused within the retry budget | power cycle as above; see [the entropy draw](#the-04-s-flash-a-fresh-store-drawing-entropy) |
+| 4 | `0100` | DRBG seed refused (same TRNG class, one step later) | power cycle as above; fixed by the same retry — if it recurs, report it |
 | 4 | `0100` | DRBG could not be seeded | power cycle and retry |
 | 5 | `0101` | store content failed verification | re-flash the firmware; if it recurs, the store was deliberately refused — report it |
 | 6 | `0110` | store could not be written durably | power cycle; if it recurs, report |
@@ -77,12 +78,14 @@ After any signature, unplug, **wait at least 5 seconds**, and plug back in. The 
 
 ## The 0.4 s flash: a fresh store drawing entropy
 
-On the first boot after a factory reset — or any boot where the secure store starts empty — the LED gives one **~0.4 second** flash before the mid-boot pulse groups. That is the board announcing: *my store came up empty, I am drawing fresh randomness to seed it*. It is normal, it happens once, and the boot continues afterwards.
+On the first boot after a factory reset — or any boot where the secure store starts empty — the LED gives one **~0.4 second** flash before the mid-boot pulse groups. That is the board announcing: *my store came up empty, I am drawing fresh randomness to seed it*. It is normal, it happens once, and the boot continues afterwards. On an ordinary boot (the store intact) the flash does **not** appear — nothing is drawn at that point.
 
 Two things can follow it that are worth recognizing:
 
 - **a pause of up to ~20 seconds** before the next pulses. That is the entropy draw being retried, not a hang — the board redraws on a stepped budget before it ever gives up. If the draw succeeds on any attempt, boot continues normally.
 - if the draw exhausts the whole budget (~20 s), the board emits signature `0011` (reason 3, above) and goes dark. Power cycle with 5+ seconds off and try again — a fresh power episode gives the randomness generator a fresh chance, and after one success the record is stored permanently (the flash does not appear again until the next factory reset).
+
+One more thing worth knowing: the seed for the board's randomness generator involves **one more** draw from the same hardware source after the store's entropy record is guaranteed — and it gets the same retry treatment. So on a cold boot after the board has been unplugged for a while, a signature `0100` (reason 4) means the same kind of marginal first-draw miss, one step later; power-cycling with 5+ seconds off recovers it, exactly like `0011`. If either signature repeats on consecutive boots, report it — that would mean the generator stays wedged across the whole retry budget, which is a hardware finding.
 
 ## A worked example
 
