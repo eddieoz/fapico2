@@ -1069,16 +1069,57 @@ pub unsafe fn init_drbg(
     let otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
     let uid: &'static mut [u8; 8] =
         init_static_slot(core::ptr::addr_of_mut!(DRBG_UID), chipid.to_be_bytes());
-    let store: &'static mut DeviceStore =
-        init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_STORE), store_handle());
-    let probe: &'static mut fapico2_platform::trng::Rp2350Probe<'static> =
-        init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_PROBE), probe);
+    // Initialized once here; the per-attempt borrows below are re-derived
+    // from the slots rather than from these handles, because each retry
+    // attempt builds its own `FuseSeedSource` (see below).
+    init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_STORE), store_handle());
+    init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_PROBE), probe);
 
-    let source = fapico2_platform::drbg_seed::FuseSeedSource::new(otp, uid, store, probe);
     // Fail-closed: no constructor hands back an unseeded generator, and a
     // refusal is fatal at boot (see the doc comment above).
-    let drbg = fapico2_platform::trng::DrbgTrng::try_new(source)
-        .unwrap_or_else(|_| fatal_boot("drbg: seed refused (see SeedError) — no generator", fatal_sig::Reason::DrbgRefused));
+    //
+    // Fatal, but not on the first miss. The seed path's own draw
+    // (`FuseSeedSource::seed` → `probe_bytes`, 32 bytes = two EHR blocks) is
+    // the second boot-fatal entropy site, and the 2026-10-31 14:16 incident
+    // (docs/audits/2026-10-31-boot-dark-trng-refused.md §7) is it firing: the
+    // store was intact so `ensure_boot_entropy` skipped its draw entirely,
+    // and the *very next* peripheral touch — this one — missed the budget on
+    // a cold power episode and parked the board with signature 0100. Same
+    // class as the site `ensure_boot_entropy` used to be, so the same
+    // treatment: retry the whole construction on the [`otp_retry`] budget.
+    // Each attempt rebuilds the source over the same write-once slots (the
+    // previous attempt's source was consumed and dropped inside `try_new`,
+    // so the re-derived borrows never alias) and takes a *fresh* draw — a
+    // retry is a new roll of the peripheral, not a replay of the failed one.
+    // The record read and the seed derivation re-run per attempt too; the
+    // derivation is deterministic and the draw is the only part that can
+    // differ, so this changes no seed content on success.
+    let drbg = fapico2_firmware::otp_retry::retry(
+        || {
+            // SAFETY: the slots were initialized exactly once above, on this
+            // pre-task boot path; the previous attempt's source (holding the
+            // prior borrows) was consumed and dropped inside `try_new` before
+            // its `Err` reached this closure's caller, so no two live values
+            // alias the same slot. Single core, no executor task exists.
+            let store: &'static mut DeviceStore = unsafe {
+                (&mut *core::ptr::addr_of_mut!(DRBG_SEED_STORE)).assume_init_mut()
+            };
+            let probe: &'static mut fapico2_platform::trng::Rp2350Probe<'static> = unsafe {
+                (&mut *core::ptr::addr_of_mut!(DRBG_SEED_PROBE)).assume_init_mut()
+            };
+            let source = fapico2_platform::drbg_seed::FuseSeedSource::new(otp, uid, store, probe);
+            fapico2_platform::trng::DrbgTrng::try_new(source).ok()
+        },
+        busy_sleep_ms,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::DEADLINE_MS,
+    )
+    .unwrap_or_else(|| {
+        fatal_boot(
+            "drbg: seed refused across the whole retry budget — no generator",
+            fatal_sig::Reason::DrbgRefused,
+        )
+    });
     init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg)
 }
 
