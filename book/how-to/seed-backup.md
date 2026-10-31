@@ -1,12 +1,12 @@
 # The seed backup
 
-The board holds a 32-byte **vendor master seed** — the key material behind the [soft lock](../using/index.md#factory-reset) and PicoForge's Backup screen. The firmware can export it **once**, as a 24-word BIP-39 phrase, and install a phrase (or a fresh seed) on any board running this firmware. Two drivers speak the same channel and print the same words for the same seed: [`scripts/backup_fido.py`](https://github.com/eddieoz/fapico2/blob/main/scripts/backup_fido.py) on the command line, and PicoForge's Backup screen.
+The board holds a 32-byte **vendor master seed** — since the seed-root work it is the **FIDO derivation root**: the key material your resident passkeys derive from, as well as the [soft lock](../using/index.md#factory-reset) and PicoForge's Backup screen. The firmware can export it **once**, as a 24-word BIP-39 phrase, and install a phrase (or a fresh seed) on any board running this firmware — restoring the phrase restores the wallet for every credential created while the seed governs. Two drivers speak the same channel and print the same words for the same seed: [`scripts/backup_fido.py`](https://github.com/eddieoz/fapico2/blob/main/scripts/backup_fido.py) on the command line, and PicoForge's Backup screen.
 
 The full record — wire notes, test coverage, failure statuses — is [`docs/backup-seed.md`](https://github.com/eddieoz/fapico2/blob/main/docs/backup-seed.md). This page is what you need to use it.
 
 <div class="security-callout">
 
-**Your passkeys are not in the phrase, and no tool can export them.** Resident credentials derive from different key material (`device_random`), non-exportable by design. The phrase carries the vendor seed: the lock key. Treat that as a wallet phrase in its own right — anyone holding it can install your seed on their board and, worse, it is the key that opens a locked board. Paper, offline, never a photo or a cloud note.
+**The phrase is your passkey wallet — treat it like one.** The seed is the FIDO derivation root: a board wiped to bare silicon, flashed fresh and restored from the phrase alone re-derives the **same passkey private keys** for the same accounts (proven on hardware — a nuked board reproduced the byte-identical key). The blast radius matches: **anyone holding the phrase holds every passkey key it governs**, no board, no PIN, no touch. It also opens a locked board. Paper, offline, never a photo or a cloud note.
 
 </div>
 
@@ -15,7 +15,10 @@ The full record — wire notes, test coverage, failure statuses — is [`docs/ba
 | Claim | Status |
 |---|---|
 | Backs up the vendor master seed — the soft-lock key | **yes** |
-| Backs up passkeys / resident credentials | **no — non-exportable by design** |
+| Backs up passkeys / resident credentials | **yes, for credentials created while the seed governs** (this firmware generation and forward) |
+| Restores credentials created **before** the seed was installed | **no — their keys died with the board that made them.** Re-register once on the seed-governed board; from then on the phrase carries them |
+| Restores U2F/stateless registrations, hmac-secret secrets, OATH/PIV/OpenPGP/Nostr keys | **no** — device-sealed, unexportable by construction. The phrase is the FIDO wallet, nothing else |
+| Carries the signature counter on restore | **no** — a restored credential starts at 1 where the old board was at *N*; some RPs warn or reject on the regression. Re-register with any RP that complains |
 | Survives a CTAP2 factory reset on the board | **yes** — reset clears PIN, credentials and vault state, never the seed |
 | Restoring replaces the previous seed | **yes, permanently** — unless you hold the previous seed's phrase, it is gone |
 | The phrase alone opens a locked board | **yes** — no PIN, no button; the phrase *is* the second factor |
@@ -56,7 +59,20 @@ python3 scripts/backup_fido.py export --out /dev/shm/fido-seed.txt
 python3 scripts/backup_fido.py finalize
 ```
 
-**Migrate to a replacement board:** export on the old board, `restore --file` on the new one, finalize the new board, delete the file.
+**Migrate to a replacement board:** export on the old board, then on the new one **reset first** (see below — the firmware refuses a seed that would orphan existing passkeys), `restore --file`, finalize the new board, delete the file. Credentials the old board created *before* its seed was installed do not migrate — re-register those once.
+
+**Restore a wallet onto a wiped or replacement board** (reset-first — the firmware enforces it):
+
+```bash
+ykman fido reset                                # wipes board B's passkeys AND its PIN; the vendor seed it keeps
+python3 scripts/backup_fido.py restore --file seed.txt
+python3 scripts/backup_fido.py finalize
+# register the same accounts again — the same (site, account) now derives the
+# SAME key the old board had. Expect some sites to warn about the signature
+# counter going backwards; re-register with any that refuse.
+```
+
+The firmware refuses the install (`0x30`) while the board holds resident passkeys and the incoming seed differs from the installed one — installing a different derivation root over existing passkeys would orphan their keys, so the tool tells you to reset first. A **same-seed** reinstall is always allowed: it cannot orphan anything. The end-to-end proof this page's claim rests on — a board nuked to bare silicon, reflashed, restored from the phrase alone, re-registering the same identity under the byte-identical key — is [`docs/audits/2026-10-31-seed-restore-proof.md`](https://github.com/eddieoz/fapico2/blob/main/docs/audits/2026-10-31-seed-restore-proof.md).
 
 **Hand a board over:** `finalize` first — or `restore --generate && finalize` to provision it with a seed nobody holds. Do this every time a board leaves your possession, because the reset does not do it for you.
 
