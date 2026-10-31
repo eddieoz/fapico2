@@ -2,8 +2,12 @@
 
 - **Epic:** `BOOT-FREEZE-POST-FLASH` (US-1301…US-1312)
 - **Story doc:** [`docs/tasks/EPIC-boot-freeze-post-flash.md`](tasks/EPIC-boot-freeze-post-flash.md)
-- **Status:** instrumentation shipped; **the trigger is not yet established**
-- **Last updated:** 2026-10-01
+- **Status:** instrumentation shipped; one intermittent trigger is now
+  established — the dark boot with signature `0011` (`TrngRefused`) was
+  decoded from a board video on 2026-10-31 and fixed
+  ([`docs/audits/2026-10-31-boot-dark-trng-refused.md`](audits/2026-10-31-boot-dark-trng-refused.md)).
+  The user-facing reading guide lives in the book's troubleshooting chapter.
+- **Last updated:** 2026-10-31
 
 ---
 

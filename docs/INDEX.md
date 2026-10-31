@@ -9,6 +9,7 @@ deliberately **not in git**.
 
 - [bootsel.md](bootsel.md) — flashing over BOOTSEL, recovery paths, why re-enumeration can take a minute.
 - [boot-freeze.md](boot-freeze.md) — a frozen board says why: the boot ladder, the fatal-signature decoder (long gap = 0, short gap = 1), and why a probe makes it worse.
+- [audits/2026-10-31-boot-dark-trng-refused.md](audits/2026-10-31-boot-dark-trng-refused.md) — the intermittent dark boot decoded from a video: `TrngRefused` from `ensure_boot_entropy`, why power-cycling re-rolls the dice, and the retry + LED draw-notice fix.
 - [pico-fido2-to-fapico2-migration.md](pico-fido2-to-fapico2-migration.md) — the durable OTP state a board carries after pico-fido2 1.0 (page-58 lock, picotool `permission failure`), the post-flash park and its root cause (the runtime `sw_lock` write, removed 2026-10-11), and the boot OTP retry.
 - [identity.md](identity.md) — USB identity (AAGUID, VID:PID), the **PC/SC allowlist step Linux/macOS need before OpenPGP/OATH work**, and the runtime VID/PID silent-lockout hazard.
 - [capacity.md](capacity.md) — hardware-verified ceilings: 856 FIDO2 resident credentials (measured to refusal), 68 OATH slots (reservation), and which constants are *not* capacities.
