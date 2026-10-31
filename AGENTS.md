@@ -451,6 +451,73 @@ hardware probe `scripts/nostr_probe.py`, and the udev rule a Linux extension
 user needs — `platform/udev/70-fapico2-nostr.rules` (scoped to the VID;
 a PID-bound rule would strand every re-identified board).
 
+### 9. The FIDO derivation root (`froot`) follows the master seed — and the seedless arm is frozen
+
+ADR 0008 is the decision record; this is the implementer's trap list
+(EPIC `FIDO-SEED-ROOT`, US-1734..1737). The rule: `froot =
+HMAC-SHA256(master_seed, "fapico2/fido-root/v1")` when a vendor master seed
+is installed, `froot = hkey.to_bytes()` when it is not
+(`crypto::derive_froot` / `FIDO_ROOT_DOMAIN`, accessor `froot()` on both
+twins). The resident scalar and the largeBlobKey derive from `froot`; the
+same phrase on two boards reproduces the same passkey wallet.
+
+- **Two call sites per derivation, and one of them is not `device_core.rs`.**
+  MC, largeBlobKey and GA live in `device_core.rs` *and* in the host twin
+  `app.rs` (`app.rs` MC ~:1665, largeBlobKey ~:1705, GA `build_assertion`
+  ~:2354). A change to one twin only passes every host test and changes
+  nothing on hardware — §1 again, and this feature was built twin-first
+  precisely because of that.
+- **The seedless arm is the old bytes, and it is frozen.** `froot ==
+  hkey_bytes` is what makes every deployed seedless device derive exactly
+  what v0.3.3 derived, with no record migration. Changing
+  `FIDO_ROOT_DOMAIN`, `"fapico2/resident-key/v1"`, `"fapico2-resident-id"`
+  or the input order orphans every deployed passkey *and* every restored
+  one. `tests/seed_root_vectors.rs` pins exact hex literals from an
+  independent implementation — treat them like ADR 0007's byte-equality
+  proof, not like unit-test fixtures.
+- **Serving time derives; the record is the cross-check.** getAssertion
+  computes the resident scalar from `(froot, cred_id)` and never trusts the
+  stored `private_key`; the stored public key is compared against the
+  derived scalar's public key, and a mismatch answers
+  `CTAP2_ERR_NO_CREDENTIALS` (the orphan gate — a wrong record is treated
+  exactly like a missing one, never signed). Non-resident records keep
+  their stored TRNG keys. Do not "optimize" the derivation away after a
+  pubkey check passes: the derivation is what makes a restored board able
+  to sign at all.
+- **The seed is monotonic.** `set_master_seed` is reachable only from
+  `LOAD`, only replaces, never clears. Once a board is seed-governed it
+  stays so short of a secure-partition nuke. No story may add a path that
+  clears the seed — a seed that could silently vanish would strand the
+  derivation root.
+- **LOAD is reset-first.** `LOAD` answers `0x30 NotAllowed` while resident
+  credentials exist, unless the incoming seed is byte-identical to the
+  installed one (same-seed reinstall is idempotent — `froot` is stable
+  under it). Two arms, placed deliberately: residents-with-no-seed refuses
+  **before** the MSE channel, a differing-seed overwrite **after** the AEAD
+  opened — so an unauthenticated caller learns only what `backup_auth`
+  already told it, never whether residents exist. The reset that makes an
+  install legal is `authenticatorReset`, which wipes residents and leaves
+  the vendor seed alone.
+- **What stays device-bound, by name — do not extend seed governance over
+  these:** `hkey` itself (pinUvAuth-P1 ECDH `derive_shared`, clientPIN
+  `getKeyAgreement`, the MSE channel device key — a seed LOAD must not
+  rotate the key-agreement identity mid-channel or break a PIN handshake),
+  the stateless U2F master (`stateless::master_from_device_random`),
+  attestation identity, per-credential hmac-secret `credRandom`
+  (`hmac_sha256(hkey_bytes, b"fapico2-hmac-cred-random")` sites — stored,
+  device-sealed, **not restored**), every other applet, and the keyregion
+  at-rest seal (`otp_key_1 ‖ chipid`).
+- **The seed is NOT for OTP.** `otp_key_1` is the RP2350 fuse root for
+  at-rest sealing, unexportable by construction; the BIP-39 phrase was
+  never "the OTP key" and must never be described as one — in docs, in
+  client-facing prose, or in a commit message.
+
+Tests: `apps/fido/tests/seed_root_restore.rs` (same-seed / different-seed /
+seedless-guard twins), `tests/seed_root_vectors.rs` (the frozen vectors),
+and the reset-first scenarios in `tests/vendor_backup.rs`
+(`load_on_a_board_with_resident_credentials_refuses`,
+`load_on_a_wiped_board_succeeds`, `a_different_seed_over_residents_refuses`).
+
 ---
 
 ## A yellow "Online - FIDO" in PicoForge is usually the USB identity, not a bug in the applet

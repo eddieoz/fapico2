@@ -6,8 +6,10 @@ how to put that phrase — or a new seed — onto a board. The tool is
 no flashing beyond any build that carries US-171/US-172 (every image since the
 `0x41` vendor channel grew the backup sub-commands).
 
-**Read §[Scope](#scope) before promising anything to a user: this backs up the
-*vendor* seed, and it does not bring passkeys back.**
+**Read §[Scope](#scope) before promising anything to a user: since EPIC
+FIDO-SEED-ROOT the phrase backs up the resident **passkey wallet** for
+credentials created while the seed governs — it still does not carry
+everything (see the **no** rows).**
 
 ---
 
@@ -16,14 +18,19 @@ no flashing beyond any build that carries US-171/US-172 (every image since the
 | claim | status |
 |---|---|
 | Backs up the **vendor master seed** — the `0x41` channel's seed: the soft-lock key material and PicoForge's Backup screen | **yes** |
-| Backs up **FIDO passkeys / resident credentials** | **no — non-exportable by design.** Credentials derive from `device_random` (`stateless::master_from_device_random`), not from this seed. No tool can export them. |
+| Backs up **FIDO passkeys / resident credentials** | **yes, for credentials created after the seed governs (this firmware version); see [EPIC-fido-seed-root](tasks/EPIC-fido-seed-root.md) and [ADR 0008](adr/0008-seed-rooted-fido-derivation.md)** — the seed is the FIDO derivation root (`froot`), so the same phrase reproduces the same wallet on another board |
+| Restores credentials created **before** the seed was installed | **no — their keys are gone with the board that made them.** A pre-seed credential was keyed by that board's own `hkey`, which left no export path. The honest answer for board A's old passkeys: re-register once on a seed-governed board; from then on the phrase carries them. |
+| Restores U2F/stateless credentials, hmac-secret secrets, OATH/PIV/OpenPGP/Nostr keys | **no** — device-sealed under `otp_key_1 ‖ chipid`, unexportable by construction, none of them identity-derived. The phrase is the FIDO wallet, nothing else. |
+| Carries the signature counter on restore | **no** — a restored credential starts at 1 where the old board had counter *N*; some RPs warn or **reject** on counter regression. Re-register with any RP that complains. This is a property of any seed-restore design (RS-Key has it too) and cannot be fixed from the seed — the old counter lives in the old board's records. |
 | Survives on the board through a CTAP2 reset | **yes** — `reset_from_seed` (`device_keystore.rs:2860`) clears pin_state/credentials/vault_state but never touches the vendor seed |
 | Restoring replaces the previous seed | **yes, permanently** — unless you hold the *previous* seed's own phrase, it is gone |
 | The phrase alone opens a locked board | **yes** — `UNLOCK` accepts the phrase's 32 bytes with no PIN and no button (the second factor *is* the phrase) |
 
-The honest one-liner for a user: *this phrase is the master seed of the
-PicoForge/RS-Key side of the board — the lock key and the Backup screen. Your
-passkeys are not in it and cannot be exported by anything.*
+The honest one-liner for a user: *this phrase is your passkey wallet for
+credentials created while the seed governs — plus the lock key and the Backup
+screen. It does not restore credentials that existed before the seed was
+installed, U2F/stateless registrations, hmac-secret secrets, or any other
+applet's keys, and it does not carry signature counters.*
 
 ## The four commands
 
@@ -84,9 +91,44 @@ python3 scripts/backup_fido.py restore --file fido-seed.txt
   confirmation before replacing it. Replacing is permanent.
 * `--generate` draws 32 bytes from the OS random generator, **installs
   first**, and prints the phrase only after the board confirms — no phrase on
-  screen that is not already on the board. Touch required.
+  screen that is not already on the board. Touch required. The tool says so
+  on stderr: this seed's entropy came from the **host**, not the board's TRNG.
 * Works even on a **sealed** board (window closed) — restore is exactly the
   recovery path finalize exists to protect.
+* The firmware refuses the install (`0x30`) while the board holds resident
+  passkeys and the incoming seed differs from the installed one — see
+  §[Restoring a wallet](#restoring-a-wallet-reset-first).
+
+### Restoring a wallet (reset-first)
+
+Since EPIC FIDO-SEED-ROOT the seed is the FIDO derivation root: installing a
+*different* root over existing passkeys would orphan every stored key, so the
+firmware refuses it. The contract is **reset-first**:
+
+```bash
+# board B holds passkeys you do not want to lose? STOP — a reset destroys
+# them. Only proceed when B's passkeys are expendable or already carried.
+ykman fido reset                    # or any CTAP2 authenticatorReset
+python3 scripts/backup_fido.py restore --file seed.txt
+python3 scripts/backup_fido.py finalize
+# register the identities again — the SAME (rp, user) now derives the SAME
+# key the old board had. scripts/probe_seed_restore.py proves it: SAME-KEY.
+```
+
+* The reset wipes board B's passkeys **and** its PIN but **not** the vendor
+  seed — so the seed leg is lossless through the reset, the passkey leg is
+  the thing the reset is for.
+* **Credentials created before the seed was installed are NOT restored** —
+  their keys were functions of the old board's device root, which left no
+  export path. Re-register once on the seed-governed board; from then on the
+  phrase carries them.
+* **Counter regression:** a restored credential's signature counter starts
+  at 1 where the old board had counter *N*. Some RPs warn or **reject** on
+  the regression — re-register with any RP that complains. This is a
+  property of any seed-restore design (RS-Key has it too); the old counter
+  lives in the old board's records and no derivation can produce it.
+* A **same-seed** reinstall is idempotent and always legal — it cannot
+  orphan anything, because the derivation root is stable under it.
 
 ### finalize → close the one-time export window
 
