@@ -7,21 +7,49 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] — 2026-10-31
+
+Released as [`fapico2-release-alpha-v0.4.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.4.0);
+full notes in [`docs/release-notes-alpha-v0.4.0.md`](docs/release-notes-alpha-v0.4.0.md).
+
+### Added — the seed-root wallet (PR #24, EPIC `FIDO-SEED-ROOT`)
+
+- **The backup seed governs FIDO derivation.** The derivation root `froot` is
+  `HMAC-SHA256(master_seed, "fapico2/fido-root/v1")` when a seed is installed
+  and the device's own root bytes otherwise — byte-identical seedless, pinned
+  by independently computed known-answer vectors
+  ([ADR 0008](docs/adr/0008-seed-rooted-fido-derivation.md)).
+- **Restoring the phrase restores the wallet — proven on hardware.** A board
+  nuked to bare silicon, reflashed and restored from the 24-word phrase alone
+  re-registered the same identity under the byte-identical P-256 key
+  ([the transcript](docs/audits/2026-10-31-seed-restore-proof.md)). The same
+  cycle on pre-epic firmware ended with a different key under the same
+  credential ID — the 2026-10-31 field report, closed at its root.
+- **getAssertion derives the resident scalar at sign time**, and a record
+  whose stored public key disagrees with the derivation never signs —
+  `CTAP2_ERR_NO_CREDENTIALS`, absence rather than a fault (the fail-closed
+  orphan gate).
+- **`LOAD` is reset-first**: `0x30 NotAllowed` while the board holds FIDO
+  records and the incoming seed would change the root; a same-seed reinstall
+  stays legal. The record count is a tri-state — a store that cannot be read
+  refuses too, never counted as empty.
+- **`scripts/probe_seed_restore.py`** — the two-board wallet probe
+  (hardware artifact, deliberately not wired into CI).
 
 ### Changed
 
-- **The seed backup is now the passkey wallet.** The vendor master seed is the
-  FIDO derivation root (`froot`): restoring the 24-word phrase on a wiped or
-  replacement board re-derives the same passkey private keys for accounts
-  registered while the seed governs (proven on hardware — a nuked board
-  reproduced the byte-identical key). Credentials created before a seed was
-  installed, U2F/stateless registrations, hmac-secret secrets and the other
-  applets' keys are not in the phrase; a restored credential's counter starts
-  at 1 (some RPs warn or reject — re-register). `LOAD` is reset-first: the
-  firmware refuses (`0x30`) a differing seed while resident passkeys exist.
-  Scope table and procedure: the [seed backup](book/how-to/seed-backup.md)
-  chapter; the decision record is ADR 0008 in the firmware tree.
+- **The book's seed-backup chapter tells the truth both ways** (PR #26): the
+  phrase is the wallet for credentials created while the seed governs, with
+  the matching blast radius stated plainly, the reset-first restore
+  procedure, and the counter-regression warning; README, AGENTS.md §9 and
+  `docs/backup-seed.md` carry the same scope.
+- **The host twin's `hkey` is durable** — derived from the persisted
+  `device_random` under a private domain string — so an emulator or
+  file-keystore process keeps its wallet across restarts (the orphan gate
+  caught the per-process random root; the device twin was always durable).
+- **`backup_fido.py`** maps the firmware's `0x30` refusal to reset-first
+  guidance, verifies the board retained the seed before reporting success,
+  and states the host-entropy provenance of `--generate`.
 
 ## [0.3.1] — 2026-10-25
 
