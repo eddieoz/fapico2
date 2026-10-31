@@ -663,6 +663,10 @@ def cmd_restore(args) -> int:
         seed = generate_seed()
         phrase = seed_to_mnemonic(seed)
         _prose("A fresh phrase was drawn from the OS random generator.")
+        _prose(
+            "Note: this seed's entropy came from the HOST machine, not the "
+            "board's TRNG — the board only stores what this install gave it."
+        )
     else:
         try:
             seed = parse_mnemonic(_read_phrase(args.file))
@@ -686,7 +690,22 @@ def cmd_restore(args) -> int:
             "installing can never be exported from it again — this phrase will "
             "be its only copy."
         )
-    restore_seed(dev, seed, _touch_prompt_for(path))
+    try:
+        restore_seed(dev, seed, _touch_prompt_for(path))
+    except BackupError as exc:
+        if exc.status == 0x30:
+            # LOAD refuses 0x30 when resident credentials exist and the
+            # incoming seed differs from the installed one (US-1737): the
+            # policy is reset-first. The shared STATUS_HELP 0x30 entry stays
+            # truthful for EXPORT, so the restore guidance lives here.
+            _prose(
+                "the firmware refused the restore (LOAD answered 0x30): "
+                "resident passkeys exist and this seed does not match the "
+                "installed one. authenticatorReset (ykman fido reset) wipes "
+                "passkeys, then restore again."
+            )
+            return 1
+        raise
     after = read_state(dev)
     _prose("Seed installed. Board now reports:")
     _prose(state_summary(after))
