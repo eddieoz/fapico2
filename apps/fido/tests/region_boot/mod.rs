@@ -1013,15 +1013,33 @@ impl Device {
 
     /// `authenticatorMakeCredential` (0x01), resident, signed with the token.
     pub fn make_cred(&mut self, rp: &str, user: &[u8]) -> (u8, Vec<u8>) {
+        self.make_cred_opts(rp, user, false)
+    }
+
+    /// [`Self::make_cred`], with the `largeBlobKey` extension requested.
+    ///
+    /// US-1735's twin-board equality scenario needs the extension on the
+    /// wire; it rides request key **6** (`extensions` — the CTAP 2.0 request
+    /// numbering `device_core.rs:237` states: "6 extensions, 7 options, 8
+    /// pinUvAuthParam"), and the pinUvAuth message stays the
+    /// clientDataHash, which `verify_token` checks regardless of extensions.
+    pub fn make_cred_lbk(&mut self, rp: &str, user: &[u8]) -> (u8, Vec<u8>) {
+        self.make_cred_opts(rp, user, true)
+    }
+
+    /// The shared body of both makeCredential shapes.
+    fn make_cred_opts(&mut self, rp: &str, user: &[u8], lbk: bool) -> (u8, Vec<u8>) {
         let challenge = [0xCCu8; 32];
+        // Seven pairs — clientDataHash(1), rp(2), user(3), pubKeyCredParams(4),
+        // options(7), pinUvAuthParam(8), pinUvAuthProtocol(9) — or eight with
+        // the largeBlobKey extensions map at key 6. The header and the pairs
+        // are counted separately on purpose — `device_full_set.rs` says the
+        // same thing, and a mismatch here is an `InvalidCbor` (0x12) from the
+        // applet with an empty body, which is a confusing way to learn about
+        // a test's own typo.
+        let pairs = if lbk { 8 } else { 7 };
         let mut r: HV<u8, 512> = HV::new();
-        // Seven pairs: clientDataHash(1), rp(2), user(3), pubKeyCredParams(4),
-        // options(7), pinUvAuthParam(8), pinUvAuthProtocol(9). The header and
-        // the pairs are counted separately on purpose — `device_full_set.rs`
-        // says the same thing, and a mismatch here is an `InvalidCbor` (0x12)
-        // from the applet with an empty body, which is a confusing way to learn
-        // about a test's own typo.
-        nh::push_map_header(&mut r, 7).unwrap();
+        nh::push_map_header(&mut r, pairs).unwrap();
         nh::push_uint(&mut r, 1).unwrap();
         nh::push_bstr(&mut r, &challenge).unwrap();
         nh::push_uint(&mut r, 2).unwrap();
@@ -1039,6 +1057,12 @@ impl Device {
         nh::push_tstr(&mut r, "public-key").unwrap();
         nh::push_tstr(&mut r, "alg").unwrap();
         nh::push_neg(&mut r, -7).unwrap();
+        if lbk {
+            nh::push_uint(&mut r, 6).unwrap();
+            nh::push_map_header(&mut r, 1).unwrap();
+            nh::push_tstr(&mut r, "largeBlobKey").unwrap();
+            nh::push_bool(&mut r, true).unwrap();
+        }
         nh::push_uint(&mut r, 7).unwrap();
         nh::push_map_header(&mut r, 1).unwrap();
         nh::push_tstr(&mut r, "rk").unwrap();
