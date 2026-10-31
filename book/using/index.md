@@ -25,7 +25,7 @@ Enroll on any WebAuthn site — `webauthn.io` is the usual first test. The site 
 
 ## Managing credentials
 
-Resident keys can be enumerated, renamed and deleted from `ykman`'s `fido cred` commands or PicoForge's credential manager. Resident SSH keys re-download to any machine with `ssh-keygen -K` — the key-handle file that lands on disk is a pointer, not a secret. Losing the board means re-enrolling the passkeys — they are non-exportable by design. The one thing that can leave the board is the vendor seed behind the soft lock: the [seed backup](../how-to/seed-backup.md).
+Resident keys can be enumerated, renamed and deleted from `ykman`'s `fido cred` commands or PicoForge's credential manager. Resident SSH keys re-download to any machine with `ssh-keygen -K` — the key-handle file that lands on disk is a pointer, not a secret. A lost board no longer means re-enrolling everything: if you kept a [seed backup](../how-to/seed-backup.md) and the passkeys were created while the seed governed, the phrase re-derives the same wallet on the replacement board (credentials that predate the seed, U2F/stateless registrations and the other applets stay board-bound).
 
 ## TOTP and HOTP
 

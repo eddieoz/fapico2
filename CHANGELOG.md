@@ -9,7 +9,19 @@ and the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The seed backup is now the passkey wallet.** The vendor master seed is the
+  FIDO derivation root (`froot`): restoring the 24-word phrase on a wiped or
+  replacement board re-derives the same passkey private keys for accounts
+  registered while the seed governs (proven on hardware — a nuked board
+  reproduced the byte-identical key). Credentials created before a seed was
+  installed, U2F/stateless registrations, hmac-secret secrets and the other
+  applets' keys are not in the phrase; a restored credential's counter starts
+  at 1 (some RPs warn or reject — re-register). `LOAD` is reset-first: the
+  firmware refuses (`0x30`) a differing seed while resident passkeys exist.
+  Scope table and procedure: the [seed backup](book/how-to/seed-backup.md)
+  chapter; the decision record is ADR 0008 in the firmware tree.
 
 ## [1.0.0] — 2026-10-01
 
