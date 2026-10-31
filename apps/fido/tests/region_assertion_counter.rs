@@ -139,11 +139,18 @@ fn keys_of(device: &mut Device) -> RegionKeys {
 /// presence window: the subject of every test here is what happens *after* an
 /// enrolment, and paying the makeCredential handshake on every fixture would
 /// make each one about the handshake.
-fn enrol(region_file: &InstalledRegion, keys: &RegionKeys, n: u32) {
+///
+/// US-1736: the planted record is made **derivation-consistent** with this
+/// device ([`Device::make_consistent`]) — the orphan gate refuses a resident
+/// record whose registered key is not `derive(froot, cred_id)`, and every
+/// assertion here is expected to be served and signed.
+fn enrol(device: &Device, region_file: &InstalledRegion, keys: &RegionKeys, n: u32) {
+    let mut cred = fixture_credential(n);
+    device.make_consistent(&mut cred);
     region_file
         .with_counting(|region| {
             let mut creds = RegionCredentials::new(region, keys);
-            creds.put(&nonce(n), &fixture_credential(n)).expect("the fixture must enrol");
+            creds.put(&nonce(n), &cred).expect("the fixture must enrol");
         })
         .expect("a counting region is installed");
 }
@@ -256,7 +263,7 @@ fn the_reply_signs_the_counter_the_record_holds() {
     let _guard = lock();
     let (region_file, mut device) = region_device("signs-the-record");
     let keys = keys_of(&mut device);
-    enrol(&region_file, &keys, 0);
+    enrol(&device, &region_file, &keys, 0);
     let (_slot, before) = record_of(&region_file, &keys, 0);
 
     let signed = assert_once(&mut device, 0);
@@ -284,7 +291,7 @@ fn thirty_one_assertions_erase_nothing_and_the_thirty_second_costs_one_live_sect
     let (region_file, mut device) = region_device("erase-profile");
     let keys = keys_of(&mut device);
     for n in 0..SLOTS_PER_SECTOR {
-        enrol(&region_file, &keys, n);
+        enrol(&device, &region_file, &keys, n);
     }
     let (target, _) = record_of(&region_file, &keys, 0);
 
@@ -366,7 +373,7 @@ fn the_counter_is_monotonic_across_a_power_cut_inside_the_window() {
     let _guard = lock();
     let (region_file, mut device) = region_device("power-cut");
     let keys = keys_of(&mut device);
-    enrol(&region_file, &keys, 0);
+    enrol(&device, &region_file, &keys, 0);
 
     let mut signed = Vec::new();
     for _ in 0..W {
@@ -414,7 +421,7 @@ fn a_persist_failure_rolls_the_bump_back_and_signs_the_durable_value() {
     let _guard = lock();
     let (region_file, mut device) = region_device("persist-failure");
     let keys = keys_of(&mut device);
-    enrol(&region_file, &keys, 0);
+    enrol(&device, &region_file, &keys, 0);
 
     // Open a full window: the restore write, then W - 1 batched assertions.
     let mut previous = assert_once(&mut device, 0);
@@ -472,7 +479,7 @@ fn the_u2f_authenticate_surface_bumps_the_record_on_the_region_path() {
     let keys = keys_of(&mut device);
     // `cred_protect` is 0 on the fixture, so no UV is owed: the legacy arm
     // refuses only `== 3` (`device_core.rs`).
-    enrol(&region_file, &keys, 0);
+    enrol(&device, &region_file, &keys, 0);
 
     // U2F `AUTHENTICATE`, enforce-only (P1 = 0x03 — `0x07` is check-only and
     // signs nothing). The body is

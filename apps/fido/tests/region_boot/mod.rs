@@ -726,6 +726,34 @@ impl Device {
         self.app.froot()
     }
 
+    /// Make a fixture credential's key material **self-consistent under the
+    /// shipped derivation**, in place (US-1736).
+    ///
+    /// `credential()`'s fixture keypair is arbitrary bytes — right for tests
+    /// that only store, delete or enumerate records, and wrong for any test
+    /// whose record must *sign*: US-1736's orphan gate refuses a resident
+    /// record whose stored public key disagrees with
+    /// `derive_resident_scalar(froot, cred_id)`, and a synthetic keypair
+    /// disagrees by construction. On a real device every MC-written record
+    /// is consistent because MC writes the pair together; a fixture that
+    /// plants a record expected to serve an assertion must do the same. This
+    /// is that step: overwrite the scalar and the registered public key with
+    /// the derivation keyed by **this device's** `froot`, so the planted
+    /// record is indistinguishable from one the device would have written.
+    pub fn make_consistent(&self, cred: &mut DeviceCredential) {
+        let froot = self.app.froot();
+        let derived = crypto::derive_resident_scalar(&froot, cred.credential_id.as_slice())
+            .expect("a fixture credential derives on the first round");
+        let sk = p256::SecretKey::from_slice(&*derived).expect("a validated scalar");
+        let pb = crypto::public_key_bytes(&sk.public_key());
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x.copy_from_slice(&pb[1..33]);
+        y.copy_from_slice(&pb[33..65]);
+        cred.private_key = PrivateScalar::from_bytes(*derived);
+        cred.public_key = DeviceCoseKey::es256(x, y);
+    }
+
     /// The vendor master seed the keystore currently holds.
     ///
     /// A `&mut self` reader because the keystore accessor takes one — and
