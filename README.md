@@ -9,6 +9,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 ## Why
 
 - **Self-custody for credentials.** Keys are generated on the device and never leave it. Everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your board is inert somewhere else. The same reasoning that keeps bitcoin keys off internet-connected machines applies to the keys that guard your email, your code and your accounts.
+- **The phrase is the wallet.** The optional 24-word backup seed is the FIDO derivation root: a board wiped to bare silicon, flashed fresh and restored from the phrase alone re-derives the **same passkey private keys** for the same accounts — proven on hardware. Credentials created before a seed was installed stay board-bound (re-register once); U2F/stateless, hmac-secret and the other applets are never in the phrase. The honest scope table and the reset-first restore procedure are in [`docs/backup-seed.md`](docs/backup-seed.md).
 - **The whole bill of materials is one Pico 2.** No proprietary secure element to trust, no sealed hardware to return to a vendor. If you can read this, you can rebuild the device from source.
 - **No network.** The device build has no network stack at all — the only networked code in the tree is the host-side emulator used for testing.
 - **Works with the tooling you already have.** Chrome, `ykman`, Yubico Authenticator and GnuPG are verified against real hardware (see the table below); the CTAP dialect targets Yubico's own client stack.
