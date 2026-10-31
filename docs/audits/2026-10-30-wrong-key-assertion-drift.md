@@ -126,3 +126,39 @@ On hardware, the same steps on any current build reproduce the report's episode 
 ---
 
 *AAGUID for the report's vendor fields: it was not captured, but the byte-exact ID derivation match (§1) identifies the firmware more strongly than the AAGUID would have.*
+
+---
+
+## 9. Fix landed (2026-10-31 — EPIC FIDO-RESIDENT-DRIFT, branch `fix/fito-drift`)
+
+The settled end-state of §7 shipped in full, as independent defenses, in story
+order US-1719 → US-1731:
+
+| Defense | Story | Commit | What it is |
+|---|---|---|---|
+| ① deterministic resident keys (true C parity) | US-1721 | `5873b48` | resident ES256 scalar = HMAC-SHA256(hkey, `"fapico2/resident-key/v1" ‖ cred_id`), bounded re-hash (cap 32), fail-closed; ADR 0007 |
+| ② CTAP 2.1 §6.1.3 overwrite on MC | US-1722 | `0e6534d` | same-ID record replaced before `put` (delete-all-by-ID, counter carry so the first assertion signs N+1); slot reclaimed, capacity invariant asserted |
+| ③ GA signs the record the match step found | US-1723 | `25c066c` | slot-addressed assertion building; the None-RP by-ID re-fetch is gone from the GA path; the opened record is re-verified against the request before signing |
+| ③ one ordering rule | US-1724 | `40591ac` | by-ID locator resolves newest-first (last index-order match), both branches |
+| ④ RP-qualified lookups | US-1725 | `89df83a` | excludeList, the migration collision probe and the credMgmt per-credential response all pass the RP hash; the RP-blind 16-candidate walk survives only for genuinely RP-less callers |
+| ④ delete-all | US-1726 | `9a91cf3` | credMgmt deleteCredential removes every same-ID record (shares delete-all-by-ID with ②); the CounterWindow flush wedge reproduced and retired; internal faults answer 0x28, not a lying 0x2E |
+| ④ migration collision | US-1727 | `e11e594` | same-ID-different-key collisions are copied (snapshot is source of truth), never retired without a copy; idempotence case byte-unchanged |
+| ④ counter window | US-1728 + follow-up | `1614443`, `0e2c1ad` | pending counter entries cleared on slot reuse and on authenticatorReset (a reset that caught a batched window wedged every later flush and refused post-reset enrolment 0x28) |
+| ④ stale index entries | US-1729 | `f9b3719` | entry generation must match the record header's; a torn commit's recycled slot is skipped as absent, never served through its stale entry |
+
+Evidence: the RED device-twin suite (US-1719, `716a3e4`) reproduced the defect
+on the host twin — both request shapes verified under K1, the oldest record —
+and passes un-ignored since US-1722. The hardware probe (US-1720, `663e39e`)
+reported **`RESULT: NO-DRIFT`, `totalCredentials=1`, `distinctIDs=1`** on a
+live board flashed with the post-epic firmware: two registrations for the same
+(rp, user.id) attested the *same* key (the derivation is observable: both
+registrations returned the §1 derivation vector `3b810ef7…ed0a` as the
+credential ID and byte-identical COSE keys), and credMgmt shows one record
+where the pre-fix board accumulated one per re-registration. Full host gates
+(`cargo test -p fapico2-fido`, `run_tests.sh`) green throughout; every
+intermediate commit left the suite green.
+
+ADR 0007 (`49059f6`) records the decision and its honest cost: **resident
+re-registration is idempotent — the key for (rp, user) is a function of the
+device + identity, exactly like pico-fido, and re-running registration cannot
+rotate the key.**
