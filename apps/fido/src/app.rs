@@ -426,7 +426,33 @@ impl<K: Keystore> fapico2_platform::persist::Persist for FidoApp<K> {
 impl<K: Keystore> FidoApp<K> {
     /// Create a new FIDO app with the given keystore.
     pub fn with_keystore(k: K) -> Self {
-        let (secret, _public) = crypto::generate_p256_keypair();
+        // US-1736/US-1737 follow-through (EPIC FIDO-SEED-ROOT): the host
+        // twin's `hkey` must be **durable**. The orphan gate refuses any
+        // resident record whose registered key disagrees with
+        // `derive_resident_scalar(froot, cred_id)` — and a per-process
+        // random `hkey` disagrees with *everything* the previous process
+        // registered, which is exactly what `test_restart`'s emulator
+        // restart caught: the records survived the restart and the gate,
+        // correctly, would not sign them. Derive the key from the
+        // keystore's persisted `device_random` under a private domain
+        // string: unique per fresh keystore (the default draws it from the
+        // host TRNG), stable across restarts (it is auth-map key 5, sealed),
+        // rotated by a reset (which regenerates it) — the same lifecycle the
+        // device twin's `HKEY_KEY` store record has. The device twin is
+        // untouched: its `hkey` is a TRNG draw persisted at boot
+        // (`device_app.rs`'s fresh-partition arm).
+        //
+        // Domain separation matters: `device_random` also roots the
+        // stateless U2F master (`stateless::master_from_device_random`),
+        // and the two roles must never share a key. The fallback keeps the
+        // old behaviour on the ~2^-128 HMAC output that is not a valid
+        // scalar — fail open to *a* key rather than panic the host process,
+        // and the device twin never takes this path at all.
+        let mut root = k.get_auth_state().device_random;
+        let derived = crypto::hmac_sha256(&root, b"fapico2/host-hkey/v1");
+        root.fill(0);
+        let secret = crypto::secret_key_from_bytes(&derived)
+            .unwrap_or_else(|| crypto::generate_p256_keypair().0);
         // US-916: mint a fresh per-device attestation identity (TRNG key +
         // on-device self-signed cert) — see `crate::attestation`.
         let attestation = AttestationIdentity::generate_host();

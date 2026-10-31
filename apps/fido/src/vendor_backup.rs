@@ -872,6 +872,21 @@ pub fn export(
 /// restore: the whole point of a device you have backed up is that it can be
 /// restored. Nothing here consults [`BackupWindow`], and
 /// `tests/vendor_backup.rs::load_still_works_after_finalize` pins that.
+///
+/// # The reset-first gate (US-1737, EPIC FIDO-SEED-ROOT)
+///
+/// `LOAD` **refuses `0x30 NotAllowed` while any resident credential exists**,
+/// unless the incoming seed is byte-identical to the one already installed
+/// (same-seed reinstall is idempotent and harmless — it cannot orphan a
+/// record, because the derivation root is stable under it). Installing a
+/// *different* root over residents would orphan every stored key: the seed
+/// now governs FIDO derivation (US-1734/US-1735), and a record's stored
+/// scalar is a function of the root that made it. Reset first
+/// (`authenticatorReset` wipes the residents; the vendor seed it leaves
+/// alone), then restore. Arm 1 of the gate (residents, no seed yet) refuses
+/// before the MSE channel; arm 2 (residents, differing seed) after the AEAD
+/// opened — the two placements are the EPIC §2's "an unauthenticated caller
+/// learns only what `backup_auth` already told it".
 pub fn load(
     data: &[u8],
     auth: Option<TokenAuth<'_>>,
@@ -899,6 +914,19 @@ pub fn load(
         return Outcome::plain(Ctap2Response::InvalidLength);
     }
 
+    // US-1737 (EPIC FIDO-SEED-ROOT), the reset-first gate, arm 1: a board
+    // with resident credentials and **no** seed would take a completely new
+    // derivation root — orphaning every resident key, whose stored scalars
+    // the new root cannot reproduce. Refuse here, before the channel: an
+    // unauthenticated caller learns only what `backup_auth` already told it,
+    // never whether residents exist. The reset (`authenticatorReset`) wipes
+    // the residents and makes the install legal — reset-first, the policy the
+    // host tool surfaces (US-1738).
+    let residents = ops.resident_credential_count();
+    if residents > 0 && ops.master_seed().is_none() {
+        return Outcome::plain(Ctap2Response::NotAllowed);
+    }
+
     let mut channel = MseChannel { key: [0u8; 32], aad: [0u8; P256_POINT_LEN] };
     if let Err(e) = ops.mse_channel(&mut channel) {
         return Outcome::plain(e);
@@ -920,6 +948,17 @@ pub fn load(
     }
     let mut seed = [0u8; MASTER_SEED_LEN];
     seed.copy_from_slice(&plain);
+    // US-1737, arm 2: on a board that already has residents, only the
+    // **same** seed may be reinstalled (idempotent — it cannot orphan
+    // anything, US-1734's froot is stable under it). A different seed on a
+    // resident board is the same orphaning move arm 1 refuses; the check
+    // could not run earlier because `incoming` is only known after the AEAD
+    // opened — and by then the caller authenticated, so there is nothing new
+    // for an outsider to learn. `master_seed()` is read again, not cached
+    // from arm 1: the trait is the state's only honest reader.
+    if residents > 0 && ops.master_seed() != Some(seed) {
+        return Outcome::plain(Ctap2Response::NotAllowed);
+    }
     // The trait is all-or-nothing, so an `Err` here means the state is
     // untouched. Nothing to roll back at this level, and nothing to charge —
     // the request authenticated; the *store* refused.
