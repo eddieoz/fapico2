@@ -37,6 +37,7 @@ use fapico2_fido::cbor::no_heap as nh;
 use fapico2_fido::cbor::no_heap::{Item, Parser};
 use fapico2_fido::crypto;
 use fapico2_fido::device_app;
+use fapico2_fido::vendor_state::{with_keystore_ops, VendorSession};
 use fapico2_fido::FidoApp;
 use fapico2_platform::fused_key::FusedKey;
 use fapico2_platform::keyregion::host::Faults;
@@ -702,6 +703,48 @@ impl Device {
     /// free to drift from the one the command path uses.
     pub fn backend(&self) -> fapico2_fido::device_keystore::CredentialBackend {
         self.app.credential_backend()
+    }
+
+    /// The device's persistent key-agreement key (`hkey`), copied out.
+    ///
+    /// US-1732's seedless guard derives the expected resident key from the
+    /// board's own root independently — the assertion has to recompute the
+    /// US-1721 derivation in the test, keyed by what the twin actually boots
+    /// with, or it would be comparing the implementation against itself.
+    /// `p256::SecretKey` is `Clone`, so the copy is total and the applet's
+    /// key is never handed out by reference.
+    pub fn hkey(&self) -> p256::SecretKey {
+        self.app.hkey().clone()
+    }
+
+    /// The vendor master seed the keystore currently holds.
+    ///
+    /// A `&mut self` reader because the keystore accessor takes one — and
+    /// honest about it: an assertion reads a device state, it does not
+    /// mutate one, but the applet's own seam is `&mut`.
+    pub fn master_seed(&mut self) -> Option<[u8; 32]> {
+        self.app.keystore().vendor.secret.master_seed
+    }
+
+    /// Install the vendor master seed through the applet's own ops seam — the
+    /// same shape `fuzz/fuzz_targets/fido_cred_state.rs` drives — and not
+    /// through the `0x41` wire, so the seed-root suites stay independent of
+    /// the vendor channel (US-1732's brief says exactly this).
+    ///
+    /// The commit runs through `with_keystore_ops`'s `grow_checked`
+    /// (all-or-nothing), against a **fresh, dropped** `VendorSession`: the
+    /// seed write needs none of the session's MSE state, and the app's live
+    /// `0x41` session must not observe a seed it did not install — `LOAD`
+    /// (US-1737) is the only wire path that may put one there. The store is
+    /// handed in so the commit is durable exactly the way a device commit
+    /// would be.
+    pub fn seed_master(&mut self, seed: [u8; 32]) {
+        let mut session = VendorSession::default();
+        let mut store: Option<&mut dyn SecureStore> = Some(&mut self.store);
+        let mut random = |buf: &mut [u8]| buf.fill(0x5Au8);
+        with_keystore_ops(self.app.keystore(), &mut session, &mut store, &mut random, |ops| {
+            ops.set_master_seed(seed).expect("the seed commit lands on a fresh device");
+        });
     }
 
     /// Fill the key region to [`FIDO_CAPACITY`] credentials, through the
