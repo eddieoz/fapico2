@@ -699,6 +699,32 @@ impl FidoApp {
         &self.hkey
     }
 
+    /// The FIDO derivation root (US-1734, EPIC FIDO-SEED-ROOT): the key
+    /// bytes the resident-scalar and largeBlobKey derivations are keyed by.
+    ///
+    /// Seed-governed when a vendor master seed is present
+    /// (`HMAC-SHA256(seed, "fapico2/fido-root/v1")`), and the raw `hkey`
+    /// bytes otherwise — the seedless arm **is** the old bytes, so every
+    /// deployed seedless device derives exactly what v0.3.3 derived
+    /// (EPIC §2 C5; `tests/seed_root_vectors.rs` pins the exact vectors).
+    ///
+    /// Derived on demand, never stored, never logged: the returned array is
+    /// scratch key material and every caller must keep it in the smallest
+    /// scope it can (EPIC §2's "the seed never leaves except through EXPORT"
+    /// covers this value's lifetime too). The host twin's copy is
+    /// `app.rs::froot` — the twin rule (AGENTS.md §1) applies to any change
+    /// here.
+    pub fn froot(&self) -> [u8; 32] {
+        match self.keystore.vendor.secret.master_seed {
+            Some(seed) => crate::crypto::derive_froot(&seed),
+            None => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(self.hkey.to_bytes().as_slice());
+                out
+            }
+        }
+    }
+
     /// US-161/162 (PICOForge-COMPAT Phase H): adopt the durable `phy` record
     /// this app's in-RAM keystore copy has fallen behind on.
     ///

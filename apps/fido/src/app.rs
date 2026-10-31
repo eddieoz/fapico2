@@ -630,6 +630,26 @@ impl<K: Keystore> FidoApp<K> {
         &mut self.keystore
     }
 
+    /// The FIDO derivation root — the host twin of
+    /// `device_app::FidoApp::froot` (US-1734, EPIC FIDO-SEED-ROOT): seed-
+    /// governed when the keystore's vendor state holds a master seed, the raw
+    /// `hkey` bytes otherwise. The twin rule (AGENTS.md §1) applies: any
+    /// change here lands on the device twin in the same commit, and
+    /// `tests/seed_root_vectors.rs` pins the exact vectors both must match.
+    ///
+    /// Derived on demand, never stored, never logged; the caller keeps the
+    /// returned array in the smallest scope it can.
+    pub fn froot(&self) -> [u8; 32] {
+        match self.keystore.get_auth_state().vendor.secret.master_seed {
+            Some(seed) => crypto::derive_froot(&seed),
+            None => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(self.hkey.to_bytes().as_slice());
+                out
+            }
+        }
+    }
+
     /// Whether the token's bound rpId (if any) matches the requesting RP.
     fn token_rp_id_ok(&self, rp_id: &str) -> bool {
         match &self.pin_token_rp_id {
