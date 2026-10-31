@@ -517,6 +517,11 @@ seedless-guard twins), `tests/seed_root_vectors.rs` (the frozen vectors),
 and the reset-first scenarios in `tests/vendor_backup.rs`
 (`load_on_a_board_with_resident_credentials_refuses`,
 `load_on_a_wiped_board_succeeds`, `a_different_seed_over_residents_refuses`).
+The hardware proof — a nuked board, reflashed, restored from the phrase alone,
+re-registering the same identity under the **byte-identical** key — is
+[`docs/audits/2026-10-31-seed-restore-proof.md`](docs/audits/2026-10-31-seed-restore-proof.md)
+(`SAME-KEY`); its residuals (no two-board pre-fix artifact, seedless-on-silicon
+untestable without a nuke) are recorded there rather than re-argued here.
 
 ---
 
