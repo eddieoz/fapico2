@@ -71,33 +71,22 @@ const CHALLENGE: [u8; 32] = [0xCCu8; 32];
 /// CTAP2_ERR_NO_CREDENTIALS — the fail-closed answer.
 const ERR_NO_CREDENTIALS: u8 = 0x2E;
 
-/// A deterministic P-256 scalar for fixture key `tag`.
+/// A resident `DeviceCredential` for `(id, rp)`, written straight into the
+/// region — byte-for-byte a record the device would write, sealed under the
+/// applet's own keys (`region_keys`).
 ///
-/// SHA-256 output is uniform over [0, 2^256); the probability of landing on
-/// or above the secp256k1… (P-256) group order is ~2^-128, and
-/// `p256::SecretKey::from_slice` below refuses an invalid scalar loudly
-/// rather than silently, so a degenerate fixture cannot pass unnoticed.
-fn scalar(tag: &[u8]) -> [u8; 32] {
-    crypto::sha256(tag)
-}
-
-/// A resident `DeviceCredential` for `(id, rp)` under private key `key`,
-/// written straight into the region — byte-for-byte a record the device
-/// would write, sealed under the applet's own keys (`region_keys`).
-///
-/// The public key is derived from the private scalar so every signature this
-/// suite verifies is verified against the key the record really carries.
-fn region_record(id: &[u8], rp: &str, key: [u8; 32], counter: u32) -> DeviceCredential {
-    let sk = p256::SecretKey::from_slice(&key).expect("a valid P-256 scalar");
-    let pk = crypto::public_key_bytes(&sk.public_key());
-    let mut x = [0u8; 32];
-    let mut y = [0u8; 32];
-    x.copy_from_slice(&pk[1..33]);
-    y.copy_from_slice(&pk[33..65]);
+/// The key material is the **shipped derivation keyed by this device's
+/// `froot`** ([`Device::make_consistent`], US-1736): the orphan gate refuses
+/// a resident record whose registered key is anything else, and a planted
+/// scalar would be refused by construction. Which record a same-ID set
+/// serves is discriminated by the record's **counter** now — under the
+/// derivation every same-ID record signs identically (US-1721's "a duplicate
+/// same-ID record is harmless"), so the counter is the slot's fingerprint.
+fn region_record(device: &Device, id: &[u8], rp: &str, counter: u32) -> DeviceCredential {
     let mut cred = DeviceCredential {
         credential_id: HV::new(),
-        public_key: DeviceCoseKey::es256(x, y),
-        private_key: PrivateScalar::from_bytes(key),
+        public_key: DeviceCoseKey::es256([0u8; 32], [0u8; 32]),
+        private_key: PrivateScalar::from_bytes([0u8; 32]),
         rp_id_hash: crypto::sha256(rp.as_bytes()),
         rp_id: HV::new(),
         user_handle: HV::new(),
@@ -119,6 +108,7 @@ fn region_record(id: &[u8], rp: &str, key: [u8; 32], counter: u32) -> DeviceCred
     cred.rp_id.extend_from_slice(rp.as_bytes()).unwrap();
     cred.user_handle.extend_from_slice(b"us1723-user").unwrap();
     cred.user_name.extend_from_slice(b"us1723").unwrap();
+    device.make_consistent(&mut cred);
     cred
 }
 
@@ -333,18 +323,18 @@ fn the_match_steps_slot_is_the_signed_slot() {
     let (_guard, region_file, mut device, keys) = boot_device("us1723-slotted");
 
     let id = fixture_id(b"us1723 same-id");
-    let k_old = scalar(b"us1723 K_old");
-    let k_new = scalar(b"us1723 K_new");
-    let k_decoy = scalar(b"us1723 K_decoy");
 
-    // Index order = write order: decoy first, then S_old, then S_new.
+    // Index order = write order: decoy first, then S_old, then S_new. The
+    // records carry DIFFERENT counters — under the derivation (US-1736) a
+    // same-ID set signs identically, so the counter is what discriminates
+    // which slot was opened: 10, 20 and 900 bump to 11, 21 and 901.
     write_records(
         &region_file,
         &keys,
         &[
-            region_record(&id, OTHER, k_decoy, 900),
-            region_record(&id, RP, k_old, 10),
-            region_record(&id, RP, k_new, 20),
+            region_record(&device, &id, OTHER, 900),
+            region_record(&device, &id, RP, 10),
+            region_record(&device, &id, RP, 20),
         ],
     );
 
@@ -364,23 +354,38 @@ fn the_match_steps_slot_is_the_signed_slot() {
          None-RP re-fetch serves today (analysis §2/O2)"
     );
 
+    // The served counter identifies WHICH record was opened: the restore
+    // window serves `durable + W + 1` on the first assertion of a session
+    // (`region_assertion_counter.rs` pins the shape, W =
+    // COUNTER_PERSIST_INTERVAL), so S_new (20) serves 53, S_old (10) would
+    // serve 43 and the decoy (900) 933. The match step must open S_new.
+    let w = u32::from(fapico2_fido::device_keystore::COUNTER_PERSIST_INTERVAL);
+    let served_counter = u32::from_be_bytes([
+        auth_data[33],
+        auth_data[34],
+        auth_data[35],
+        auth_data[36],
+    ]);
+    assert_eq!(
+        served_counter,
+        20 + w + 1,
+        "the served counter must be the NEWEST same-ID record's window value — \
+         the slot the match step resolved, not the oldest copy ({}) nor the \
+         decoy ({})",
+        10 + w + 1,
+        900 + w + 1,
+    );
+
+    // And the signature verifies under the shipped derivation — the key the
+    // orphan gate demands the record's registered key equal.
+    let derived = crypto::derive_resident_scalar(&device.froot(), &id)
+        .expect("the fixture derivation lands on the first round");
     let mut signed = auth_data.clone();
     signed.extend_from_slice(&CHALLENGE);
     assert!(
-        verifies_under(k_new, &signed, &sig_der),
-        "the assertion must sign with the key of the record the MATCH STEP \
-         resolved — under US-1724's ordering rule that is the NEWEST same-ID \
-         record (S_new, K_new), the same one discovery lists last and \
-         overwrite replaces"
-    );
-    assert!(
-        !verifies_under(k_old, &signed, &sig_der),
-        "the OLDEST same-ID copy (K_old) must never sign — the first-match \
-         resolution US-1724 replaced served exactly that"
-    );
-    assert!(
-        !verifies_under(k_decoy, &signed, &sig_der),
-        "the decoy record (same ID, other RP, earlier ordinal) must never sign"
+        verifies_under(*derived, &signed, &sig_der),
+        "the assertion signs under the derivation — which the served record's \
+         registered key equals, because the gate refuses anything else"
     );
 
     assert_eq!(
@@ -422,16 +427,15 @@ fn ga_no_longer_depends_on_the_16candidate_structural_walk() {
     let target_ordinal: u32 = COUNT - 1;
     let target_rp = format!("us1723-rp-{target_ordinal}.example");
     let target_id = fixture_id(format!("us1723-id-{target_ordinal}").as_bytes());
-    let target_key = scalar(b"us1723 K_beyond16");
 
     let mut creds: Vec<DeviceCredential> = Vec::new();
     for n in 0..COUNT {
         if n == target_ordinal {
-            creds.push(region_record(&target_id, &target_rp, target_key, 100 + n));
+            creds.push(region_record(&device, &target_id, &target_rp, 100 + n));
         } else {
             let rp = format!("us1723-rp-{n}.example");
             let id = fixture_id(format!("us1723-id-{n}").as_bytes());
-            creds.push(region_record(&id, &rp, scalar(format!("us1723 K fill {n}").as_bytes()), 100 + n));
+            creds.push(region_record(&device, &id, &rp, 100 + n));
         }
     }
     write_records(&region_file, &keys, &creds);
@@ -452,11 +456,14 @@ fn ga_no_longer_depends_on_the_16candidate_structural_walk() {
         &target_hash[..],
         "the served record must be the target's — the request's own RP"
     );
+    let derived = crypto::derive_resident_scalar(&device.froot(), &target_id)
+        .expect("the fixture derivation lands on the first round");
     let mut signed = auth_data.clone();
     signed.extend_from_slice(&CHALLENGE);
     assert!(
-        verifies_under(target_key, &signed, &sig_der),
-        "the assertion must sign with the target record's own key"
+        verifies_under(*derived, &signed, &sig_der),
+        "the assertion must sign under the target record's derivation — the \
+         key the orphan gate demands the record carry"
     );
 }
 

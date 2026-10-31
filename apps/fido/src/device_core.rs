@@ -2151,7 +2151,41 @@ impl FidoApp {
         let lbk = cred.large_blob_key;
         let user_handle = cred.user_handle.clone();
         let resident = cred.resident;
-        let private_key = cred.private_key.copy_out();
+        // US-1736 (EPIC FIDO-SEED-ROOT): a resident record's signing key is
+        // **derived at sign time** from `(froot, cred_id)`, never trusted
+        // from the record. Derivation is a serving-time contract now, not a
+        // generation-time event: this is what makes a restored board sign a
+        // restored identity whose record carries no usable stored scalar.
+        // Non-resident records keep the stored key — they are TRNG-keyed and
+        // device-bound, out of the wallet's scope by design. The orphan gate
+        // (EPIC §2 C3) sits here, before the counter bump: a resident record
+        // whose stored public key disagrees with the derivation never signs,
+        // and the answer is absence (`CTAP2_ERR_NO_CREDENTIALS`), not a
+        // fault — a wrong record is treated exactly like a missing one, the
+        // US-1573/US-1723 rule. A seedless device is untouched by the gate:
+        // `froot` is the bytes MC keyed, so derived == stored for every
+        // record MC ever wrote.
+        let private_key = if resident {
+            let derived = crypto::derive_resident_scalar(&self.froot(), cred.credential_id.as_slice())
+                .ok_or_else(|| err(Ctap2Response::KeyStoreFull))?;
+            // The derivation returned a scalar it already validated
+            // (`SecretKey::from_slice` inside the loop); this reconstruction
+            // is the totality check, the same shape MC uses.
+            let sk = p256::SecretKey::from_slice(&*derived)
+                .map_err(|_| err(Ctap2Response::KeyStoreFull))?;
+            let pub_bytes = crypto::public_key_bytes(&sk.public_key());
+            match (cred.public_key.x, cred.public_key.y) {
+                (Some(sx), Some(sy))
+                    if sx[..] == pub_bytes[1..33] && sy[..] == pub_bytes[33..65] => {}
+                _ => return Err(err(Ctap2Response::NoCredentials)),
+            }
+            // `PrivateScalar` is the zeroizing carrier the non-resident arm
+            // already yields; the copy out of the `Zeroizing` local is the
+            // same 32-byte hand-off `copy_out` does.
+            crate::device_keystore::PrivateScalar::from_bytes(*derived)
+        } else {
+            cred.private_key.copy_out()
+        };
 
         // SOAK-FINDING-1 review round 2: transactional counter bump — the
         // snapshot is made durable here or the bump reverts.

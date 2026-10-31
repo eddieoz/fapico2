@@ -125,6 +125,12 @@ fn write_fixture(device: &mut Device, region_file: &InstalledRegion, n: u32, for
         cred.credential_id.clear();
         cred.credential_id.extend_from_slice(id).unwrap();
     }
+    // US-1736: the planted record must be derivation-consistent with this
+    // device (`Device::make_consistent`) — the orphan gate refuses a
+    // resident record whose registered key is not `derive(froot, cred_id)`,
+    // and every fixture here is expected to serve an assertion. The call
+    // sits AFTER the ID overrides: the derivation keys on the final ID.
+    device.make_consistent(&mut cred);
     region_file.with(|region| {
         let mut creds = RegionCredentials::new(region, &keys);
         creds

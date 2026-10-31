@@ -352,6 +352,133 @@ fn key_agreement_bytes(device: &mut Device) -> Vec<u8> {
     cbor
 }
 
+/// Plant one resident record directly into a twin's key region — the shape a
+/// future record-transfer or migration leg would produce: the registered
+/// public key is whatever the caller says, the stored scalar is deliberately
+/// **not** the derivation's answer (`[0x66; 32]`), so a GA that trusted the
+/// stored scalar would sign under the wrong key and fail every verification
+/// here.
+///
+/// The record goes through the applet's own codec and key derivation
+/// (`region_keys`, `RegionCredentials::put`), so it is sealed exactly as a
+/// device-written record would be — `region_boot::enroll_directly`'s
+/// discipline, with the identity under test's fields.
+fn plant_record(
+    device: &mut Device,
+    region_file: &InstalledRegion,
+    cred_id: &[u8],
+    x: [u8; 32],
+    y: [u8; 32],
+) {
+    let keys = device.with_store(|store| {
+        let ks = DeviceKeystore::load(store).expect("readable").expect("snapshot present");
+        region_keys(store, &ks)
+    });
+    let mut cred = DeviceCredential {
+        credential_id: HV::new(),
+        public_key: DeviceCoseKey::es256(x, y),
+        private_key: PrivateScalar::from_bytes([0x66u8; 32]),
+        rp_id_hash: crypto::sha256(RP.as_bytes()),
+        rp_id: HV::new(),
+        user_handle: HV::new(),
+        user_name: HV::new(),
+        user_display_name: HV::new(),
+        cred_protect: 0,
+        large_blob_key: None,
+        hmac_secret: HV::new(),
+        cred_blob: HV::new(),
+        third_party_payment: false,
+        pin_complexity_policy: false,
+        resident: true,
+        algorithm: -7,
+        counter: 0,
+        revoked: false,
+        expires_at: None,
+    };
+    cred.credential_id.extend_from_slice(cred_id).unwrap();
+    cred.rp_id.extend_from_slice(RP.as_bytes()).unwrap();
+    cred.user_handle.extend_from_slice(USER_ID).unwrap();
+    region_file.with(|region| {
+        let mut creds = RegionCredentials::new(region, &keys);
+        creds.put(&nonce(7), &cred).expect("the planted record writes");
+    });
+}
+
+/// US-1736 scenario: a restored board signs a restored identity **without a
+/// usable stored key**. Board A registers under seed S (key K); board B —
+/// same seed — holds only a planted record for the same credential ID with
+/// the same public key and a junk stored scalar. The derivation at sign time
+/// reconstructs K and the signature verifies under it.
+#[test]
+fn a_restored_board_signs_without_a_usable_stored_key() {
+    let _guard = lock();
+
+    // Board A registers the identity under seed S.
+    let (cred_id, kx, ky) = register_on("us1736-a", Some(SEED_S));
+
+    // Board B: same seed, planted record, no usable stored scalar.
+    let region_b = install("us1736-b");
+    let mut b = Device::boot(keyed_store());
+    b.grant_presence_always();
+    b.set_pin(PIN);
+    b.seed_master(SEED_S);
+    plant_record(&mut b, &region_b, &cred_id, kx, ky);
+
+    let (status, cbor) = b.get_assertion(RP, None);
+    assert_eq!(status, 0x00, "the restored board must serve the planted identity");
+    let (ad, sig) = ga_parts(&cbor);
+    let mut signed = ad;
+    signed.extend_from_slice(&CHALLENGE);
+    assert!(
+        verifies_under(kx, ky, &signed, &sig),
+        "the signature must verify under board A's key K — derived from the \
+         seed at sign time, not read from the record"
+    );
+}
+
+/// US-1736 scenario (the orphan gate, EPIC §2 C3): a resident record whose
+/// stored public key disagrees with the derivation never signs, and the
+/// answer is `CTAP2_ERR_NO_CREDENTIALS` — absence, not fault.
+#[test]
+fn a_record_whose_stored_key_disagrees_with_the_derivation_never_signs() {
+    let _guard = lock();
+    let region = install("us1736-orphan");
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+    device.set_pin(PIN);
+    device.seed_master(SEED_S);
+
+    // The identity's credential ID is device-independent, so the ID is the
+    // real one; the registered public key is unrelated to anything the
+    // seed could derive.
+    let cred_id = derived_resident_id();
+    plant_record(&mut device, &region, &cred_id, [0xAAu8; 32], [0xBBu8; 32]);
+
+    let (status, cbor) = device.get_assertion(RP, None);
+    assert_eq!(
+        status, 0x2E,
+        "a disagreeing record answers NO_CREDENTIALS — never a guess, never a signature"
+    );
+    assert!(cbor.is_empty(), "the refusal carries no body");
+
+    // The allowList shape of the same request: same refusal.
+    let (status_allow, _cbor) = device.get_assertion(RP, Some(&cred_id));
+    assert_eq!(status_allow, 0x2E, "the orphan gate does not depend on the request shape");
+}
+
+/// The frozen resident-ID derivation, restated from the client's side (the
+/// same independent recomputation `resident_reregister.rs` pins): the record
+/// the orphan gate judges carries the real identity's ID.
+fn derived_resident_id() -> Vec<u8> {
+    use sha2::Digest;
+    let rp_hash = crypto::sha256(RP.as_bytes());
+    let mut h = sha2::Sha256::new();
+    h.update(b"fapico2-resident-id");
+    h.update(&rp_hash);
+    h.update(USER_ID);
+    h.finalize().to_vec()
+}
+
 
 /// US-1732 scenario 3 — the seedless back-compat guard (EPIC §2 C5), a live
 /// regression guard from this story on (see the module docs for why it runs

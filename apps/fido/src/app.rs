@@ -2324,7 +2324,37 @@ impl<K: Keystore> FidoApp<K> {
         // Sign over authData || clientDataHash.
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(client_data_hash);
-        let signature = match sign_with_alg(cred.algorithm, &cred.private_key, &signed_data) {
+        // US-1736 (EPIC FIDO-SEED-ROOT): a resident P-256 record's signing
+        // key is **derived at sign time** from `(froot, cred_id)` — the same
+        // serving-time contract the device twin's `build_assertion` runs —
+        // never trusted from the record. The orphan gate matches the device
+        // twin: a stored public key that disagrees with the derivation never
+        // signs and answers `NoCredentials` — absence, not fault. Seedless
+        // devices are untouched (`froot` is what MC keyed, so derived ==
+        // stored for every record MC ever wrote). Non-resident records and
+        // every other algorithm keep the stored key.
+        let signing_key: Vec<u8> = if cred.resident && matches!(cred.algorithm, -7 | -9) {
+            let Some(scalar) = crypto::derive_resident_scalar(&self.froot(), &cred.credential_id)
+            else {
+                return vec![Ctap2Response::KeyStoreFull.code()];
+            };
+            match (&cred.public_key.x, &cred.public_key.y) {
+                (Some(sx), Some(sy)) => {
+                    let Some(sk) = crypto::secret_key_from_bytes(&*scalar) else {
+                        return vec![Ctap2Response::InvalidCommand.code()];
+                    };
+                    let pub_bytes = crypto::public_key_bytes(&sk.public_key());
+                    if pub_bytes[1..33] != **sx || pub_bytes[33..65] != **sy {
+                        return vec![Ctap2Response::NoCredentials.code()];
+                    }
+                }
+                _ => return vec![Ctap2Response::NoCredentials.code()],
+            }
+            scalar.to_vec()
+        } else {
+            cred.private_key.clone()
+        };
+        let signature = match sign_with_alg(cred.algorithm, &signing_key, &signed_data) {
             Some(sig) => sig,
             None => return vec![Ctap2Response::InvalidCommand.code()],
         };
