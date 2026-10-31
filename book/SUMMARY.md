@@ -17,6 +17,7 @@
 - [Features](./features/index.md)
     - [The Nostr applet](./features/nostr.md)
 - [What it works with](./interop/index.md)
+- [Troubleshooting the boot](./troubleshooting/index.md)
 - [FAQ](./faq/index.md)
 - [Security](./security/index.md)
 - [Threat model](./threat-model.md)
