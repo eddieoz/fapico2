@@ -39,6 +39,10 @@ deliberately **not in git**.
 - [adr/0005-nostr-key-storage.md](adr/0005-nostr-key-storage.md) — the Nostr records' device-bound
   key derivation, the FIDO-range carve and occupancy guard, the deliberate second secp256k1
   implementation, and the scalar RAM-lifetime amendment.
+- [adr/0008-seed-rooted-fido-derivation.md](adr/0008-seed-rooted-fido-derivation.md) — the vendor
+  master seed governs the FIDO derivation root (`froot`) so restoring the phrase restores the
+  resident passkey wallet; the seedless byte-compat freeze, serving-time derivation with the
+  fail-closed orphan gate, the reset-first LOAD contract, and what stays device-bound.
 
 The three round-based red-team security assessments live in
 [`archive/`](archive/README.md): [round 2](archive/SECURITY-ASSESSMENT-ROUND2.md)

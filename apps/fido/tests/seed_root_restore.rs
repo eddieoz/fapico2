@@ -474,7 +474,7 @@ fn derived_resident_id() -> Vec<u8> {
     let rp_hash = crypto::sha256(RP.as_bytes());
     let mut h = sha2::Sha256::new();
     h.update(b"fapico2-resident-id");
-    h.update(&rp_hash);
+    h.update(rp_hash);
     h.update(USER_ID);
     h.finalize().to_vec()
 }
