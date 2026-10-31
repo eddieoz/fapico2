@@ -91,6 +91,25 @@ CTAP2_ERR_PIN_NOT_SET = 0x35
 # The CTAP2 status the LOAD refusal (US-1737) answers while residents exist.
 CTAP2_ERR_NOT_ALLOWED = 0x30
 
+# Set once the probe has installed a fresh seed on board A: from that moment
+# the board holds seed material that was never written down, and ANY abort —
+# a touch timeout, a refusal on board B, a crash — must tell the operator
+# that board A was mutated and how to recover the seed (exportable until
+# `finalize`). An undisclosed half-state is the one thing worse than
+# stopping.
+BOARD_A_MUTATED = False
+
+
+def _abort_disclosure() -> None:
+    if BOARD_A_MUTATED:
+        _prose(
+            "\nNOTE: this run installed a freshly drawn seed on board A "
+            "before aborting. That seed's phrase was never printed — but the "
+            "seed is still on board A and exportable (`backup_fido.py "
+            "export`) until you run `finalize`. Export it or re-provision "
+            "board A; do not leave it in limbo."
+        )
+
 
 def pin_is_set(path: str) -> bool:
     """`clientPIN 0x01 getPinRetries` as the PIN-state probe.
@@ -119,9 +138,11 @@ def ensure_seed_governed(path: str) -> bytes:
 
     `has_seed` ⇒ export it. No seed ⇒ draw one from the OS CSPRNG and install
     it (touch), so the probe is self-contained on a stock board. A board with
-    residents but no seed will refuse the install itself once US-1737 lands;
-    pre-epic the probe cannot see residents over the `0x41` channel, which is
-    exactly why the PIN guard above refuses early.
+    residents but no seed is refused by the firmware itself (the reset-first
+    gate, 0x30) — mapped here to the same guidance `load_seed` gives, because
+    the generic STATUS_HELP text for 0x30 describes EXPORT semantics and
+    would misdirect. Once the fresh seed is installed the board is MUTATED:
+    the caller's abort paths must disclose that (see `BOARD_A_MUTATED`).
     """
     with open_device(path) as dev:
         state = read_state(dev)
@@ -136,10 +157,24 @@ def ensure_seed_governed(path: str) -> bytes:
             f"board A at {path} has no seed. Installing a freshly drawn one "
             "(touch board A when prompted)…"
         )
-        restore_seed(dev, fresh, _touch_prompt_for(path))
+        try:
+            restore_seed(dev, fresh, _touch_prompt_for(path))
+        except BackupError as exc:
+            if exc.status == CTAP2_ERR_NOT_ALLOWED:
+                _prose(
+                    "the firmware REFUSED the install (0x30 NotAllowed): "
+                    "board A still holds resident credentials, and installing "
+                    "a seed that governs derivation would orphan their keys. "
+                    "authenticatorReset (ykman fido reset) wipes passkeys, "
+                    "then re-run this probe."
+                )
+                raise SystemExit(2) from exc
+            raise
         after = read_state(dev)
         if not after["has_seed"]:
             raise BackupError(f"board A did not retain the installed seed: {after}")
+        global BOARD_A_MUTATED
+        BOARD_A_MUTATED = True
         return fresh
 
 
@@ -290,7 +325,18 @@ if __name__ == "__main__":
         sys.exit(main())
     except BackupError as exc:
         _prose(f"error: {exc}")
+        _abort_disclosure()
         sys.exit(2)
+    except SystemExit:
+        # `load_seed` and `ensure_seed_governed` exit 2 with their own
+        # reset-first guidance; the disclosure rides on top of it.
+        _abort_disclosure()
+        raise
     except KeyboardInterrupt:
         _prose("\naborted")
+        _abort_disclosure()
         sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - a probe reports, never crashes bare
+        _prose(f"error: {type(exc).__name__}: {exc}")
+        _abort_disclosure()
+        sys.exit(1)

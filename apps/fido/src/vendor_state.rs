@@ -907,23 +907,35 @@ impl VendorOps for KeystoreVendorOps<'_, '_, '_> {
         self.ks.vendor.secret.master_seed
     }
 
-    fn resident_credential_count(&self) -> usize {
-        // The snapshot's resident array — the non-region backend.
-        let mut n = self.ks.credentials.iter().filter(|c| c.resident).count();
-        // The key region's index entries (US-1563's `used()` — the same
-        // number `getCredsMetadata` reports). Reachable only with the store
-        // the keys derive from; a missing store, an undecodable snapshot or
-        // an absent region contributes zero, per the trait contract — the
-        // US-1736 orphan gate is the fail-closed layer behind this one.
-        if let Some(store) = self.store.as_deref() {
-            if let Some(keys) = crate::device_app::region_keys(store, self.ks) {
-                if let Some(region) = crate::device_app::key_region() {
-                    let mut creds = crate::device_keystore::RegionCredentials::new(region, &keys);
-                    n += creds.used().unwrap_or(0) as usize;
-                }
-            }
+    fn resident_credential_count(&self) -> Option<usize> {
+        // The snapshot's resident array — always knowable.
+        let n = self.ks.credentials.iter().filter(|c| c.resident).count();
+        // The key region's index entries (`used()` — unfiltered: residency
+        // lives inside the sealed record, and the trait doc records why the
+        // gate wants the stricter "any FIDO record" semantics). `None` —
+        // never a collapsed zero — when a region is present but the count
+        // cannot be read: undecodable keys, a faulted index, or a region
+        // with no store to open it against. A fault is not evidence that
+        // the wallet is empty, and the LOAD gate refuses on `None`.
+        match self.store.as_deref() {
+            Some(store) => match crate::device_app::key_region() {
+                None => Some(n),
+                Some(region) => match crate::device_app::region_keys(store, self.ks) {
+                    Some(keys) => {
+                        let mut creds =
+                            crate::device_keystore::RegionCredentials::new(region, &keys);
+                        // `None` — a faulted index — passes straight through:
+                        // it is never collapsed into a count.
+                        creds.used().map(|u| n + u as usize)
+                    }
+                    None => None,
+                },
+            },
+            None => match crate::device_app::key_region() {
+                None => Some(n),
+                Some(_) => None,
+            },
         }
-        n
     }
 
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {
@@ -1192,11 +1204,12 @@ impl<K: crate::keystore::Keystore> VendorOps for MemoryVendorOps<'_, K> {
         self.store.get_auth_state().vendor.secret.master_seed
     }
 
-    fn resident_credential_count(&self) -> usize {
+    fn resident_credential_count(&self) -> Option<usize> {
         // The host keystore's array is the only backend this implementation
-        // serves; `list_credentials` is the trait's own enumeration seam, so
-        // the count cannot disagree with what the command path would serve.
-        self.store.list_credentials().iter().filter(|c| c.resident).count()
+        // serves, and it is always readable — `list_credentials` is the
+        // trait's own enumeration seam, so the count cannot disagree with
+        // what the command path would serve.
+        Some(self.store.list_credentials().iter().filter(|c| c.resident).count())
     }
 
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {

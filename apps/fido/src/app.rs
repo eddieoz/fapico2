@@ -17,6 +17,7 @@ use crate::DEFAULT_MAX_CRED_BLOB_LENGTH;
 use crate::DEFAULT_MAX_RPIDS_MINPIN_LENGTH;
 use crate::FidoError;
 use p256::SecretKey;
+use zeroize::Zeroizing;
 
 // ------------------------------------------------------------------
 // CTAP2 makeCredential request
@@ -2359,7 +2360,7 @@ impl<K: Keystore> FidoApp<K> {
         // devices are untouched (`froot` is what MC keyed, so derived ==
         // stored for every record MC ever wrote). Non-resident records and
         // every other algorithm keep the stored key.
-        let signing_key: Vec<u8> = if cred.resident && matches!(cred.algorithm, -7 | -9) {
+        let signing_key: Zeroizing<Vec<u8>> = if cred.resident && matches!(cred.algorithm, -7 | -9) {
             let Some(scalar) = crypto::derive_resident_scalar(&self.froot(), &cred.credential_id)
             else {
                 return vec![Ctap2Response::KeyStoreFull.code()];
@@ -2367,7 +2368,12 @@ impl<K: Keystore> FidoApp<K> {
             match (&cred.public_key.x, &cred.public_key.y) {
                 (Some(sx), Some(sy)) => {
                     let Some(sk) = crypto::secret_key_from_bytes(&*scalar) else {
-                        return vec![Ctap2Response::InvalidCommand.code()];
+                        // Twin parity with the device twin's identical
+                        // totality check (`device_core.rs` answers
+                        // KeyStoreFull here): unreachable on both twins, but
+                        // the twins must answer it identically if it ever
+                        // becomes reachable.
+                        return vec![Ctap2Response::KeyStoreFull.code()];
                     };
                     let pub_bytes = crypto::public_key_bytes(&sk.public_key());
                     if pub_bytes[1..33] != **sx || pub_bytes[33..65] != **sy {
@@ -2376,9 +2382,13 @@ impl<K: Keystore> FidoApp<K> {
                 }
                 _ => return vec![Ctap2Response::NoCredentials.code()],
             }
-            scalar.to_vec()
+            // Zeroized-on-drop: this is a private key crossing a plain
+            // `Vec`'s lifetime, and the EPIC's hygiene line ("Zeroizing on
+            // drop where it is a local") is the rule the device twin already
+            // keeps end to end.
+            Zeroizing::new(scalar.to_vec())
         } else {
-            cred.private_key.clone()
+            Zeroizing::new(cred.private_key.clone())
         };
         let signature = match sign_with_alg(cred.algorithm, &signing_key, &signed_data) {
             Some(sig) => sig,

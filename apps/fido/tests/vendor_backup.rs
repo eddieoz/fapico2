@@ -79,12 +79,21 @@ pub use fapico2_fido::vendor41::{
     OrgAttestationView, SoftLock, TokenAuth, VendorOps,
 };
 pub use fapico2_fido::vendor_state::{self, VendorSession};
+use fapico2_fido::vendor_state::with_keystore_ops;
 // The glob above brings `fapico2_fido::Result<T>` (a `FidoError` alias) into
 // scope, which is not the `Result` the `VendorOps` methods return. An explicit
 // import outranks a glob, so this resolves the name to the std one.
 pub use core::result::Result;
 pub use heapless::Vec as HV;
 pub use vendor_backup::{BackupWindow, BLOB_MAX, BLOB_MIN, MASTER_SEED_LEN, TAG_LEN};
+
+// US-1737's implementation-level test drives the real `KeystoreVendorOps`
+// against a real key region, so it needs the shared region fixture. Imported
+// by name (not glob) so nothing here collides with the `fapico2_fido::*`
+// glob above.
+mod region_boot;
+use region_boot::{credential, install, keyed_store, lock, nonce, region_keys, RegionCredentials};
+use fapico2_platform::secure_store::SecureStore;
 
 // ---------------------------------------------------------------------------
 // CTAP2 status codes, spelled as literals on the test side
@@ -221,6 +230,9 @@ struct MockOps {
     /// to hold. Zero by construction, so every pre-existing scenario keeps
     /// its meaning; the reset-first scenarios set it directly.
     residents: usize,
+    /// Flipped to make the count answer `None` — the "a backend holds
+    /// records the count cannot read" state the gate must refuse on.
+    residents_unknown: bool,
 }
 
 impl MockOps {
@@ -245,6 +257,7 @@ impl MockOps {
             seal_writes: 0,
             seal_fails: false,
             residents: 0,
+            residents_unknown: false,
         }
     }
 
@@ -284,8 +297,12 @@ impl VendorOps for MockOps {
         self.seed
     }
 
-    fn resident_credential_count(&self) -> usize {
-        self.residents
+    fn resident_credential_count(&self) -> Option<usize> {
+        if self.residents_unknown {
+            None
+        } else {
+            Some(self.residents)
+        }
     }
 
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {
@@ -1589,13 +1606,17 @@ fn load_on_a_board_with_resident_credentials_refuses() {
     // what it was.
     assert_eq!(ops.master_seed(), None);
     assert_eq!(ops.seed_writes, 0, "the refusal wrote nothing");
-    assert_eq!(ops.resident_credential_count(), 1, "the residents survived the refusal");
+    assert_eq!(
+        ops.resident_credential_count(),
+        Some(1),
+        "the residents survived the refusal"
+    );
 }
 
 #[test]
 fn load_on_a_wiped_board_succeeds() {
     let mut ops = MockOps::new();
-    assert_eq!(ops.resident_credential_count(), 0, "the reset-first precondition");
+    assert_eq!(ops.resident_credential_count(), Some(0), "the reset-first precondition");
     let token = [0x57u8; 32];
     let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
 
@@ -1655,6 +1676,114 @@ fn a_different_seed_over_residents_refuses() {
     );
     assert_eq!(ops.master_seed(), Some([0x11u8; 32]), "the old seed survived");
     assert_eq!(ops.seed_writes, 1, "the refusal wrote nothing");
+}
+
+#[test]
+fn an_unreadable_store_refuses_load() {
+    // The tri-state's whole point: `None` — a backend holds FIDO records the
+    // count could not read (a faulted region index is the hardware shape) —
+    // is NOT "no residents". A fault is not evidence that the wallet is
+    // empty, and `RegionCredentials::remaining()` refuses to report 0 on a
+    // fault for exactly this reason; the gate agrees.
+    let mut ops = MockOps::new();
+    ops.residents_unknown = true;
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
+
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        NOT_ALLOWED,
+        "an unreadable store refuses the install — fail closed, same 0x30, \
+         same reset-first remediation"
+    );
+    assert_eq!(ops.master_seed(), None, "the refusal wrote nothing");
+
+    // And arm 2 agrees: an unknown count refuses a *differing* seed even
+    // when one is installed (while a same-seed reinstall stays legal — it
+    // cannot orphan anything, whatever the count says).
+    let mut ops = MockOps::with_seed([0x11u8; 32]);
+    ops.residents_unknown = true;
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x22u8; 32]);
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        NOT_ALLOWED,
+    );
+    let req_same = load_request(&mut ops, &token, "1234", &[0x11u8; 32]);
+    assert_eq!(
+        vendor_backup::load(&req_same, Some(token_auth(&token)), gate(true), &mut ops)
+            .status
+            .code(),
+        OK,
+        "same-seed reinstall is idempotent under an unknown count too"
+    );
+}
+
+/// The `KeystoreVendorOps` implementation — the only one that runs on
+/// hardware — is exercised against a real region holding a **non-resident**
+/// record, pinning the gate's documented stricter semantics: the count is
+/// "any FIDO record the store holds", not "records credMgmt would
+/// enumerate", because residency lives inside the sealed record and reading
+/// it out would cost one AEAD open per record on a gate that runs before
+/// the channel. The bounded cost is a reset that sacrifices non-resident
+/// records too — which `authenticatorReset` wipes anyway.
+///
+/// Driven through `with_keystore_ops` (the fuzz target's seam) because the
+/// reset-first tests above run on `MockOps`, which is exactly the layer
+/// where an implementation bug would hide.
+#[test]
+fn keystore_ops_count_includes_region_records_resident_or_not() {
+    use fapico2_platform::trng::HostTrng;
+
+    let _guard = lock();
+    let region_file = install("us1737-count");
+    let mut store = keyed_store();
+    let mut trng = HostTrng::new();
+    let mut ks = fapico2_fido::device_keystore::DeviceKeystore::fresh(&mut trng)
+        .expect("host TRNG supplies entropy");
+    assert!(
+        ks.persist_if_dirty(&mut store),
+        "the device random must be durable before the region keys derive"
+    );
+    let keys = region_keys(&store, &ks);
+
+    // A NON-resident record: the device writes these into the region too
+    // (the MC non-resident branch), and credMgmt's discovery would skip it —
+    // the count must still see it.
+    let cred = credential(1, false);
+    region_file.with(|region| {
+        let mut creds = RegionCredentials::new(region, &keys);
+        creds.put(&nonce(1), &cred).expect("the fixture record commits");
+    });
+
+    let mut session = VendorSession::default();
+    let mut store_opt: Option<&mut dyn SecureStore> = Some(&mut store);
+    let mut random = |buf: &mut [u8]| buf.fill(0x5Au8);
+    with_keystore_ops(&mut ks, &mut session, &mut store_opt, &mut random, |ops| {
+        assert_eq!(
+            ops.resident_credential_count(),
+            Some(1),
+            "a non-resident region record is counted — the gate refuses on \
+             any FIDO record, the documented stricter contract"
+        );
+    });
+
+    // And the empty-region arm reads as Some(0), not None: a *readable*
+    // empty index is a known-zero, which is what lets a genuinely wiped
+    // board install a seed.
+    let _region_empty = install("us1737-count-empty");
+    let mut ks2 = fapico2_fido::device_keystore::DeviceKeystore::fresh(&mut trng)
+        .expect("host TRNG supplies entropy");
+    let mut store2 = keyed_store();
+    assert!(ks2.persist_if_dirty(&mut store2));
+    let mut store_opt2: Option<&mut dyn SecureStore> = Some(&mut store2);
+    with_keystore_ops(&mut ks2, &mut session, &mut store_opt2, &mut random, |ops| {
+        assert_eq!(
+            ops.resident_credential_count(),
+            Some(0),
+            "a readable empty region is a known zero, never unknown"
+        );
+    });
 }
 
 #[test]
