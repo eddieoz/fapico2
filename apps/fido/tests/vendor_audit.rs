@@ -1573,6 +1573,9 @@ impl VendorOps for ScriptedOps {
     fn master_seed(&self) -> Option<[u8; 32]> {
         None
     }
+    fn resident_credential_count(&self) -> usize {
+        0
+    }
     fn set_master_seed(&mut self, _seed: [u8; 32]) -> Result<(), Ctap2Response> {
         Err(Ctap2Response::NotAllowed)
     }

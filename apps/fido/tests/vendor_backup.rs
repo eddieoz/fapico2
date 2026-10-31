@@ -217,6 +217,10 @@ struct MockOps {
     seal_writes: u32,
     /// Flipped to make `seal_backup` refuse, so the `Err` path is reachable.
     seal_fails: bool,
+    /// US-1737's gate input: how many resident credentials the mock pretends
+    /// to hold. Zero by construction, so every pre-existing scenario keeps
+    /// its meaning; the reset-first scenarios set it directly.
+    residents: usize,
 }
 
 impl MockOps {
@@ -240,6 +244,7 @@ impl MockOps {
             sealed: false,
             seal_writes: 0,
             seal_fails: false,
+            residents: 0,
         }
     }
 
@@ -277,6 +282,10 @@ impl VendorOps for MockOps {
 
     fn master_seed(&self) -> Option<[u8; 32]> {
         self.seed
+    }
+
+    fn resident_credential_count(&self) -> usize {
+        self.residents
     }
 
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {
@@ -1547,6 +1556,124 @@ fn read_export_blob(body: &[u8]) -> Vec<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// US-1737 (EPIC FIDO-SEED-ROOT) — the reset-first LOAD gate
+// ---------------------------------------------------------------------------
+
+/// The `LOAD` request whose sealed plaintext is `seed`, over an established
+/// MSE channel — the `load_still_works_after_finalize` shape.
+fn load_request(ops: &mut MockOps, token: &[u8; 32], pin: &str, seed: &[u8; 32]) -> Rng {
+    let (_sk, _dev, key, aad) = channel(ops);
+    let sealed = chacha20poly1305_ref(&key, &[8u8; 12], &aad, seed);
+    let mut params: Rng = HV::new();
+    map(&mut params, 1);
+    uint(&mut params, 1);
+    bstr(&mut params, &sealed);
+    client_request(token, 0x03, Some(&params), Some(pin))
+}
+
+#[test]
+fn load_on_a_board_with_resident_credentials_refuses() {
+    let mut ops = MockOps::new();
+    ops.residents = 1;
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
+
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        NOT_ALLOWED,
+        "installing a NEW root over residents orphans their keys — the \
+         reset-first refusal (EPIC FIDO-SEED-ROOT C4)"
+    );
+    // No credential is deleted, and no seed appeared: the state is exactly
+    // what it was.
+    assert_eq!(ops.master_seed(), None);
+    assert_eq!(ops.seed_writes, 0, "the refusal wrote nothing");
+    assert_eq!(ops.resident_credential_count(), 1, "the residents survived the refusal");
+}
+
+#[test]
+fn load_on_a_wiped_board_succeeds() {
+    let mut ops = MockOps::new();
+    assert_eq!(ops.resident_credential_count(), 0, "the reset-first precondition");
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
+
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        OK,
+    );
+    assert_eq!(ops.master_seed(), Some([0x6Bu8; 32]), "the seed is installed");
+    // And a subsequent registration derives under the seed: the derivation
+    // root is now the domain-separated function of it (US-1734), which the
+    // device-twin suite (`seed_root_restore.rs`) proves end to end through
+    // the command path — two same-seed boards, one wallet.
+    assert_eq!(
+        fapico2_fido::crypto::derive_froot(&ops.master_seed().unwrap()),
+        fapico2_fido::crypto::derive_froot(&[0x6Bu8; 32]),
+        "the installed seed governs the derivation root"
+    );
+}
+
+#[test]
+fn same_seed_load_is_idempotent() {
+    let mut ops = MockOps::with_seed([0x6Bu8; 32]);
+    ops.residents = 2; // credentials registered UNDER this seed
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
+
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        OK,
+        "the SAME seed cannot orphan anything — the root is stable under it"
+    );
+    assert_eq!(ops.master_seed(), Some([0x6Bu8; 32]));
+    // "every existing credential still signs under its key": the signing
+    // property is the device-twin suite's to prove
+    // (`seed_root_restore.rs::reregistration_on_a_seeded_board_stays_idempotent`);
+    // what the wire can assert here is that the root those credentials were
+    // keyed by is bit-identical after the reinstall.
+    assert_eq!(
+        fapico2_fido::crypto::derive_froot(&ops.master_seed().unwrap()),
+        fapico2_fido::crypto::derive_froot(&[0x6Bu8; 32]),
+    );
+}
+
+#[test]
+fn a_different_seed_over_residents_refuses() {
+    let mut ops = MockOps::with_seed([0x11u8; 32]);
+    ops.residents = 1; // credentials keyed by the CURRENT root
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x22u8; 32]);
+
+    assert_eq!(
+        vendor_backup::load(&req, Some(token_auth(&token)), gate(true), &mut ops).status.code(),
+        NOT_ALLOWED,
+        "a DIFFERING seed over residents is the same orphaning move arm 1 \
+         refuses — this arm runs after the AEAD opened, because `incoming` \
+         is only known then and the caller has authenticated by now"
+    );
+    assert_eq!(ops.master_seed(), Some([0x11u8; 32]), "the old seed survived");
+    assert_eq!(ops.seed_writes, 1, "the refusal wrote nothing");
+}
+
+#[test]
+fn the_load_refusal_sits_after_authentication() {
+    let mut ops = MockOps::new();
+    ops.residents = 1;
+    let token = [0x57u8; 32];
+    let req = load_request(&mut ops, &token, "1234", &[0x6Bu8; 32]);
+
+    // The request is signed with one token and presented with another — a
+    // genuine MAC failure (the `finalize` suite's pattern). A caller must
+    // not learn whether residents exist without authenticating: the answer
+    // is the authentication failure, never the gate's 0x30.
+    let wrong = [0xFFu8; 32];
+    let st = vendor_backup::load(&req, Some(token_auth(&wrong)), gate(true), &mut ops);
+    assert_eq!(st.status.code(), PIN_AUTH_INVALID);
+    assert!(st.pin_auth_failure, "a rejected pinUvAuthParam must be charged");
+    assert_eq!(ops.master_seed(), None);
+}
 
 
 

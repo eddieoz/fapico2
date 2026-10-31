@@ -907,6 +907,25 @@ impl VendorOps for KeystoreVendorOps<'_, '_, '_> {
         self.ks.vendor.secret.master_seed
     }
 
+    fn resident_credential_count(&self) -> usize {
+        // The snapshot's resident array — the non-region backend.
+        let mut n = self.ks.credentials.iter().filter(|c| c.resident).count();
+        // The key region's index entries (US-1563's `used()` — the same
+        // number `getCredsMetadata` reports). Reachable only with the store
+        // the keys derive from; a missing store, an undecodable snapshot or
+        // an absent region contributes zero, per the trait contract — the
+        // US-1736 orphan gate is the fail-closed layer behind this one.
+        if let Some(store) = self.store.as_deref() {
+            if let Some(keys) = crate::device_app::region_keys(store, self.ks) {
+                if let Some(region) = crate::device_app::key_region() {
+                    let mut creds = crate::device_keystore::RegionCredentials::new(region, &keys);
+                    n += creds.used().unwrap_or(0) as usize;
+                }
+            }
+        }
+        n
+    }
+
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {
         let old = self.ks.vendor.secret.master_seed;
         let committed = commit(
@@ -1171,6 +1190,13 @@ impl<K: crate::keystore::Keystore> VendorOps for MemoryVendorOps<'_, K> {
 
     fn master_seed(&self) -> Option<[u8; 32]> {
         self.store.get_auth_state().vendor.secret.master_seed
+    }
+
+    fn resident_credential_count(&self) -> usize {
+        // The host keystore's array is the only backend this implementation
+        // serves; `list_credentials` is the trait's own enumeration seam, so
+        // the count cannot disagree with what the command path would serve.
+        self.store.list_credentials().iter().filter(|c| c.resident).count()
     }
 
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response> {

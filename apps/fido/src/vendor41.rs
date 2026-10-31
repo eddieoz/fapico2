@@ -3987,6 +3987,25 @@ pub trait VendorOps {
 
     fn master_seed(&self) -> Option<[u8; 32]>;
 
+    /// How many resident credentials the state currently holds, across
+    /// **every** backend the implementation serves.
+    ///
+    /// US-1737 (EPIC FIDO-SEED-ROOT): `LOAD`'s reset-first gate reads this —
+    /// installing a derivation root over residents orphans their keys, so
+    /// the count is the one fact the gate exists on. "Resident" is whatever
+    /// predicate the credMgmt discovery paths serve (the EPIC §2 rule: find
+    /// the existing one, never invent a second), and the implementations
+    /// count exactly what their credential store would enumerate:
+    /// `KeystoreVendorOps` counts the snapshot's resident array plus the key
+    /// region's index entries, `MemoryVendorOps` the host keystore's array.
+    ///
+    /// Best-effort by contract: a backend that cannot be read right now
+    /// contributes its count as `0` rather than an error, because the gate's
+    /// job is to protect records it can *see* — the orphan gate (US-1736) is
+    /// the belt-and-braces for what slips past. A store error is not
+    /// evidence that the wallet is empty.
+    fn resident_credential_count(&self) -> usize;
+
     /// Install a master seed, durably, or leave the state untouched.
     fn set_master_seed(&mut self, seed: [u8; 32]) -> Result<(), Ctap2Response>;
 
