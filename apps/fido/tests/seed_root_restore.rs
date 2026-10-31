@@ -1,0 +1,253 @@
+//! US-1732 — the RED device-twin suite for seed-governed wallet restore
+//! (EPIC FIDO-SEED-ROOT).
+//!
+//! # The field report this file pins as code
+//!
+//! The 2026-10-31 diagnosis: a seed exported from board A and imported into
+//! board B, then re-registering the same passkey, produced a **different
+//! wallet** on B — while delete-and-recreate on B reproduces B's key
+//! consistently, so the identity is deterministic and the *root* is what
+//! differs. The settled chain (EPIC §1): the resident credential ID is
+//! device-independent, but the signing scalar is
+//! `HMAC-SHA256(hkey_bytes, "fapico2/resident-key/v1" ‖ cred_id)` and
+//! `hkey` is a TRNG-random per-device P-256 scalar — and the backup master
+//! seed that EXPORT/LOAD move between devices is inert: it has no consumer
+//! outside the vendor transport and its snapshot slot. Custody without
+//! authority.
+//!
+//! # Why the device twin on the region path
+//!
+//! `AGENTS.md` §1: there are two `FidoApp`s and the shipped one is
+//! `device_app::FidoApp`. The wallet lives in the keyregion on hardware, so
+//! every scenario here boots the twin over a `Rp2350SecureStore` + installed
+//! key region through the shared [`region_boot`] fixture and drives
+//! `process_ctap2_with_store` — the shipped path — asserting
+//! `backend() == KeyRegion` before anything else, because a snapshot-backed
+//! run would prove nothing about the wallet.
+//!
+//! # The three scenarios
+//!
+//! 1. **Same seed, same wallet** — `#[ignore]`d RED: on today's code the
+//!    seed is inert, so two boards that `seed_master` the same 32 bytes still
+//!    draw different TRNG `hkey`s and attest under different keys. US-1734
+//!    (the `froot` accessor) and US-1735 (MC keyed by `froot`) flip this.
+//! 2. **Different seeds, different keys** — green today and green after the
+//!    fix: on today's code different `hkey`s already give different keys;
+//!    afterwards different `froot`s do. This is the defect restated in the
+//!    affirmative, and it guards the *negative* direction of the fix — the
+//!    seed must separate wallets too, not only unify them.
+//! 3. **Seedless board behaves exactly as v0.3.3** — the back-compat guard
+//!    (EPIC §2 C5), un-ignored and green on today's code: the twin exposes
+//!    its `hkey()`, so the suite can derive the expected US-1721 scalar
+//!    independently and assert the attested key matches, byte for byte.
+//!    When US-1734 lands, this scenario keeps running unchanged — the
+//!    seedless arm of `froot` *is* `hkey.to_bytes()`, so any deviation is a
+//!    break here first. (The EPIC's Step-2 note expected this scenario to be
+//!    RED until US-1734 exposed a `froot` accessor; the twin's existing
+//!    `hkey()` accessor makes the independent assertion expressible today,
+//!    so it runs as a live guard from this story on instead of being parked.)
+
+mod region_boot;
+
+use fapico2_fido::cbor::no_heap::{Item, Parser};
+use fapico2_fido::crypto;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use region_boot::*;
+
+/// The RP and user both boards register — the identity that must collapse to
+/// one key once the seed governs (EPIC US-1732's BDD).
+const RP: &str = "example.com";
+const USER_ID: &[u8] = b"us1732-user";
+
+/// The fixture's PIN — the device is PIN-set, so MC/GA ride a token the
+/// fixture mints (`region_boot::Device::set_pin`).
+const PIN: &[u8] = b"123456";
+
+/// Board A's seed, board B's different seed. Byte patterns, not entropy: the
+/// values do not matter, only that they are 32 bytes and unequal.
+const SEED_S: [u8; 32] = [0x42u8; 32];
+const SEED_T: [u8; 32] = [0x77u8; 32];
+
+/// The fixture's constant challenge — the clientDataHash tail of every
+/// verified signature here, same discipline as `resident_reregister.rs`.
+const CHALLENGE: [u8; 32] = [0xCCu8; 32];
+
+/// Boot one region-backed device twin, PIN-set, seeded with `seed`
+/// (`None` = seedless), and register `RP`/`USER_ID`.
+///
+/// Returns the credential ID and the attested key's `(x, y)`. The region and
+/// the device are dropped here — the caller only needs the identity, and the
+/// region provider is a process global so exactly one is installed at a time
+/// (`region_boot`'s module docs).
+fn register_on(tag: &str, seed: Option<[u8; 32]>) -> (Vec<u8>, [u8; 32], [u8; 32]) {
+    let region = install(tag);
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+    device.set_pin(PIN);
+    if let Some(s) = seed {
+        device.seed_master(s);
+    }
+    assert_eq!(
+        device.master_seed(),
+        seed,
+        "the fixture's seed did not land where the device core will read it"
+    );
+    assert_eq!(
+        device.backend(),
+        fapico2_fido::device_keystore::CredentialBackend::KeyRegion,
+        "the fixture must be region-backed — a snapshot-backed run replaces by ID and masks drift"
+    );
+    let (status, cbor) = device.make_cred(RP, USER_ID);
+    assert_eq!(status, 0x00, "resident makeCredential must succeed");
+    let (_ad, cred_id, x, y) = mc_parts(&cbor);
+    drop(device);
+    drop(region);
+    (cred_id, x, y)
+}
+
+/// The credential ID, and the attested P-256 key `(x, y)`, out of a
+/// makeCredential reply — the same walk `resident_reregister.rs::mc_parts`
+/// uses: the COSE key lives inside `authData`'s attestedCredentialData tail,
+/// rpIdHash(32) flags(1) signCount(4) aaguid(16) credIdLen(2) credId COSE.
+fn mc_parts(cbor: &[u8]) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32]) {
+    let ad = bstr_at(cbor, 2).expect("makeCredential reply carries authData");
+    let id_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let cred_id = ad[55..55 + id_len].to_vec();
+    let cose = &ad[55 + id_len..];
+    let mut x = [0u8; 32];
+    let mut y = [0u8; 32];
+    let mut p = Parser::new(cose);
+    let Item::Map(n) = p.next().unwrap() else { panic!("COSE key is a map") };
+    for _ in 0..n {
+        let key = match p.next().unwrap() {
+            Item::U(u) => u as i64,
+            Item::N(n) => n,
+            other => panic!("COSE label {other:?}"),
+        };
+        match key {
+            -2 => match p.next().unwrap() {
+                Item::B(b) => x.copy_from_slice(b),
+                other => panic!("x is bytes, got {other:?}"),
+            },
+            -3 => match p.next().unwrap() {
+                Item::B(b) => y.copy_from_slice(b),
+                other => panic!("y is bytes, got {other:?}"),
+            },
+            _ => p.skip().unwrap(),
+        }
+    }
+    (ad.to_vec(), cred_id, x, y)
+}
+
+/// The authData and DER signature out of a getAssertion response.
+fn ga_parts(cbor: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (
+        bstr_at(cbor, 2).expect("getAssertion reply carries authData"),
+        bstr_at(cbor, 3).expect("getAssertion reply carries a signature"),
+    )
+}
+
+/// Does `sig_der` verify over `signed` under the P-256 key `(x, y)`?
+fn verifies_under(x: [u8; 32], y: [u8; 32], signed: &[u8], sig_der: &[u8]) -> bool {
+    let mut point = [0u8; 65];
+    point[0] = 0x04;
+    point[1..33].copy_from_slice(&x);
+    point[33..65].copy_from_slice(&y);
+    let Ok(vk) = VerifyingKey::from_sec1_bytes(&point) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_der(sig_der) else {
+        return false;
+    };
+    vk.verify(signed, &sig).is_ok()
+}
+
+/// US-1732 scenario 1 — RED until US-1734/US-1735.
+#[test]
+#[ignore = "RED until US-1734/US-1735 (EPIC FIDO-SEED-ROOT): the master seed is \
+            inert on today's code, so two same-seed boards still draw different \
+            TRNG hkeys and attest under different keys"]
+fn two_boards_with_the_same_seed_derive_the_same_credential_key() {
+    let _guard = lock();
+
+    let (cred_a, xa, ya) = register_on("us1732-same-a", Some(SEED_S));
+    let (cred_b, xb, yb) = register_on("us1732-same-b", Some(SEED_S));
+
+    assert_eq!(
+        cred_a, cred_b,
+        "the resident ID is device-independent — the EPIC's settled fact 1"
+    );
+    assert_eq!(
+        (xa, ya),
+        (xb, yb),
+        "the same seed must reproduce the same passkey private key for the \
+         same (rp, user) — the settled end-state this epic exists to land"
+    );
+}
+
+/// US-1732 scenario 2 — the defect restated in the affirmative; green today
+/// and green after the fix.
+#[test]
+fn two_boards_with_different_seeds_derive_different_keys() {
+    let _guard = lock();
+
+    let (cred_a, xa, ya) = register_on("us1732-diff-a", Some(SEED_S));
+    let (cred_b, xb, yb) = register_on("us1732-diff-b", Some(SEED_T));
+
+    assert_eq!(cred_a, cred_b, "same identity ⇒ same credential ID, any root");
+    assert_ne!(
+        (xa, ya),
+        (xb, yb),
+        "different roots must derive different keys — the seed separates \
+         wallets as surely as it unifies them"
+    );
+}
+
+/// US-1732 scenario 3 — the seedless back-compat guard (EPIC §2 C5), a live
+/// regression guard from this story on (see the module docs for why it runs
+/// un-ignored rather than parked RED).
+#[test]
+fn a_seedless_board_behaves_exactly_as_v0_3_3() {
+    let _guard = lock();
+
+    let _region = install("us1732-seedless");
+    let mut device = Device::boot(keyed_store());
+    device.grant_presence_always();
+    device.set_pin(PIN);
+    assert_eq!(device.master_seed(), None, "a stock device has no master seed");
+    assert_eq!(
+        device.backend(),
+        fapico2_fido::device_keystore::CredentialBackend::KeyRegion,
+        "the fixture must be region-backed"
+    );
+
+    let (status, cbor) = device.make_cred(RP, USER_ID);
+    assert_eq!(status, 0x00);
+    let (_ad, cred_id, x, y) = mc_parts(&cbor);
+
+    // The independent US-1721 derivation, keyed by the board's own hkey —
+    // what v0.3.3 shipped. The frozen rule: derive_resident_scalar's output
+    // for a given (hkey, cred_id) must not change by one bit (EPIC §2).
+    let hkey_bytes = device.hkey().to_bytes();
+    let derived = crypto::derive_resident_scalar(hkey_bytes.as_slice(), &cred_id)
+        .expect("the seedless derivation is never exhausted (US-1721)");
+    let sk = p256::SecretKey::from_slice(&*derived).expect("a validated scalar");
+    let pub_bytes = crypto::public_key_bytes(&sk.public_key());
+    let mut ex = [0u8; 32];
+    let mut ey = [0u8; 32];
+    ex.copy_from_slice(&pub_bytes[1..33]);
+    ey.copy_from_slice(&pub_bytes[33..65]);
+    assert_eq!((x, y), (ex, ey), "the attested key must be the hkey-keyed US-1721 derivation");
+
+    // And getAssertion signs under that same key, over authData ‖
+    // clientDataHash.
+    let (ga_status, ga_cbor) = device.get_assertion(RP, Some(&cred_id));
+    assert_eq!(ga_status, 0x00, "seedless getAssertion must serve the record");
+    let (ad, sig) = ga_parts(&ga_cbor);
+    let mut signed = ad;
+    signed.extend_from_slice(&CHALLENGE);
+    assert!(
+        verifies_under(x, y, &signed, &sig),
+        "the seedless assertion must sign under the record's registered key"
+    );
+}
