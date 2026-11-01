@@ -32,9 +32,17 @@ INS_RESET = 0x1E  # the management applet's RESET
 INS_VERIFY_PIN = 0x1B
 INS_SET_PIN = 0x1C  # P1 0 = SET, P1 1 = CHANGE
 INS_LOCK = 0x1D
+#: US-1742 — the touch-policy verb. P1 0 = enable touch (friction-free),
+#: P1 1 = bypass on for the three signing arms (open session + a press).
+INS_SET_TOUCH_POLICY = 0x1F
+SW_OK = 0x9000
 SW_PIN_LOCKED = 0x63C0
 SW_PIN_NOT_SET = 0x6A82
 SW_PIN_SESSION_REQUIRED = 0x6982
+SW_TOUCH_REQUIRED = 0x6985
+#: US-1746 — caps bit 4 (the verb exists) and flags bit 3 (bypass armed).
+CAP_TOUCH_POLICY = 0x0010
+FLAG_TOUCH_BYPASS = 0x08
 
 
 def select(conn, aid):
@@ -106,6 +114,111 @@ def main():
         sw, _ = apdu(INS_VERIFY_PIN, 0, pin)
         print(f"  -> SW={sw:#06x} (expect 9000 — the session is applet-global, not per-connection)")
         print("\n--pin legs done; the full gated-command matrix is the emulator suite's")
+        conn.disconnect()
+        return
+
+    # ---- US-1749: the optional --touch-bypass legs ----------------------
+    #
+    # --touch-bypass walks the policy verb over the *device* (CCID): the
+    # advertisement, the disable leg's consent chain (closed-session
+    # refusal, verify, the consent press), the ten-signature chain that
+    # must cost zero further touches, LOCK clearing the flag, the
+    # friction-free enable leg, and the power-cycle leg — the user
+    # unplugs and replugs mid-run and the script reconnects, proving the
+    # RAM flag died with the power. The HID leg of the same matrix rides
+    # the extension on hardware (the probe is PC-SC only); its
+    # observations are recorded in the audit transcript beside these.
+    if "--touch-bypass" in sys.argv:
+        import getpass
+
+        def connect():
+            for r in readers():
+                try:
+                    c = r.createConnection()
+                    c.connect()
+                    if select(c, NOSTR_AID)[0] == SW_OK:
+                        return r.name, c
+                except Exception:
+                    pass
+            sys.exit("no reader selected the Nostr applet")
+
+        def session():
+            """A fresh (reader, transmit) pair — the power-cycle leg rebuilds it."""
+            n, c = connect()
+            print(f"  (connected via {n})")
+
+            def a(ins, p1=0, data=b""):
+                d, s1, s2 = c.transmit([0x00, ins, p1, 0x00, len(data)] + list(data))
+                return (s1 << 8) | s2, bytes(d)
+
+            return a, c
+
+        a, conn = session()
+        print("\n[T1] GET_INFO — the advertisement")
+        sw, data = a(0x10)
+        assert sw == SW_OK and len(data) == 8
+        caps = int.from_bytes(data[2:4], "big")
+        flags = data[7]
+        assert caps & CAP_TOUCH_POLICY, f"caps {caps:#06x} lacks the touch-policy bit"
+        print(f"  -> caps={caps:#06x} flags={flags:#02x} (CAP_TOUCH_POLICY set, "
+              f"bypass {'ARMED' if flags & FLAG_TOUCH_BYPASS else 'clear'})")
+
+        print("\n[T2] SET_TOUCH_POLICY P1=1 before any verify — the refusal")
+        sw, _ = a(INS_SET_TOUCH_POLICY, 1)
+        expect = "6A82 (no PIN)" if sw == SW_PIN_NOT_SET else "6982 (session closed)"
+        print(f"  -> SW={sw:#06x} (expect {expect})")
+        assert sw in (SW_PIN_NOT_SET, SW_PIN_SESSION_REQUIRED)
+
+        pin = getpass.getpass("PIN (the board's, to open the session): ").encode()
+        print("\n[T3] VERIFY_PIN")
+        sw, _ = a(INS_VERIFY_PIN, 0, pin)
+        print(f"  -> SW={sw:#06x} (expect 9000)")
+        assert sw == SW_OK
+
+        print("\n[T4] SET_TOUCH_POLICY P1=1 — TOUCH the board when the LED lights")
+        input("      (the consent press), then press Enter to send… ")
+        sw, _ = a(INS_SET_TOUCH_POLICY, 1)
+        print(f"  -> SW={sw:#06x} (expect 9000)")
+        assert sw == SW_OK
+        sw, data = a(0x10)
+        flags = data[7]
+        assert flags & FLAG_TOUCH_BYPASS, "the advertisement must follow the flag"
+        print(f"  -> flags={flags:#02x} — FLAG_TOUCH_BYPASS stands")
+
+        print("\n[T5] the ten-signature chain — DO NOT touch the board; "
+              "if the LED lights, the bypass failed")
+        sw, data = a(0x11)  # LIST_KEYS
+        assert sw == SW_OK and data and data[0] >= 1, "an identity is needed for the chain"
+        for i in range(10):
+            sw, data = a(0x15, 0, bytes(32))  # SIGN idx0
+            assert sw == SW_OK, f"sign {i + 1}/10 refused {sw:#06x} — the bypass did not hold"
+        print("  -> 10/10 signs answered 9000 with no touch")
+
+        print("\n[T6] LOCK — the flag must die with the session")
+        sw, _ = a(INS_LOCK)
+        print(f"  -> SW={sw:#06x}")
+        sw, data = a(0x10)
+        flags = data[7]
+        assert not flags & FLAG_TOUCH_BYPASS, "LOCK must clear the flag"
+        sw, _ = a(INS_SET_TOUCH_POLICY, 1)
+        print(f"  -> flags={flags:#02x}, disable-now answers {sw:#06x} "
+              f"(expect 6982 — the session closed with the lock)")
+        assert sw == SW_PIN_SESSION_REQUIRED
+
+        print("\n[T7] the enable leg — friction-free in this locked state")
+        sw, _ = a(INS_SET_TOUCH_POLICY, 0)
+        print(f"  -> SW={sw:#06x} (expect 9000, no touch)")
+        assert sw == SW_OK
+
+        input("\n[T8] POWER CYCLE: unplug the board, wait 5 s, replug, then press Enter… ")
+        a, conn = session()
+        sw, data = a(0x10)
+        flags = data[7]
+        assert not flags & FLAG_TOUCH_BYPASS, "the RAM flag must die with the power"
+        print(f"  -> flags={flags:#02x} — the bypass is gone after the power cycle")
+
+        print("\n--touch-bypass legs done; the HID arm of this matrix rides the "
+              "extension (US-1749's transcript records both)")
         conn.disconnect()
         return
 
