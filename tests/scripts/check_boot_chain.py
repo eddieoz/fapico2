@@ -343,6 +343,61 @@ def arena_demand() -> int | None:
     return int(m.group(1).replace("_", "")) if m else None
 
 
+def ensure_nightly() -> str | None:
+    """Make `cargo +nightly` work, or return the reason it cannot.
+
+    The self-heal below runs the nightly measurement itself, so a runner
+    without the toolchain pre-installed (CI's device job installs only
+    stable) gets it lazily — once, and only on the stale-stamp path.
+    """
+    probe = subprocess.run(
+        ["cargo", "+nightly", "--version"], capture_output=True, text=True
+    )
+    if probe.returncode == 0:
+        return None
+    install = subprocess.run(
+        [
+            "rustup", "toolchain", "install", "nightly",
+            "--target", "thumbv8m.main-none-eabi", "--profile", "minimal",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if install.returncode != 0:
+        return f"cargo +nightly is unavailable and the install failed: {install.stderr.strip()[-300:]}"
+    probe = subprocess.run(
+        ["cargo", "+nightly", "--version"], capture_output=True, text=True
+    )
+    if probe.returncode != 0:
+        return "cargo +nightly is still unavailable after the toolchain install"
+    return None
+
+
+def re_measure() -> tuple[bool, str]:
+    """Run the sanctioned re-measurement (`measure_task_arena.py`) and report.
+
+    `True` means the tree now carries a fresh stamp and a re-read demand
+    (which the caller must compare against the constant it found); `False`
+    means the re-measurement itself could not run, with the reason.
+    """
+    nightly = ensure_nightly()
+    if nightly is not None:
+        return False, nightly
+    run = subprocess.run(
+        ["python3", str(ROOT / "tests/scripts/measure_task_arena.py")],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if run.returncode != 0:
+        return False, (
+            f"measure_task_arena.py exited {run.returncode}: "
+            f"{(run.stderr or run.stdout).strip()[-400:]}"
+        )
+    return True, (run.stdout or "").strip()
+
+
 def check_arena() -> tuple[bool, str]:
     demand = arena_demand()
     size = arena_symbol_size()
@@ -365,19 +420,46 @@ def check_arena() -> tuple[bool, str]:
             "Re-measure:  python3 tests/scripts/measure_task_arena.py"
         )
     current = arena_stamp.fingerprint(ROOT)
+    restamped_note = ""
+    stale_declared = ""
     if declared != current:
-        return False, (
-            f"  - task arena: the demand constant's stamp no longer matches the "
-            f"sources it was measured from (declared {declared[:16]}…, current "
-            f"{current[:16]}…). Either a task future grew, or a dependency in the "
-            "firmware's closure moved, since the last measurement — so the "
-            f"{demand} B below is stale and the headroom figure it produces is "
-            "meaningless. It is also what a documentation commit does: the stamp "
-            "is byte-exact over the source text and cannot tell a comment from "
-            "code (see the limitation documented in tests/scripts/arena_stamp.py). "
-            "Re-measure either way (needs nightly) — the measurement is the "
-            "authority, not the stamp:  "
-            "python3 tests/scripts/measure_task_arena.py"
+        stale_declared = declared[:16]
+        # Self-heal (2026-11-01): the stamp is byte-exact over the source
+        # text and cannot tell a comment from code, so every commit that
+        # touches the closure — including a documentation edit that moved no
+        # byte of any task future — staled it and blocked the whole device
+        # job on a manual nightly run. The gate now runs the sanctioned
+        # re-measurement itself: the measurement is the authority, not the
+        # stamp, and a demand that did not move is re-stamped in the
+        # workspace instead of failing the PR. A demand that DID move is
+        # still a hard fail — that is the gate's real job.
+        ok, reason = re_measure()
+        if not ok:
+            return False, (
+                f"  - task arena: the demand constant's stamp no longer matches the "
+                f"sources it was measured from (declared {declared[:16]}…, current "
+                f"{current[:16]}…), and the automatic re-measurement could not run: "
+                f"{reason}. Fix the environment or re-measure by hand (needs "
+                "nightly):  python3 tests/scripts/measure_task_arena.py"
+            )
+        new_demand = arena_demand()
+        new_declared = arena_stamp.declared_stamp(ROOT)
+        if new_demand != demand:
+            return False, (
+                f"  - task arena: the re-measurement moved the demand "
+                f"{demand} B -> {new_demand} B — a task future grew or shrank in "
+                "this change. The constant in firmware/src/lib.rs has been "
+                "re-written to the measured value; REVIEW that diff (and raise "
+                "embassy-executor's task-arena-size feature if the statics allow "
+                "it) before committing it."
+            )
+        demand = new_demand
+        declared = new_declared
+        restamped_note = (
+            f"  - task arena: the stamp was stale ({stale_declared}… vs the "
+            "sources); re-measured in place — the demand did not move, so the "
+            "fresh stamp is written to firmware/src/lib.rs. Commit it with the "
+            "series (git add firmware/src/lib.rs) so CI does not re-measure.\n"
         )
 
     if demand > size:
@@ -395,7 +477,8 @@ def check_arena() -> tuple[bool, str]:
             f"arena ({size / max(demand, 1):.2f}x)."
         )
     return True, (
-        f"  - task arena: demand {demand} B fits ARENA {size} B "
+        restamped_note
+        + f"  - task arena: demand {demand} B fits ARENA {size} B "
         f"({size / max(demand, 1):.2f}x, floor {ARENA_MIN_HEADROOM_X1000 / 1000}x; "
         f"measurement stamp {declared[:16]}… verified against the current sources)"
     )
