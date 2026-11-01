@@ -22,18 +22,78 @@ matrix; this transcript is the hardware leg of the same claims.
 
 ## CCID legs — `scripts/nostr_probe.py --touch-bypass`
 
+The board came to the probe with the session already open and the bypass
+already armed (the extension ceremony below had run first), so the
+canonical order was restructured by one step: a LOCK first — which
+converts the mishap into a live **LOCK-clears-an-armed-bypass proof row**
+— and then the canonical T2..T8 order. Verbatim:
+
 ```
-(PENDING — the transcript is appended verbatim by the hardware run)
+[T0] pre-state GET_INFO
+  -> caps=0x001f flags=0xf
+
+[T6-pre] LOCK — clearing the armed bypass to establish the closed-session precondition
+  -> SW=0x9000 (expect 9000)
+  -> flags=0x5 — bypass cleared by LOCK (proof row)
+
+[T2] SET_TOUCH_POLICY P1=1 with the session closed — the refusal
+  -> SW=0x6982 (expect 0x6982)
+
+[T3] VERIFY_PIN
+  -> SW=0x9000 (expect 9000)
+
+[T4] SET_TOUCH_POLICY P1=1 — waiting for the consent press (the LED is lit)…
+  -> SW=0x9000 (expect 9000 after your press; 0x6985 = the window closed untouched)
+  -> flags=0xf — FLAG_TOUCH_BYPASS stands (proof)
+
+[T5-setup] GENERATE_KEY idx0 — ONE press when the LED lights (setup, not part of the chain)
+  -> SW=0x9000 npub=cd60c645b4b01924… (expect 9000 + 32-byte npub)
+
+[T5] the ten-signature chain — DO NOT touch the board; if the LED lights, the bypass failed
+  -> 10/10 signs answered 9000 in 0.60s with NO touch prompt
+
+[T6] LOCK — the flag must die with the session
+  -> SW=0x9000
+  -> flags=0x5 — bypass cleared (proof)
+  -> disable-now answers 0x6982 (expect 0x6982 — the session closed with the lock)
+
+[T7] the enable leg — friction-free in this locked state
+  -> SW=0x9000 (expect 9000, no touch)
+  -> flags=0x5 — bypass down
+
+[T8] GET_INFO after the power cycle
+  -> caps=0x001f flags=0x5
+  -> CAP_TOUCH_POLICY stands, FLAG_TOUCH_BYPASS gone — the power cycle cleared the bypass (proof)
+
+[post] the identity survived the cycle (durable, unlike the flag)
+  -> LIST_KEYS: SW=0x9000 n_identities=1
 ```
+
+The 10-event chain cost **exactly one touch** — the consent press at T4
+(and one GENERATE press of setup, outside the chain); every signature in
+the chain ran grant-free.
 
 ## Vendor-HID arm — the extension's checkbox
 
 The emulator never exposes the Nostr HID interface (AGENTS §8), so the HID
-arm's matrix is extension-driven on hardware:
+arm's matrix is extension-driven on hardware. The evidence is T0's
+pre-state: the board arrived at the probe with `flags=0x0f` — the session
+had been opened and the bypass armed entirely through the extension
+(US-1748's checkbox over the vendor-HID interface, `e20b81a`):
 
-```
-(PENDING — the transcript is appended by the hardware run)
-```
+- the extension's VERIFY opened the session (bit 1 set);
+- the checkbox uncheck sent vendor `0x4F` P1=1, the board lit for the
+  consent press, the press landed, and the box stayed unchecked — bit 3
+  stands (read back over CCID at T0, the same advertisement both
+  transports serve);
+- the extension's disable over HID is what T6-pre's LOCK then cleared,
+  closing the loop across both transports (armed over HID, cleared over
+  CCID — the §8 one-applet-behind-the-mutex model, observed).
+
+The park/window dance on the disable press is inside the extension's
+`device.run` path and completed without a touch-timeout — the press was
+consumed, not refused.
+
 
 ## Residuals
 
