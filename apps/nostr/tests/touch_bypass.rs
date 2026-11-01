@@ -788,3 +788,36 @@ fn getinfo_stays_width_clean() {
     // failing test referencing the §6 rule.
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Review follow-up — the verify_pin failure arm: the US-1745 LOCK rationale
+// applies to every session close, not just LOCK's. A failed verify closes
+// the session; a stale bypass surviving it would let the next VERIFY
+// silently resurrect a touch-free session the user believes they closed.
+// ---------------------------------------------------------------------------
+
+/// **A failed verify clears the armed bypass with the session** — the
+/// session closed, the flag dies with it, and the correct verify that
+/// reopens the session does not resurrect the bypass: re-arming it costs
+/// a new disable-leg press, exactly as after a LOCK.
+#[test]
+#[ignore = "review RED: the verify_pin failure arm keeps the flag standing"]
+fn a_failed_verify_clears_the_armed_bypass() {
+    reset_presses();
+    let (app, path) = pin_app("failed-verify-clears");
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu_policy(0x01));
+    assert_eq!(sw, SW_OK, "the fixture arms the bypass");
+    assert!(app.touch_bypass());
+
+    // A wrong PIN closes the session — the bypass dies with it.
+    let (_, sw) = call(&mut app, &apdu(0x1B, 0x00, b"000000"));
+    assert_eq!(sw, 0x63C2, "the wrong PIN burns an attempt");
+    assert!(!app.touch_bypass(), "the failed verify cleared the flag");
+
+    // The correct verify reopens the session — the bypass stays gone.
+    let (_, sw) = call(&mut app, &apdu(0x1B, 0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass(), "re-verify does not resurrect the flag");
+    std::fs::remove_file(&path).ok();
+}
