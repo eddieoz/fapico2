@@ -54,7 +54,7 @@ What the device does, and proof that it does it. Everything listed here is imple
 
 - **Up to 8 Nostr identities** — BIP-340 (Schnorr) signing and NIP-44 v2 encryption, computed on the chip; the full tour is [the applet page](./nostr.md), the walk-through is [the how-to](../how-to/nostr.md)
 - **NIP-07 `window.nostr`** for web pages — `getPublicKey`, `signEvent`, `nip44.encrypt`/`decrypt`, `listKeys` — via the [fapico2 Nostr extension](https://github.com/eddieoz/fapico2-nostr-extension) over WebHID (Chrome 116+, usage page `0xFF00`)
-- **Touch on every private-key operation** — sign, encrypt, decrypt, generate, import, label, delete, export; only the public reads are touch-free, and no config bit changes that
+- **Touch on every private-key operation** — sign, encrypt, decrypt, generate, import, label, delete; only the public reads are touch-free — with one deliberate exception: the **touch bypass** exempts sign/encrypt/decrypt behind an open PIN session plus a physical consent press, and dies with the session (LOCK, a failed verify, power); generate/import/label/delete have no bypass ([the applet page](./nostr.md#the-touch-bypass-consented-session-bound-ram-only), [the how-to](../how-to/nostr.md#the-touch-bypass--one-consent-press-opens-the-signing-chain))
 - Keys sealed as AEAD records in the key store under the chip-unique OTP root — the same at-rest story as passkeys ([why device-bound](../../docs/adr/0005-nostr-key-storage.md))
 - The event is hashed in the browser; only the 32-byte sighash reaches the board, and the signature comes back with the npub that produced it
 

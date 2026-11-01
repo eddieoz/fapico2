@@ -121,9 +121,22 @@ Three properties worth knowing:
 
 ## 7. The touch, timeouts, and what the errors mean
 
-The board asks for the BOOTSEL press on every command that uses or changes the private key set — sign, encrypt, decrypt, generate, import, label, delete. The three reads (public key, list, ping) are touch-free. There is **no config bit** that turns the touch off.
+The board asks for the BOOTSEL press on every command that uses or changes the private key set — sign, encrypt, decrypt, generate, import, label, delete. The three reads (public key, list, ping) are touch-free. The touch can be silenced for the signing commands only — deliberately, with a physical consent press — by the touch bypass below; the four key-management commands (generate, import, label, delete) press the button unconditionally, on every board, in every state.
 
 On a PIN-set board there is a gate in front of the touch: an unverified session is refused before the button ever lights, and the popup routes you to the verify screen instead (section 5). A touch you press while the session is closed consents to nothing — the refusal consumes the armed grant, never a signature.
+
+### The touch bypass — one consent press opens the signing chain
+
+Nostr platforms send chains of events, and a touch per signature makes a 10-event chain 10 presses. The board therefore offers a **touch bypass** for exactly the three signing commands — **sign, NIP-44 encrypt, NIP-44 decrypt** — and nothing else. The model is the PIN session's twin, and it is worth reading the asymmetry once:
+
+- **Turning it off (silencing the button) is the dangerous direction**, so it costs the most: an **open PIN session** and a **physical press on the board**. Unchecking *"Require touch for signing"* on the popup's PIN manage screen lights the board's LED; the press is you consenting to go touch-free. The firmware enforces both — the extension can only ask.
+- **Turning it on again (the button back) is the safe direction** and is friction-free: checking the box answers instantly, no session, no press, whatever the board's state.
+- **The bypass is RAM-only and dies with the session it was opened in.** LOCK, a failed verify, and a power cycle clear it; a deselect/re-select keeps it. Unplug the board and it is gone — *a bypass that survives unplug is a bypass the user forgot they owned*. The checkbox re-renders checked on the next connect because the board says so, not because the extension remembered anything.
+- **A board with no PIN can never arm the bypass.** The privilege is anchored in the PIN session: no PIN record, no disable.
+
+While the bypass is armed, a 10-event chain costs **one press total** — the consent press itself. Every signature after it runs grant-free, and the popup's checkbox shows unchecked (*Require touch for signing* off) exactly as long as the board is in that state — the checkbox renders the board's own advertisement, not a preference the extension keeps.
+
+If the consent press never comes (the window is ~15 s), the disable is refused with the touch word, the checkbox snaps back to checked, and the status line says why — the board never half-applies a policy. The full error rows are in [troubleshooting](../troubleshooting/nostr.md).
 
 The amber touch bar appears the moment the board asks; keepalives keep it live while the board waits. If no press comes, the device refuses with its touch status word and the extension reports it in plain words:
 
@@ -134,7 +147,7 @@ The amber touch bar appears the moment the board asks; keepalives keep it live w
 | *that identity is not on the device* | the slot is empty or tombstoned (`6A82`) | check the Keys screen |
 | *the device refused the data — it could not read the request* | malformed payload (`6A80`) | check what you pasted / the request shape |
 | *the device refused the command length* | the counterparty's key is not a valid curve point (`6A87` on the device — the extension's map words it as a length refusal) | check the counterparty's npub |
-| *the device could not complete the operation — its store faulted* | the store refused (`6F00`) — boot degraded or a slot that would not open | reflash/recovery; see [troubleshooting](#10-troubleshooting) |
+| *the device could not complete the operation — its store faulted* | the store refused (`6F00`) — boot degraded or a slot that would not open | reflash/recovery; see [troubleshooting](../troubleshooting/nostr.md) |
 | *the device does not serve that command* | unknown command (`6D00`) — usually a firmware older than the extension | update the board's firmware |
 | *your PIN is needed first* | a gated command answered `6982` — the session is closed (fresh power-up, or LOCK) | verify the PIN; the interrupted operation resumes |
 | *wrong PIN — N attempts left* | the budget answered (`63C1`–`63C3`) | the count is durable; enter the right one |

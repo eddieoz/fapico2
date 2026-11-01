@@ -13,7 +13,7 @@ Two consequences shaped the design, both recorded in [ADR 0005](https://github.c
 
 ## The command surface
 
-One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 00 00 02` and speaks plain ISO-7816 APDUs — the `INS` column below. Over **USB HID** it answers a third interface (interface 3, vendor usage page `0xFF00`) speaking CTAPHID framing with vendor command bytes `0x40`–`0x4E` and a CBOR payload — the byte column. Same applet, same consent rules, two clients:
+One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 00 00 02` and speaks plain ISO-7816 APDUs — the `INS` column below. Over **USB HID** it answers a third interface (interface 3, vendor usage page `0xFF00`) speaking CTAPHID framing with vendor command bytes `0x40`–`0x4F` and a CBOR payload — the byte column. Same applet, same consent rules, two clients:
 
 | Command | CCID `INS` | HID vendor byte | Touch? | Request → response |
 |---|---|---|---|---|
@@ -22,9 +22,9 @@ One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 0
 | `GET_PUBKEY` | `0x12` | `0x41` | no | — → npub(32) + bech32 `npub1…`(63) |
 | `GENERATE_KEY` | `0x13` | `0x46` | **touch** | — → npub(32) |
 | `IMPORT_KEY` | `0x14` | `0x47` | **touch** | scalar(32) → npub(32) |
-| `SIGN` | `0x15` | `0x42` | **touch** | sighash(32) → npub(32) ‖ sig(64) |
-| `NIP44_ENCRYPT` | `0x16` | `0x43` | **touch** | peer_x(32) ‖ plaintext → `0x02` ‖ nonce(32) ‖ ct ‖ mac(32) |
-| `NIP44_DECRYPT` | `0x17` | `0x44` | **touch** | sender_x(32) ‖ payload → plaintext |
+| `SIGN` | `0x15` | `0x42` | **touch**¹ | sighash(32) → npub(32) ‖ sig(64) |
+| `NIP44_ENCRYPT` | `0x16` | `0x43` | **touch**¹ | peer_x(32) ‖ plaintext → `0x02` ‖ nonce(32) ‖ ct ‖ mac(32) |
+| `NIP44_DECRYPT` | `0x17` | `0x44` | **touch**¹ | sender_x(32) ‖ payload → plaintext |
 | `SET_LABEL` | `0x18` | `0x4A` | **touch** | utf8(≤32) → — |
 | `DELETE_KEY` | `0x19` | `0x49` | **touch** | — → the destroyed identity's npub(32) |
 | `VERIFY_PIN` | `0x1B` | `0x4B` | no | pin(6..64) → — ; opens the session |
@@ -32,12 +32,16 @@ One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 0
 | `CHANGE_PIN` | `0x1C`, P1 `0x01` | `0x4C` | no | lc(1) ‖ current ‖ new → — |
 | `LOCK` | `0x1D` | `0x4D` | no | — → — ; closes the session |
 | `CEREMONY_START` | `0x1E` | `0x4E` | no | — → migrated(2 BE) ‖ already(2 BE) |
+| `SET_TOUCH_POLICY` | `0x1F`, P1 `0x00`/`0x01` | `0x4F` | no² | — → — ; sets the signing-arm touch policy |
+
+¹ the three signing arms skip the touch while the touch bypass is armed — see [the touch bypass](#the-touch-bypass-consented-session-bound-ram-only) below.
+² the verb itself is never touch-gated; its **disable leg** (P1 `0x01`) demands an open PIN session plus a physical press of its own.
 
 The PIN verbs are touch-free by design — the PIN *is* the consent — and the ceremony's consent is its dialog plus its own refusal gates (below), not the button. `EXPORT_KEY` (`0x1A`/`0x48`) is **retired** (US-1699): the constant survives so the negative tests can name the byte, but the dispatcher has no arm for it and it answers `6D00` on every transport, on every board, with no grandfathering. On a PIN-set board the six touch-gated commands answer `6982` *before* the touch check until `VERIFY_PIN` opens a session — see [PIN custody](#pin-custody-and-the-session).
 
-The command surface is fixed in `apps/nostr/src/lib.rs:108-160`; the HID vendor-byte mapping is `firmware/src/nostr_wire.rs:121-146`. `SIGN` answers with the npub *alongside* the signature (`apps/nostr/src/lib.rs:721-726`) — a host that signed against the wrong identity cannot paper over it, because the answer names the key that produced the signature.
+The command surface is fixed in `apps/nostr/src/lib.rs:108-166`; the HID vendor-byte mapping is `firmware/src/nostr_wire.rs:121-146`. `SIGN` answers with the npub *alongside* the signature (`apps/nostr/src/lib.rs:721-726`) — a host that signed against the wrong identity cannot paper over it, because the answer names the key that produced the signature.
 
-Three touch-free reads, and only three. An npub is public; a label is owner-authored text — listed without a touch, so a label is part of the public surface by definition. Everything that uses or changes the private set presses the button, and **no config bit turns that off**.
+Three touch-free reads, and only three. An npub is public; a label is owner-authored text — listed without a touch, so a label is part of the public surface by definition. Everything that uses or changes the private set presses the button — with exactly **one deliberate exception**: the touch bypass [below](#the-touch-bypass-consented-session-bound-ram-only), which exempts the three signing arms and nothing else. The four key-management commands (generate, import, label, delete) have no bypass, no config bit, and no exemption on any board in any state.
 
 ```text
                 ┌────────────────────────── one NostrApp ──────────────────────────┐
@@ -57,6 +61,12 @@ Three touch-free reads, and only three. An npub is public; a label is owner-auth
                 │  NostrRegion store (platform/src/keyregion/nostr_store.rs)   │
                 └──────────────────────────────────────────────────────────────────┘
 ```
+
+## The touch bypass — consented, session-bound, RAM-only
+
+`SET_TOUCH_POLICY` (US-1742..1746, EPIC `NOSTR-TOUCH-BYPASS`) is the touch analogue of the PIN session. P1 = `0x00` re-enables the touch (the safe direction: no gate, no grant, no store access — byte-identical `9000` whatever the board's state, so the verb cannot fingerprint the board); P1 = `0x01` arms the bypass for the three signing arms, and is the *consented* direction: shape → **PIN gate** (`6A82` with no record, `6982` with the session closed — every refusal eats an armed grant) → **a physical press** (`6985` if the window closed untouched) → the flag stands. The press consents to going touch-free, the dangerous direction; the enable direction is friction-free so the button can always be had back.
+
+The flag is RAM-only beside the session flag behind the shared applet mutex — it spans CCID and vendor-HID for free, and it dies with the thing it was opened in: **LOCK, a failed verify, the factory wipe and every boot clear it; deselect/re-select preserves it.** GET_INFO advertises the verb unconditionally (caps bit 4, `0x0010`) and the live state from the same field the gate reads (flags bit 3, `0x08`) — the advertisement cannot lie about the command paths. The user-facing walkthrough — the extension's checkbox, the consent press, what a 10-event chain costs — is in [the how-to](../how-to/nostr.md#the-touch-bypass--one-consent-press-opens-the-signing-chain); the error rows are in [troubleshooting](../troubleshooting/nostr.md).
 
 ## The touch, in three tag domains
 
