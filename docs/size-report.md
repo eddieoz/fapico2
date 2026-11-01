@@ -116,12 +116,12 @@ this number, and the number is 336.
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 827,672 | `0x10000200` | no (flash) |
-| `.rodata` | 20,808 | `0x100ca318` | no (flash) |
+| `.text` | 831,908 | `0x10000200` | no (flash) |
+| `.rodata` | 20,904 | `0x100cb3a8` | no (flash) |
 | `.data` | 13,884 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100d2aa0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 400,940 | `0x20003640` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x2006546c` | yes |
+| `.gnu.sgstubs` | 0 | `0x100d3ba0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 401,052 | `0x20003640` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x200654dc` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -141,9 +141,9 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 895,428 B** · **`.data` = 13,884 B** · **`.bss` = 401,964 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 899,760 B** · **`.data` = 13,884 B** · **`.bss` = 402,076 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 415,848 B** (415,852 B address-to-address: `__sheap` `0x2006586c` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x2006586c` → **main stack zone = 116,628 B** of 532,480 B of SRAM.
+**RAM statics = 415,960 B** (415,964 B address-to-address: `__sheap` `0x200658dc` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x200658dc` → **main stack zone = 116,516 B** of 532,480 B of SRAM.
 
 `bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
