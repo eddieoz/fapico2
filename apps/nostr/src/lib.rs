@@ -1694,12 +1694,16 @@ impl NostrApp {
         write_sw(resp, SW_OK);
     }
 
-    /// US-1742: `SET_TOUCH_POLICY` (INS `0x1F`, P1 = `0x00` enable touch /
-    /// `0x01` bypass on, no payload) — the touch analogue of the PIN
-    /// session. The shape checks come first (P2 zero, no payload, P1 in the
-    /// whitelist); the legs land with US-1743 (the disable leg's consent
-    /// chain) and US-1744 (the enable leg's friction-free arm) — at this
-    /// story the verb answers `9000` without changing any state.
+    /// US-1742/US-1743/US-1744: `SET_TOUCH_POLICY` (INS `0x1F`, P1 =
+    /// `0x00` enable touch / `0x01` bypass on, no payload) — the touch
+    /// analogue of the PIN session. The shape checks come first (P2 zero,
+    /// no payload, P1 whitelisted); the disable leg is the consented,
+    /// privileged direction (US-1743): an open PIN session **and** a
+    /// physical press, in the standing gate order — shape → PIN gate →
+    /// touch → execute — so every refusal eats an armed grant and no
+    /// refusal ever sets the flag. The enable leg is the safe direction
+    /// (US-1744): friction-free, idempotent, leaking nothing about the
+    /// board's PIN state.
     fn set_touch_policy(
         &mut self,
         p1: u8,
@@ -1715,9 +1719,33 @@ impl NostrApp {
             return;
         }
         match p1 {
-            // The legs: disable = US-1743's consent chain, enable = US-1744's
-            // friction-free arm. Until they land the verb is shape-only.
-            0x00 | 0x01 => write_sw(resp, SW_OK),
+            // Enable (US-1744): the safe direction — no gate, no grant, no
+            // store access, byte-identical reply whatever the board state.
+            0x00 => {
+                self.touch_bypass = false;
+                write_sw(resp, SW_OK);
+            }
+            // Disable (US-1743): shape → PIN gate → touch → execute. The
+            // touch rides the SIGN path unchanged: `user_present(grant, idx)`
+            // with idx = the request's idx field (= P1 here), so the tag is
+            // the applet's bit-30 domain on both transports.
+            0x01 => {
+                if !self.pin_set {
+                    write_sw(resp, SW_PIN_NOT_SET);
+                    return;
+                }
+                if !self.pin_unlocked {
+                    write_sw(resp, SW_PIN_SESSION_REQUIRED);
+                    return;
+                }
+                let grant = self.presence_grant;
+                if !user_present(grant, p1 as u16) {
+                    write_sw(resp, SW_TOUCH_REQUIRED);
+                    return;
+                }
+                self.touch_bypass = true;
+                write_sw(resp, SW_OK);
+            }
             _ => write_sw(resp, SW_WRONG_P1_P2),
         }
     }
