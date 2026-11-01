@@ -485,6 +485,28 @@ mod tests {
         );
     }
 
+    /// US-1742: `SET_TOUCH_POLICY` rides the vendor channel as `0x4F` — the
+    /// next free byte after the ceremony's `0x4E` — mapped to the applet's
+    /// `INS_SET_TOUCH_POLICY` (`0x1F`). The leg selection rides the
+    /// envelope's idx field onto P1 (the SET_PIN precedent): `[0, b""]` is
+    /// the enable leg, `[1, b""]` the disable leg. `0x50` stays unmapped —
+    /// the in-band refusal for an unmapped byte on the HID arm is the
+    /// standing `vendor_range_and_method_mapping` row.
+    #[test]
+    fn set_touch_policy_maps_to_the_policy_ins() {
+        assert_eq!(
+            vendor_to_ins(0x4F),
+            Some(0x1F),
+            "0x4F maps to the applet's SET_TOUCH_POLICY"
+        );
+        let req = [0x82, 0x01, 0x40]; // array(2) [1, bytes ""] — the disable leg
+        assert_eq!(
+            decode_request_inner(&req),
+            Some((0x01, &[][..])),
+            "the leg rides P1 through the envelope, arg intact and empty"
+        );
+    }
+
     /// US-1699: the retired `EXPORT_KEY` vendor byte is an **unsupported
     /// method** — `0x48` answers the in-band `6D00` (the CBOR `sw` field)
     /// without the applet ever running, the same class of refusal as any
