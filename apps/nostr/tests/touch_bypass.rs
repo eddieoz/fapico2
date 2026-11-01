@@ -492,7 +492,6 @@ fn a_refusal_consumes_an_armed_grant() {
 /// **Enable with no PIN, no session, no touch — allowed**: a board can
 /// always get its button back; the deny grant is never consulted.
 #[test]
-#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
 fn enable_with_no_pin_no_session_no_touch_is_allowed() {
     let (app, path) = app_with_identity("enable-no-pin");
     let mut app = app.with_presence_grant(counting_deny);
@@ -510,7 +509,6 @@ fn enable_with_no_pin_no_session_no_touch_is_allowed() {
 /// no store (a degraded applet answers SW_STORE_FAULT to anything that
 /// touches the store).
 #[test]
-#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
 fn enable_is_idempotent_in_every_state() {
     // PIN-less.
     let (app, path) = app_with_identity("enable-pinless");
@@ -553,7 +551,6 @@ fn enable_is_idempotent_in_every_state() {
 /// byte-identical (SW_OK, empty body): the verb cannot fingerprint the
 /// board, the `lock_answers_9000_in_every_state_and_leaks_nothing` shape.
 #[test]
-#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
 fn enable_leaks_nothing_about_pin_state() {
     // Every row collects (body, sw) of the enable reply; the states differ,
     // the replies must not.
