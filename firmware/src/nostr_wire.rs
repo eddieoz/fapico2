@@ -79,6 +79,10 @@ pub const NOSTR_CMD_LOCK: u8 = 0x4D;
 /// The extension's consent dialog (US-1716) gates the request client-side;
 /// the device's own gates live in the verb.
 pub const NOSTR_CMD_CEREMONY_START: u8 = 0x4E;
+/// §2.2 `SET_TOUCH_POLICY` (US-1742) — the touch analogue of the PIN
+/// session. The envelope's idx field rides P1: `0` selects the enable leg
+/// (touch required again), `1` the disable leg (the consented press).
+pub const NOSTR_CMD_SET_TOUCH_POLICY: u8 = 0x4F;
 
 /// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
 /// above the applet's `MAX_REQUEST_ARG` is decodable, so every vendor arm
@@ -122,7 +126,7 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
     use fapico2_nostr::{
         INS_CEREMONY_START, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
         INS_IMPORT_KEY, INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT,
-        INS_SET_LABEL, INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN,
+        INS_SET_LABEL, INS_SET_PIN, INS_SET_TOUCH_POLICY, INS_SIGN, INS_VERIFY_PIN,
     };
     let ins = match cmd {
         NOSTR_CMD_PING => INS_GET_INFO,
@@ -139,6 +143,7 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
         NOSTR_CMD_SET_PIN => INS_SET_PIN,
         NOSTR_CMD_LOCK => INS_LOCK,
         NOSTR_CMD_CEREMONY_START => INS_CEREMONY_START,
+        NOSTR_CMD_SET_TOUCH_POLICY => INS_SET_TOUCH_POLICY,
         _ => return None,
     };
     Some(ins)
