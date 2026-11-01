@@ -284,7 +284,6 @@ fn a_fresh_boot_over_the_same_region_clears_the_flag() {
 /// the shape checks and answer SW_OK (the legs land with US-1743/US-1744 —
 /// at this story the handler changes no state).
 #[test]
-#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
 fn well_formed_policy_requests_reach_the_shape_handler() {
     let (app, path) = app_with_identity("verb-shape");
     let mut app = app;
@@ -299,7 +298,6 @@ fn well_formed_policy_requests_reach_the_shape_handler() {
 /// **Unknown P1 is refused in shape**: an INS 0x1F whose P1 is not 0x00/0x01
 /// answers 6A86 before any state is read or touched.
 #[test]
-#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
 fn policy_unknown_p1_is_refused_in_shape() {
     let (app, path) = app_with_identity("verb-p1");
     let mut app = app.with_presence_grant(|_| false);
@@ -313,7 +311,6 @@ fn policy_unknown_p1_is_refused_in_shape() {
 /// **The verb refuses a payload**: like `LOCK`, the policy verb carries no
 /// request body — a payload is 6A80 before any state is read.
 #[test]
-#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
 fn policy_refuses_payload() {
     let (app, path) = app_with_identity("verb-payload");
     let mut app = app;

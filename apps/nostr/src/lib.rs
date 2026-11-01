@@ -156,6 +156,13 @@ pub const INS_LOCK: u8 = 0x1D;
 /// [`SW_CEREMONY_NOT_NEEDED`].
 pub const INS_CEREMONY_START: u8 = 0x1E;
 
+/// `SET_TOUCH_POLICY` (US-1742) — the touch-policy verb. P1 selects the
+/// leg: `0x00` re-enables the touch (the safe direction, friction-free),
+/// `0x01` disables it for the three signing arms (the consented direction:
+/// an open PIN session **and** a physical press, US-1743). No payload.
+/// Touch-free and session-free itself — the verb answers in shape order.
+pub const INS_SET_TOUCH_POLICY: u8 = 0x1F;
+
 /// The PIN retry budget, reset to this on every successful verify — the
 /// OATH precedent (`MAX_OTP_COUNTER = 3`): a durable budget makes guessing
 /// cost something a power cycle cannot refund.
@@ -1687,6 +1694,34 @@ impl NostrApp {
         write_sw(resp, SW_OK);
     }
 
+    /// US-1742: `SET_TOUCH_POLICY` (INS `0x1F`, P1 = `0x00` enable touch /
+    /// `0x01` bypass on, no payload) — the touch analogue of the PIN
+    /// session. The shape checks come first (P2 zero, no payload, P1 in the
+    /// whitelist); the legs land with US-1743 (the disable leg's consent
+    /// chain) and US-1744 (the enable leg's friction-free arm) — at this
+    /// story the verb answers `9000` without changing any state.
+    fn set_touch_policy(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        match p1 {
+            // The legs: disable = US-1743's consent chain, enable = US-1744's
+            // friction-free arm. Until they land the verb is shape-only.
+            0x00 | 0x01 => write_sw(resp, SW_OK),
+            _ => write_sw(resp, SW_WRONG_P1_P2),
+        }
+    }
+
     /// US-1714/US-1715: `CEREMONY_START` (INS `0x1E`, P1 = P2 = 0, no
     /// payload) — the explicit custody-migration ceremony. The response
     /// body is `migrated(2 BE) ‖ already(2 BE)`, the reseat report.
@@ -2022,6 +2057,7 @@ impl App for NostrApp {
             INS_VERIFY_PIN => self.verify_pin(p1, p2, data, resp),
             INS_LOCK => self.lock(p1, p2, data, resp),
             INS_CEREMONY_START => self.ceremony_start(p1, p2, data, resp),
+            INS_SET_TOUCH_POLICY => self.set_touch_policy(p1, p2, data, resp),
             INS_SET_PIN => {
                 if p1 == 0x01 {
                     self.change_pin(p1, p2, data, resp)
