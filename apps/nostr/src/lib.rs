@@ -160,7 +160,9 @@ pub const INS_CEREMONY_START: u8 = 0x1E;
 /// leg: `0x00` re-enables the touch (the safe direction, friction-free),
 /// `0x01` disables it for the three signing arms (the consented direction:
 /// an open PIN session **and** a physical press, US-1743). No payload.
-/// Touch-free and session-free itself — the verb answers in shape order.
+/// The verb is not wrapped in the dispatch-level gates: the enable leg
+/// answers in shape order, the disable leg carries its own session and
+/// touch gates.
 pub const INS_SET_TOUCH_POLICY: u8 = 0x1F;
 
 /// The PIN retry budget, reset to this on every successful verify — the
