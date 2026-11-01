@@ -671,6 +671,23 @@ cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
 ./run_tests.sh --suites-only   # just the emulator suites — what ci.yml's pytest-gate runs
 ```
 
+**The task-arena stamp (US-956/US-964) — the thing that keeps blocking PRs.**
+`TASK_ARENA_DEMAND_B_STAMP` (`firmware/src/lib.rs`) is a byte-exact
+fingerprint over the firmware's whole source closure — it cannot tell a
+comment from code, so **any** edit under the closure (apps/nostr, firmware,
+manifests, docs in either) stales it and the device-integration gate notices.
+The gate now self-heals: on a stale stamp it runs the sanctioned nightly
+re-measurement itself, and **passes** when the demand did not move (the
+fresh stamp is written to `firmware/src/lib.rs` — commit it with the series),
+failing only when a task future actually grew. When you know a series
+touched the closure and want CI to skip the re-measure entirely, run it
+yourself before pushing:
+
+```bash
+python3 tests/scripts/measure_task_arena.py   # nightly; re-measures + re-stamps
+git add firmware/src/lib.rs
+```
+
 **The pytest interpreter.** The suites live in this repository (`tests/`) and
 their dependencies are declared in `tests/requirements.txt`. `run_tests.sh`
 takes the interpreter from `PICO_FIDO2_VENV`, defaulting to the sibling
