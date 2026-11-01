@@ -15,7 +15,8 @@
 
 use fapico2_nostr::{
     crypto, NostrApp, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_PUBKEY, INS_LIST_KEYS,
-    INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SIGN, SW_TOUCH_REQUIRED,
+    INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SIGN, SW_TOUCH_REQUIRED, SW_WRONG_DATA,
+    SW_WRONG_P1_P2,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -262,10 +263,61 @@ fn a_fresh_boot_over_the_same_region_clears_the_flag() {
     let rebooted = NostrApp::boot(open_region(&path)).with_presence_grant(|_| false);
     assert!(
         !rebooted.touch_bypass(),
-        "boot is the same as a power cycle for the RAM flag"
+        "boot is the same as a power cycle for the power-cycle story (US-1745)"
     );
     let mut rebooted = rebooted;
     let (_, sw) = call(&mut rebooted, &apdu_sign(1));
     assert_eq!(sw, SW_TOUCH_REQUIRED, "SIGN demands a grant again after boot");
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1742 — the verb's wire shape: INS 0x1F, vendor byte 0x4F, P1 = policy.
+// The envelope's idx field rides P1 (the SET_PIN precedent): [0, b""] is the
+// enable leg, [1, b""] the disable leg. The wire mapping itself is pinned on
+// the firmware side (nostr_wire.rs's test module — the applet crate cannot
+// import the firmware crate); the routing claims ride that module's
+// source-level assertions.
+// ---------------------------------------------------------------------------
+
+/// **Well-formed requests reach the shape handler**: P1 of 0x00 and 0x01 pass
+/// the shape checks and answer SW_OK (the legs land with US-1743/US-1744 —
+/// at this story the handler changes no state).
+#[test]
+#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
+fn well_formed_policy_requests_reach_the_shape_handler() {
+    let (app, path) = app_with_identity("verb-shape");
+    let mut app = app;
+    for p1 in [0x00u8, 0x01] {
+        let (data, sw) = call(&mut app, &apdu(0x1F, p1, &[]));
+        assert_eq!(sw, SW_OK, "P1={p1:#04x} passes the shape checks");
+        assert!(data.is_empty(), "the verb has no response body");
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Unknown P1 is refused in shape**: an INS 0x1F whose P1 is not 0x00/0x01
+/// answers 6A86 before any state is read or touched.
+#[test]
+#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
+fn policy_unknown_p1_is_refused_in_shape() {
+    let (app, path) = app_with_identity("verb-p1");
+    let mut app = app.with_presence_grant(|_| false);
+    for p1 in [0x02u8, 0xFF] {
+        let (_, sw) = call(&mut app, &apdu(0x1F, p1, &[]));
+        assert_eq!(sw, SW_WRONG_P1_P2, "P1={p1:#04x} is refused in shape");
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The verb refuses a payload**: like `LOCK`, the policy verb carries no
+/// request body — a payload is 6A80 before any state is read.
+#[test]
+#[ignore = "US-1742 RED: the SET_TOUCH_POLICY verb does not exist yet"]
+fn policy_refuses_payload() {
+    let (app, path) = app_with_identity("verb-payload");
+    let mut app = app;
+    let (_, sw) = call(&mut app, &apdu(0x1F, 0x00, &[0x00]));
+    assert_eq!(sw, SW_WRONG_DATA, "the verb takes no request body");
     std::fs::remove_file(&path).ok();
 }
