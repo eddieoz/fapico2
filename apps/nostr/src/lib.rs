@@ -1691,6 +1691,10 @@ impl NostrApp {
             return;
         }
         self.pin_unlocked = false;
+        // US-1745: the bypass is a session privilege — a stale bypass
+        // surviving a lock would mean the next VERIFY silently resurrects
+        // a touch-free session the user believes they closed.
+        self.touch_bypass = false;
         write_sw(resp, SW_OK);
     }
 
@@ -2011,6 +2015,9 @@ impl App for NostrApp {
         // opens no longer protects anything).
         self.pin_set = false;
         self.pin_unlocked = false;
+        // US-1745: the flag dies with the wipe — stale "set" would be the
+        // lie, the same shape as the pin caches reset beside it.
+        self.touch_bypass = false;
     }
 
     /// Dispatch the §2.2 wire table. Unimplemented arms are the US-1642

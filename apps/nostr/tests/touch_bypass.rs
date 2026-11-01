@@ -600,7 +600,6 @@ fn enable_leaks_nothing_about_pin_state() {
 /// construction). A re-verify does not silently resurrect it: SIGN demands
 /// the touch again.
 #[test]
-#[ignore = "US-1745 RED: lock does not clear the flag yet"]
 fn lock_clears_the_flag_and_reverify_does_not_restore_it() {
     let (app, path) = pin_app("lifecycle-lock");
     let mut app = app.with_presence_grant(counting_allow);
@@ -612,10 +611,12 @@ fn lock_clears_the_flag_and_reverify_does_not_restore_it() {
     assert_eq!(sw, SW_OK);
     assert!(!app.touch_bypass(), "LOCK clears the flag");
 
-    // A re-verify opens the session again — the bypass stays gone.
+    // A re-verify opens the session again — the bypass stays gone. The
+    // proof binds the deny grant: SIGN now answers the touch word.
     let (_, sw) = call(&mut app, &apdu(0x1B, 0x00, PIN));
     assert_eq!(sw, SW_OK);
     assert!(!app.touch_bypass(), "re-verify does not resurrect the flag");
+    let mut app = app.with_presence_grant(counting_deny);
     let (_, sw) = call(&mut app, &apdu_sign(1));
     assert_eq!(sw, SW_TOUCH_REQUIRED, "SIGN demands the touch again");
     std::fs::remove_file(&path).ok();
@@ -626,7 +627,6 @@ fn lock_clears_the_flag_and_reverify_does_not_restore_it() {
 /// the RAM caches with the records, the pin_unlocked reset at the same
 /// site's shape.
 #[test]
-#[ignore = "US-1745 RED: the wipe does not clear the flag yet"]
 fn management_reset_clears_the_flag() {
     let (app, path) = pin_app("lifecycle-wipe");
     let mut app = app.with_presence_grant(counting_allow);
@@ -642,7 +642,6 @@ fn management_reset_clears_the_flag() {
 /// **Deselect and re-select preserve it** — same rule as the PIN session
 /// (US-1693): a SELECT cycle is not a power cycle.
 #[test]
-#[ignore = "US-1745 RED: unpinned"]
 fn deselect_and_reselect_preserve_the_flag() {
     let (app, path) = pin_app("lifecycle-deselect");
     let mut app = app.with_presence_grant(counting_allow);
@@ -664,7 +663,6 @@ fn deselect_and_reselect_preserve_the_flag() {
 /// touched by a CTAP2 reset (and the Nostr applet is never constructed
 /// anew by it).
 #[test]
-#[ignore = "US-1745 RED: unpinned"]
 fn ctap2_reset_never_reaches_the_nostr_applet() {
     let device_core = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
