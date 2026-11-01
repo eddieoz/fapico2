@@ -280,18 +280,17 @@ fn a_fresh_boot_over_the_same_region_clears_the_flag() {
 // source-level assertions.
 // ---------------------------------------------------------------------------
 
-/// **Well-formed requests reach the shape handler**: P1 of 0x00 and 0x01 pass
-/// the shape checks and answer SW_OK (the legs land with US-1743/US-1744 —
-/// at this story the handler changes no state).
+/// **Well-formed requests reach the shape handler**: the enable leg (P1
+/// 0x00) passes the shape checks and answers SW_OK with no response body.
+/// The disable leg's semantics are the US-1743 rows' business — by the time
+/// that story lands, P1 = 0x01 is no longer a shape-only `9000`.
 #[test]
 fn well_formed_policy_requests_reach_the_shape_handler() {
     let (app, path) = app_with_identity("verb-shape");
     let mut app = app;
-    for p1 in [0x00u8, 0x01] {
-        let (data, sw) = call(&mut app, &apdu(0x1F, p1, &[]));
-        assert_eq!(sw, SW_OK, "P1={p1:#04x} passes the shape checks");
-        assert!(data.is_empty(), "the verb has no response body");
-    }
+    let (data, sw) = call(&mut app, &apdu(0x1F, 0x00, &[]));
+    assert_eq!(sw, SW_OK, "P1=0x00 passes the shape checks");
+    assert!(data.is_empty(), "the verb has no response body");
     std::fs::remove_file(&path).ok();
 }
 
@@ -390,7 +389,6 @@ fn apdu_policy(p1: u8) -> HeaplessVec<u8, 300> {
 /// with no PIN can never disable the touch. `SW_PIN_NOT_SET` (6A82), flag
 /// stays down.
 #[test]
-#[ignore = "US-1743 RED: the disable leg is still shape-only"]
 fn no_pin_refuses_the_disable_leg() {
     let (app, path) = app_with_identity("disable-no-pin");
     let mut app = app.with_presence_grant(|_| false);
@@ -403,7 +401,6 @@ fn no_pin_refuses_the_disable_leg() {
 /// **PIN set but session closed — refuse**: `SW_PIN_SESSION_REQUIRED`
 /// (6982), flag stays down.
 #[test]
-#[ignore = "US-1743 RED: the disable leg is still shape-only"]
 fn closed_session_refuses_the_disable_leg() {
     let (app, path) = app_with_identity("disable-closed");
     let mut app = app.with_rng_provider(pinned_salt);
@@ -420,7 +417,6 @@ fn closed_session_refuses_the_disable_leg() {
 /// press; the counting grant is consulted once and denies, `6985`, flag
 /// down.
 #[test]
-#[ignore = "US-1743 RED: the disable leg is still shape-only"]
 fn open_session_no_touch_refuses_the_disable_leg() {
     reset_presses();
     let (app, path) = pin_app("disable-no-touch");
@@ -436,20 +432,21 @@ fn open_session_no_touch_refuses_the_disable_leg() {
 /// and SIGN runs grant-free afterwards (the counting grant saw no
 /// consultation from the signing arms while the bypass is on).
 #[test]
-#[ignore = "US-1743 RED: the disable leg is still shape-only"]
 fn open_session_and_touched_the_flag_stands() {
     reset_presses();
     let (app, path) = pin_app("disable-touched");
-    let mut app = app.with_presence_grant(counting_deny);
+    let mut app = app.with_presence_grant(counting_allow);
     let (_, sw) = call(&mut app, &apdu_policy(0x01));
     assert_eq!(sw, SW_OK, "the consent chain completes");
     assert!(app.touch_bypass(), "the flag stands");
-    // The payoff: the signing arms now run without consulting the grant.
+    // The payoff: the signing arms now run without consulting the grant —
+    // the count is taken after the disable leg's own consent press.
+    let after_disable = presses();
     let (_, sw) = call(&mut app, &apdu_sign(1));
     assert_eq!(sw, SW_OK, "SIGN runs grant-free under the bypass");
     assert_eq!(
         presses(),
-        0,
+        after_disable,
         "the SIGN consumed no press — the bypass is the exemption"
     );
     std::fs::remove_file(&path).ok();
@@ -461,10 +458,14 @@ fn open_session_and_touched_the_flag_stands() {
 /// unconsulted; with the session open, the deny grant is consulted exactly
 /// once per request and every refusal leaves the flag down.
 #[test]
-#[ignore = "US-1743 RED: the disable leg is still shape-only"]
 fn a_refusal_consumes_an_armed_grant() {
     reset_presses();
-    let (app, path) = pin_app("disable-eats");
+    let (app, path) = app_with_identity("disable-eats");
+    // A PIN-set but unverified board: pin_app verifies, so this one stops
+    // after SET_PIN to keep the session closed for the first phase.
+    let mut app = app.with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0x00, PIN)); // SET_PIN only
+    assert_eq!(sw, SW_OK);
     let mut app = app.with_presence_grant(counting_deny);
     // Closed session: the gate refuses, the press path never runs.
     let (_, sw) = call(&mut app, &apdu_policy(0x01));
