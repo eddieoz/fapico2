@@ -484,3 +484,107 @@ fn a_refusal_consumes_an_armed_grant() {
     assert!(!app.touch_bypass(), "no refusal ever set the flag");
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// US-1744 — the enable leg: the safe direction stays friction-free.
+// ---------------------------------------------------------------------------
+
+/// **Enable with no PIN, no session, no touch — allowed**: a board can
+/// always get its button back; the deny grant is never consulted.
+#[test]
+#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
+fn enable_with_no_pin_no_session_no_touch_is_allowed() {
+    let (app, path) = app_with_identity("enable-no-pin");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    let (_, sw) = call(&mut app, &apdu_policy(0x00));
+    assert_eq!(sw, SW_OK, "the safe direction never refuses");
+    assert!(!app.touch_bypass(), "the flag is down after enable");
+    assert_eq!(presses(), 0, "no grant consulted");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Enable is idempotent in every state** — PIN-less, PIN-set unverified,
+/// PIN-set verified, and a degraded applet: the reply is SW_OK every time,
+/// the flag lands down, and the degraded row proves the enable leg reads
+/// no store (a degraded applet answers SW_STORE_FAULT to anything that
+/// touches the store).
+#[test]
+#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
+fn enable_is_idempotent_in_every_state() {
+    // PIN-less.
+    let (app, path) = app_with_identity("enable-pinless");
+    let mut app = app.with_presence_grant(counting_deny);
+    let (_, sw) = call(&mut app, &apdu_policy(0x00));
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass());
+    std::fs::remove_file(&path).ok();
+
+    // PIN-set unverified.
+    let (app, path) = app_with_identity("enable-unverified");
+    let mut app = app.with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    let mut app = app.with_presence_grant(counting_deny);
+    let (_, sw) = call(&mut app, &apdu_policy(0x00));
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass());
+    std::fs::remove_file(&path).ok();
+
+    // PIN-set verified, bypass armed.
+    let (app, path) = pin_app("enable-verified");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    let (_, sw) = call(&mut app, &apdu_policy(0x00));
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass());
+    std::fs::remove_file(&path).ok();
+
+    // Degraded applet (no region at all): the enable leg reads no store —
+    // anything that touched the store would answer SW_STORE_FAULT here.
+    let mut degraded = NostrApp::new().with_presence_grant(counting_deny);
+    degraded.set_touch_bypass(true);
+    let (_, sw) = call(&mut degraded, &apdu_policy(0x00));
+    assert_eq!(sw, SW_OK, "the enable leg reads no store");
+    assert!(!degraded.touch_bypass());
+}
+
+/// **Enable leaks nothing about PIN state** — every state's reply is
+/// byte-identical (SW_OK, empty body): the verb cannot fingerprint the
+/// board, the `lock_answers_9000_in_every_state_and_leaks_nothing` shape.
+#[test]
+#[ignore = "US-1744 RED: the enable leg is implemented but unpinned"]
+fn enable_leaks_nothing_about_pin_state() {
+    // Every row collects (body, sw) of the enable reply; the states differ,
+    // the replies must not.
+    let mut replies: Vec<(HeaplessVec<u8, 4096>, Sw)> = Vec::new();
+
+    // PIN-less.
+    let (app, path) = app_with_identity("leak-pinless");
+    let mut app = app;
+    replies.push(call(&mut app, &apdu_policy(0x00)));
+    std::fs::remove_file(&path).ok();
+
+    // PIN-set unverified.
+    let (app, path) = app_with_identity("leak-unverified");
+    let mut app = app.with_rng_provider(pinned_salt);
+    let (_, sw) = call(&mut app, &apdu(0x1C, 0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    replies.push(call(&mut app, &apdu_policy(0x00)));
+    std::fs::remove_file(&path).ok();
+
+    // PIN-set verified.
+    let (app, path) = pin_app("leak-verified");
+    let mut app = app;
+    replies.push(call(&mut app, &apdu_policy(0x00)));
+    std::fs::remove_file(&path).ok();
+
+    // Degraded.
+    let mut degraded = NostrApp::new();
+    replies.push(call(&mut degraded, &apdu_policy(0x00)));
+
+    for (body, sw) in &replies {
+        assert_eq!(*sw, SW_OK);
+        assert!(body.is_empty(), "no response body, no fingerprint");
+    }
+}
