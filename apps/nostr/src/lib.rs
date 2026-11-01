@@ -495,6 +495,16 @@ pub struct NostrApp {
     /// (US-1693) is the only setter to `true`; `LOCK` (US-1694) and boot
     /// clear it.
     pin_unlocked: bool,
+    /// US-1741: the touch bypass — a **PIN-session privilege** that exempts
+    /// exactly SIGN, NIP44 ENC and NIP44 DEC from the touch; GENERATE,
+    /// IMPORT, SET_LABEL and DELETE never consult it. RAM-only beside
+    /// `pin_unlocked` (same shared `Mutex`, so it spans CCID and vendor-HID
+    /// for free): `LOCK`, the factory wipe and every boot clear it, and
+    /// deselect/re-select preserve it. Only `SET_TOUCH_POLICY`'s disable
+    /// leg (US-1743) — open session plus a physical press — may set it;
+    /// a touch-free signature is never anonymous to the PIN. Default
+    /// `false` — touch enabled — at every boot.
+    touch_bypass: bool,
     /// US-1714: the custody OTP leg — what the ceremony may ask of the OTP
     /// controller (assess, burn, derive) and nothing more. `&'static dyn`
     /// because the OTP controller is a singleton the firmware owns for the
@@ -561,6 +571,7 @@ impl NostrApp {
             presence_grant: None,
             pin_set: false,
             pin_unlocked: false,
+            touch_bypass: false,
             custody_otp: None,
             custody: CustodyHealth::Unknown,
             region_source: None,
@@ -595,6 +606,7 @@ impl NostrApp {
                 presence_grant: None,
                 pin_set: false,
                 pin_unlocked: false,
+                touch_bypass: false,
                 custody_otp: None,
                 custody: CustodyHealth::Unknown,
                 region_source: None,
@@ -608,6 +620,7 @@ impl NostrApp {
             presence_grant: None,
             pin_set,
             pin_unlocked: false,
+            touch_bypass: false,
             custody_otp: None,
             custody: CustodyHealth::Unknown,
             region_source: None,
@@ -659,6 +672,26 @@ impl NostrApp {
     pub fn with_presence_grant(mut self, grant: fn(u32) -> bool) -> Self {
         self.presence_grant = Some(grant);
         self
+    }
+
+    /// US-1741: read the touch-bypass flag. Host-only — the device-visible
+    /// view of this state is GET_INFO's `FLAG_TOUCH_BYPASS` (US-1746), which
+    /// derives from the same field, and a second device-side read would be
+    /// exactly the divergent source of truth §4 forbids. The gate itself
+    /// reads the field directly; this accessor exists so the state stories
+    /// can assert the flag's semantics from a test.
+    #[cfg(feature = "host")]
+    pub fn touch_bypass(&self) -> bool {
+        self.touch_bypass
+    }
+
+    /// US-1741: set the touch-bypass flag. Host-only — on the wire the flag
+    /// is set only by `SET_TOUCH_POLICY`'s disable leg (US-1743: open PIN
+    /// session plus a physical press), and the verb does not exist yet when
+    /// the state stories run, so the tests arm the flag through this seam.
+    #[cfg(feature = "host")]
+    pub fn set_touch_bypass(&mut self, on: bool) {
+        self.touch_bypass = on;
     }
 
     /// The in-place form of the three builders, for the one caller that
@@ -879,7 +912,7 @@ impl NostrApp {
         // Destructure once: the store borrow must coexist with the RNG pool
         // draw, and disjoint field borrows compose where a `&mut self`
         // method call would not.
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
 
         // State before the touch (see the doc comment).
@@ -977,7 +1010,7 @@ impl NostrApp {
         }
         // IMPORT_KEY draws nothing: the scalar is the host's, and its
         // validity is checked above.
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         match writability(&mut store, p1 as u16) {
             Ok(true) => {}
@@ -1023,7 +1056,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1092,7 +1125,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1260,7 +1293,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1327,7 +1360,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         // Classify after the form check: a corrupt slot (our tag, a body
         // that will not open) destroys through force_tombstone with no
@@ -1939,10 +1972,13 @@ impl App for NostrApp {
         // writes its own word through the dispatch below, and the cache
         // stays where the fail-closed construction left it.
         if self.region.is_none() {
-            let Self { region, provider, pin_set, pin_unlocked, .. } = self;
+            let Self { region, provider, pin_set, pin_unlocked, touch_bypass, .. } = self;
             if let Some(mut store) = try_attach(region, provider) {
                 *pin_set = pin_boot_classification(store.read_pin());
                 *pin_unlocked = false;
+                // US-1741: the first process call is the boot substitute —
+                // the RAM flag comes up down, exactly as `boot` leaves it.
+                *touch_bypass = false;
             }
         }
         // Header guard first: a sub-4-byte APDU would index `apdu[2]`/
