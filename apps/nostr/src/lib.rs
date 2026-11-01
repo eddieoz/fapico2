@@ -1056,7 +1056,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1065,7 +1065,10 @@ impl NostrApp {
                 return;
             }
         };
-        if !user_present(*presence_grant, p1 as u16) {
+        // US-1741: the bypass exempts exactly the signing arms — while the
+        // flag stands this call is skipped and SIGN runs grant-free. The
+        // gate order is otherwise untouched: shape → gate → state → touch.
+        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -1125,7 +1128,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1134,7 +1137,9 @@ impl NostrApp {
                 return;
             }
         };
-        if !user_present(*presence_grant, p1 as u16) {
+        // US-1741: the bypass exempts exactly the signing arms — while the
+        // flag stands this call is skipped and NIP44_ENC runs grant-free.
+        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -1230,7 +1235,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, presence_grant, .. } = self;
+        let Self { region, provider, presence_grant, touch_bypass, .. } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1239,7 +1244,9 @@ impl NostrApp {
                 return;
             }
         };
-        if !user_present(*presence_grant, p1 as u16) {
+        // US-1741: the bypass exempts exactly the signing arms — while the
+        // flag stands this call is skipped and NIP44_DEC runs grant-free.
+        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }

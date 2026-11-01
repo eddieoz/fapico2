@@ -169,7 +169,6 @@ fn bip340_verify(px: &[u8; 32], msg: &[u8; 32], sig: &[u8; 64]) -> bool {
 /// **Bypass on — SIGN answers without a presence grant**: the reply is SW_OK
 /// and the signature verifies against the identity's public key.
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn bypass_on_sign_answers_without_a_presence_grant() {
     let (app, path) = app_with_identity("sign-bypass");
     let mut app = app
@@ -178,7 +177,7 @@ fn bypass_on_sign_answers_without_a_presence_grant() {
     app.set_touch_bypass(true);
     let (data, sw) = call(&mut app, &apdu_sign(1));
     assert_eq!(sw, SW_OK, "a bypassed SIGN needs no press");
-    assert_eq!(data.len(), 64, "npub(32) ‖ sig(64)");
+    assert_eq!(data.len(), 96, "npub(32) ‖ sig(64)");
     let npub = crypto::xonly_pubkey(&seed_scalar()).unwrap();
     assert_eq!(&data[..32], &npub[..], "the answer names the signing key");
     let mut sig = [0u8; 64];
@@ -195,7 +194,6 @@ fn bypass_on_sign_answers_without_a_presence_grant() {
 /// arms run with the grant denied, and the decrypt of the device's own
 /// payload returns the exact plaintext.
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn bypass_on_nip44_enc_and_dec_answer_without_a_presence_grant() {
     let (app, path) = app_with_identity("nip44-bypass");
     let mut app = app
@@ -212,7 +210,6 @@ fn bypass_on_nip44_enc_and_dec_answer_without_a_presence_grant() {
 
 /// **Bypass on — GENERATE still demands the touch**, and no slot is written.
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn bypass_on_generate_still_demands_the_touch() {
     let (app, path) = app_with_identity("generate-bypass");
     let mut app = app.with_presence_grant(|_| false);
@@ -228,7 +225,6 @@ fn bypass_on_generate_still_demands_the_touch() {
 
 /// **Bypass on — DELETE still demands the touch**, and the identity survives.
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn bypass_on_delete_still_demands_the_touch() {
     let (app, path) = app_with_identity("delete-bypass");
     let mut app = app.with_presence_grant(|_| false);
@@ -243,7 +239,6 @@ fn bypass_on_delete_still_demands_the_touch() {
 /// **Bypass off — default state touches as today**: a freshly booted applet
 /// has the flag down and SIGN without a grant answers 6985.
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn bypass_off_default_state_touches_as_today() {
     let (app, path) = app_with_identity("default-off");
     let mut app = app.with_presence_grant(|_| false);
@@ -260,7 +255,6 @@ fn bypass_off_default_state_touches_as_today() {
 /// comes up with the flag down, SIGN demanding the grant again. (The boot
 /// arm of the US-1741 Step 2 initialization; the full matrix is US-1745.)
 #[test]
-#[ignore = "US-1741 RED: the touch_bypass flag does not exist yet"]
 fn a_fresh_boot_over_the_same_region_clears_the_flag() {
     let (app, path) = app_with_identity("boot-clears");
     let mut app = app.with_presence_grant(|_| false);
