@@ -339,6 +339,12 @@ pub const CAP_PIN_MGMT: u16 = 0x0004;
 /// failure mode. A v0.2.0-era client ignores unknown bits.
 pub const CAP_CEREMONY: u16 = 0x0008;
 
+/// caps bit 4: `SET_TOUCH_POLICY` (`0x1F`, vendor `0x4F`) is served
+/// (US-1742). Set in the same edit as the verb — an advertised command
+/// that refuses is the §4 failure mode. A pre-US-1742 client ignores
+/// unknown bits.
+pub const CAP_TOUCH_POLICY: u16 = 0x0010;
+
 /// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] (the key-management trio
 /// `0x13`–`0x15`, US-1644/US-1645), [`CAP_NIP44`] (the NIP-44 pair
 /// `0x16`/`0x17`, US-1653) and [`CAP_PIN_MGMT`] (the PIN custody dialect,
@@ -346,7 +352,7 @@ pub const CAP_CEREMONY: u16 = 0x0008;
 /// failure mode (`apps/fido` getInfo history), so this constant changes in
 /// the same commit as the arms it covers — `tests/wire.rs` re-derives the
 /// cap rows and the harness suite asserts the wire value.
-pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT | CAP_CEREMONY;
+pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT | CAP_CEREMONY | CAP_TOUCH_POLICY;
 
 // The `flags` byte of `GET_INFO` (US-1700) — the PIN state bits, derived
 // from the **same cached state the gate and the ceremony read**, so the
@@ -364,6 +370,11 @@ pub const FLAG_SESSION_UNLOCKED: u8 = 0x02;
 /// whole layout lands in one GET_INFO change instead of churning every
 /// layout pin twice.
 pub const FLAG_MIGRATION_PENDING: u8 = 0x04;
+/// `flags` bit 3: the touch bypass is armed — the three signing arms skip
+/// the touch until LOCK or power clears it (US-1741/US-1746). Derived from
+/// the **same `self.touch_bypass` field the gate reads** — never a second
+/// read, never a recomputation (the §4 rule the other flag bits follow).
+pub const FLAG_TOUCH_BYPASS: u8 = 0x08;
 
 // ---------------------------------------------------------------------------
 // bech32 npub (NIP-19)
@@ -773,6 +784,10 @@ impl NostrApp {
         // `&mut self` read mid-borrow would not.
         let pin_set = self.pin_set;
         let pin_unlocked = self.pin_unlocked;
+        // US-1746: the advertisement is the gate's own field — the same
+        // read the signing arms' bypass check consults, so the wire claim
+        // cannot diverge from what the gate honours.
+        let touch_bypass = self.touch_bypass;
         let Some(mut store) = self.store(resp) else { return };
         let mut n: u8 = 0;
         for index in 0..NOSTR_SLOTS as u16 {
@@ -809,6 +824,11 @@ impl NostrApp {
             }
         {
             flags |= FLAG_MIGRATION_PENDING;
+        }
+        // US-1746: the bypass state rides bit 3, from the same field the
+        // gate reads — no second read, no recomputation.
+        if touch_bypass {
+            flags |= FLAG_TOUCH_BYPASS;
         }
         resp.extend_from_slice(&APPLET_VERSION).ok();
         resp.extend_from_slice(&CAPS.to_be_bytes()).ok();
