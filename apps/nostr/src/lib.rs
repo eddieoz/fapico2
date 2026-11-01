@@ -519,11 +519,12 @@ pub struct NostrApp {
     /// exactly SIGN, NIP44 ENC and NIP44 DEC from the touch; GENERATE,
     /// IMPORT, SET_LABEL and DELETE never consult it. RAM-only beside
     /// `pin_unlocked` (same shared `Mutex`, so it spans CCID and vendor-HID
-    /// for free): `LOCK`, the factory wipe and every boot clear it, and
-    /// deselect/re-select preserve it. Only `SET_TOUCH_POLICY`'s disable
-    /// leg (US-1743) — open session plus a physical press — may set it;
-    /// a touch-free signature is never anonymous to the PIN. Default
-    /// `false` — touch enabled — at every boot.
+    /// for free): `LOCK`, a failed verify, the factory wipe and every boot
+    /// clear it, and deselect/re-select preserve it. Only
+    /// `SET_TOUCH_POLICY`'s disable leg (US-1743) — open session plus a
+    /// physical press — may set it; a touch-free signature is never
+    /// anonymous to the PIN. Default `false` — touch enabled — at every
+    /// boot.
     touch_bypass: bool,
     /// US-1714: the custody OTP leg — what the ceremony may ask of the OTP
     /// controller (assess, burn, derive) and nothing more. `&'static dyn`
@@ -1684,6 +1685,14 @@ impl NostrApp {
         write_sw(resp, sw.unwrap_or(SW_OK));
         self.pin_set = pin_set;
         self.pin_unlocked = unlocked;
+        // US-1745's rationale applies to every session close, not just
+        // LOCK's: a failed verify closes the session, and a stale bypass
+        // surviving it would let the next VERIFY silently resurrect a
+        // touch-free session the user believes they closed. The success
+        // arm keeps the flag — the session it was opened in still stands.
+        if !unlocked {
+            self.touch_bypass = false;
+        }
     }
 
     /// US-1694: `LOCK` (INS `0x1D`, no payload) — close the custody session

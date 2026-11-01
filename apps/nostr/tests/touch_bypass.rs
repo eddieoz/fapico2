@@ -801,7 +801,6 @@ fn getinfo_stays_width_clean() {
 /// reopens the session does not resurrect the bypass: re-arming it costs
 /// a new disable-leg press, exactly as after a LOCK.
 #[test]
-#[ignore = "review RED: the verify_pin failure arm keeps the flag standing"]
 fn a_failed_verify_clears_the_armed_bypass() {
     reset_presses();
     let (app, path) = pin_app("failed-verify-clears");
