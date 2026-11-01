@@ -114,6 +114,15 @@ consumed, not refused.
   (`test_verify_then_disable_arms_the_bypass_and_sign_runs_touch_free`
   states the division in its own comment); the HID arm's park/window dance
   on the disable press is observable only here, on hardware.
+- **Review follow-up (2026-11-01, after this transcript):** the code review
+  of PR #27 found that a failed verify closed the session without clearing
+  an armed bypass — a failed-then-correct verify resurrected a touch-free
+  session without a new disable-leg press. Closed in `ac72bce` (the
+  failure arm drops the flag beside `pin_unlocked`; host-covered by
+  `a_failed_verify_clears_the_armed_bypass`, 26/26 in
+  `apps/nostr/tests/touch_bypass.rs`). This transcript's legs were run
+  before the change; none of them exercised the failed-verify path, so no
+  recorded leg is invalidated.
 - **The consent press on the extension's disable leg** is not
   machine-testable (the extension repo's own rule); the ceremony record in
   that repo (`docs/ceremony-results.md`) is its release gate.
