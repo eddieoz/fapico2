@@ -585,3 +585,103 @@ fn enable_leaks_nothing_about_pin_state() {
         assert!(body.is_empty(), "no response body, no fingerprint");
     }
 }
+
+// ---------------------------------------------------------------------------
+// US-1745 — the lifecycle matrix: the bypass lives exactly as long as the
+// session it was opened in. Power cycle, LOCK and the factory wipe clear
+// it; deselect/re-select preserve it; the CTAP2 reset never reaches it.
+// (The power-cycle row is `a_fresh_boot_over_the_same_region_clears_the_
+// flag`, the US-1741 block's last test.)
+// ---------------------------------------------------------------------------
+
+/// **LOCK clears it** — the bypass dies with the session, on the shared
+/// applet instance both transports drive (§8: one applet behind the
+/// `Mutex`, so an applet-level LOCK covers CCID and vendor-HID by
+/// construction). A re-verify does not silently resurrect it: SIGN demands
+/// the touch again.
+#[test]
+#[ignore = "US-1745 RED: lock does not clear the flag yet"]
+fn lock_clears_the_flag_and_reverify_does_not_restore_it() {
+    let (app, path) = pin_app("lifecycle-lock");
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu_policy(0x01));
+    assert_eq!(sw, SW_OK, "the fixture arms the bypass");
+    assert!(app.touch_bypass());
+
+    let (_, sw) = call(&mut app, &apdu(0x1D, 0x00, &[])); // LOCK
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass(), "LOCK clears the flag");
+
+    // A re-verify opens the session again — the bypass stays gone.
+    let (_, sw) = call(&mut app, &apdu(0x1B, 0x00, PIN));
+    assert_eq!(sw, SW_OK);
+    assert!(!app.touch_bypass(), "re-verify does not resurrect the flag");
+    let (_, sw) = call(&mut app, &apdu_sign(1));
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "SIGN demands the touch again");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Management RESET clears it** — the wipe through the dispatcher's
+/// route (the proxy forward is pinned by presence.rs's F-A3 gate) resets
+/// the RAM caches with the records, the pin_unlocked reset at the same
+/// site's shape.
+#[test]
+#[ignore = "US-1745 RED: the wipe does not clear the flag yet"]
+fn management_reset_clears_the_flag() {
+    let (app, path) = pin_app("lifecycle-wipe");
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu_policy(0x01));
+    assert_eq!(sw, SW_OK);
+    assert!(app.touch_bypass());
+
+    app.factory_wipe();
+    assert!(!app.touch_bypass(), "the wipe clears the flag");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Deselect and re-select preserve it** — same rule as the PIN session
+/// (US-1693): a SELECT cycle is not a power cycle.
+#[test]
+#[ignore = "US-1745 RED: unpinned"]
+fn deselect_and_reselect_preserve_the_flag() {
+    let (app, path) = pin_app("lifecycle-deselect");
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu_policy(0x01));
+    assert_eq!(sw, SW_OK);
+    assert!(app.touch_bypass());
+
+    app.deselect();
+    assert!(
+        app.touch_bypass(),
+        "deselect preserves the flag — same rule as the PIN session"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **CTAP2 reset never reaches it** — the source assertion: FIDO's
+/// `handle_reset` (the `authenticatorReset` arm) names no Nostr applet
+/// reach — it wipes only FIDO's own region, so the Nostr flag is not
+/// touched by a CTAP2 reset (and the Nostr applet is never constructed
+/// anew by it).
+#[test]
+#[ignore = "US-1745 RED: unpinned"]
+fn ctap2_reset_never_reaches_the_nostr_applet() {
+    let device_core = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../apps/fido/src/device_core.rs"
+    ))
+    .expect("apps/fido/src/device_core.rs is readable from the nostr test crate");
+    let body = device_core
+        .split("pub(crate) fn handle_reset")
+        .nth(1)
+        .expect("handle_reset exists in device_core.rs");
+    let body = &body[..body
+        .find("\n    pub(crate) fn ")
+        .or_else(|| body.find("\n    fn "))
+        .expect("the reset arm terminates at the next method")];
+    assert!(
+        !body.to_lowercase().contains("nostr"),
+        "the CTAP2 reset arm must never reach the Nostr applet — \
+         authenticatorReset wipes only FIDO's range (US-1650's contract)"
+    );
+}
