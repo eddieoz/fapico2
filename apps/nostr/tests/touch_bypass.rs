@@ -493,6 +493,7 @@ fn a_refusal_consumes_an_armed_grant() {
 /// always get its button back; the deny grant is never consulted.
 #[test]
 fn enable_with_no_pin_no_session_no_touch_is_allowed() {
+    reset_presses();
     let (app, path) = app_with_identity("enable-no-pin");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);

@@ -60,13 +60,6 @@ def emu(tmp_path):
         yield e
 
 
-@pytest.fixture()
-def deny(tmp_path):
-    with NostrEmu("deny", tmp_path, presence="deny") as e:
-        assert e.select()[1] == SW_OK
-        yield e
-
-
 def read_info(emu):
     data, _ = emu.send(apdu(INS_GET_INFO))
     caps = (data[2] << 8) | data[3]
