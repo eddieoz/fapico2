@@ -260,12 +260,11 @@ fn a_fresh_boot_over_the_same_region_clears_the_flag() {
     let (app, path) = app_with_identity("boot-clears");
     let mut app = app.with_presence_grant(|_| false);
     app.set_touch_bypass(true);
-    let rebooted = NostrApp::boot(open_region(&path)).with_presence_grant(|_| false);
+    let mut rebooted = NostrApp::boot(open_region(&path)).with_presence_grant(|_| false);
     assert!(
         !rebooted.touch_bypass(),
         "boot is the same as a power cycle for the power-cycle story (US-1745)"
     );
-    let mut rebooted = rebooted;
     let (_, sw) = call(&mut rebooted, &apdu_sign(1));
     assert_eq!(sw, SW_TOUCH_REQUIRED, "SIGN demands a grant again after boot");
     std::fs::remove_file(&path).ok();
@@ -372,7 +371,7 @@ fn pinned_salt(out: &mut [u8]) {
 /// A PIN-set, verified applet holding the slot-1 identity — the disable
 /// leg's "session open" precondition.
 fn pin_app(tag: &str) -> (NostrApp, std::path::PathBuf) {
-    let (mut app, path) = app_with_identity(tag);
+    let (app, path) = app_with_identity(tag);
     let mut app = app.with_rng_provider(pinned_salt);
     let (_, sw) = call(&mut app, &apdu(0x1C, 0x00, PIN)); // SET_PIN
     assert_eq!(sw, SW_OK, "the fixture's PIN sets");
