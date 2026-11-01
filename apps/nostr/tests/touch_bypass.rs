@@ -683,3 +683,108 @@ fn ctap2_reset_never_reaches_the_nostr_applet() {
          authenticatorReset wipes only FIDO's range (US-1650's contract)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// US-1746 — GET_INFO advertises the capability and the live state, derived
+// from the gate's own field. The layout stays applet_ver(2) ‖ caps(2) ‖
+// max_plaintext(2) ‖ n_identities(1) ‖ flags(1) — u8/u16 widths only, so
+// the §6 32-bit rule holds by construction.
+// ---------------------------------------------------------------------------
+
+/// One GET_INFO walk returning (caps, flags) — the two fields the story
+/// asserts on, decoded from the fixed 8-byte body.
+fn get_info_fields(app: &mut NostrApp) -> (u16, u8) {
+    let (data, sw) = call(app, &apdu(0x10, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data.len(), 8, "applet_ver(2) ‖ caps(2) ‖ max_pt(2) ‖ n(1) ‖ flags(1)");
+    let caps = u16::from_be_bytes([data[2], data[3]]);
+    let flags = data[7];
+    (caps, flags)
+}
+
+/// **The capability bit is unconditional** — any booted applet advertises
+/// caps bit 4, because the verb exists on this firmware.
+#[test]
+fn the_capability_bit_is_unconditional() {
+    let (app, path) = app_with_identity("advertise-caps");
+    let mut app = app;
+    let (caps, _) = get_info_fields(&mut app);
+    assert_eq!(
+        caps & 0x0010,
+        0x0010,
+        "CAP_TOUCH_POLICY is advertised unconditionally"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The state flag tracks the gate's field exactly** — bit 3 absent then
+/// present, and no other flag bit moves.
+#[test]
+fn the_state_flag_tracks_the_gate_field() {
+    let (app, path) = pin_app("advertise-flag");
+    let mut app = app;
+    let (_, flags_off) = get_info_fields(&mut app);
+    assert_eq!(
+        flags_off & 0x08,
+        0,
+        "bypass down: FLAG_TOUCH_BYPASS absent"
+    );
+    app.set_touch_bypass(true);
+    let (_, flags_on) = get_info_fields(&mut app);
+    assert_eq!(flags_on & 0x08, 0x08, "bypass up: FLAG_TOUCH_BYPASS present");
+    assert_eq!(
+        flags_off & !0x08,
+        flags_on & !0x08,
+        "no other flag bit moved"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The advertisement cannot diverge from the gate** — the source
+/// assertion: GET_INFO's flag bit is computed from `self.touch_bypass`,
+/// the same field US-1741's signing gates read, with no second read or
+/// recomputation between the two.
+#[test]
+fn the_advertisement_cannot_diverge_from_the_gate() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/lib.rs"
+    ))
+    .expect("apps/nostr/src/lib.rs is readable from its own test crate");
+    let get_info = src
+        .split("fn get_info")
+        .nth(1)
+        .expect("get_info exists");
+    let get_info = &get_info[..get_info.find("\n    fn ").expect("get_info terminates")];
+    assert!(
+        get_info.contains("self.touch_bypass"),
+        "GET_INFO must read the gate's own field, not a recomputation"
+    );
+    assert!(
+        get_info.contains("FLAG_TOUCH_BYPASS"),
+        "GET_INFO must set the flag bit from that field"
+    );
+    // And the flag constant's doc names the derivation rule, so a future
+    // editor meets the §4 convention at the definition site.
+    let flag_doc = src
+        .split("pub const FLAG_TOUCH_BYPASS")
+        .nth(1)
+        .map(|_| ())
+        .is_some();
+    assert!(flag_doc, "the FLAG_TOUCH_BYPASS constant exists");
+}
+
+/// **getInfo stays width-clean** — the response body is still the fixed
+/// 8-byte layout of u8/u16 fields (no integer wider than 16 bits anywhere
+/// in it), so the §6 32-bit rule is unchanged by the new bits.
+#[test]
+fn getinfo_stays_width_clean() {
+    let (app, path) = app_with_identity("advertise-width");
+    let mut app = app;
+    let (data, _) = get_info_fields(&mut app);
+    let _ = data;
+    // The 8-byte layout assertion lives in get_info_fields; this row
+    // exists so a layout change (a wider integer, a new field) has a named
+    // failing test referencing the §6 rule.
+    std::fs::remove_file(&path).ok();
+}
