@@ -363,7 +363,18 @@ Traps this shape has already produced — all fixed, all cheap to re-create:
 
 The touch model: three reads are touch-free (`GET_INFO`, `GET_PUBKEY`,
 `LIST_KEYS`) and **every other command presses the button**, with no config
-bit to change that. The press consents to the **identity**, not the opcode —
+bit to change that — plus one deliberate exception (US-1741..1746,
+EPIC `NOSTR-TOUCH-BYPASS`): a **consented, session-bound signing bypass**.
+`SET_TOUCH_POLICY` (INS `0x1F`, vendor `0x4F`; P1 = `0x00` re-enable /
+`0x01` bypass) lets an open PIN session plus a physical press exempt
+exactly SIGN, NIP44 ENC and NIP44 DEC from the touch; GENERATE, IMPORT,
+SET_LABEL and DELETE never skip it. The bypass is a **PIN-session
+privilege**: a board with no PIN can never arm it, the disable leg's
+touch sits after the PIN gate and every refusal eats an armed grant,
+LOCK and the power cycle clear it (deselect preserves it), and the
+enable direction is friction-free so the button can always be had back.
+RAM-only — a bypass that survives unplug is a bypass the user forgot
+they owned. The press consents to the **identity**, not the opcode —
 the tag is `0x4000_0000 ‖ idx` over CCID and `0x6000_0000 ‖ CID` over HID,
 disjoint from FIDO's `0x8000_0000 ‖ CID` (`apps/nostr/src/lib.rs:1362-1400`).
 Two properties are load-bearing and both came out of the presence audit
