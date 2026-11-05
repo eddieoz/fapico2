@@ -7,7 +7,7 @@ sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID
 import cbor2
 
-DEV = "/dev/hidraw8"
+DEV = os.environ.get("FA_HIDRAW", "/dev/hidraw8")
 
 def raw_write(frame):
     fd = os.open(DEV, os.O_RDWR | os.O_NONBLOCK)
