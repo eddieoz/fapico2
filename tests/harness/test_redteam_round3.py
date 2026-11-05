@@ -43,11 +43,8 @@ Private ports (see the port map in ccid_relay.py): 36019/36020 CCID pair,
 import hashlib
 import hmac
 import os
-import socket
 import struct
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -55,7 +52,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests"))
 
-from harness.test_restart import CcidEmu, Emu, _bin  # noqa: E402
+from harness.test_restart import CcidEmu, Emu  # noqa: E402
 
 RELAY_CCID_PORT = 36019
 CCID_CLIENT_PORT = 36020

@@ -9,7 +9,7 @@ Tests the classic OpenPGP card attack surface:
   6. ECDH/PSO:DECIPHER oracle — uniform error for malformed points
   7. Resetting code / RESET RETRY COUNTER without it
 """
-import sys, time
+import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ccid import Card
 

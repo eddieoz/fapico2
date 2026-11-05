@@ -6,9 +6,9 @@ Tests the three attack classes that need no PIN knowledge:
   3. seed poisoning — can PUT overwrite/add a credential without VALIDATE,
      letting an attacker predict future OTPs?
 """
-import sys, time
+import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
-from ccid import Card, toBytes
+from ccid import Card
 
 c = Card()
 r, sw = c.select("A0000005272101")
