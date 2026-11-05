@@ -6,16 +6,18 @@ Malleability questions that need no credential:
      that echoes claimed flags is exploitable exactly like the alwaysUv lie.)
   2. Is the getInfo response reproducible byte-for-byte (a device that varies
      it leaks per-call state, e.g. a counter or a nonce)?
-  3. Does a mutated response frame get accepted on the next command (i.e. does
-     the device validate anything about the channel it just used)?
-  4. Store flood: hammer credMgmt / largeBlobs / makeCredential without a
+  3. Store flood: hammer credMgmt / largeBlobs / makeCredential without a
      token and confirm bounded errors and no state damage.
+
+(A former question — "does a mutated response frame get accepted on the next
+command" — was advertised here but never implemented; see
+docs/audits/2026-11-05-redteam-quality-audit.md T3. Implement it before re-adding the claim.)
 """
 import sys, time, hashlib, cbor2
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
-from ctaphid import CTAPHID
+from ctaphid import CTAPHID, DEV
 
-h = CTAPHID("/dev/hidraw8")
+h = CTAPHID(DEV)
 h.init()
 cid = h.cid
 

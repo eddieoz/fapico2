@@ -4,7 +4,7 @@ race the firmware documents as an exemption (US-705.1).
 import os, struct, time, select, sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 
-DEV = "/dev/hidraw8"
+DEV = os.environ.get("FA_HIDRAW", "/dev/hidraw8")
 fd = os.open(DEV, os.O_RDWR | os.O_NONBLOCK)
 
 def drain(t=0.3):

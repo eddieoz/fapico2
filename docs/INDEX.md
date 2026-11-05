@@ -51,7 +51,17 @@ same-day report) and the [round-3 remediation
 record](archive/SECURITY-ASSESSMENT-ROUND3-REMEDIATION.md) (what is fixed, with
 the hardware evidence). The Nostr arc's own red-team pass is
 [archive/SECURITY-ASSESSMENT-NOSTR.md](archive/SECURITY-ASSESSMENT-NOSTR.md)
-(2026-10-10, firmware + extension).
+(2026-10-10, firmware + extension). The red-team program record is here too:
+[2026-11-05-redteam-attack-coverage.md](audits/2026-11-05-redteam-attack-coverage.md)
+maps the researched hardware-wallet/security-token attack classes onto the
+suite (S/P/H/— per class), and
+[2026-11-05-redteam-quality-audit.md](audits/2026-11-05-redteam-quality-audit.md)
+is the per-script tautology/ghost/fabrication audit (the round-3 exploit's
+inverted VALIDATE MAC is A1 there). The tooling itself stays in
+[`../redteam/`](../redteam/) — one Python file per probe, no docs.
+`tests/harness/test_redteam.py` (US-923) replays the round-1 attacks as
+refusals; `tests/harness/test_redteam_round3.py` executes the open round-3
+findings (F4 takeover, F8 protocol 1) as live proofs against the emulator.
 
 ## Living budgets and gates (CI reads these — do not move)
 

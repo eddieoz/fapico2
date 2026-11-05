@@ -81,6 +81,9 @@ docs/tasks/
 # ZCode session state (not repo content)
 .zcode/
 
+# Security-scanner session state (not repo content)
+.mimosa/
+
 # mdBook build output
 book/build/
 

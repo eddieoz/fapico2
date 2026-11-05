@@ -40,6 +40,19 @@ except Exception as e:
     print("CTAP1 REGISTER: %s: %s" % (type(e).__name__, e))
 
 # --- wrong PIN #1 (6 digits) with timing ----------------------------------
+# Budget guard (docs/audits/2026-11-05-redteam-quality-audit.md G2): retries are a consumable
+# resource; never burn an attempt unless the device reports more than a
+# floor of them remaining.
+RETRY_FLOOR = 3
+def remaining():
+    r = retries()
+    return r[0] if isinstance(r, tuple) else r
+
+if remaining() is None or remaining() <= RETRY_FLOOR:
+    print("insufficient retry budget (have %s, floor %d) — skipping wrong-PIN legs"
+          % (remaining(), RETRY_FLOOR))
+    sys.exit(2)
+
 t0 = time.perf_counter()
 try:
     cp.get_pin_token("000000")
@@ -47,7 +60,7 @@ try:
 except ctap.CtapError as e:
     print("wrong PIN (000000) refused: %s (%s) in %.2fms" % (e.code, e, (time.perf_counter()-t0)*1000))
 r1 = retries()
-print("pin retries after 1 wrong: %s  (decrement: %s)" % (r1, r0[3] - r1[3] if r1 and r0 else "?"))
+print("pin retries after 1 wrong: %s" % (r1,))
 
 # --- wrong PIN #2 (longer, to detect length-based early exit) -------------
 t0 = time.perf_counter()
@@ -56,10 +69,8 @@ try:
 except ctap.CtapError as e:
     print("wrong PIN (13 chars) refused: %s in %.2fms" % (e.code, (time.perf_counter()-t0)*1000))
 r2 = retries()
-print("pin retries after 2 wrong: %s" % r2)
+print("pin retries after 2 wrong: %s" % (r2,))
 
-# --- pinUvAuth token permission probing ----------------------------------
-# legacy leg (subCommand 0x05, no permissions) vs 2.1 leg (0x09 with perms)
-from fido2.ctap2.pin import PinProtocolV1
-# (no further wrong attempts — retries are a consumable resource)
-print("\nSTOPPING PIN attempts: 2 of %d retries burned" % (r0[3] if r0 else "?"))
+print("\nSTOPPING PIN attempts: %s retries remaining (floor %d)"
+      % (remaining(), RETRY_FLOOR))
+sys.exit(0)

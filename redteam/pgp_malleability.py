@@ -12,7 +12,7 @@ Three classes:
      truncation at every boundary. Uniform error is the pass condition.
 """
 import sys, time, collections
-sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from ccid import Card
 
 AID = "D276000124010304000000000000000000"
@@ -24,14 +24,6 @@ def tlv(tag, val):
 # 0x40 / Brainpool-256 is 0x24 per the AID capability byte; use opaque bytes —
 # the point is the MUTATION test, not a valid curve equation).
 BASE = bytes.fromhex("0932100000000000000000000000000000000000000000000000000000000000")
-
-def decipher_body(point, ephemeral=None, extra=b""):
-    # 0xB6 = tag for ephemeral public key in a decipher data object
-    inner = tlv(0xB6, point)
-    if ephemeral is not None:
-        inner += tlv(0x7F, bytes([0x40]) + ephemeral)   # 7F47-ish wrapper
-    body = inner + extra
-    return bytes([0xA0, 0x00]) if not body else body
 
 def run():
     c = Card()
@@ -63,7 +55,6 @@ def run():
         "double-add":  BASE + BASE,           # 64-byte concatenation
         "p256-order":  bytes.fromhex("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"),
         "small-order-8": bytes([0]*30 + [8, 1]),
-        "neg-y":       BASE[:31] + bytes([(BASE[31] ^ 0x80) if False else BASE[31]]),
     }
     for name, pt in muts.items():
         probe("dec:" + name, lambda p=pt: c.apdu(0x00, 0x2A, 0xFF, 0x00,
@@ -104,9 +95,24 @@ def run():
     for k, v in results.items():
         if k.startswith("dec:"):
             dec_responses |= v
+    # canary: the sweep means something only if the un-mutated input reached
+    # the cipher — i.e. base was accepted (9000). On a fully-gated applet every
+    # input answers the same refusal and "uniform" proves nothing.
+    base_sw_canary_ok = bool(results.get("dec:base")) and any(
+        sw == 0x9000 for sw, _ in results["dec:base"])
+    print("  canary (valid base input accepted): %s" % base_sw_canary_ok)
     print("  PSO:DECIPHER distinct responses: %s" % dec_responses)
-    print("  => %s" % ("UNIFORM (no malleability)" if len(dec_responses) == 1
-                       else "DISTINGUISHABLE (%d classes)" % len(dec_responses)))
+    if len(dec_responses) > 1:
+        print("  => DISTINGUISHABLE (%d classes) — malleability/oracle candidate" % len(dec_responses))
+    elif results.get("dec:base") and base_sw_canary_ok:
+        print("  => UNIFORM over 11 mutations with a VALID-INPUT CANARY (no malleability)")
+    else:
+        print("  => INCONCLUSIVE: even the base input was refused like everything "
+              "else — the applet gated before its curve check, so uniformity is "
+              "a property of the gate, not of the crypto. Open a PW1 session and "
+              "produce one successful decipher (the canary) before trusting a "
+              "uniform sweep.")
+    sys.exit(1 if len(dec_responses) > 1 else 0)
     print("  PSO:CDS distinct responses: %s" % distinct)
     print("  => %s" % ("UNIFORM (no algorithm confusion)" if len(distinct) == 1
                        else "DISTINGUISHABLE — algorithm/shape is observable"))

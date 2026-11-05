@@ -1,9 +1,10 @@
 """US-923: red-team regression suite — the EPIC SEC-HARDEN gate (Phase F).
 
 Every case replays one attack executed against the live device during the
-authorized red-team assessment (2026-09-22,
-``redteam/out/ASSESSMENT_REPORT.md``) against the emulation binary, and
-asserts the attack is REFUSED on the fixed (US-901–US-922) build.
+authorized red-team assessment (2026-09-22; the round-1 report is not in this
+repository — the published records live in ``docs/archive/
+SECURITY-ASSESSMENT-*.md``) against the emulation binary, and asserts the
+attack is REFUSED on the fixed (US-901–US-922) build.
 
 TDD red/green (controller decision, binding): the *red* evidence for each
 case is the assessment record — the attack verifiably succeeded against the
