@@ -2,7 +2,7 @@
 hostility, largeBlobs, and the vendor 0x41 channel. Success = the device
 survives every input with a defined response (no hang, no drop-off).
 """
-import sys, os, struct, time, select, random
+import sys, os, struct, time, select
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID
 import cbor2

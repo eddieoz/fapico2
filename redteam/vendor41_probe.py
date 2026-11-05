@@ -11,7 +11,7 @@ Authority per apps/fido/src/vendor41.rs `decision()`:
   ATT_IMPORT 0x09 Touch | ATT_CLEAR 0x0A Touch  | ATT_STATE 0x0B StatusOnly
   CONFIG_WRITE 0x0C Touch | CONFIG_READ 0x0D Ungated | AUDIT_CONFIG 0x0E StatusOnly
 """
-import sys, time
+import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID
 import cbor2

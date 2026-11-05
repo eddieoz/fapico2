@@ -7,11 +7,11 @@ hidraw exposes those as ioctls, which need no libusb interface claim.
   HIDIOCSFEATURE(dir=WRITE, 'H', 0x06, len)
   HIDIOCGFEATURE(dir=READ,  'H', 0x07, len)
 """
-import fcntl, os, struct, sys, time
+import fcntl, os
 
 def ioc(direction, typ, nr, size):
     # _IOC(dir,type,nr,size); dir 1=write 2=read on Linux
-    IOC_NRBITS, IOC_TYPEBITS, IOC_SIZEBITS, IOC_DIRBITS = 8, 8, 14, 2
+    IOC_NRBITS, IOC_TYPEBITS, IOC_SIZEBITS = 8, 8, 14
     IOC_NRSHIFT = 0
     IOC_TYPESHIFT = IOC_NRSHIFT + IOC_NRBITS
     IOC_SIZESHIFT = IOC_TYPESHIFT + IOC_TYPEBITS

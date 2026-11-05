@@ -10,7 +10,7 @@ them:
 Also centralizes the hidraw path so `FA_HIDRAW` is honoured everywhere (the
 QUALITY_AUDIT G3 ghost).
 """
-import os, sys
+import os
 
 DEV = os.environ.get("FA_HIDRAW", "/dev/hidraw8")
 

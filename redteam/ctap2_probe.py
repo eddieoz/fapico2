@@ -1,5 +1,5 @@
 """CTAP2 auth-state probes: PIN state, token-less ops, vendor channels, largeBlobs."""
-import sys, time, json
+import sys, time
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID
 import cbor2

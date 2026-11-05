@@ -1,8 +1,8 @@
 """Phase 1 recon: capture device identity on every interface an attacker sees."""
-import sys, json, struct, hashlib
+import sys, json
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
-from ctaphid import CTAPHID, INIT, CBOR, PING, WINK, CANCEL, MSG, VENDOR
-from ccid import Card, toBytes
+from ctaphid import CTAPHID
+from ccid import Card
 
 def dump(label, b):
     print("  %s (%d): %s" % (label, len(b), b.hex()))
