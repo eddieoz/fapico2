@@ -15,6 +15,7 @@ deliberately **not in git**.
 - [capacity.md](capacity.md) — hardware-verified ceilings: 856 FIDO2 resident credentials (measured to refusal), 68 OATH slots (reservation), and which constants are *not* capacities.
 - [client-compatibility.md](client-compatibility.md) — client-side quirks no firmware change can fix.
 - [audits/2026-11-06-picoforge-dialect-probe.md](audits/2026-11-06-picoforge-dialect-probe.md) — the stock-AAGUID board answering the full RS-Key `0x41` dialect (CONFIG_READ, STATE without key 5, MSE, PC/SC `data[2] = 8`): the hardware evidence behind PicoForge's fapico2 support (EPIC PF-FAPICO2, PR eddieoz/picoforge#1).
+- [audits/2026-11-07-picoforge-gui-same-key-proof.md](audits/2026-11-07-picoforge-gui-same-key-proof.md) — the US-1758 closure: the full backup/reset/restore cycle driven through the PicoForge GUI on the stock-AAGUID board, `SAME-KEY` re-registration (byte-identical credential ID and P-256 key), Lock engage/unlock/disable, Audit and Attestation — plus divergence D8 (fapico2 token-gates UNLOCK when a PIN is set) and its RS-Key-compatible fix.
 
 ## Using and trusting the device
 
