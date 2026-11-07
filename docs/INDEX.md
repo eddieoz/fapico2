@@ -14,6 +14,7 @@ deliberately **not in git**.
 - [identity.md](identity.md) — USB identity (AAGUID, VID:PID), the **PC/SC allowlist step Linux/macOS need before OpenPGP/OATH work**, and the runtime VID/PID silent-lockout hazard.
 - [capacity.md](capacity.md) — hardware-verified ceilings: 856 FIDO2 resident credentials (measured to refusal), 68 OATH slots (reservation), and which constants are *not* capacities.
 - [client-compatibility.md](client-compatibility.md) — client-side quirks no firmware change can fix.
+- [audits/2026-11-06-picoforge-dialect-probe.md](audits/2026-11-06-picoforge-dialect-probe.md) — the stock-AAGUID board answering the full RS-Key `0x41` dialect (CONFIG_READ, STATE without key 5, MSE, PC/SC `data[2] = 8`): the hardware evidence behind PicoForge's fapico2 support (EPIC PF-FAPICO2, PR eddieoz/picoforge#1).
 
 ## Using and trusting the device
 

@@ -26,7 +26,9 @@ and whose getInfo disagreed about a name would be a worse bug than either being
 hardcoded.
 
 ```bash
-# A build aimed at a PicoForge that has not yet been taught fapico2's AAGUID.
+# Identity experiments only — a stock-AAGUID build no longer needs this:
+# PicoForge's feat/fapico2-support branch (PR eddieoz/picoforge#1) classifies
+# 66617069636F3200…0002 as FirmwareType::Fapico2 natively.
 FAPICO2_IDENTITY_OVERRIDE_ACK=1 \
 FAPICO2_AAGUID_HEX=2479C7BF6B3056839EC80E8171A918B7 cargo build --release -p fapico2-firmware
 
@@ -65,8 +67,11 @@ flashed from the other are two authenticators that share no passkeys. A passkey
 enrolled on one is invisible to the other. The only record of which image was
 which was somebody's flash log.
 
-The escape hatch stays — developing against a PicoForge that has not yet
-learned our AAGUID is a real job, and so is a fork shipping under its own name.
+The escape hatch stays — identity experiments and forks shipping under their
+own name are real jobs. Stock-AAGUID development against PicoForge no longer
+needs it: the `feat/fapico2-support` branch classifies fapico2's own AAGUID
+(`FirmwareType::Fapico2`, capability-gated RS-Key vendor features) — the
+hardware confirmation is [`audits/2026-11-06-picoforge-dialect-probe.md`](audits/2026-11-06-picoforge-dialect-probe.md).
 It is now a thing you have to say you are doing, twice, in a command line that
 gets copied around. `docs/identity.md` and the `platform::identity` module docs
 both say so; a build that skips it does not build.
