@@ -167,6 +167,19 @@ pub const CTAP_KEEPALIVE_PERIOD_MS: u64 = 250;
 /// refusal is observable as SW=6985 rather than a host-side abort.
 pub const CCID_WINDOW_MS: u64 = 15_000;
 
+/// US-1762 (RESCUE-WRITE-PRESENCE, Shape A per US-1761's diagnosis): the
+/// Rescue applet's **blocking** WRITE gate's bound. The device injects
+/// `button::rescue_wait_grant` (the US-914 `wait_grant` shape) and the
+/// emulation's block mode mirrors it over the latch-as-pad stand-in; both
+/// wait this long for the press inside the WRITE APDU, then answer `6985`
+/// byte-exactly. **10 s, not [`CCID_WINDOW_MS`]'s 15** (D-5): a blocking
+/// APDU sits inside the host's T=1 transaction, and the observed libccid
+/// abort ceiling is ~14.5 s — the proven in-APDU precedents on this tree
+/// (PSO, nostr) are 10 s, and WTX does not exist here. It is a separate
+/// constant from `PSO_TOUCH_WINDOW_MS`/nostr's on purpose: change one
+/// wait's budget, the others do not follow.
+pub const RESCUE_WRITE_WAIT_MS: u64 = 10_000;
+
 /// US-1660 (design §A.8.3a #4, §A.8.3 #2): the Nostr vendor interface's own
 /// touch window — **15 s, not the CTAP2 30 s**, and not [`CCID_WINDOW_MS`]
 /// either. Reusing either would couple two unrelated rationales: the CTAP2

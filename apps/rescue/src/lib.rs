@@ -1001,11 +1001,25 @@ impl RescueApp {
         self
     }
 
-    /// US-1536: attach the shared presence runtime's grant path
-    /// (`fapico2_firmware::presence::window_grant` — the same join-or-open
-    /// window the OATH and mgmt applets are given). Takes precedence over the
+    /// US-1536: attach the device grant path. Takes precedence over the
     /// fallback, and with it attached the whole grant path *is* the runtime's
     /// shared service: one pending slot, one button latch, one clock.
+    ///
+    /// **Which gate the device injects changed with US-1762
+    /// (RESCUE-WRITE-PRESENCE, Shape A):** the Rescue applet gets the
+    /// **blocking** wait (`button::rescue_wait_grant` — the US-914/OpenPGP
+    /// shape, 10 s, the same transport-bound bound the nostr CCID arm uses),
+    /// not the join-or-open `window_grant` the OATH and mgmt applets keep.
+    /// The US-1761 hardware trace proved the join-or-open logic correct and
+    /// its timing unusable: a real client's retry and a real operator's
+    /// press do not reliably meet inside the armed grant's 10 s life, so a
+    /// correct operator saw `6985` with their finger inside the lit period.
+    /// Under the blocking contract the first `WRITE` **waits** for the press
+    /// (up to 10 s — D-5's libccid abort ceiling) and completes inside the
+    /// request; a client that retries anyway is harmless, and one that
+    /// cannot wait at all sees the same `6985` the reference answers. The
+    /// host/emulation builds may still inject `window_grant` or an
+    /// auto-ack stand-in; the applet is gate-agnostic by construction.
     pub fn with_presence_grant(mut self, g: fn(u32) -> bool) -> Self {
         self.presence_grant = Some(g);
         self

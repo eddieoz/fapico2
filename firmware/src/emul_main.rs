@@ -73,11 +73,37 @@ static EMUL_PRESENCE_TRACE: std::sync::Mutex<Vec<fapico2_firmware::presence::Pre
 
 /// The emulation's presence-event sink: append to the ordered trace. The
 /// runtime publishes every event it `note()`s here when the hook is
-/// installed (window mode only).
+/// installed (window/block mode only).
 fn emul_presence_event_sink(ev: fapico2_firmware::presence::PresenceEvent) {
     if let Ok(mut q) = EMUL_PRESENCE_TRACE.lock() {
         q.push(ev);
     }
+}
+
+/// US-1762: the block mode's pad-sampler stand-in. On the device the
+/// blocking gate samples the BOOTSEL pad directly (the button task is
+/// starved while the serve task blocks); the emulator has no pad — the
+/// latch injected by the harness's `0x50` control **is** the pad level.
+/// A stale edge is drained by the serve loop's tick between commands, so
+/// a level held into a blocking wait is a press held before the request —
+/// the anti-harvest baseline, exactly as on the pad.
+fn emul_latch_level() -> bool {
+    fapico2_firmware::presence::PRESS_LATCH.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// US-1762: the block mode's rescue gate — the device's own shape
+/// (`button::rescue_wait_grant`: `wait_grant`, 10 s, D-5's bound) over the
+/// emulator's pad stand-in. The press-during-the-wait leg is NOT drivable
+/// here (the emulator is single-threaded: while the WRITE blocks, the
+/// serve loop cannot read the CCID control channel the press rides on) —
+/// the timeout leg is, and the press path is `wait_grant`'s own, which the
+/// presence suite covers and US-1766's hardware re-ceremony proves.
+fn emul_rescue_block_grant(tag: u32) -> bool {
+    fapico2_firmware::presence::wait_grant(
+        tag,
+        fapico2_firmware::presence::RESCUE_WRITE_WAIT_MS,
+        emul_latch_level,
+    )
 }
 
 /// The trace as text lines — `Kind tag=0xTAG t=NOWms delta=DELTAms`, one
@@ -466,18 +492,33 @@ fn main() {
         fapico2_firmware::presence::init(emul_now_ms),
         "presence runtime double-init"
     );
-    // US-1759: the rescue-WRITE window mode. Opt-in (see the trace block
-    // above); the hook is write-once, so the install sits here at boot next
-    // to `init`, before any traffic — the same boot discipline the device
-    // bin keeps for its own hook.
-    let rescue_presence_window =
-        matches!(std::env::var("FAPICO2_RESCUE_PRESENCE").as_deref(), Ok("window"));
-    if rescue_presence_window {
+    // US-1759/US-1762: the rescue-WRITE presence modes. Opt-in (see the
+    // trace block above); the hook is write-once, so the install sits here
+    // at boot next to `init`, before any traffic — the same boot discipline
+    // the device bin keeps for its own hook.
+    //
+    // * `window` — the join-or-open `window_grant` (the mgmt/OATH/OTP
+    //   contract, which still ships): the harness presses while the window
+    //   is open and the retry consumes the arm.
+    // * `block` — US-1762's Shape A, the device's own rescue gate
+    //   (`wait_grant`, 10 s) over the latch-as-pad stand-in. Only the
+    //   timeout leg is drivable here (a press during the blocked APDU
+    //   cannot be delivered — the serve loop is the thing that reads it).
+    let rescue_presence_mode = match std::env::var("FAPICO2_RESCUE_PRESENCE").as_deref() {
+        Ok("window") => Some("window"),
+        Ok("block") => Some("block"),
+        _ => None,
+    };
+    if rescue_presence_mode.is_some() {
         assert!(
             fapico2_firmware::presence::set_presence_event_hook(Some(emul_presence_event_sink)),
             "presence event hook double-init"
         );
-        eprintln!("rescue presence: shared runtime window_grant (FAPICO2_RESCUE_PRESENCE=window)");
+        eprintln!(
+            "rescue presence: {} gate (FAPICO2_RESCUE_PRESENCE={})",
+            rescue_presence_mode.unwrap(),
+            rescue_presence_mode.unwrap()
+        );
     }
     // FAPICO2_HID_PORT lets the restart tests run a private instance.
     let hid_port = std::env::var("FAPICO2_HID_PORT")
@@ -777,14 +818,21 @@ fn main() {
         .with_device_handler(unsafe {
             &mut *core::ptr::addr_of_mut!(EMUL_RESCUE_DEVICE_HANDLER)
         });
-    // US-1759: in window mode the rescue app's grant IS the shared runtime's
-    // join-or-open gate — the device's own injection (`main.rs:1247`), so the
-    // emulator exercises the same service, the same single pending slot and
-    // the same tag binding the board does. Unset keeps the host auto-ack
-    // (`default_user_present()`), which is what every existing suite runs on.
-    if rescue_presence_window {
-        rescue_app = rescue_app
-            .with_presence_grant(fapico2_firmware::presence::window_grant);
+    // US-1759/US-1762: in window mode the rescue app's grant IS the shared
+    // runtime's join-or-open gate (the mgmt/OATH/OTP contract); in block
+    // mode it is US-1762's Shape A — the device's own injection
+    // (`main.rs`, `button::rescue_wait_grant`) mirrored over the latch-as-pad
+    // stand-in. Unset keeps the host auto-ack (`default_user_present()`),
+    // which is what every existing suite runs on.
+    match rescue_presence_mode {
+        Some("window") => {
+            rescue_app =
+                rescue_app.with_presence_grant(fapico2_firmware::presence::window_grant);
+        }
+        Some("block") => {
+            rescue_app = rescue_app.with_presence_grant(emul_rescue_block_grant);
+        }
+        _ => {}
     }
     // US-1643: the Nostr applet's key-region stand-in — a `FileKeyRegion`
     // over a host file, the emulator's fifth-handle analogue. The file
@@ -843,7 +891,7 @@ fn main() {
             &mut dispatcher,
             &mut store,
             &partition_path,
-            rescue_presence_window,
+            rescue_presence_mode,
         );
     });
 }
@@ -1086,7 +1134,7 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     dispatcher: &mut Dispatcher<8>,
     store: &mut HostSecureStore,
     partition_path: &std::path::Path,
-    rescue_presence_window: bool,
+    rescue_presence_mode: Option<&'static str>,
 ) {
     let mut resp_buf = HeaplessVec::<u8, MAX_RESPONSE>::new();
     // US-1524: the shared serve loop's state. `HidServe` owns the CTAP-HID
@@ -1133,7 +1181,7 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                     running = false;
                     continue;
                 }
-            } else if rescue_presence_window && frame.len() == 1 && frame[0] == 0x50 {
+            } else if rescue_presence_mode.is_some() && frame.len() == 1 && frame[0] == 0x50 {
                 // US-1759: one press edge into the shared latch. No reply —
                 // the button is not a request/response surface; the next
                 // loop iteration's drain tick observes the edge, exactly as
@@ -1215,13 +1263,15 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
         // device.
         serve_pass(&mut srv, &mut EmulLink { transport }, &mut app, &mut slot);
 
-        // US-1759: the button task's tick, in window mode — one drain per
-        // serve iteration so a latched press edge arms the pending window on
-        // the next pass (the device's button task does this every 10 ms; the
-        // loop's 1 ms sleep is this build's cadence). In the default mode the
-        // latch is never set by anything, so the tick stays window-mode-only
-        // and the default behavior is untouched.
-        if rescue_presence_window {
+        // US-1759/US-1762: the button task's tick, in window and block mode —
+        // one drain per serve iteration so a latched press edge arms the
+        // pending window on the next pass (the device's button task does
+        // this every 10 ms; the loop's 1 ms sleep is this build's cadence)
+        // and a stale edge never survives into the next command's request.
+        // In the default mode the latch is never set by anything, so the
+        // tick stays presence-mode-only and the default behavior is
+        // untouched.
+        if rescue_presence_mode.is_some() {
             fapico2_firmware::presence::drain_press();
         }
 

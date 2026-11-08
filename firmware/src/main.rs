@@ -1237,14 +1237,26 @@ async fn main(spawner: Spawner) -> ! {
                     &mut *core::ptr::addr_of_mut!(boot::RESCUE_DEVICE_HANDLER)
                 })
                 // US-1536: `WRITE PhyConfig` rewrites the USB identity, so it
-                // takes the same join-or-open touch window the OATH and mgmt
-                // applets already use (`window_grant`, not
-                // `request_grant_in_window` — the CCID task owns no window of
-                // its own, so the gate opens one on demand). pico-keys-sdk
-                // gates the same APDU on `rescue_require_user_presence()`;
-                // RS-Key does the same. Without it this applet is an
-                // unauthenticated, unattended rewrite of the device's VID/PID.
-                .with_presence_grant(fapico2_firmware::presence::window_grant)
+                // is touch-gated. pico-keys-sdk gates the same APDU on
+                // `rescue_require_user_presence()`; RS-Key does the same.
+                // Without it this applet is an unauthenticated, unattended
+                // rewrite of the device's VID/PID.
+                //
+                // US-1762 (RESCUE-WRITE-PRESENCE, Shape A per US-1761's
+                // hardware diagnosis): the gate is the **blocking** wait —
+                // the US-914/OpenPGP shape, the same transport the nostr
+                // CCID arm uses (D7) — not the join-or-open `window_grant`
+                // the OATH and mgmt applets keep. The trace excluded
+                // H1 (starvation) and H3 (slot pre-occupation) outright and
+                // pinned the failure as the cross-call retry contract's
+                // timing: a real client's retry and a real human's press do
+                // not meet inside the armed grant's 10 s life. The blocking
+                // wait converts the press inside the first APDU; the
+                // no-press timeout answers `6985` byte-exactly (D-5: a 10 s
+                // bound, under the ~14.5 s libccid abort ceiling; WTX does
+                // not exist on this tree). `window_grant` itself stays
+                // byte-identical for mgmt/OTP/OATH (D-6).
+                .with_presence_grant(button::rescue_wait_grant)
         },
     );
 
