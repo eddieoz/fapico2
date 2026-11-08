@@ -1442,8 +1442,12 @@ fn nostr_window_tag_domain_check_is_exact() {
 // diagnosis. If one of these is RED on the host, the logic itself is broken
 // and the fix is host-verifiable end to end.
 //
-// They are `#[ignore]`d as written (RED-first discipline): US-1762/US-1763
-// flip them.
+// US-1763 flipped them: all five pass on the host (the US-1760 twin-trap
+// record holds — the logic contract was never broken; the device defect was
+// the retry contract's timing, fixed by US-1762's Shape A). The tag below
+// now models the CCID consumers that KEEP the join-or-open gate (mgmt
+// WRITE_CONFIG/RESET, OATH, OTP); the rescue leg's blocking contract is
+// pinned by the US-1762 scenario tests below it.
 
 const INS_WRITE_TAG: u32 = 0x1C;
 
@@ -1457,7 +1461,6 @@ const INS_WRITE_TAG: u32 = 0x1C;
 /// And a second WRITE APDU joins the open window and answers 0x00
 /// ```
 #[test]
-#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
 fn a_press_during_an_open_ccid_write_window_arms_the_retry() {
     use super::PresenceEventKind as K;
     let _g = TEST_LOCK.lock().unwrap();
@@ -1518,7 +1521,6 @@ fn a_press_during_an_open_ccid_write_window_arms_the_retry() {
 /// And no grant is armed
 /// ```
 #[test]
-#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
 fn a_press_with_no_open_window_is_discarded() {
     use super::PresenceEventKind as K;
     let _g = TEST_LOCK.lock().unwrap();
@@ -1553,7 +1555,6 @@ fn a_press_with_no_open_window_is_discarded() {
 /// And the next WRITE APDU opens a fresh window and answers 0x6985
 /// ```
 #[test]
-#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
 fn a_press_after_the_window_expired_is_discarded() {
     use super::PresenceEventKind as K;
     let _g = TEST_LOCK.lock().unwrap();
@@ -1600,7 +1601,6 @@ fn a_press_after_the_window_expired_is_discarded() {
 /// Then no edge is observed while pending and the APDU answers 0x6985
 /// ```
 #[test]
-#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
 fn a_press_held_before_the_window_opened_is_not_consent() {
     use super::PresenceEventKind as K;
     let _g = TEST_LOCK.lock().unwrap();
@@ -1653,7 +1653,6 @@ fn a_press_held_before_the_window_opened_is_not_consent() {
 /// grant lives `PRESENCE_WINDOW_MS` (10 s) from the press while the window
 /// lives 15 s — the gap where a correct operator fails.
 #[test]
-#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
 fn a_retry_later_than_the_armed_grants_expiry_is_refused() {
     use super::PresenceEventKind as K;
     let _g = TEST_LOCK.lock().unwrap();
@@ -1777,4 +1776,62 @@ fn the_rescue_blocking_bound_stays_under_the_libccid_abort_ceiling() {
         super::RESCUE_WRITE_WAIT_MS < super::CCID_WINDOW_MS,
         "the in-APDU bound is stricter than the cross-call window's 15 s"
     );
+}
+
+/// Scenario (US-1763): the documented client flow succeeds end to end.
+///
+/// ```gherkin
+/// Given a rescue WRITE APDU is refused with 0x6985 and opens a window
+/// When the operator presses while the window is open
+/// And the client re-sends the WRITE APDU within the window
+/// Then the second APDU answers 0x00
+/// And the trace shows exactly one Press, one Armed, and one consumed grant
+/// ```
+///
+/// This is the join-or-open contract verbatim — which after US-1762 is the
+/// shipped contract of the OTHER CCID consumers (mgmt WRITE_CONFIG/RESET,
+/// OATH, OTP), not the rescue leg's: the rescue WRITE now blocks (the
+/// US-1762 scenario above is that contract's end-to-end shape). The
+/// machinery is the same shared service, and this pins it once, here.
+#[test]
+fn the_documented_client_flow_succeeds_end_to_end() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(90_000);
+    let mut rt = runtime();
+
+    // Given: the first WRITE refused 0x6985 and opened the window.
+    assert!(!rt.window_grant(INS_WRITE_TAG));
+    let _ = event_log_take();
+
+    // When: the operator presses while the window is open.
+    tick_to(91_000);
+    emul_inject_press();
+    assert!(rt.poll_press());
+
+    // And: the client re-sends within the window.
+    tick_to(91_500);
+    assert!(rt.window_grant(INS_WRITE_TAG), "the second APDU answers 0x00");
+
+    // Then: exactly one Press, one Armed, and one consumed grant.
+    let evs = event_log_take();
+    let kinds: Vec<_> = evs.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == K::Press).count(),
+        1,
+        "exactly one Press: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == K::Armed).count(),
+        1,
+        "exactly one Armed: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == K::Grant).count(),
+        1,
+        "exactly one consumed Grant: {kinds:?}"
+    );
+    assert_eq!(rt.pending_tag(), None, "the window closed with the grant");
 }
