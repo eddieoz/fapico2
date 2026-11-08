@@ -298,6 +298,13 @@ jobs:
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi
+          # The task-arena stamp's self-heal (check_boot_chain US-956) builds
+          # with `+nightly` (-Zprint-type-sizes). Without the thumb target on
+          # the nightly toolchain too, the re-measurement dies with E0463
+          # (typenum: can't find the thumbv8m core rmeta) and a stale stamp
+          # fails the job instead of re-measuring. PR #29 found this the
+          # hard way.
+          rustup target add thumbv8m.main-none-eabi --toolchain nightly
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi
       - name: Build release firmware
