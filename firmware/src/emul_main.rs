@@ -54,7 +54,7 @@ use fapico2_fido::CTAP2_MAX_MSG;
 //
 // * `FAPICO2_RESCUE_PRESENCE=window` — the rescue app's grant becomes the
 //   shared runtime's `window_grant` (the device's own injection,
-//   `main.rs:1247`), and the serve loop drains the press latch once per
+//   `main.rs:1259`), and the serve loop drains the press latch once per
 //   iteration (the button task's 10 ms tick, at the loop's 1 ms cadence).
 //   Unset keeps the host auto-ack exactly as every existing suite sees it.
 // * CCID body `0x50` — inject one press edge (`emul_inject_press`). Window
@@ -1187,8 +1187,10 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                 // loop iteration's drain tick observes the edge, exactly as
                 // the device's button task does within one 10 ms tick.
                 fapico2_firmware::presence::emul_inject_press();
-            } else if frame.len() == 1 && frame[0] == 0x51 {
-                // US-1759: the ordered presence-event trace so far.
+            } else if rescue_presence_mode.is_some() && frame.len() == 1 && frame[0] == 0x51 {
+                // US-1759: the ordered presence-event trace so far. Gated on
+                // the presence mode like `0x50` (post-review): in the default
+                // mode the body goes to the dispatcher like any other frame.
                 let trace = presence_trace_text();
                 if let Err(e) = transport.write_ccid(&trace) {
                     eprintln!("ccid write error: {}", e);

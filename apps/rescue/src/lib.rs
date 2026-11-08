@@ -1018,8 +1018,10 @@ impl RescueApp {
     /// (up to 10 s — D-5's libccid abort ceiling) and completes inside the
     /// request; a client that retries anyway is harmless, and one that
     /// cannot wait at all sees the same `6985` the reference answers. The
-    /// host/emulation builds may still inject `window_grant` or an
-    /// auto-ack stand-in; the applet is gate-agnostic by construction.
+    /// host/emulation builds may still inject `window_grant` (the emulator's
+    /// `FAPICO2_RESCUE_PRESENCE=window`), the blocking gate mirrored over the
+    /// latch-as-pad stand-in (`=block`), or an auto-ack stand-in (unset); the
+    /// applet is gate-agnostic by construction.
     pub fn with_presence_grant(mut self, g: fn(u32) -> bool) -> Self {
         self.presence_grant = Some(g);
         self

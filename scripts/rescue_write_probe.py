@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """US-1761 (RESCUE-WRITE-PRESENCE): the rescue WRITE presence-window hardware probe.
 
+⚠️ CONTRACT DRIFT (post-US-1762): this script was written against the
+US-1761 retry contract. On a board flashed with US-1762's Shape A blocking
+gate, the FIRST WRITE blocks up to 10 s (a press inside it grants
+in-request), so legs A/C/G/D/E narrate the wrong world — their hypotheses
+(press timing across a 15 s cross-call window; the armed-grant expiry) no
+longer exist. The US-1761 diagnosis artifacts in docs/audits/ were produced
+with this script against the OLD capture build and remain valid FOR THAT
+BUILD. Re-base the legs before the next hardware run.
+
+
 Drives the PicoForge client flow over PC/SC — the exact APDUs the client
 sends on a config save (``tests/harness/rescue_ccid.py``'s transcriptions of
 ``picoforge/src/hal/rescue/ops.rs``) — against the **apdu-trace capture
@@ -20,10 +30,11 @@ Legs (the EPIC's spread):
   E held           the button is HELD before the WRITE — no edge while pending
   D no-press       WRITE 6985 -> no press -> wait past the 15 s deadline ->
                    WRITE again opens a fresh window
-  F foreign-window a CTAPHID U2F REGISTER (untouched) opens the FIDO window
-                   first; then rescue WRITE -> press -> retry — H3(b) directly:
-                   with the single slot held by the FIDO tag, `window_grant`
-                   must refuse without ever opening a Window.
+  F foreign-window INVALID AS SCRIPTED (see the 2026-11-08 diagnosis audit's
+                   residuals): the raw U2F REGISTER is not servable over
+                   CTAPHID_MSG yet (AGENTS.md §4) and the CCID T=1 session
+                   resets — excluded from the default --legs for that reason.
+                   H3(b)'s no-theft refusal is pinned by the host logic suite.
 
 After the last leg the US-922 ring is drained over CTAPHID vendor 0x42 on the
 pinned CID and the presence events (E_PRESS..E_PGRANT, dbg.rs 50..54) are
@@ -195,9 +206,10 @@ def drain_ring(vid=None, pid=None):
         return bytes(b)
 
     descs = [d for d in list_descriptors()
-             if (vid is None or d.vid == vid) and (pid is None or d.pid == pid)]
+             if "fapico2" in (getattr(d, "product_name", "") or "").lower()
+             and (vid is None or d.vid == vid) and (pid is None or d.pid == pid)]
     if len(descs) != 1:
-        raise SystemExit(f"expected exactly one HID device, got {descs}")
+        raise SystemExit(f"expected exactly one fapico2 HID device, got {descs}")
     conn = open_connection(descs[0])
 
     def xchg(payload):
@@ -206,7 +218,15 @@ def drain_ring(vid=None, pid=None):
         n = int.from_bytes(pkt[5:7], "big")
         return pkt[7:7 + n]
 
-    hdr = xchg(b"\x01")
+    # The documented first-drain-after-boot flake: the first header exchange
+    # can be answered by the CTAP_READ_CONFIG 00 reply; retry before giving up
+    # (US-1761 audit residuals).
+    hdr = b""
+    for _ in range(4):
+        hdr = xchg(b"\x01")
+        if len(hdr) >= 6:
+            break
+        time.sleep(0.5)
     if len(hdr) < 6:
         raise SystemExit(f"drain refused ({hdr.hex()}) — is this the apdu-trace build?")
     count = struct.unpack_from("<I", hdr, 0)[0]
@@ -256,7 +276,7 @@ def render(buf, out):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", help="write the decoded ring dump here")
-    ap.add_argument("--legs", default="A,B,C,G,E,D,F",
+    ap.add_argument("--legs", default="A,B,C,G,E,D",  # F excluded: invalid as scripted, see the docstring
                     help="comma-separated legs to run (default: all, in order)")
     ap.add_argument("--no-drain", action="store_true", help="skip the ring drain")
     args = ap.parse_args(argv)

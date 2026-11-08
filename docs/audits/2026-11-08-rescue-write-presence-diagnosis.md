@@ -25,16 +25,23 @@ altogether.**
 
 ## The evidence, leg by leg
 
-All SW values from the probe transcript (`legs-run-stdout.log`); every claim
-below is cross-checked against the ring dump (`full-ring-dump.txt`), where
-`Window/Press/Armed/Discarded/Grant` are the runtime's own records.
+SW values from the probe transcripts and the ring; every claim below is
+cross-checked against the ring dump (`full-ring-dump.txt`), where
+`Window/Press/Armed/Discarded/Grant` are the runtime's own records. One
+capture gap, recorded honestly: `legs-run-stdout.log` starts at leg B (leg F's
+trip aborted the capture and leg A was re-run separately), so leg A's SW and
+timing claims trace to the ring records alone (seq 231–247). Wall-clock
+durations quoted in the audits (e.g. "2.4 s") are the interactive probe
+runs' own prints; the ring stamps are exchange-*completion* times, so
+arrival-based durations derived from the ring are inferences, not
+measurements.
 
 | leg | flow | retry SW | what the ring shows |
 |---|---|---|---|
 | A (press early) | WRITE → press → retry +1 s | **6985** | window at t=1024707; the retry's APDU left **before** the first press (t=1027365, operator reaction ≈2.7 s); presses armed at 1027365…1039532 — all after the retry was already answered |
 | B (press middle) | WRITE → press ~7 s → retry | **9000** | Window 353860; 7× Press→Armed 356368–361813; **Grant 362362** (latency 549 ms) |
-| C (press late) | WRITE → press ~13 s → retry | **9000** | Window 362524; 9× Press→Armed; **Grant 376025** (latency 190 ms) — the retry 13.5 s after the window opened, still inside 15 s |
-| G (press, retry +11 s — the H2 variant) | WRITE → press → retry ~12 s after open | **9000** | Window 376185; 9× Press→Armed 377621–386844; **Grant 388186** (latency 1342 ms). **Caveat, recorded honestly:** the operator pressed repeatedly during the 11 s wait, so the *last* arm was only 1.3 s old — this leg did **not** isolate the 10 s expiry; the expiry is instead visible structurally (below) |
+| C (press late) | WRITE → press ~13 s → retry | **9000** | Window 362524; 10× Press→Armed; **Grant 376025** (latency 190 ms) — the retry 13.5 s after the window opened, still inside 15 s |
+| G (press, retry +11 s — the H2 variant) | WRITE → press → retry ~12 s after open | **9000** | Window 376185; 10× Press→Armed 377621–386844; **Grant 388186** (latency 1342 ms). **Caveat, recorded honestly:** the operator pressed repeatedly during the 11 s wait, so the *last* arm was only 1.3 s old — this leg did **not** isolate the 10 s expiry; the expiry is instead visible structurally (below) |
 | E (held before the WRITE) | hold → WRITE → release → retry | 6985 then **9000** | the held press produced **no edge while pending** (anti-harvest correct, one-shot `6985` immediately); the retry's grant came from a post-release press arming the still-open window |
 | D (no press) | WRITE → 17 s → WRITE | 6985 / **6985** | Window 129424 (fresh) after the first window's 15 s expiry; **no Press/Armed anywhere in the leg** — a no-press window opens, expires, and the next WRITE opens a fresh one |
 | F (foreign CTAPHID window) | U2F REGISTER → WRITE → press → retry | *(probe crashed)* | the raw CTAPHID MSG frame was answered `06` and the CCID T=1 session reset — CTAP1 is not servable over `CTAPHID_MSG` yet (AGENTS.md §4), so the leg as scripted is invalid on this build. H3(b)'s no-theft refusal stays pinned by the host logic suite (`hid_and_ccid_tag_domains_never_join`) |
