@@ -166,3 +166,39 @@ def test_the_default_mode_still_auto_acks(tmp_path):
         # And the trace channel exists but holds nothing: no hook is
         # installed outside window mode.
         assert read_trace(emu.client) == ""
+
+
+# -- US-1762 (RESCUE-WRITE-PRESENCE, Shape A): the blocking rescue gate -------
+#
+# The device's rescue gate is now the US-914 blocking wait (10 s, D-5): the
+# first WRITE waits for the press inside the APDU. The emulator mirrors it
+# (`FAPICO2_RESCUE_PRESENCE=block`, `emul_rescue_block_grant`). The
+# press-during-the-wait leg is NOT drivable here — the emulator is
+# single-threaded, so while the WRITE blocks, the serve loop cannot read the
+# CCID control channel a press rides on; the timeout leg is, and the press
+# path is `wait_grant`'s own (presence suite) plus US-1766's hardware
+# re-ceremony.
+
+def test_block_mode_times_out_as_6985(tmp_path):
+    """No press: the blocking WRITE waits its 10 s bound, then answers 6985."""
+    with RescueEmu("presence", tmp_path,
+                   extra_env={"FAPICO2_RESCUE_PRESENCE": "block"}) as emu:
+        _, sw = emu.select()
+        assert sw == 0x9000
+
+        t0 = time.monotonic()
+        _, sw = emu.send(BRIGHTNESS_WRITE)
+        elapsed = time.monotonic() - t0
+        assert sw == 0x6985, "the no-press timeout must answer byte-exact 6985"
+        assert 9.5 <= elapsed < 19, (
+            f"the wait must hold ~10 s (the D-5 bound), took {elapsed:.1f}s"
+        )
+
+        # The blocking shape opens no cross-call window and arms nothing.
+        trace = parse_trace(read_trace(emu.client))
+        assert trace == [], f"no events expected on a timed-out wait: {trace}"
+
+        # And the write did not happen.
+        blob, sw = emu.send(READ_PHY_P2_ONE)
+        assert sw == 0x9000
+        assert parse_phy(blob).get(TAG_LED_BRIGHTNESS) != bytes([0x40])

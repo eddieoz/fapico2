@@ -173,6 +173,31 @@ pub fn nostr_wait_grant(tag: u32) -> bool {
     blocking_touch_wait(tag, PSO_TOUCH_WINDOW_MS)
 }
 
+/// US-1762 (RESCUE-WRITE-PRESENCE, Shape A): the Rescue applet's device
+/// gate — the same blocking wait under the WRITE command's own tag. The
+/// join-or-open cross-call window it replaced is correct logic that a real
+/// client and a real human cannot hit: the US-1761 hardware trace excluded
+/// H1 and H3 outright (ten windows, ten clean opens; over sixty
+/// Press→Armed pairs, none lost) and pinned the surviving failure mode —
+/// the client's retry lands when it lands, and the armed grant lives only
+/// 10 s after the press (`PRESENCE_WINDOW_MS`) while the window lives 15 s.
+/// Measured: the operator's press came 2.7 s after LED-solid (after the
+/// client's retry had already been answered) or the retry followed the last
+/// press by more than the grant's life — the press arms a window nobody
+/// consumes, and the operator sees `6985` with their finger inside the lit
+/// period. Blocking converts the press **inside the first APDU**: no
+/// cross-call grant exists for a client to miss, and the no-press timeout
+/// still answers `6985` byte-exactly.
+///
+/// The bound is the lib's [`RESCUE_WRITE_WAIT_MS`] — 10 s (`D-5`: the
+/// PSO/nostr precedent — the same CCID transport, the same ~14.5 s libccid
+/// abort ceiling; WTX does not exist on this tree) — kept beside the other
+/// window constants so the emulation's block mode waits on the same
+/// number the board does.
+pub fn rescue_wait_grant(tag: u32) -> bool {
+    blocking_touch_wait(tag, fapico2_firmware::presence::RESCUE_WRITE_WAIT_MS)
+}
+
 /// The shared touch-wait body (US-914's mechanism): light the touch
 /// prompt, block the serve task for at most `window_ms` waiting for a
 /// BOOTSEL press *edge* under `tag`, clear the prompt. The pad is sampled

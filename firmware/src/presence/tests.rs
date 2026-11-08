@@ -704,11 +704,12 @@ fn presence_events_are_stamped_per_grant() {
     let _g = TEST_LOCK.lock().unwrap();
     let _ = event_log_take(); // drop anything an earlier test left
 
-    // The sink is write-once, and this is the only test that installs it.
-    assert!(
-        super::set_presence_event_hook(Some(record_event)),
-        "the first event-hook install must win"
-    );
+    // The sink is write-once. US-1762: this test no longer assumes it
+    // installs first — the US-1760/US-1762 scenario tests install
+    // tolerantly and sort earlier — so the install is attempted, and the
+    // property asserted is the one that holds regardless of order: a
+    // second install on the SAME hook is refused.
+    let _ = super::set_presence_event_hook(Some(record_event));
     assert!(
         !super::set_presence_event_hook(Some(record_event)),
         "the event hook is write-once — a second install must be refused"
@@ -1696,4 +1697,84 @@ fn a_retry_later_than_the_armed_grants_expiry_is_refused() {
     assert!(!rt.window_grant(INS_WRITE_TAG), "already consumed");
     assert_eq!(rt.stats().grants, 0);
     rt.end_request(INS_WRITE_TAG);
+}
+
+// ── US-1762 (RESCUE-WRITE-PRESENCE, Shape A): the blocking rescue gate ──────
+//
+// US-1761's hardware trace pinned the failure as the cross-call retry
+// contract's timing, so the Rescue applet's gate became the US-914 blocking
+// wait (`button::rescue_wait_grant` → `wait_grant`, bound
+// `RESCUE_WRITE_WAIT_MS`). These are that contract's scenarios on the host —
+// green as written (the wait_grant machinery is US-914's, already proven);
+// they pin the rescue tag's shape and the D-5 bound so a regression in
+// either is a test failure, not a ceremony.
+
+/// Scenario (US-1763's end-to-end flow, blocking contract): the first WRITE
+/// **waits** for the press and completes inside the request — no cross-call
+/// window, one Armed, one consumed Grant, nothing left over.
+#[test]
+fn the_first_rescue_write_waits_for_the_press_and_grants_inside_the_request() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(70_000);
+    // Entry sample not-pressed, then the operator's press holds.
+    queue_levels([false, true, true, true]);
+    let mut rt = runtime();
+    assert!(
+        rt.wait_grant(INS_WRITE_TAG, super::RESCUE_WRITE_WAIT_MS, paced_level),
+        "the press inside the wait grants the SAME APDU that opened the wait"
+    );
+    let evs = event_log_take();
+    let kinds: Vec<_> = evs.iter().map(|e| (e.kind, e.tag)).collect();
+    assert_eq!(
+        kinds,
+        vec![(K::Armed, INS_WRITE_TAG), (K::Grant, INS_WRITE_TAG)],
+        "exactly one arm and one consumed grant, both under INS_WRITE — \
+         no Window event: the blocking shape opens no cross-call window"
+    );
+    // And the slot is released: the next command can begin.
+    assert!(rt.begin_request(INS_WRITE_TAG));
+    rt.end_request(INS_WRITE_TAG);
+}
+
+/// The no-press timeout: fail-closed after `RESCUE_WRITE_WAIT_MS`, no
+/// events at all, slot released. On the wire this is the byte-exact `6985`.
+#[test]
+fn a_rescue_write_with_no_press_answers_6985_after_the_wait() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(80_000);
+    queue_levels([]); // every poll reads "not pressed"
+    let mut rt = runtime();
+    assert!(
+        !rt.wait_grant(INS_WRITE_TAG, super::RESCUE_WRITE_WAIT_MS, paced_level),
+        "no press inside the bound ⇒ fail-closed (the 6985 timeout)"
+    );
+    assert!(
+        event_log_take().is_empty(),
+        "a timed-out wait arms nothing and consumes nothing"
+    );
+    assert!(rt.begin_request(INS_WRITE_TAG), "the slot was released");
+    rt.end_request(INS_WRITE_TAG);
+}
+
+/// D-5's bound, as a test: the blocking rescue wait is 10 s — under the
+/// observed ~14.5 s libccid T=1 abort ceiling, above nothing arbitrary. If
+/// this constant ever moves, the move is a deliberate transport argument,
+/// not a typo.
+#[test]
+fn the_rescue_blocking_bound_stays_under_the_libccid_abort_ceiling() {
+    assert_eq!(super::RESCUE_WRITE_WAIT_MS, 10_000);
+    assert!(
+        super::RESCUE_WRITE_WAIT_MS < 14_500,
+        "a blocking APDU must time out before the host's T=1 abort (~14.5 s)"
+    );
+    assert!(
+        super::RESCUE_WRITE_WAIT_MS < super::CCID_WINDOW_MS,
+        "the in-APDU bound is stricter than the cross-call window's 15 s"
+    );
 }
