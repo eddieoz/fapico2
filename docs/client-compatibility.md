@@ -137,3 +137,24 @@ is solid while the device is waiting: press while it is solid and save
 again; under the blocking contract the very next save completes inside its
 own request. The raw-hex rendering is PicoForge's own bypass of its SW table
 (follow-up 1 above), not a firmware status word this firmware invented.
+
+### PIN-less first-run config-save matrix (US-1765, hardware-verified 2026-11-08)
+
+On a fresh board with **no PIN set**, the configuration-save matrix against
+the D4 tiers (`apps/fido/src/vendor41.rs`), verified by driving both
+transports deliberately (CCID is always enumerated; the "FIDO route" means
+the client driving config over the HID transport):
+
+| route | tier | result, no PIN | what the operator does |
+|---|---|---|---|
+| Rescue (CCID) | benign — LED GPIO/brightness/options | `9000` via touch | press when the LED goes solid ("Press the device button to confirm"); the blocking wait holds ≤10 s |
+| Rescue (CCID) | identity — VID/PID, USB strings | `9000` via touch | the same — the rescue applet is the **recovery** surface; a forgotten PIN must not forfeit the identity repair, so no tier exists there |
+| FIDO (`0x41`) | benign | `9000` via touch | "Touch your device if it flashes" — the vendor command opens a keepalive window under the HID channel tag; the press arms it (trace: `Window(0x8000_0013) → Press → Armed → Grant`, 84 ms latency) |
+| FIDO (`0x41`) | identity | **`0x36` instantly, no touch asked** | PicoForge's "Authentication Required" dialog is the correct UX — the strongest gate in the `0x41` dialect is not downgraded for first-run convenience |
+
+The coherent PIN-less path for identity writes: set a PIN on the Passkeys
+screen, then retry — the client mints an `acfg` `pinUvAuthToken` and the
+write succeeds (the token handshake is what `scripts/fix_usb_identity.py
+write` performs; the matrix run verified the refusal side live and left the
+token side to that tooling, since the board under test was PIN-less by
+precondition).
