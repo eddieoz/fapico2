@@ -63,10 +63,14 @@
 //!
 //! # Emulation hook status
 //!
-//! [`emul_inject_press`] is currently **host-test-only**: the `fapico2-emulation`
-//! bin does not attach the shared runtime (its auto-ack default keeps the
-//! existing e2e suites green). Wiring the emulation bin to the runtime with
-//! injected presses is deferred to the US-920/US-924 scope.
+//! [`emul_inject_press`] is host-test-only **by default**: the
+//! `fapico2-emulation` bin attaches the shared runtime at boot, but its rescue
+//! app keeps the host auto-ack unless `FAPICO2_RESCUE_PRESENCE=window` is set —
+//! then the app's grant IS the shared [`window_grant`] (the device's own
+//! injection), the serve loop drains the latch once per iteration (the button
+//! task's tick), a CCID body `0x50` injects one press edge, and a CCID body
+//! `0x51` returns the ordered [`PresenceEvent`] trace (`emul_main.rs`, US-1759).
+//! The default stays auto-ack so the existing e2e suites are byte-identical.
 //!
 //! # The presence handshake, instrumented (US-1020)
 //!

@@ -39,6 +39,74 @@ use fapico2_firmware::pending_up::PendingUp;
 use heapless::Vec as HeaplessVec;
 use fapico2_fido::CTAP2_MAX_MSG;
 
+// US-1759: the ordered presence-event trace, and the emulation control codes
+// that drive the rescue WRITE presence window over the harness CCID socket.
+//
+// The emulation's FIDO and OATH presence stand-ins alternate/auto-ack inside
+// the app (the documented `emul_touch_lands_in_window` shape), so the *shared*
+// presence runtime — the thing the board's button task and `window_grant`
+// drive — was never exercised end to end: the rescue app auto-acked and the
+// one consent gate a recovery surface actually has was un-exercisable here
+// (the same hole US-132 closed for OATH and US-1646 for Nostr). The runtime
+// IS attached (it has been since US-921's parity work), so wiring the rescue
+// app to it takes one knob plus a way to press the button the emulator does
+// not have:
+//
+// * `FAPICO2_RESCUE_PRESENCE=window` — the rescue app's grant becomes the
+//   shared runtime's `window_grant` (the device's own injection,
+//   `main.rs:1247`), and the serve loop drains the press latch once per
+//   iteration (the button task's 10 ms tick, at the loop's 1 ms cadence).
+//   Unset keeps the host auto-ack exactly as every existing suite sees it.
+// * CCID body `0x50` — inject one press edge (`emul_inject_press`). Window
+//   mode only: in the default mode nothing drains the latch, so a press
+//   injected there would sit stale.
+// * CCID body `0x51` — the ordered presence-event trace so far, as text
+//   lines, on the same socket. The runtime already `note()`s every
+//   Window/Press/Armed/Discarded/Grant with tag and clock; the harness reads
+//   the log instead of reconstructing it.
+//
+// Both control bodies are one-byte CCID payloads — no APDU starts with
+// `0x50`/`0x51` on this surface (CLA is `0x00` or `0x80`), and they are
+// emulation-binary control codes that never exist on a device wire.
+static EMUL_PRESENCE_TRACE: std::sync::Mutex<Vec<fapico2_firmware::presence::PresenceEvent>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The emulation's presence-event sink: append to the ordered trace. The
+/// runtime publishes every event it `note()`s here when the hook is
+/// installed (window mode only).
+fn emul_presence_event_sink(ev: fapico2_firmware::presence::PresenceEvent) {
+    if let Ok(mut q) = EMUL_PRESENCE_TRACE.lock() {
+        q.push(ev);
+    }
+}
+
+/// The trace as text lines — `Kind tag=0xTAG t=NOWms delta=DELTAms`, one
+/// event per line, oldest first. Text, not a binary format: the harness
+/// asserts on kinds, tags and their order, and a human reading a failing
+/// run's log should not need a decoder.
+fn presence_trace_text() -> Vec<u8> {
+    use fapico2_firmware::presence::PresenceEventKind as K;
+    let q = match EMUL_PRESENCE_TRACE.lock() {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = String::new();
+    for ev in q.iter() {
+        let kind = match ev.kind {
+            K::Press => "Press",
+            K::Armed => "Armed",
+            K::Discarded => "Discarded",
+            K::Window => "Window",
+            K::Grant => "Grant",
+        };
+        out.push_str(&format!(
+            "{} tag=0x{:08X} t={}ms delta={}ms\n",
+            kind, ev.tag, ev.now_ms, ev.delta_ms
+        ));
+    }
+    out.into_bytes()
+}
+
 /// US-711 emulation parity: the emulation stand-in for the device's
 /// `boot::RESET_GENERATION` counter (`firmware/src/boot.rs`). The factory
 /// reset handler below bumps it; the serve loop observes it at the same
@@ -398,6 +466,19 @@ fn main() {
         fapico2_firmware::presence::init(emul_now_ms),
         "presence runtime double-init"
     );
+    // US-1759: the rescue-WRITE window mode. Opt-in (see the trace block
+    // above); the hook is write-once, so the install sits here at boot next
+    // to `init`, before any traffic — the same boot discipline the device
+    // bin keeps for its own hook.
+    let rescue_presence_window =
+        matches!(std::env::var("FAPICO2_RESCUE_PRESENCE").as_deref(), Ok("window"));
+    if rescue_presence_window {
+        assert!(
+            fapico2_firmware::presence::set_presence_event_hook(Some(emul_presence_event_sink)),
+            "presence event hook double-init"
+        );
+        eprintln!("rescue presence: shared runtime window_grant (FAPICO2_RESCUE_PRESENCE=window)");
+    }
     // FAPICO2_HID_PORT lets the restart tests run a private instance.
     let hid_port = std::env::var("FAPICO2_HID_PORT")
         .ok()
@@ -696,6 +777,15 @@ fn main() {
         .with_device_handler(unsafe {
             &mut *core::ptr::addr_of_mut!(EMUL_RESCUE_DEVICE_HANDLER)
         });
+    // US-1759: in window mode the rescue app's grant IS the shared runtime's
+    // join-or-open gate — the device's own injection (`main.rs:1247`), so the
+    // emulator exercises the same service, the same single pending slot and
+    // the same tag binding the board does. Unset keeps the host auto-ack
+    // (`default_user_present()`), which is what every existing suite runs on.
+    if rescue_presence_window {
+        rescue_app = rescue_app
+            .with_presence_grant(fapico2_firmware::presence::window_grant);
+    }
     // US-1643: the Nostr applet's key-region stand-in — a `FileKeyRegion`
     // over a host file, the emulator's fifth-handle analogue. The file
     // persists across emulator restarts exactly as the partition image does
@@ -753,6 +843,7 @@ fn main() {
             &mut dispatcher,
             &mut store,
             &partition_path,
+            rescue_presence_window,
         );
     });
 }
@@ -995,6 +1086,7 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
     dispatcher: &mut Dispatcher<8>,
     store: &mut HostSecureStore,
     partition_path: &std::path::Path,
+    rescue_presence_window: bool,
 ) {
     let mut resp_buf = HeaplessVec::<u8, MAX_RESPONSE>::new();
     // US-1524: the shared serve loop's state. `HidServe` owns the CTAP-HID
@@ -1037,6 +1129,20 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
                     0x31, 0xF5, 0x73, 0xC0, 0x01, 0x60, 0x00, 0x90, 0x00, 0x1C,
                 ]; // C parity: atr_openpgp (openpgp.c:294), T=1
                 if let Err(e) = transport.write_ccid(atr) {
+                    eprintln!("ccid write error: {}", e);
+                    running = false;
+                    continue;
+                }
+            } else if rescue_presence_window && frame.len() == 1 && frame[0] == 0x50 {
+                // US-1759: one press edge into the shared latch. No reply —
+                // the button is not a request/response surface; the next
+                // loop iteration's drain tick observes the edge, exactly as
+                // the device's button task does within one 10 ms tick.
+                fapico2_firmware::presence::emul_inject_press();
+            } else if frame.len() == 1 && frame[0] == 0x51 {
+                // US-1759: the ordered presence-event trace so far.
+                let trace = presence_trace_text();
+                if let Err(e) = transport.write_ccid(&trace) {
                     eprintln!("ccid write error: {}", e);
                     running = false;
                     continue;
@@ -1108,6 +1214,16 @@ fn serve_loop<K: fapico2_fido::keystore::Keystore>(
         // encoded was reproducible in the emulator and fixed only on the
         // device.
         serve_pass(&mut srv, &mut EmulLink { transport }, &mut app, &mut slot);
+
+        // US-1759: the button task's tick, in window mode — one drain per
+        // serve iteration so a latched press edge arms the pending window on
+        // the next pass (the device's button task does this every 10 ms; the
+        // loop's 1 ms sleep is this build's cadence). In the default mode the
+        // latch is never set by anything, so the tick stays window-mode-only
+        // and the default behavior is untouched.
+        if rescue_presence_window {
+            fapico2_firmware::presence::drain_press();
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
