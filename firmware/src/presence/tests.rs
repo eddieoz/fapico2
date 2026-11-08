@@ -1423,3 +1423,277 @@ fn nostr_window_tag_domain_check_is_exact() {
     );
     assert!(!is_nostr_window_tag(0x1C), "the mgmt/rescue inventory is not ours");
 }
+
+// ── US-1760 (EPIC RESCUE-WRITE-PRESENCE): the CCID WRITE window scenarios ──
+//
+// The BDD scenarios of the EPIC, as host tests over the shared runtime's
+// join-or-open gate (`window_grant`) — the code the rescue applet's WRITE
+// gate reaches through `with_presence_grant`. The tag is the rescue applet's
+// `INS_WRITE` (`apps/rescue/src/lib.rs:431`); spelled here as the constant so
+// the presence suite does not grow a dependency on the applet crate.
+//
+// **Scope honesty (US-1760's review amendment):** these validate the *logic
+// contract* of the presence service, not device scheduling. A green host run
+// does NOT reproduce H1 (button-task starvation) or H3-by-concurrency (a
+// foreign window holding the slot); the twin-trap record for this epic is
+// that the headline scenario is expected to be green here — the device/host
+// divergence is scheduling-side, and US-1761 (the hardware trace) carries the
+// diagnosis. If one of these is RED on the host, the logic itself is broken
+// and the fix is host-verifiable end to end.
+//
+// They are `#[ignore]`d as written (RED-first discipline): US-1762/US-1763
+// flip them.
+
+const INS_WRITE_TAG: u32 = 0x1C;
+
+/// Scenario: a press during an open CCID WRITE window arms the retry.
+///
+/// ```gherkin
+/// Given a rescue WRITE APDU has been refused with 0x6985
+/// And the presence window for tag INS_WRITE is open
+/// When the operator presses the button while the window is open
+/// Then the presence trace records Press followed by Armed(tag=INS_WRITE)
+/// And a second WRITE APDU joins the open window and answers 0x00
+/// ```
+#[test]
+#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
+fn a_press_during_an_open_ccid_write_window_arms_the_retry() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins, and the later
+    // tests share it. Attempted here (not asserted) because test order must
+    // not decide who owns the install.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(10_000);
+    let mut rt = runtime();
+
+    // Given: the first WRITE was refused 0x6985 and left the window open
+    // under INS_WRITE.
+    assert!(
+        !rt.window_grant(INS_WRITE_TAG),
+        "the first attempt is the 0x6985 that opens the window"
+    );
+    assert_eq!(rt.pending_tag(), Some(INS_WRITE_TAG));
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| (e.kind, e.tag)).collect::<Vec<_>>(),
+        vec![(K::Window, INS_WRITE_TAG)]
+    );
+
+    // When: the operator presses while the window is open.
+    tick_to(10_500);
+    emul_inject_press();
+    assert!(rt.poll_press(), "the press must be seen while pending");
+
+    // Then: Press followed by Armed(tag=INS_WRITE) on the trace.
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| (e.kind, e.tag)).collect::<Vec<_>>(),
+        vec![(K::Press, 0), (K::Armed, INS_WRITE_TAG)],
+        "the trace records Press then Armed, bound to INS_WRITE"
+    );
+
+    // And: the second WRITE APDU joins the open window and answers 0x00.
+    assert!(
+        rt.window_grant(INS_WRITE_TAG),
+        "the retry joins the open window and is granted"
+    );
+    let evs = event_log_take();
+    assert_eq!(evs.iter().map(|e| e.kind).collect::<Vec<_>>(), vec![K::Grant]);
+    assert_eq!(
+        rt.pending_tag(),
+        None,
+        "the grant consumed and closed the window"
+    );
+}
+
+/// Scenario: a press with no open window is discarded.
+///
+/// ```gherkin
+/// Given no presence request is pending
+/// When the operator presses the button
+/// Then the trace records Press followed by Discarded
+/// And no grant is armed
+/// ```
+#[test]
+#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
+fn a_press_with_no_open_window_is_discarded() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins, and the later
+    // tests share it. Attempted here (not asserted) because test order must
+    // not decide who owns the install.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(20_000);
+    let mut rt = runtime();
+
+    // When: a press with nothing pending (the button task's idle tick).
+    emul_inject_press();
+    assert!(!rt.poll_press());
+
+    // Then: Press followed by Discarded; no grant is armed.
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![K::Press, K::Discarded]
+    );
+    assert!(rt.request(INS_WRITE_TAG).is_none(), "no grant to serve");
+    assert_eq!(rt.pending_tag(), None, "nothing was pending and nothing is");
+}
+
+/// Scenario: a press after the window expired is discarded.
+///
+/// ```gherkin
+/// Given a rescue WRITE window was opened and its 15 s deadline has passed
+/// When the operator presses the button
+/// Then the trace records Press followed by Discarded
+/// And the next WRITE APDU opens a fresh window and answers 0x6985
+/// ```
+#[test]
+#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
+fn a_press_after_the_window_expired_is_discarded() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins, and the later
+    // tests share it. Attempted here (not asserted) because test order must
+    // not decide who owns the install.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(30_000);
+    let mut rt = runtime();
+
+    // Given: the window is open and its 15 s deadline passes.
+    assert!(!rt.window_grant(INS_WRITE_TAG));
+    let _ = event_log_take();
+    tick_to(30_000 + CCID_WINDOW_MS as u32 + 1_000);
+
+    // When: the operator presses after the deadline — the button task's
+    // expiry sweep closes the window first, and the late press finds
+    // nothing pending.
+    emul_inject_press();
+    assert!(!rt.poll_press());
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![K::Press, K::Discarded]
+    );
+
+    // Then: the next WRITE opens a *fresh* window and answers 0x6985.
+    assert!(!rt.window_grant(INS_WRITE_TAG));
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| (e.kind, e.tag)).collect::<Vec<_>>(),
+        vec![(K::Window, INS_WRITE_TAG)],
+        "a fresh window, not the expired one"
+    );
+    rt.end_request(INS_WRITE_TAG);
+}
+
+/// Scenario: a press held before the window opened is not consent.
+///
+/// ```gherkin
+/// Given the button is held down before the WRITE APDU arrives
+/// When the window opens and the APDU polls once
+/// Then no edge is observed while pending and the APDU answers 0x6985
+/// ```
+#[test]
+#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
+fn a_press_held_before_the_window_opened_is_not_consent() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins, and the later
+    // tests share it. Attempted here (not asserted) because test order must
+    // not decide who owns the install.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(40_000);
+    let mut rt = runtime();
+
+    // Given: the button is held down before the WRITE APDU arrives — the
+    // edge latched while nothing was pending, and the button task's tick
+    // drains it (anti-harvest: a press that predates the request is not
+    // consent for it).
+    emul_inject_press();
+    assert!(!rt.poll_press(), "the idle tick discards the held press");
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![K::Press, K::Discarded]
+    );
+
+    // When: the window opens and the APDU polls once — no *edge* is
+    // observed while pending (the latch is clear; a held button produces
+    // no new edge).
+    assert!(
+        !rt.window_grant(INS_WRITE_TAG),
+        "0x6985: the held press must not arm the window"
+    );
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![K::Window],
+        "one window, no arm"
+    );
+    rt.end_request(INS_WRITE_TAG);
+}
+
+/// Scenario: a retry later than the armed grant's expiry is refused.
+///
+/// ```gherkin
+/// Given a press armed the grant at t
+/// When the client re-sends the WRITE APDU more than 10 s after the press
+/// And the window deadline has not passed
+/// Then the APDU answers 0x6985 and the trace shows the expired grant consumed
+/// ```
+///
+/// This is the EPIC's H2 expiry variant, as a logic contract: the armed
+/// grant lives `PRESENCE_WINDOW_MS` (10 s) from the press while the window
+/// lives 15 s — the gap where a correct operator fails.
+#[test]
+#[ignore = "US-1760 RED — flipped green by US-1762/US-1763 (RESCUE-WRITE-PRESENCE)"]
+fn a_retry_later_than_the_armed_grants_expiry_is_refused() {
+    use super::PresenceEventKind as K;
+    let _g = TEST_LOCK.lock().unwrap();
+    // The sink is write-once; whoever installs first wins, and the later
+    // tests share it. Attempted here (not asserted) because test order must
+    // not decide who owns the install.
+    let _ = super::set_presence_event_hook(Some(record_event));
+    let _ = event_log_take();
+    tick_to(50_000);
+    let mut rt = runtime();
+
+    // Given: a press armed the grant at t = 53 s (window deadline 65 s,
+    // grant deadline 63 s).
+    assert!(!rt.window_grant(INS_WRITE_TAG));
+    let _ = event_log_take();
+    tick_to(53_000);
+    emul_inject_press();
+    assert!(rt.poll_press());
+    let evs = event_log_take();
+    assert_eq!(
+        evs.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![K::Press, K::Armed]
+    );
+
+    // When: the retry comes more than 10 s after the press but before the
+    // window's own deadline.
+    tick_to(64_000);
+    assert!(
+        !rt.window_grant(INS_WRITE_TAG),
+        "the armed grant expired 10 s after the press"
+    );
+
+    // Then: the trace shows the expired grant consumed — no `Grant` event
+    // was emitted, and the consumption is real: a retry even one tick later
+    // still finds nothing, so the earlier request is what ate the grant.
+    assert!(
+        event_log_take().iter().all(|e| e.kind != K::Grant),
+        "an expired grant is consumed silently — it never reports consent"
+    );
+    tick_to(64_500);
+    assert!(!rt.window_grant(INS_WRITE_TAG), "already consumed");
+    assert_eq!(rt.stats().grants, 0);
+    rt.end_request(INS_WRITE_TAG);
+}
