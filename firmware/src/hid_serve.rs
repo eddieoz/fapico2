@@ -1537,6 +1537,19 @@ pub async fn serve_once_dual<S: HidIo, A: FidoDispatch, N: NostrDispatch>(
                         asm_f.payload().len() as u16,
                         u32::from_be_bytes(channel),
                     );
+                    // US-922: the diagnostic ring's drain lives on the FIDO
+                    // interface only — the same check `serve_once` makes
+                    // below. `serve_loop_dual` (US-1660) never carried it,
+                    // which is how the US-933 capture procedure's drain died
+                    // on hardware while every host test stayed green: the
+                    // emulator drives `serve_once`, the board drives this
+                    // loop. **FIDO arm only** — on the Nostr interface
+                    // `0x42` is a Nostr vendor command (US-1642's dialect),
+                    // and a frame there must never reach the FIDO dispatch.
+                    #[cfg(any(feature = "dbg-log", feature = "apdu-trace", feature = "boot-timeline"))]
+                    if io_f.debug_drain(cmd, &channel, asm_f.payload()).await {
+                        return;
+                    }
                     app.sync_generations();
                     dispatch(
                         cid_f,
