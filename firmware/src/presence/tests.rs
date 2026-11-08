@@ -1454,7 +1454,7 @@ const INS_WRITE_TAG: u32 = 0x1C;
 /// Scenario: a press during an open CCID WRITE window arms the retry.
 ///
 /// ```gherkin
-/// Given a rescue WRITE APDU has been refused with 0x6985
+/// Given a CCID WRITE APDU (mgmt/OATH/OTP — see the re-scope note above) has been refused with 0x6985
 /// And the presence window for tag INS_WRITE is open
 /// When the operator presses the button while the window is open
 /// Then the presence trace records Press followed by Armed(tag=INS_WRITE)
@@ -1549,7 +1549,7 @@ fn a_press_with_no_open_window_is_discarded() {
 /// Scenario: a press after the window expired is discarded.
 ///
 /// ```gherkin
-/// Given a rescue WRITE window was opened and its 15 s deadline has passed
+/// Given a CCID WRITE window was opened and its 15 s deadline has passed
 /// When the operator presses the button
 /// Then the trace records Press followed by Discarded
 /// And the next WRITE APDU opens a fresh window and answers 0x6985

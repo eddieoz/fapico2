@@ -79,6 +79,16 @@ already missed, and a final `6985`.
   the device-side half of the same event, and the operator's statement is
   recorded verbatim as the client-side half.
 
+## Artifact provenance
+
+The proof-directory artifacts (`shape-a-first-press-trace.txt`,
+`final-ring-dump.txt`) were rendered by the session's inline decoder (hex
+`a=/b=` fields for named events), while the diagnosis directory's came from
+`scripts/rescue_write_probe.py`'s renderer (decimal `b=`); same ring layout,
+same values — the proof audit decimalizes when quoting. Wall-clock durations
+in this audit are the interactive probe runs' own prints; ring stamps are
+exchange-completion times.
+
 ## Verification record (EPIC §Verification record)
 
 | field | value |
