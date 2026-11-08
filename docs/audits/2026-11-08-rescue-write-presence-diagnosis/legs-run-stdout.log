@@ -1,0 +1,60 @@
+  [middle] WRITE -> 6985 (window should now be open)
+    >>> PRESS THE BUTTON NOW (middle leg)
+    ... waiting 0.5s before the retry
+  [middle] retry WRITE -> 9000 (GRANTED)
+
+==============================================================
+Leg C — press LATE in the window (~13 s of 15)
+==============================================================
+  [late] WRITE -> 6985 (window should now be open)
+    >>> PRESS THE BUTTON NOW (late leg)
+    ... waiting 0.5s before the retry
+  [late] retry WRITE -> 9000 (GRANTED)
+
+==============================================================
+Leg G — press EARLY, retry LATE (~12 s later: past the 10 s armed-grant expiry, inside the 15 s window — the H2 variant)
+==============================================================
+  [grant-expiry] WRITE -> 6985 (window should now be open)
+    >>> PRESS THE BUTTON NOW (grant-expiry leg)
+    ... waiting 11s before the retry
+  [grant-expiry] retry WRITE -> 9000 (GRANTED)
+
+==============================================================
+Leg E — the button is HELD before the WRITE (no edge while pending)
+==============================================================
+    >>> HOLD THE BUTTON DOWN NOW and keep holding until told
+  [held] WRITE (button still held) -> 6985
+    >>> you may release the button
+  [held] retry WRITE -> 9000 (GRANTED)
+
+==============================================================
+Leg D — no press; the 15 s window expires; the next WRITE opens a fresh one
+==============================================================
+  [no-press] WRITE -> 6985
+    ... hands OFF the button for 17 s
+  [no-press] WRITE after expiry -> 6985 (fresh window expected)
+
+==============================================================
+Leg F — a foreign (FIDO/CTAPHID) window holds the slot first (H3b)
+==============================================================
+  [foreign] U2F REGISTER (no touch) -> 06 (6985 expected; the FIDO window is now open)
+Traceback (most recent call last):
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/fapico2/scripts/rescue_write_probe.py", line 315, in <module>
+    main()
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/fapico2/scripts/rescue_write_probe.py", line 299, in main
+    leg_foreign_window(conn)
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/fapico2/scripts/rescue_write_probe.py", line 174, in leg_foreign_window
+    _, sw = apdu(conn, WRITE_PHY)
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/fapico2/scripts/rescue_write_probe.py", line 99, in apdu
+    data, sw1, sw2 = conn.transmit(list(raw))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/pico-fido2/.test-venv/lib/python3.12/site-packages/smartcard/CardConnectionDecorator.py", line 88, in transmit
+    return self.component.transmit(command, protocol)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/pico-fido2/.test-venv/lib/python3.12/site-packages/smartcard/CardConnection.py", line 179, in transmit
+    data, sw1, sw2 = self.doTransmit(command, protocol)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/tools/home/eddieoz/Projects/git/pico/pico-fido2/.test-venv/lib/python3.12/site-packages/smartcard/pcsc/PCSCCardConnection.py", line 307, in doTransmit
+    raise CardConnectionException(
+smartcard.Exceptions.CardConnectionException: Failed to transmit with protocol T1. Card was reset.: Card was reset. (0x80100068)
