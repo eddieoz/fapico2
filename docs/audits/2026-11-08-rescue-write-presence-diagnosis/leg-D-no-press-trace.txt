@@ -1,0 +1,42 @@
+seq=    0 t=     278ms T1 event= 40 a=0x6A4C57F4 b=0x00000000
+seq=    0 t=       0ms T0 event=  0 a=0x00000000 b=0x00000000
+seq=    1 t=  112423ms T1 event= 41 a=0x0000000D b=0x00000000
+seq=    2 t=  112423ms T1 event= 43 a=0x00A40404 b=0x08A0583F
+seq=    3 t=  112423ms T1 event= 43 a=0xC19B7E4F b=0x21000000
+seq=    4 t=  112423ms T1 event= 42 a=0x0000000E b=0x00009000
+seq=    5 t=  112423ms T1 event= 43 a=0x01020800 b=0x7C36644D
+seq=    6 t=  112423ms T1 event= 43 a=0xFF8A74C7 b=0x90000000
+seq=    7 t=  112424ms T2 Window    tag=0x0000001C b=112424
+seq=    8 t=  112424ms T1 event= 41 a=0x00000008 b=0x00000001
+seq=    9 t=  112424ms T1 event= 43 a=0x801C0100 b=0x03050140
+seq=   10 t=  112424ms T1 event= 42 a=0x00000002 b=0x00006985
+seq=   11 t=  112424ms T1 event= 43 a=0x69850000 b=0x00000000
+seq=   12 t=  129424ms T2 Window    tag=0x0000001C b=129424
+seq=   13 t=  129424ms T1 event= 41 a=0x00000008 b=0x00000002
+seq=   14 t=  129424ms T1 event= 43 a=0x801C0100 b=0x03050140
+seq=   15 t=  129424ms T1 event= 42 a=0x00000002 b=0x00006985
+seq=   16 t=  129424ms T1 event= 43 a=0x69850000 b=0x00000000
+seq=   17 t=  136601ms T2 Press     tag=0x00000000 b=136601
+seq=   18 t=  136601ms T2 Armed     tag=0x0000001C b=136601
+seq=   19 t=  141092ms T2 Press     tag=0x00000000 b=141092
+seq=   20 t=  141092ms T2 Armed     tag=0x0000001C b=141092
+seq=   21 t=  142328ms T2 Press     tag=0x00000000 b=142328
+seq=   22 t=  142328ms T2 Armed     tag=0x0000001C b=142328
+seq=   23 t=  143534ms T2 Press     tag=0x00000000 b=143534
+seq=   24 t=  143534ms T2 Armed     tag=0x0000001C b=143534
+seq=   25 t=  144091ms T1 event= 41 a=0x0000000D b=0x00000003
+seq=   26 t=  144091ms T1 event= 43 a=0x00A40404 b=0x08A0583F
+seq=   27 t=  144091ms T1 event= 43 a=0xC19B7E4F b=0x21000000
+seq=   28 t=  144091ms T1 event= 42 a=0x0000000E b=0x00009000
+seq=   29 t=  144091ms T1 event= 43 a=0x01020800 b=0x7C36644D
+seq=   30 t=  144091ms T1 event= 43 a=0xFF8A74C7 b=0x90000000
+seq=   31 t=  144091ms T2 Grant     tag=0x0000001C b=557
+seq=   32 t=  144251ms T1 event= 41 a=0x00000008 b=0x00000004
+seq=   33 t=  144251ms T1 event= 43 a=0x801C0100 b=0x03050140
+seq=   34 t=  144251ms T1 event= 42 a=0x00000002 b=0x00009000
+seq=   35 t=  144251ms T1 event= 43 a=0x90000000 b=0x00000000
+seq=   36 t=  161252ms T2 Window    tag=0x0000001C b=161252
+seq=   37 t=  161252ms T1 event= 41 a=0x00000008 b=0x00000005
+seq=   38 t=  161252ms T1 event= 43 a=0x801C0100 b=0x03050140
+seq=   39 t=  161252ms T1 event= 42 a=0x00000002 b=0x00006985
+seq=   40 t=  161252ms T1 event= 43 a=0x69850000 b=0x00000000
