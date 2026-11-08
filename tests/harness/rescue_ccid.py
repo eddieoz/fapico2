@@ -37,6 +37,11 @@ PORTS = {
     "read": (36003, 36004),
     "write": (36005, 36006),
     "reboot": (36007, 36008),
+    # US-1759: the rescue WRITE presence-window suite. Its emulator runs with
+    # `FAPICO2_RESCUE_PRESENCE=window` (the shared-runtime `window_grant`
+    # injected into the rescue app) — a separate process from the auto-ack
+    # ones, per the port map's discipline.
+    "presence": (36021, 36022),
 }
 
 #: `RESCUE_AID` (`picoforge/src/hal/rescue/constants.rs:106`).
@@ -133,6 +138,30 @@ def secure(lock: int, key_index: int = 0x00) -> bytes:
     return bytes([CLA, 0x1D, key_index, lock, 0x00])
 
 
+# -- US-1759 emulation-private control codes ---------------------------------
+#
+# Two one-byte CCID bodies the *emulation binary* serves on the same socket
+# (`firmware/src/emul_main.rs`): `0x50` injects one button press into the
+# shared presence latch (window mode only — nothing drains it in the default
+# auto-ack mode), `0x51` returns the ordered presence-event trace as text.
+# They are not APDUs and not client bytes: no APDU on this surface begins
+# with either byte (CLA is 0x00 or 0x80), and they exist only in the
+# emulation binary, never on a device wire.
+
+PRESS = b"\x50"
+TRACE = b"\x51"
+
+
+def send_control(sock: socket.socket, code: bytes) -> None:
+    """Send a one-byte control code; a press answers nothing."""
+    sock.sendall(struct.pack(">H", len(code)) + code)
+
+
+def read_trace(sock: socket.socket) -> str:
+    """Read the ordered presence-event trace (`0x51`), decoded as text."""
+    return frame(sock, TRACE).decode("utf-8")
+
+
 def split(resp: bytes) -> tuple[bytes, int]:
     """Split an APDU response into `(data, sw)`, the SW as a single int."""
     assert len(resp) >= 2, f"response must carry a status word: {resp.hex()}"
@@ -201,13 +230,17 @@ class RescueEmu:
     all private per instance, so a write in one test is not visible to the next.
     """
 
-    def __init__(self, key: str, tmp_path: Path, log_path: Path | None = None):
+    def __init__(self, key: str, tmp_path: Path, log_path: Path | None = None,
+                 extra_env: dict[str, str] | None = None):
         if key not in PORTS:
             raise ValueError(f"no ports reserved for {key!r}; add them to PORTS "
                              f"and to the port map in tests/harness/ccid_relay.py")
         self.dial_port, self.client_port = PORTS[key]
         self.tmp_path = tmp_path
         self.log_path = log_path
+        #: Extra emulator environment (`FAPICO2_RESCUE_PRESENCE=window`, the
+        #: US-1759 window mode). Merged over the inherited environment.
+        self.extra_env = dict(extra_env or {})
         self.relay = None
         self.emulator = None
         self.client = None
@@ -238,6 +271,7 @@ class RescueEmu:
         # A private HID port so a Rescue test can never displace the shared
         # run_tests.sh HID listener (the port map's reason for 35988).
         env["FAPICO2_HID_PORT"] = str(self.dial_port + 100)
+        env.update(self.extra_env)
 
         if self.log_path is not None:
             self._log = self.log_path.open("w+")
