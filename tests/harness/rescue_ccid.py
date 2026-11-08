@@ -37,10 +37,11 @@ PORTS = {
     "read": (36003, 36004),
     "write": (36005, 36006),
     "reboot": (36007, 36008),
-    # US-1759: the rescue WRITE presence-window suite. Its emulator runs with
+    # US-1759/US-1762: the rescue WRITE presence suite. Its emulator runs with
     # `FAPICO2_RESCUE_PRESENCE=window` (the shared-runtime `window_grant`
-    # injected into the rescue app) — a separate process from the auto-ack
-    # ones, per the port map's discipline.
+    # injected into the rescue app) or `=block` (US-1762's Shape A blocking
+    # gate over the latch-as-pad stand-in) — a separate process from the
+    # auto-ack ones, per the port map's discipline.
     "presence": (36021, 36022),
 }
 

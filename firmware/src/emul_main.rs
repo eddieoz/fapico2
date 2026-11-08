@@ -84,10 +84,18 @@ fn emul_presence_event_sink(ev: fapico2_firmware::presence::PresenceEvent) {
 /// blocking gate samples the BOOTSEL pad directly (the button task is
 /// starved while the serve task blocks); the emulator has no pad — the
 /// latch injected by the harness's `0x50` control **is** the pad level.
-/// A stale edge is drained by the serve loop's tick between commands, so
-/// a level held into a blocking wait is a press held before the request —
-/// the anti-harvest baseline, exactly as on the pad.
+///
+/// Two device-parity duties live here, both reviewer-found (post-EPIC
+/// review): the **pacing** — the device's sampler paces the wait's poll
+/// rate with a ~5 ms pause per sample, and this stand-in must do the same
+/// or a no-press block-mode wait hot-spins the host for the full 10 s
+/// (`wait_grant` itself does not pace); and the **baseline** — the drain
+/// tick consumes any injected press before the next dispatch, so the
+/// wait's entry baseline is ALWAYS "released" here and the anti-harvest-
+/// at-entry leg is unreachable in the emulator (it is covered by the
+/// presence host suite and hardware, not by this stand-in).
 fn emul_latch_level() -> bool {
+    std::thread::sleep(std::time::Duration::from_millis(5));
     fapico2_firmware::presence::PRESS_LATCH.load(core::sync::atomic::Ordering::SeqCst)
 }
 

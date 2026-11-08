@@ -51,8 +51,8 @@ CLIENT_PORT = 35970  # shared relay: tests connect here
 #   36123           test_redteam_round3.py private HID port (F4/F8)
 #                   emulator, a separate process from the auto-ack one (US-1651)
 #   36021/36022     test_rescue_presence_window.py private relay (US-1759) —
-#                   window-mode emulator (FAPICO2_RESCUE_PRESENCE=window), a
-#                   separate process from the auto-ack one
+#                   presence-mode emulator (FAPICO2_RESCUE_PRESENCE=window|block),
+#                   a separate process from the auto-ack one
 #   35973           dead dial port for direct-spawn FIDO-only emulators
 # Every private relay is spawned with explicit --ccid-port/--client-port and
 # its emulator is pointed at the private dial-in via FAPICO2_CCID_PORT.
