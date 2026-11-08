@@ -1,14 +1,24 @@
 # fapico2 - The F**king Authenticator
 
-**The F\*\*king Authenticator.** Your passkeys, PGP keys and 2FA tokens — on hardware you own.
+**The F\*\*king Authenticator.** Your Nostr identities, passkeys, PGP keys and 2FA tokens — on hardware you own.
 
-fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) into a multi-applet hardware authenticator: FIDO2/U2F passkeys, OpenPGP 3.4, OATH (TOTP/HOTP) and YubiKey-protocol OTP served by **one firmware, one binary**, over one USB composite device. No vendor account, no cloud, no subscription. Written in Rust, licensed AGPLv3, built from source — or download the alpha image below.
+fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) into a multi-applet hardware authenticator: hardware-backed Nostr identities (BIP-340 signing, NIP-44 encryption), FIDO2/U2F passkeys, OpenPGP 3.4, OATH (TOTP/HOTP) and YubiKey-protocol OTP served by **one firmware, one binary**, over one USB composite device. No vendor account, no cloud, no subscription. Written in Rust, licensed AGPLv3, built from source — or download the alpha image below.
 
 [![CI](https://github.com/eddieoz/fapico2/actions/workflows/ci.yml/badge.svg)](https://github.com/eddieoz/fapico2/actions/workflows/ci.yml)
 
+## Self-custody for your credentials
+
+If you self-custody bitcoin, you already know the drill: keys generated on hardware you own, never on an exchange, never on a machine you don't control. Your credentials deserve the same discipline — and they guard far more than your sats. The passkey to your email, the PGP key that signs your commits, your Nostr identity, your TOTP codes: today most of them live on someone else's server, synced to someone else's cloud, revocable by someone else's policy.
+
+fapico2 applies the same rule to all of them. Keys are generated on the device and never leave it; everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your board is inert somewhere else. One ~$5 board, no account to suspend, no server to breach, no vendor deciding whether your country gets served.
+
+Krux and SeedSigner sign the transaction; fapico2 authenticates the human operating them. Open Bitcoin self-custody hardware, extended from coins to credentials.
+
+**And for the people who need it most:** journalists and human rights defenders working under repressive surveillance. Commercial keys cost $50–60 — days of income in some countries — and vendors have stopped shipping to some repressive jurisdictions. A cloud-synced passkey ties identity to a platform account that can be suspended from afar. fapico2 is the other path: one Pico board obtainable almost anywhere, open source from firmware to flashing guide, with a published threat model so you can make an informed choice instead of trusting a vendor.
+
 ## Why
 
-- **Self-custody for credentials.** Keys are generated on the device and never leave it. Everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your board is inert somewhere else. The same reasoning that keeps bitcoin keys off internet-connected machines applies to the keys that guard your email, your code and your accounts.
+- **Self-custody for credentials.** Keys are generated on the device and never leave it. Everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your board is inert somewhere else.
 - **The phrase is the wallet.** The optional 24-word backup seed is the FIDO derivation root: a board wiped to bare silicon, flashed fresh and restored from the phrase alone re-derives the **same passkey private keys** for the same accounts — proven on hardware. Credentials created before a seed was installed stay board-bound (re-register once); U2F/stateless, hmac-secret and the other applets are never in the phrase. The honest scope table and the reset-first restore procedure are in [`docs/backup-seed.md`](docs/backup-seed.md).
 - **The whole bill of materials is one Pico 2.** No proprietary secure element to trust, no sealed hardware to return to a vendor. If you can read this, you can rebuild the device from source.
 - **No network.** The device build has no network stack at all — the only networked code in the tree is the host-side emulator used for testing.
@@ -21,11 +31,11 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 | App | What you use it for | Transport | AID | Verified with |
 |---|---|---|---|---|
 | FIDO2/U2F | passkeys, WebAuthn; CTAP2.1 incl. credProtect, credMgmt, largeBlobs, hmac-secret | CTAP-HID | n/a (HID) | Chrome, python-fido2 2.2.1, ykman |
+| Nostr | BIP-340 event signing and NIP-44 encryption for Nostr identities | vendor HID, interface 3 (usage page `0xFF00`, commands `0x40`–`0x4E`) + CCID | `F0 00 00 00 02` | fapico2 Nostr extension — end-to-end on hardware; host emulator suites |
 | OpenPGP 3.4 | PGP signing/encryption, SSH auth | CCID | `D2 76 00 01 24 01` | gpg / scdaemon 2.4.4 (on-card ECC key generation) |
 | OATH (YKOATH) | TOTP/HOTP codes | CCID | `A0 00 00 05 27 21 01` | ykman, Yubico Authenticator |
 | OTP | YubiKey-slot OTP | CCID | `A0 00 00 05 27 20 01` | ykman otp |
 | Management | device config, rescue surface | CCID | `A0 00 00 05 27 47 11 17` | ykman, PicoForge |
-| Nostr | BIP-340 event signing and NIP-44 encryption for Nostr identities | vendor HID, interface 3 (usage page `0xFF00`, commands `0x40`–`0x4E`) + CCID | `F0 00 00 00 02` | fapico2 Nostr extension — end-to-end on hardware; host emulator suites |
 | PIV | smartcard login | — | `A0 00 00 03 08` | **deferred — post-v1.0.0** |
 
 Hardware acceptance was run against all three headline command sets (FIDO2/U2F, OpenPGP 3.4, OATH); the full matrix — USB IDs, algorithms, per-device results — is [`docs/hardware-matrix.md`](docs/hardware-matrix.md).

@@ -20,6 +20,14 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 - **No one else's copy.** A passkey synced to a phone vendor's cloud lives on every device signed into that account, and you trust the vendor's sync to keep it. A resident passkey on fapico2 exists on one board you own.
 - **Nothing to revoke, no one to trust.** No account to suspend, no server to breach, subpoena or shut down. The board answers to you and works as long as the board does.
 
+## Who is this for
+
+**Bitcoiners and nostriches.** You already keep your keys off exchanges and your seed phrase off the internet. But the credentials that guard your wallets — the passkeys, PGP keys and Nostr identity behind your mail, your code, your accounts — still live on someone else's server or sync to someone else's cloud. fapico2 extends the same custody discipline from coins to credentials. Krux and SeedSigner sign the transaction; fapico2 authenticates the human operating them.
+
+**Journalists and activists under surveillance.** Phishing-resistant authentication on hardware you can actually get: ~$5 instead of $50–60, no vendor account to suspend, no cloud to subpoena, and a board you can order from any electronics shop. Everything is open source and the threat model is published — audit what you carry instead of trusting it.
+
+**Everyone else, too.** The TOTP app, the password manager, the six digits copied on every login — fapico2 replaces the drawer of tokens with one board you own.
+
 ## What it is for
 
 <div class="pain-lead">
@@ -31,6 +39,16 @@ Then put them on a board you own: tap it, type your PIN once, and you are in. No
 </div>
 
 <div class="usecase-grid">
+  <div class="usecase">
+    <div class="uc-icon">🕯️</div>
+    <h3>Nostr identity, in hardware</h3>
+    <p>Sign events with BIP-340, encrypt with NIP-44 — the private key never reaches the browser. Touch-gated. <a href="./how-to/nostr.md">Walkthrough.</a></p>
+  </div>
+  <div class="usecase">
+    <div class="uc-icon">🛡️</div>
+    <h3>For hostile environments</h3>
+    <p>Phishing-resistant auth with no vendor account, no cloud sync and no subscription — on a board obtainable almost anywhere. <a href="./threat-model.md">The threat model.</a></p>
+  </div>
   <div class="usecase">
     <div class="uc-icon">🔑</div>
     <h3>Passkey logins</h3>
