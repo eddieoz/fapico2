@@ -29,6 +29,7 @@ from harness.rescue_ccid import (
     READ_PHY_P2_ONE,
     TAG_LED_BRIGHTNESS,
     PRESS,
+    TRACE,
     RescueEmu,
     parse_phy,
     read_trace,
@@ -163,9 +164,12 @@ def test_the_default_mode_still_auto_acks(tmp_path):
         assert sw == 0x9000
         _, sw = emu.send(BRIGHTNESS_WRITE)
         assert sw == 0x9000, "the default mode must stay the host auto-ack"
-        # And the trace channel exists but holds nothing: no hook is
-        # installed outside window mode.
-        assert read_trace(emu.client) == ""
+        # And the 0x51 control is gated on the presence mode (post-review):
+        # in the default mode the body reaches the dispatcher like any other
+        # frame, and the Rescue app's header guard answers 6700 — the trace
+        # channel does not exist outside window/block mode.
+        data, sw = emu.send(TRACE)
+        assert (data, sw) == (b"", 0x6700), f"unexpected 0x51 default answer: {data!r} {sw:04X}"""
 
 
 # -- US-1762 (RESCUE-WRITE-PRESENCE, Shape A): the blocking rescue gate -------
