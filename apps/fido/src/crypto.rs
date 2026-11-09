@@ -1277,10 +1277,13 @@ fn sha256_fixed_via<const N: usize, S: fapico2_platform::sha256_accel::BlockSink
     msg: &[u8; N],
     sink: &mut S,
 ) -> Result<[u8; 32], S::Error> {
-    // `1 << 61` rather than a bare 0: `absurd_extreme_comparisons` aside, the
-    // named bound is the one the SHA-256 length field imposes, and this is the
-    // line a reader checks it against.
-    debug_assert!(N <= (1usize << 61), "SHA-256 cannot encode a 2^61-byte message");
+    // `1u64 << 61` rather than a bare 0: `absurd_extreme_comparisons` aside,
+    // the named bound is the one the SHA-256 length field imposes, and this is
+    // the line a reader checks it against. Stated in u64 because the bound is
+    // a property of that 64-bit field, not of `usize` — on thumbv8m (32-bit
+    // usize) `1usize << 61` overflows at compile time, while `usize` values
+    // here can never reach 2^31 bytes anyway.
+    debug_assert!(N as u64 <= (1u64 << 61), "SHA-256 cannot encode a 2^61-byte message");
     fapico2_platform::sha256_accel::hash_into(msg, (N as u64) * 8, sink)
 }
 
