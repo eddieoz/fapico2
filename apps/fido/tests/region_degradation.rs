@@ -287,8 +287,11 @@ fn rust_files(rel: &str) -> Vec<std::path::PathBuf> {
 /// * a line naming `fatal_boot::` — a path reference, which this tree does not
 ///   use today but which is not an invocation.
 ///
-/// What survives is a line that *calls* `fatal_boot(`. 23 of them: 18 in
-/// `boot.rs`, 5 in `main.rs`, and none anywhere else.
+/// What survives is a line that *calls* `fatal_boot(`. 22 of them: 15 in
+/// `boot.rs`, 7 in `main.rs`, and none anywhere else. (The header comment
+/// above US-1558's baseline said "23: 18 in boot.rs, 5 in main.rs" — the
+/// split had already drifted from the total; the total was the assertion,
+/// and US-1808/1809's delta is recorded at it below.)
 fn fatal_boot_call_sites(rel: &str) -> Vec<String> {
     let mut out = Vec::new();
     for path in rust_files(rel) {
@@ -329,15 +332,23 @@ fn no_new_halt_site_is_reachable_from_the_key_region() {
     // **The epic's own number.** Measured before US-1558/US-1560 and required to
     // be unchanged by them: this epic adds no halt site.
     //
-    // All 23 are in `firmware/src` — `boot.rs` and `main.rs` — which is the other
+    // All 22 are in `firmware/src` — `boot.rs` and `main.rs` — which is the other
     // reason the count is a meaningful assertion: nothing this epic touched
     // could have added one, so the test says so about the tree rather than about
     // one directory.
+    //
+    // **US-1808/1809 moved the number, deliberately.** 23 → 22: the two
+    // boot-entropy sites (`ensure_boot_entropy`, `init_drbg`'s seed draw) no
+    // longer call `fatal_boot` directly — ADR 0004 amendment 3 routes their
+    // refusal through `boot.rs::entropy_reboot_or_park`, which holds the one
+    // new `fatal_boot` (the `Action::Park` arm) and parks legibly with the
+    // same reason at the bound. Every other site is the one US-1558
+    // measured, unchanged.
     let sites = all_halt_sites();
-    assert_eq!(sites.len(), 23, "the fatal_boot call-site count must not change:\n{}", sites.join("\n"));
+    assert_eq!(sites.len(), 22, "the fatal_boot call-site count must not change without US-1808/1809's recorded delta:\n{}", sites.join("\n"));
 
     // **The second scenario's first clause, checked where it can actually
-    // fail.** Not "the total is 23" — "there is no `fatal_boot` anywhere under
+    // fail.** Not "the total is 22" — "there is no `fatal_boot` anywhere under
     // `platform/src/keyregion/`", which is the claim: a key-region read that
     // halts is exactly the failure S10 exists to prevent, and it would be
     // invisible in the total if someone removed a site somewhere else.
