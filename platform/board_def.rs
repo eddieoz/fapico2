@@ -704,6 +704,21 @@ SECTIONS {{
     .secure_partition (NOLOAD) : {{
         KEEP(*(.secure_partition))
     }} > SECURE
+
+    /* US-1805: SRAM the entropy-refusal reboot counter lives in, retained
+     * across SCB::sys_reset. The reset preserves SRAM but the Rust runtime
+     * zero-inits .bss on every boot — including the rebooted one — so a
+     * counter in .bss would wipe itself across the very reboot it counts.
+     * .retain is a section of its own, outside crt0's zero/copy ranges
+     * (.bss/.data), so nothing writes it at init; power-on leaves its
+     * contents undefined, which the counter's magic word detects
+     * (firmware/src/entropy_reset.rs). NOLOAD, and KEEP()ed like the two
+     * sections above: a static in it has no live input symbols the linker
+     * would otherwise keep. ADR 0004 amendment 3 is the decision this
+     * section serves. */
+    .retain (NOLOAD) : {{
+        KEEP(*(.retain))
+    }} > RAM
 }}
 
 /* The RP2350 bootrom only scans the first 4 KiB of flash for the PICOBIN block
