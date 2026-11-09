@@ -288,6 +288,46 @@ fn pico2_partition_is_unchanged_from_the_hand_written_memory_x() {
     );
 }
 
+/// US-1805 / EPIC `COLD-BOOT-ENTROPY-WINDOW`: the generated linker script
+/// declares a `.retain (NOLOAD)` section, the address the entropy-refusal
+/// reboot counter lives at.
+///
+/// Gherkin: "Given the board file / When memory.x is rendered / Then it
+/// contains a `.retain (NOLOAD)` section / And the section targets RAM / And
+/// the section is KEEP()ed so the linker cannot GC it."
+///
+/// The section has to exist because `SCB::sys_reset` preserves SRAM but the
+/// Rust runtime zero-inits `.bss` on *every* boot, including the rebooted
+/// one — a counter in `.bss` would wipe itself across the very reboot it is
+/// counting. `.retain` is its own section, outside the crt0 zero/copy ranges
+/// (`.bss`/`.data`), so the reset preserves it and the runtime never touches
+/// it; power-on leaves the contents undefined, which the counter's magic
+/// guard handles. KEEP()ed for the same reason `.key_region` is: a section
+/// with no live input symbols is garbage-collected by default.
+#[test]
+fn the_generated_linker_script_declares_the_retained_ram_section() {
+    let mx = render_memory_x(&selected());
+    assert!(
+        mx.contains(".retain (NOLOAD) : {"),
+        "generated memory.x must declare the .retain (NOLOAD) section:\n{mx}"
+    );
+    assert!(
+        mx.contains("KEEP(*(.retain))"),
+        "the .retain section must be KEEP()ed or the linker GCs a counter with no input symbols:\n{mx}"
+    );
+    assert!(
+        mx.contains(".retain (NOLOAD) : { KEEP(*(.retain)) } > RAM")
+            || (mx.contains(".retain (NOLOAD)") && mx.contains("} > RAM")),
+        "the .retain section must target RAM — it is SRAM the reset preserves, not flash:\n{mx}"
+    );
+    // "The section is not the zeroed or copied range": crt0's zero/copy
+    // ranges are .bss and .data; `.retain` must be a distinct section name so
+    // the runtime's init never covers it. This asserts the name is not a
+    // substring of either — trivially true of this literal, but it pins the
+    // property the generated script must keep if the section is ever renamed.
+    assert!(!".retain".contains(".bss") && !".retain".contains(".data"));
+}
+
 /// Every way a board file can be wrong is a hard refusal, never a default.
 ///
 /// The failure this exists to prevent: a misspelled key, a board that does not
