@@ -111,6 +111,13 @@ pub mod fatal_sig;
 /// pure, host-tested — the device wrapper in `boot.rs` supplies the real read
 /// and the busy-wait).
 pub mod otp_retry;
+/// US-1803: the entropy-wait blink's shape (pure, host-tested; the device
+/// driver in `boot.rs::entropy_wait_sleep` drives the pin over it).
+pub mod wait_blink;
+/// US-1804: the entropy-refusal bounded-reboot decision (pure, host-tested;
+/// the device side in `boot.rs::entropy_reboot_or_park` owns the volatile
+/// access and the two exits).
+pub mod entropy_reset;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
