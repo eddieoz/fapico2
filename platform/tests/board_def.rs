@@ -315,17 +315,23 @@ fn the_generated_linker_script_declares_the_retained_ram_section() {
         mx.contains("KEEP(*(.retain))"),
         "the .retain section must be KEEP()ed or the linker GCs a counter with no input symbols:\n{mx}"
     );
+    // Targets RAM, and is its own output section — crt0's zero/copy ranges
+    // collect `*(.data .data.*)` and `*(.bss .bss.*)` (cortex-m-rt link.x),
+    // so a distinct input-section name is what keeps the runtime's init from
+    // ever covering it. memory.x does not render those ranges itself; the
+    // distinct-name property is what this script must keep, and the
+    // retention-across-sys_reset behaviour itself is the release link plus
+    // the hardware leg (US-1813).
+    let retain_block = mx.split(".retain (NOLOAD)").nth(1).expect("section body");
+    let body_end = retain_block.split('}').next().unwrap();
     assert!(
-        mx.contains(".retain (NOLOAD) : { KEEP(*(.retain)) } > RAM")
-            || (mx.contains(".retain (NOLOAD)") && mx.contains("} > RAM")),
+        retain_block.contains("KEEP(*(.retain))") && !body_end.contains(".bss") && !body_end.contains(".data"),
+        "the .retain output section must collect only its own input section:\n{mx}"
+    );
+    assert!(
+        mx.contains("} > RAM") && mx.find(".retain (NOLOAD)").unwrap() > mx.find("RAM   : ORIGIN").unwrap(),
         "the .retain section must target RAM — it is SRAM the reset preserves, not flash:\n{mx}"
     );
-    // "The section is not the zeroed or copied range": crt0's zero/copy
-    // ranges are .bss and .data; `.retain` must be a distinct section name so
-    // the runtime's init never covers it. This asserts the name is not a
-    // substring of either — trivially true of this literal, but it pins the
-    // property the generated script must keep if the section is ever renamed.
-    assert!(!".retain".contains(".bss") && !".retain".contains(".data"));
 }
 
 /// Every way a board file can be wrong is a hard refusal, never a default.
