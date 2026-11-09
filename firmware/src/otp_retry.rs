@@ -28,8 +28,18 @@
 //!
 //! The core is pure over injected closures so the attempt bookkeeping is
 //! host-testable; the device wrapper in `boot.rs` supplies the real read and
-//! the TIMERAWL busy-wait (the same source [`crate`]'s boot ladder uses —
-//! `Timer::after` is not available on the early boot path).
+//! the sleep (the same source [`crate`]'s boot ladder uses — `Timer::after`
+//! is not available on the early boot path).
+//!
+//! Two caller policies share this core. The OTP reads keep the original one:
+//! a **silent** window of up to [`DEADLINE_MS`], refusal → immediate park.
+//! The two boot-entropy sites (US-1802..1810, EPIC
+//! `COLD-BOOT-ENTROPY-WINDOW`) now pass [`ENTROPY_DEADLINE_MS`] and a
+//! **blinking** sleep ([`crate::wait_blink`]: 80 ms lit / 170 ms dark, one
+//! pair per step), and their refusal reboots boundedly
+//! ([`crate::entropy_reset`], ADR 0004 amendment 3) — a 60 s window never
+//! reads as a dead board, and a transient settle self-recovers instead of
+//! parking.
 
 /// Sleep between attempts, in ms. Small enough to ride out a rail that
 /// settles within seconds, coarse enough that the worst case does not turn
@@ -61,15 +71,19 @@ pub const DEADLINE_MS: u64 = 20_000;
 /// boundedly on refusal (`crate::entropy_reset`, ADR 0004 amendment 3).
 pub const ENTROPY_DEADLINE_MS: u64 = 60_000;
 
-/// Retry `read` on `None`, sleeping [`STEP_MS`] between attempts, until it
+/// Retry `read` on `None`, sleeping `step_ms` between attempts, until it
 /// succeeds or `deadline_ms` of sleep has elapsed. The first attempt is
 /// immediate: a healthy board pays nothing.
 ///
 /// Pure: `read` and `sleep_ms` are injected, so the attempt/sleep
 /// bookkeeping is assertable on the host (see the tests). The device wrapper
-/// passes its busy-wait; there is deliberately no LED activity in the window —
-/// a silent boot of up to ~[`DEADLINE_MS`] is documented operator behavior,
-/// and a signature still follows a real refusal.
+/// passes its busy-wait. What the *window* looks like is the caller's
+/// policy, and it differs by site since ADR 0004 amendment 3 (US-1802..1810):
+/// the OTP reads pass [`DEADLINE_MS`] and a silent sleep — a dark window of
+/// up to ~[`DEADLINE_MS`] is documented operator behavior, and a real
+/// refusal parks immediately; the two boot-entropy sites pass
+/// [`ENTROPY_DEADLINE_MS`] and a blinking sleep ([`crate::wait_blink`]) and
+/// their refusal reboots boundedly ([`crate::entropy_reset`]).
 pub fn retry<T>(
     mut read: impl FnMut() -> Option<T>,
     mut sleep_ms: impl FnMut(u64),
