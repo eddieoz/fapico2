@@ -1122,9 +1122,15 @@ pub unsafe fn init_drbg(
     .unwrap_or_else(|| {
         // US-1809: no longer a park on the spot — bounded reboot per ADR 0004
         // amendment 3 (parks legibly with this same reason at the bound). The
-        // message still names the site.
+        // message still names the site, and names the one deterministic
+        // non-TRNG cause worth ruling out: a failed `store.write` in
+        // `ensure_boot_entropy` leaves the seed record absent (logged there,
+        // invisible without a probe), and the seed path fail-closes on it —
+        // retrying a deterministic failure for the whole budget, then parking
+        // signed DrbgRefused, would misattribute the root cause.
         entropy_reboot_or_park(
-            "drbg: seed refused across the whole retry budget — no generator",
+            "drbg: seed refused across the whole retry budget — no generator \
+             (if the TRNG reads healthy, check whether boot.entropy.v1 persisted)",
             fatal_sig::Reason::DrbgRefused,
         )
     });
@@ -2095,11 +2101,18 @@ pub fn entropy_reboot_or_park(msg: &str, reason: fatal_sig::Reason) -> ! {
     match fapico2_firmware::entropy_reset::decide(magic, attempts) {
         fapico2_firmware::entropy_reset::Action::Park => fatal_boot(msg, reason),
         fapico2_firmware::entropy_reset::Action::Reboot => {
-            retained_write(fapico2_firmware::entropy_reset::bumped(magic, attempts));
+            // Log from the *bumped* state, not the raw read: on a fresh
+            // power-on boot the retained bytes are undefined, so the raw
+            // count is garbage — `attempts + 1` has overflowed u32 on it
+            // (0xFFFF_FFFF is exactly the pattern the magic guard exists
+            // for) and would read as a nonsense retry number at best and a
+            // panic mid-boot at worst.
+            let next = fapico2_firmware::entropy_reset::bumped(magic, attempts);
+            retained_write(next);
             defmt::error!(
                 "{} — rebooting for retry {} of {}",
                 msg,
-                attempts + 1,
+                next.attempts,
                 fapico2_firmware::entropy_reset::MAX_REFUSED_BOOTS
             );
             cortex_m::peripheral::SCB::sys_reset()

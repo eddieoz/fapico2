@@ -51,10 +51,20 @@
 pub const RETAIN_MAGIC: u32 = 0x5254_4E52;
 
 /// The number of consecutive refused boots after which the board parks
-/// instead of rebooting again. Worst case is three refused boots — with the
-/// 60 s entropy budget each, ~3 minutes of visible blinking — and then a
-/// legible park with the same signature the site would have emitted
-/// immediately before this epic.
+/// instead of rebooting again. Worst case is three refused boots that
+/// reboot, **plus the parking boot's own window** — with the 60 s entropy
+/// budget each, ~4 minutes of visible blinking — and then a legible park
+/// with the same signature the site would have emitted immediately before
+/// this epic.
+///
+/// The bound is *consecutive*: one boot in which both entropy sites succeed
+/// clears it. A marginal oscillator that refuses most boots but completes
+/// some therefore re-arms the bound on every success and never parks — that
+/// is the chosen tradeoff, not an oversight: a board that sometimes boots is
+/// a working device the owner can still use, where parking it would brick a
+/// board the hardware has not condemned. The bound exists for the case
+/// nothing succeeds — the hard wedge — where three refusals in a row are
+/// evidence the reset does not clear the stall.
 pub const MAX_REFUSED_BOOTS: u32 = 3;
 
 /// What a refusal site does once the whole entropy budget is exhausted.
