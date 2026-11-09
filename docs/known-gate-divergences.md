@@ -2770,6 +2770,18 @@ first produces `TrngError::Stalled`.
 * Not that the peripheral was observed to reach the stalled state, or to
   produce a block inside 20 ms. Neither was observed.
 
+> **MEASURED FLOOR (2026-11-09, US-1801).** The "never measured" residual
+> above now has a first data point: on a cold power episode (board
+> unconnected for a long time), the *episode-level* settling of the TRNG is
+> **≥ 20.4 s** — a boot filmed on 2026-11-09 shows the `otp_retry` budget
+> (20 s) consumed in full inside `init_drbg`'s TRNG nonce draw and the draw
+> succeeding on the deadline's final attempts. This is the per-*block*
+> budget's episode-scale sibling: the 20 ms `MAX_ENTROPY_WAIT` itself is
+> still unmeasured. Decode, site-naming and the success-tail variant are in
+> [`docs/audits/2026-11-09-cold-boot-entropy-window.md`](docs/audits/2026-11-09-cold-boot-entropy-window.md);
+> the budget re-sizing it drove (the entropy sites' 60 s `ENTROPY_DEADLINE_MS`)
+> is EPIC `COLD-BOOT-ENTROPY-WINDOW` (US-1800…US-1814).
+
 ### The assumptions that would fail the claim
 
 1. **Calibration.** The budget is sized for the configuration
