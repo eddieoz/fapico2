@@ -1061,6 +1061,11 @@ pub unsafe fn init_drbg(
         fapico2_platform::trng::Rp2350Probe<'static>,
     >,
 > {
+    // The two OTP identity legs are deliberately NOT rewired to the bounded
+    // reboot: they keep the OTP budget, the silent window and the immediate
+    // park (ADR 0004 — §22's escalated lock recovers by neither retry nor
+    // reset, so there is nothing for a reboot to re-roll). Only the DRBG seed
+    // draw below — the measured 2026-11-09 site — is a boot-entropy site.
     let otp = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)", fatal_sig::Reason::OtpKeyRow));
     let chipid = read_chipid()
@@ -1110,17 +1115,27 @@ pub unsafe fn init_drbg(
             let source = fapico2_platform::drbg_seed::FuseSeedSource::new(otp, uid, store, probe);
             fapico2_platform::trng::DrbgTrng::try_new(source).ok()
         },
-        busy_sleep_ms,
+        entropy_wait_sleep,
         fapico2_firmware::otp_retry::STEP_MS,
-        fapico2_firmware::otp_retry::DEADLINE_MS,
+        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
     )
     .unwrap_or_else(|| {
-        fatal_boot(
+        // US-1809: no longer a park on the spot — bounded reboot per ADR 0004
+        // amendment 3 (parks legibly with this same reason at the bound). The
+        // message still names the site.
+        entropy_reboot_or_park(
             "drbg: seed refused across the whole retry budget — no generator",
             fatal_sig::Reason::DrbgRefused,
         )
     });
-    init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg)
+    let drbg = init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg);
+    // US-1809: the counter clears here — the first point at which *both*
+    // entropy sites have succeeded in one boot, not the boot's very top. A
+    // counter bumped by a refused boot survives until a boot genuinely
+    // reaches serving entropy, so a hard wedge still walks the bound and
+    // parks; see [`entropy_reset_clear`].
+    entropy_reset_clear();
+    drbg
 }
 
 /// Move the device DRBG out of [`DRBG`] by value, exactly once (US-1006).
@@ -1858,8 +1873,11 @@ pub fn derive_oath_seal() -> OathSeal {
 /// found the second occurrence saw two identical call sites and rerouted one.
 ///
 /// The draw is now a [`fapico2_platform::trng::TrngProbe`], whose wait
-/// carries the named budget, and a refusal is fatal with a message naming
-/// this site. The trade is the one US-1008 made for the sanity draw, and the
+/// carries the named budget, and a refusal carries a message naming this
+/// site — since US-1808 that refusal reboots boundedly rather than parking
+/// (ADR 0004 amendment 3), and the window blinks while it waits
+/// ([`entropy_wait_sleep`]). The trade is the one US-1008 made for the
+/// sanity draw, and the
 /// reasoning is different in the one way that matters: that site was a
 /// *diagnostic*, and a diagnostic that can kill the boot belongs somewhere
 /// else. This site is not a diagnostic — without the slot every bound
@@ -1895,27 +1913,33 @@ pub fn ensure_boot_entropy(
     // that shows this pulse reached the draw; a fatal that does not, died
     // elsewhere. It fires once per boot, before the first attempt.
     entropy_draw_notice();
-    // The draw is retried on the same stepped budget as the OTP reads (see
-    // [`read_otp_key_1`]): one missed per-block window — the generation tail
-    // the datasheet itself warns about, on a budget
-    // ([`fapico2_platform::trng::MAX_ENTROPY_WAIT_MS`]) derived from a
-    // datasheet average and never measured on silicon (D-8) — used to park
-    // the board on the spot. Each attempt is a full enable/wait/read cycle
+    // The draw is retried on a stepped budget of its own since US-1802: the
+    // OTP reads' 20 s sized a fuse rail; the 2026-11-09 decode
+    // (docs/audits/2026-11-09-cold-boot-entropy-window.md) measured a cold
+    // power episode's TRNG settling at >= 20.4 s — the old budget consumed in
+    // full, the draw succeeding on the deadline's tail — so the entropy sites
+    // get `ENTROPY_DEADLINE_MS` (60 s, >= 2x the measured floor). Each
+    // attempt is a full enable/wait/read cycle
     // ([`fapico2_platform::trng::draw_blocks`]), so a retry is a fresh roll
     // of the peripheral, not a prolongation of the failed one; a refusal
     // scrubs the buffer (`try_fresh_bytes`'s contract), so no attempt
-    // inherits another's contents. Only a source that refuses across the
-    // whole budget is fatal, with the signature this site would have
-    // emitted on the first miss.
+    // inherits another's contents. The window blinks while it waits
+    // ([`entropy_wait_sleep`]). A refusal across the whole budget no longer
+    // parks on the spot: it reboots boundedly (ADR 0004 amendment 3,
+    // [`entropy_reboot_or_park`]) and parks legibly — the same signature this
+    // site would have emitted on the first miss — only at the bound.
     if fapico2_firmware::otp_retry::retry(
         || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
-        busy_sleep_ms,
+        entropy_wait_sleep,
         fapico2_firmware::otp_retry::STEP_MS,
-        fapico2_firmware::otp_retry::DEADLINE_MS,
+        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
     )
     .is_none()
     {
-        fatal_boot("boot entropy: TRNG refused across the whole retry budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
+        // US-1808: no longer a park on the spot — bounded reboot per ADR 0004
+        // amendment 3 (`entropy_reboot_or_park` parks legibly with this same
+        // reason at the bound). The message still names the site.
+        entropy_reboot_or_park("boot entropy: TRNG refused across the whole retry budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
@@ -1945,6 +1969,156 @@ fn entropy_draw_notice() {
     led.set_high();
     busy_wait_us(400_000);
     led.set_low();
+}
+
+/// US-1806: the entropy wait's sleep — one wait-blink step per 250 ms retry
+/// step, so a window that lasts seconds blinks `.--.--.--.` instead of
+/// sitting dark looking dead (the owner's 2026-11-09 decision; see
+/// [`fapico2_firmware::wait_blink`] for the rhythm and its collision test).
+///
+/// The shape is [`entropy_draw_notice`]'s: gate on [`FATAL_LED_MOUNTED`]
+/// (same discipline — before `mark_fatal_led_ready()` there is no pin to
+/// drive, and an entropy wait on such a path stays silent rather than
+/// writing through an uninitialised slot), drive the level sequence from
+/// [`fapico2_firmware::wait_blink::step_levels`], park dark on exit. The
+/// blink is deliberately not a rung: the ladder's pulse count is a monotone
+/// progress counter whose meaning an extra pulse would corrupt.
+///
+/// The entropy sites pass [`fapico2_firmware::otp_retry::STEP_MS`] only —
+/// one call per attempt, one dot-dash pair per call. Anything else falls
+/// back to [`busy_sleep_ms`], so a caller that mis-hands this closure is a
+/// silent wait, never a wrong rhythm: the wait-blink's reading
+/// (`docs/boot-freeze.md`) stays owned by exactly one driver.
+fn entropy_wait_sleep(ms: u64) {
+    if ms != fapico2_firmware::wait_blink::WAIT_BLINK_PERIOD_MS
+        || !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire)
+    {
+        busy_sleep_ms(ms);
+        return;
+    }
+    // SAFETY: the `LED_OUT` slot is written exactly once at the top of `main`
+    // before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`; this is the
+    // pre-task boot path, single-core, so no heartbeat or trussed-UI driver
+    // shares the pin.
+    let led: &mut Output<'static> =
+        unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
+    for level in fapico2_firmware::wait_blink::step_levels() {
+        // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303); park dark on exit.
+        match level {
+            fapico2_firmware::boot_ladder::Level::On => {
+                led.set_high();
+                busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_ON_MS * 1000) as u32);
+            }
+            fapico2_firmware::boot_ladder::Level::Off => {
+                led.set_low();
+                busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_OFF_MS * 1000) as u32);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// US-1807: the retained refusal counter and the bounded reboot.
+//
+// ADR 0004 amendment 3: a refusal at either entropy site no longer parks on
+// the spot — it reboots and re-rolls, bounded by this counter, and parks
+// legibly (same `fatal_boot`, same signature) only at
+// [`fapico2_firmware::entropy_reset::MAX_REFUSED_BOOTS`]. The decision
+// arithmetic is [`fapico2_firmware::entropy_reset`]'s (pure, host-tested);
+// this block owns the SRAM the counter lives in and the two exits.
+// ---------------------------------------------------------------------------
+
+/// The retained refusal counter, in the `.retain (NOLOAD)` section
+/// (`memory.x`, rendered by `platform/board_def.rs`).
+///
+/// `SCB::sys_reset` preserves SRAM but the Rust runtime zero-inits `.bss` on
+/// every boot — including the rebooted one — so the counter lives outside the
+/// crt0 zero/copy ranges, in a NOLOAD section nothing writes at init. The
+/// initializer below is therefore never *loaded*: power-on leaves the bytes
+/// undefined, which is why every access goes through [`fapico2_firmware::entropy_reset::RETAIN_MAGIC`]
+/// and why the reads and writes are volatile through `addr_of!` — a `static
+/// mut` with a known initializer in a NOLOAD section can otherwise be
+/// const-folded to that initializer by LLVM, which would make the counter
+/// read as fresh across a reboot and turn the bound into an unbounded loop.
+///
+/// SAFETY (static mut): single-core, boot path only; the counter is read
+/// once per refusal decision and written by that decision or by the
+/// success clear, all before any task exists.
+#[repr(C, align(4))]
+struct RetainedCounter {
+    magic: u32,
+    attempts: u32,
+}
+
+#[link_section = ".retain"]
+#[used]
+static mut RETAINED_COUNTER: RetainedCounter = RetainedCounter { magic: 0, attempts: 0 };
+
+/// Volatile read of the retained counter — [`fapico2_firmware::entropy_reset::Retained`]'s
+/// exact layout (`repr(C, align(4))`, two `u32`s), see [`RETAINED_COUNTER`].
+fn retained_read() -> (u32, u32) {
+    // SAFETY: see [`RETAINED_COUNTER`]; volatile to defeat const-folding of
+    // the initializer (a rebooted boot must read what the previous boot wrote).
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(RETAINED_COUNTER);
+        (
+            core::ptr::addr_of!((*ptr).magic).read_volatile(),
+            core::ptr::addr_of!((*ptr).attempts).read_volatile(),
+        )
+    }
+}
+
+/// Volatile write of the retained counter.
+fn retained_write(state: fapico2_firmware::entropy_reset::Retained) {
+    // SAFETY: see [`RETAINED_COUNTER`].
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(RETAINED_COUNTER);
+        core::ptr::addr_of_mut!((*ptr).magic).write_volatile(state.magic);
+        core::ptr::addr_of_mut!((*ptr).attempts).write_volatile(state.attempts);
+    }
+}
+
+/// A boot-entropy refusal: reboot and re-roll, bounded, or park legibly.
+///
+/// The device side of [`fapico2_firmware::entropy_reset::decide`]. On
+/// [`fapico2_firmware::entropy_reset::Action::Park`] this is the *same*
+/// [`fatal_boot`] path the sites used before the bounded reboot existed — the
+/// signature (`0011` `TrngRefused` / `0100` `DrbgRefused`) still names the
+/// cause and the park is still permanent, which is ADR 0004's whole concern.
+/// On [`fapico2_firmware::entropy_reset::Action::Reboot`] the bumped counter
+/// is written (volatile, before the reset — `sys_reset` preserves it) and
+/// `SCB::sys_reset()` restarts boot from the top: the ladder re-runs, the
+/// owner sees attempt 2 or 3, and the settling clock has been running through
+/// the whole blinking window, so the rebooted boot's draw is warm.
+pub fn entropy_reboot_or_park(msg: &str, reason: fatal_sig::Reason) -> ! {
+    let (magic, attempts) = retained_read();
+    match fapico2_firmware::entropy_reset::decide(magic, attempts) {
+        fapico2_firmware::entropy_reset::Action::Park => fatal_boot(msg, reason),
+        fapico2_firmware::entropy_reset::Action::Reboot => {
+            retained_write(fapico2_firmware::entropy_reset::bumped(magic, attempts));
+            defmt::error!(
+                "{} — rebooting for retry {} of {}",
+                msg,
+                attempts + 1,
+                fapico2_firmware::entropy_reset::MAX_REFUSED_BOOTS
+            );
+            cortex_m::peripheral::SCB::sys_reset()
+        }
+    }
+}
+
+/// Clear the retained refusal counter after a boot in which *both* entropy
+/// sites succeeded.
+///
+/// Called at the end of [`init_drbg`] — the first point both sites have
+/// succeeded in one boot, not the boot's very top: a counter bumped by a
+/// refused boot must survive until a boot genuinely reaches serving entropy,
+/// or three refusals followed by one mid-window success would lose the
+/// history and let a hard wedge loop forever. Writes the cleared state
+/// ([`fapico2_firmware::entropy_reset::cleared`]) so the next refusal starts
+/// from one.
+pub fn entropy_reset_clear() {
+    retained_write(fapico2_firmware::entropy_reset::cleared());
 }
 
 // ---------------------------------------------------------------------------
