@@ -213,3 +213,58 @@ healthy later in the same episode) stands as data, unexplained. The
 register per 4 pages") also disagrees with both `pico-keys-sdk` and the RP2350
 register map (64 pages of 64 rows, one register per page) — a reconciliation
 that is now academic but belongs in any future reinstatement review.
+
+---
+
+## Amendment 3, 2026-11-09 — the transient-stall carve-out is exercised: the entropy sites reboot, bounded
+
+**Unchanged:** the decision. No fallback key, no lock/absence distinction, the
+signature, the park, the watchdog refusal. What changes is *where* the park is
+reached, at exactly two sites, and why.
+
+**The measurement** ([`docs/audits/2026-11-09-cold-boot-entropy-window.md`](../audits/2026-11-09-cold-boot-entropy-window.md)):
+the first hardware data for the TRNG wait budget. A cold power episode (board
+unconnected for a long time — the established trigger) settles the TRNG at
+**≥ 20.4 s**: a recorded boot consumed the entire 20 s `otp_retry` budget
+inside `init_drbg`'s TRNG nonce draw and the draw succeeded on the deadline's
+final attempts. Three parked episodes (the 2026-10-31 `0011` and `0100`
+incidents, plus the owner's repeated post-unplug failures) bound the same
+phenomenon from the other side. A settling stall is a **transient hang mode —
+one a reset actually clears** — the exact shape the watchdog refusal in
+`docs/boot-freeze.md` wrote its carve-out for, and the exact shape an
+immediate park turns into a brick only the owner's power cycle fixes.
+
+**The carve-out, exercised narrowly.** A refusal at the two boot-entropy
+sites (`ensure_boot_entropy`'s record draw, `init_drbg`'s DRBG seed nonce) no
+longer parks on the spot: the board reboots (`SCB::sys_reset`) and re-rolls
+the draw from the top of boot, bounded by a magic-guarded counter in a
+`.retain (NOLOAD)` SRAM section (`firmware/src/entropy_reset.rs`,
+`MAX_REFUSED_BOOTS = 3`). At the bound the board parks via the **same**
+`fatal_boot(msg, reason)` path — signature `0011`/`0100`, emitted once,
+permanent — so the park stays legible, which is this ADR's whole concern. The
+counter clears only after `init_drbg` returns, the first point at which both
+entropy sites have succeeded in one boot.
+
+**Why this is not the watchdog, and not a reversal.** The refusal stands for
+hangs a reset does *not* clear; the carve-out applies to one that does. The
+mechanism is deliberately not a watchdog: it is a decision at the refusal
+site, made with memory (`entropy_reset::decide`, pure and host-tested), so
+the bound is reasoned about in one place rather than armed in boot-progress
+feed points. The signature is still emitted exactly once — at the bound —
+and never in the reboot loop, so the loop is legible as work (each rebooted
+boot re-runs the ladder from the top) rather than as a stuck signal.
+
+**Why the OTP sites keep the immediate park.** `read_otp_key_1` /
+`read_chipid` refusals still park after their 20 s budget, blink-free and
+without a reboot: they guard against §22's escalated `SW_LOCK` mode, which
+the ADR's own measurement established recovers by neither retry nor dwell —
+and a reboot re-runs the reads against the same locked rows. There is nothing
+for a reset to re-roll. Their budget, their silence, and their park are
+unchanged, and the reboot loop is scoped to `TrngRefused` and `DrbgRefused`
+and to nothing else.
+
+**The open question the hardware leg answers** (US-1813, recorded in the
+audit doc's validation section when it runs): does `sys_reset` clear the
+settling — so the rebooted boot's window is short — or does only VBUS removal,
+in which case the bound is what catches a hard autocorrelation wedge. The
+bound covers both answers; that is why it exists.
