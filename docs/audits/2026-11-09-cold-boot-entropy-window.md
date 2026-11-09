@@ -113,8 +113,50 @@ fixed build in §6 below when it is run.
 
 ## 6. Hardware validation (fixed build)
 
-*Not yet run* — this section carries the decode table of the fixed build
-when the owner flashes it and records a cold episode (US-1813). The open
-question it answers: does `SCB::sys_reset` clear the settling (so the
-rebooted boot's window is short), or does only VBUS removal — in which case
-the bound is what catches a hard wedge.
+**First observation — 2026-11-10 00:40, the board that reproduced the stall,
+fixed build flashed over BOOTSEL** (rescue `REBOOT(BOOTSEL)` →
+`fapico2.uf2` sha256 `9fc33491…`, re-enumerated `fa20:0002` and serving).
+Episode: board unpowered for **1 minute**, then filmed from the replug
+(`20261110_004056_1.mp4`, 60 fps, 9.29 s, macro framing — LED spot tracked
+at ~(935, 200) of 1296×604).
+
+| time (s) | LED | decoded |
+|---|---|---|
+| 0.00–2.32 | dark | pre-ladder (HAL init) |
+| 2.32–3.50 | 15 pulses, 80 ms period | cumulative ladder through `RUNG_STORE`(10)+`RUNG_DRBG`(15) — **no window between them** |
+| 3.50–4.08 | dark 0.58 s | inter-phase gap |
+| 4.08–4.52 | 6 pulses | `RUNG_MIGRATION` (cumulative 21) |
+| 4.52–4.75 | dark 0.23 s | inter-phase gap |
+| 4.75–6.72 | 24 pulses | `RUNG_APPS`+`USB`+`SERVING` (cumulative 45) |
+| 6.72 → | 0.52 s on / 0.48 s off | 1 Hz heartbeat — **serving, ~6.7 s after power-on** |
+
+Pulse counts are duration arithmetic (span ÷ 80 ms period), which the frame
+granularity makes exact where per-pulse counting is not (a 40 ms pulse reads
+as 1–2 frames and flickers across the threshold).
+
+**Findings:**
+
+1. **The cold episode did not reproduce at a 1-minute dwell.** The draw was
+   warm: no `.--.--.--.` window, no dark stretch, and no 400 ms draw notice
+   (the `boot.entropy.v1` record was present; `ensure_boot_entropy` skipped
+   and `init_drbg`'s seed draw succeeded on the first attempt). The settling
+   trigger therefore needs a **longer unpowered dwell than 60 s** — the
+   owner's established trigger is "unconnected for a long time", and one
+   minute after a serving episode does not re-arm it. This bounds the
+   phenomenon from below in a new dimension: the ≥ 20.4 s settle of §3
+   belongs to *long*-dwell cold episodes, not to every power gap.
+2. **The warm path is behaviourally unchanged.** The blink window, the
+   bigger budget and the bounded reboot are invisible when the draw succeeds
+   immediately — the boot completes in ~6.7 s, ladder and heartbeat
+   identical to the pre-fix image's warm boots. No regression on the path
+   every normal boot takes.
+
+**Still to observe on hardware** (this section grows when filmed):
+
+- the blinking window itself (`.--.--.--.`, 80/170) during a genuine
+  long-dwell cold episode;
+- a refusal across the 60 s budget — the board leaving the bus and re-running
+  the ladder (attempt 2 of 3), which answers the open question: does
+  `SCB::sys_reset` clear the settling (rebooted boot's window short), or
+  only VBUS removal (the bound catches a hard wedge);
+- the bound parking with `0011`/`0100` after `MAX_REFUSED_BOOTS`.
