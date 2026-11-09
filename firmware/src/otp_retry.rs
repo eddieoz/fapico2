@@ -43,6 +43,24 @@ pub const STEP_MS: u64 = 250;
 /// with the same LED signature it would have emitted immediately.
 pub const DEADLINE_MS: u64 = 20_000;
 
+/// Sleep budget for the **boot-entropy** sites (`ensure_boot_entropy`'s
+/// record draw, `init_drbg`'s DRBG seed nonce), in ms. Sized on the first
+/// hardware measurement of the settling floor: the 2026-11-09 decode
+/// ([`docs/audits/2026-11-09-cold-boot-entropy-window.md`]) shows a cold
+/// power episode settling at **≥ 20.4 s** — [`DEADLINE_MS`] consumed in
+/// full, the draw succeeding on the deadline's final attempts. 60 s is
+/// twice that floor with margin, still an exact multiple of [`STEP_MS`].
+///
+/// The OTP reads deliberately keep [`DEADLINE_MS`]: a fuse rail that fails
+/// one read at 19.9 s is the same dead row at 59.9 s (§22's escalated lock
+/// recovers by neither retry nor dwell), so their budget stays at the size
+/// that already covered its measured window — and their refusal still parks
+/// immediately. Only the two entropy sites pass this constant; `retry`
+/// takes the deadline as an argument, so nothing else's behaviour moves.
+/// These two sites blink while they wait (`crate::wait_blink`) and reboot
+/// boundedly on refusal (`crate::entropy_reset`, ADR 0004 amendment 3).
+pub const ENTROPY_DEADLINE_MS: u64 = 60_000;
+
 /// Retry `read` on `None`, sleeping [`STEP_MS`] between attempts, until it
 /// succeeds or `deadline_ms` of sleep has elapsed. The first attempt is
 /// immediate: a healthy board pays nothing.
@@ -135,5 +153,26 @@ mod tests {
         assert_eq!(value, None);
         assert_eq!(rig.reads.get(), 1);
         assert_eq!(rig.sleeps.get(), 0);
+    }
+
+    /// US-1802 / EPIC `COLD-BOOT-ENTROPY-WINDOW`. The 2026-11-09 decode
+    /// ([`docs/audits/2026-11-09-cold-boot-entropy-window.md`] — sibling
+    /// `docs/` at the repo root) measured a cold episode settling at
+    /// **≥ 20.4 s**: the 20 s budget was consumed in full and the draw
+    /// succeeded on the deadline's final attempts. The entropy draws get
+    /// their own budget, sized on that measurement; the OTP reads keep
+    /// [`DEADLINE_MS`] and their silent-window policy, unchanged by
+    /// construction (`retry` takes the deadline as an argument).
+    #[test]
+    fn the_entropy_deadline_covers_the_measured_settling_floor_with_margin() {
+        // Bigger than the OTP reads' budget — that one sized a fuse rail, not
+        // a settling ring oscillator.
+        assert!(ENTROPY_DEADLINE_MS > DEADLINE_MS);
+        // An exact multiple of the retry step, so the loop spends the whole
+        // budget and the final attempt lands at the deadline, not past it.
+        assert_eq!(ENTROPY_DEADLINE_MS % STEP_MS, 0);
+        // At least twice the measured 20.4 s settling floor — margin, not a
+        // guess at the upper bound (which is unmeasured; see the audit).
+        assert!(ENTROPY_DEADLINE_MS >= 2 * 20_400);
     }
 }
