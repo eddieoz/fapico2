@@ -3869,3 +3869,37 @@ rediscover the analysis:
   so bad-token attempts during a warming window do not advance the latch.
   Deliberate: nothing behind the gate can succeed during the window, so
   there is nothing to brute-force; the latch resumes at Ready.
+
+## D-WB2 (2026-11-10, WARM-BOOT-SERVE follow-up): the serial surfaces must share one 26-bit value — the rescue body carries the serial id, not the chipid
+
+**Found as a user-visible regression**: picoforge reported "Applet not
+available on any PicoFido or RS-Key reader" for CCID applets while FIDO
+worked. The empty detail suffix proved a pre-APDU skip: picoforge's
+`DeviceHandle::open` filters readers by serial, comparing the
+**rescue-identity serial** (its decode of the rescue SELECT body:
+`u32::from_be_bytes([body[4] & 0x03, body[5], body[6], body[7]])` — the
+pico-keys-sdk wire convention, where the body carries the platform serial
+id whose head encodes the serial) against the **FIDO-side serial** (the
+management `TAG_SERIAL` render). Our body carried the **raw chipid** while
+`TAG_SERIAL` carried the SHA-256 hash — two different numbers from one
+board, so the filter skipped every reader. The reference
+(`pico-keys-sdk/src/rescue.c:79`) puts `pico_serial.id` in the body — the
+serial id, not the chipid — which is why 0.5.0 devices pair and ours did
+not.
+
+**Fix**: the serial value is the hash scaled into the 26-bit space the
+rescue decode can express (`SERIAL_MODULUS = 2^26`); `serial_hash4`
+returns exactly its big-endian bytes (byte 0 self-masks below 2^26 — the
+"already serial4-masked by the firmware" shape picoforge's comment
+expects); the rescue body carries `serial4 ‖ SHA-256(chipid)[4..8]`
+(the head pairs, the tail keeps the 8-byte device-unique id shape).
+USB iSerial, management `TAG_SERIAL`, and the rescue decode agree by
+construction — hardware-verified (`07904452` / `7904452` / `7904452`).
+
+**Deliberately not moved**: the OATH `device_id`
+(`SHA-256(chipid)[..8]`, the public PBKDF2 salt). Moving it would
+re-derive every existing OATH access key and orphan the credentials; the
+old "all three identities are one hash" coupling is decoupled with
+rationale in `tests/device_oath.rs`. **Fleet impact**: every board's USB
+serial changes once on the next firmware boot (hosts re-enumerate it as
+a different device; picoforge re-pairs) — pre-release, no deployed fleet.
