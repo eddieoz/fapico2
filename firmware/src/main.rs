@@ -1652,6 +1652,13 @@ async fn entropy_bringup_task() {
         return;
     }
     defmt::info!("entropy bring-up: task started — warming the TRNG in the background");
+    // Retry-log throttle: attempt 1, then one line per 16 attempts (4 s at
+    // the STEP_MS cadence), plus the success line. A wedged TRNG retries
+    // forever — an unthrottled warn would flood the diagnostic ring (the
+    // dbg-log/apdu-trace builds share it with presence records) and drown
+    // everything else; the pollable status TLV (US-1827) is the instrument
+    // for "is it still warming", not this log.
+    let mut attempts: u32 = 0;
     loop {
         match boot::try_seed_drbg_once() {
             Ok(()) => {
@@ -1673,7 +1680,13 @@ async fn entropy_bringup_task() {
                 return;
             }
             Err(_) => {
-                defmt::warn!("entropy bring-up: TRNG still warming — retrying");
+                attempts += 1;
+                if attempts == 1 || attempts % 16 == 0 {
+                    defmt::warn!(
+                        "entropy bring-up: TRNG still warming — attempt {}",
+                        attempts
+                    );
+                }
                 Timer::after_millis(fapico2_firmware::otp_retry::STEP_MS).await;
             }
         }
