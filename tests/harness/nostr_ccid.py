@@ -119,14 +119,24 @@ def frame(sock: socket.socket, payload: bytes) -> bytes:
 
 
 def _wait_relay_line(proc: subprocess.Popen, needle: str, timeout: float) -> None:
+    # The relay's stdout (stderr merged in) is its only diagnostic surface,
+    # so a failure MUST name what it printed — a bare timeout hides the
+    # crash reason (a port held by a leaked process, a bind refusal) and
+    # turns one glanceable port conflict into a 10-setup mystery. This
+    # file's whole class failed exactly that way on CI 2026-11-10.
+    seen: list[str] = []
     deadline = time.time() + timeout
     while time.time() < deadline:
         line = proc.stdout.readline()
         if not line:
             break
+        seen.append(line.rstrip())
         if needle in line:
             return
-    raise AssertionError(f"ccid relay did not report {needle!r} within {timeout}s")
+    raise AssertionError(
+        f"ccid relay did not report {needle!r} within {timeout}s; "
+        f"relay output: {seen!r}"
+    )
 
 
 class NostrEmu:
