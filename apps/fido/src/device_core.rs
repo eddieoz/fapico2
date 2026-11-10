@@ -2503,6 +2503,32 @@ impl FidoApp {
             return Err(err(Ctap2Response::MissingParameter));
         }
 
+        // US-1823/US-1826, review P1 follow-up (WARM-BOOT-SERVE): the
+        // clientPIN subcommands that DRAW refuse while the pool is empty.
+        // The shape checks above ran first (the nostr PIN-gate precedent:
+        // shapes, then state, then gates); the deterministic subcommands —
+        // getRetries (0x01) and getKeyAgreement (0x02) — stay ungated, both
+        // because they are and because the client needs them to learn the
+        // refusal cleanly and to retry.
+        //
+        // Why these four and why it matters more than a generic draw: the
+        // token MINT (`getPinToken` 0x05 / `getPinUvAuthTokenUsingPin…`
+        // 0x09) hands the token to the client ECDH-wrapped — a warming-
+        // window mint is an attacker-derivable pinUvAuthToken, and the
+        // token outlives Ready, so it is a PIN bypass for every UV-gated
+        // operation. The setPIN (0x03) / changePIN (0x04) salts are
+        // **persisted**: a keystream salt makes the stored PIN verifier
+        // brute-forceable offline — the PIN is the root of everything.
+        // The refusal word is `Other` (0x7F), the US-1007 precedent, same
+        // as the makeCredential gate. The host twin carries no pool (its
+        // host source cannot starve), so this gate is device-path-only by
+        // construction — not a missed twin.
+        if self.rng_pool.is_empty()
+            && matches!(subcommand, 0x03 | 0x04 | 0x05 | 0x09)
+        {
+            return Err(err(Ctap2Response::Other));
+        }
+
         match subcommand {
             0x01 => {
                 // getRetries

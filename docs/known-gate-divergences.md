@@ -3835,3 +3835,37 @@ because an unburned lock page is still an unburned lock page.
 **What this section is not.** It is not a claim that criterion #8 was
 satisfied, and not a request to waive it. It is the number, and the
 reasoning, so the decision is visible to whoever owns it.
+
+## D-WB1 (2026-11-10, WARM-BOOT-SERVE): pool-served draws that serve during a warming window — recorded, not gated
+
+The warming gates (US-1826 + the review follow-ups) cover the draws whose
+warming-window output is dangerous: makeCredential's keypair (a known
+private key), clientPIN's token mint (an attacker-derivable pinUvAuthToken)
+and persisted PIN salts (a brute-forceable verifier). These remaining pool
+consumers also serve during a warming window, and the decision is that
+their degradation is acceptable; recorded so the next reader does not
+rediscover the analysis:
+
+- **getInfo's `enc_identifier` / `enc_cred_store_state` IVs**
+  (`device_core.rs`, US-1609/F3): IVs are distinct per call (the pool
+  cursor advances), the key is `HKDF(pin_token)` — secret — and the
+  plaintext is not attacker-chosen. The F3 counter-oracle killer survives
+  (the ciphertext still varies every call). Computable-but-unique IVs under
+  a secret key; no oracle reopens.
+- **hmac-secret v2 protocol IVs** (`derive_hmac_output`): same shape —
+  distinct draws, secret `hkey`-derived key. The class table's
+  `HmacSecretCredRandom = Refuse` row is about credRandom *creation*
+  (persisted), which does not draw from the pool; the v2 response IVs are
+  ephemera.
+- **keyregion record-write GCM nonces** (`bump_sign_counter`, the C→Rust
+  migration, `delete_all_by_id`, vendor backup's EXPORT nonce): a
+  computable-but-unique nonce per write. GCM's hard requirement is
+  non-reuse, which holds (distinct pool windows per write, distinct
+  stretch constants per exhaustion); the keys are secret and
+  deterministic-per-boot regardless of nonce entropy. The EXPORT nonce is
+  protocol challenge material — computability weakens replay resistance,
+  and the vendor41 channel is token-gated.
+- **The makeCredential warming gate precedes the PIN-auth-failure latch**,
+  so bad-token attempts during a warming window do not advance the latch.
+  Deliberate: nothing behind the gate can succeed during the window, so
+  there is nothing to brute-force; the latch resumes at Ready.
