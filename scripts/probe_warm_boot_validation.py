@@ -23,9 +23,12 @@ this script's timestamps) and it produces the table the audit doc's §6
   6. **The LED reading** — not automatable; the filming covers it
      (wait rhythm while Warming, 1 Hz after Ready).
 
-Usage:  probe_warm_boot_validation.py [--assert-touch]
-        (--assert-touch waits for the button on the assertion/mint steps;
-         without it the script still decodes everything else.)
+Usage:  probe_warm_boot_validation.py [--assert-touch] [--max-wait SECS]
+        Start the probe BEFORE power-on (it waits up to --max-wait, default
+        1800 s, for the device to attach — so a long-dwell cold episode can
+        be sitting unplugged while the probe and the camera are rolling).
+        --assert-touch waits for the button on the assertion/mint steps;
+        without it the script still decodes everything else.
 
 Every line is prefixed with a monotonic timestamp so the film and the log
 correlate. Exit code 0 when the epic's claims all held; 1 with the failed
@@ -121,6 +124,8 @@ def oath_challenge_is_constant() -> bool | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--assert-touch", action="store_true")
+    ap.add_argument("--max-wait", type=int, default=1800,
+                    help="seconds to wait for attach/Ready before failing")
     args = ap.parse_args()
 
     log("probe start — start filming now; power-on should precede this")
@@ -129,7 +134,8 @@ def main() -> int:
     failures = []
     ctap2 = None
     status = None
-    for _ in range(60):
+    deadline = time.monotonic() + args.max_wait
+    while time.monotonic() < deadline:
         ctap2, _dev = find_ctap2()
         status = entropy_status_ccid()
         if ctap2 is not None and status is not None:
@@ -168,7 +174,8 @@ def main() -> int:
                     failures.append(f"mc-refusal-word-0x{e.code:02X}")
 
     # Claim 5: the OATH challenge fingerprint.
-    for _ in range(30):
+    deadline = time.monotonic() + args.max_wait
+    while time.monotonic() < deadline:
         const = oath_challenge_is_constant()
         if const is False:
             break
@@ -181,7 +188,8 @@ def main() -> int:
 
     # Claim 4: warming -> ready flip (poll the TLV).
     ready = False
-    for _ in range(120):
+    deadline = time.monotonic() + args.max_wait
+    while time.monotonic() < deadline:
         st = entropy_status_ccid()
         if st and st["ready"]:
             ready = True
