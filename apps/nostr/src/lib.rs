@@ -1847,6 +1847,26 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        // Gate 0 (US-1823/US-1826, audit A1 — WARM-BOOT-SERVE): the
+        // ceremony is creation-class and then some — it burns OTP rows
+        // with pool-drawn words. During a warming window the rng provider
+        // is `None` (the device warming posture), `ceremony_entropy_word`
+        // draws a zero, and `custody::burn` verify-fails into a TORN
+        // custody row: recoverable (the ceremony resumes over torn rows),
+        // but a destructive side effect no warming command should reach —
+        // and zero words served to an OTP burn is exactly what the epic's
+        // "no creation operation ever serves zeros" invariant forbids.
+        // Refuse outright, retryable; the ceremony re-runs once Ready.
+        // Device-only predicate: on a host build `rng == None` means the
+        // OS-entropy fallback, not warming.
+        #[cfg(target_arch = "arm")]
+        if self.rng.is_none() {
+            // 0x6985 is the applet's retryable word (the touch rows share
+            // it): "not right now", not "broken" — the ceremony re-runs
+            // once Ready and the entropy is live.
+            write_sw(resp, SW_TOUCH_REQUIRED);
+            return;
+        }
         // Gate 1: the gate must exist. Cache read, the same one the gate
         // itself consults.
         if !self.pin_set {
