@@ -52,3 +52,44 @@ The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community
 - **Register a passkey** somewhere you actually log in — see the [SSH how-to](../how-to/ssh.md) and the [Linux login how-to](../how-to/linux-auth.md).
 - **Enrol your TOTP codes** with `ykman oath` once the allowlist edit is done.
 - **Generate your PGP key on the card** with `gpg --card-status` and `gpg --change-pin` for the card's own PIN.
+
+## Randomness warming: what a fresh board shows (2026-11-10)
+
+A freshly flashed board has to draw its own randomness once — the entropy
+record its keys are bound to — and on a **cold day**, or a board that sat
+unplugged for a long time, the generator (TRNG) can take tens of seconds,
+occasionally minutes, to settle. This is normal and measured, not a fault
+(see [the boot troubleshooting table](../troubleshooting/boot.md)).
+
+What you will see, in order:
+
+1. **The boot ladder**, then on a fresh install **one ~0.4 s flash** (the
+   entropy-draw notice), then possibly the **fast-blink rhythm**
+   (`.--.--.--.`) for up to about a minute while the generator settles.
+2. **PicoForge / the management config shows the board as alive the whole
+   time.** The entropy state is readable over every interface: management
+   `READ_CONFIG` (CCID), the CTAP config read (0x42), and the OTP
+   capabilities page all carry tag `0x0B` — a flags byte whose **ready**
+   bit says whether randomness is available, and a **row-unfused** warning
+   bit (below). A client that knows the tag shows *"randomness warming —
+   provisioning can proceed once ready"* instead of failing.
+3. **Reads always work.** Passkey logins, OATH code computation, OpenPGP
+   and PIV signatures are deterministic — they serve while the board is
+   warming. Only **creation-class** operations (registering a new passkey,
+   on-card key generation, SET_CODE, Nostr key generation) answer
+   *"warming — retry"* until the board's LED settles from the fast blink
+   into the steady **1 Hz heartbeat** (and the config bit flips to ready).
+4. **Power-cycling is the accelerator.** The settle is a property of a
+   power episode, not of the board: unplugging for ≥ 5–10 seconds and
+   replugging gives the generator a fresh episode that usually settles in
+   seconds. If a fresh install's draw exhausts its whole budget and parks
+   (a long-flash signature, then dark), power-cycle and retry — after one
+   success the entropy record is stored permanently.
+
+**The row-unfused warning.** A board whose OTP key row has never been
+written (for example a browser-only first install that never ran the
+provisioning ceremony) works perfectly but binds its at-rest encryption to
+a degenerate key. The config bit makes that state visible instead of
+silent. It is informational — no action is required, and no burn happens
+automatically; fusing is a deliberate provisioning step with its own
+ordering constraints.
