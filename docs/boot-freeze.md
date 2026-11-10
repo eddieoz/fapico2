@@ -116,12 +116,18 @@ failure above. The measurement behind it is
 | What you see | What it means |
 |---|---|
 | Ladder, then a **fast-blink window** (`.--.--.--.` — 80 ms lit / 170 ms dark, one pair per 250 ms retry step, up to ~60 s), then the boot continues | Entropy settling — the TRNG of a cold power episode can take ≥ 20.4 s to settle (measured 2026-11-09). The board is **working; do not unplug**. This rhythm is driven by exactly one driver (`firmware/src/wait_blink.rs`, collision-tested) — nothing else on the pin can produce it |
-| Ladder, blink window, board **leaves the bus and re-runs the ladder from the top** | A window refused at its 60 s deadline; the board is on attempt 2 or 3 of 3 (bounded reboot, ADR 0004 amendment 3). Measured 2026-11-10: the rebooted boot's window is **the same length** — `sys_reset` does not clear the settling; only VBUS removal does |
-| Three refused windows, then **one** long-flash signature (`0011`/`0100`) | The bound expired — the stall is not transient. Park, permanent, exactly as pre-2026-11-09 builds parked; power-cycle-5 s is the recovery |
+| *(2026-11-10, superseded row kept for the record)* blink window, board **leaves the bus and re-runs the ladder** | The bounded reboot of ADR 0004 amendment 3 — **deleted** by amendment 4 / WARM-BOOT-SERVE (US-1825): the 2026-11-10 decode showed the reboots bought nothing, and a provisioned board no longer blocks on entropy at all. Unreachable on current builds; kept so an old build's video still decodes |
+| Fresh install: blink window, then **one** long-flash signature (`0011`/`0100`) | The legacy first-install draw refused its whole budget — park, permanent, legible (ADR 0004 amendment 4: freshness parks only where construction cannot proceed without it). Power-cycle-5 s is the recovery |
+| **Post-boot** (provisioned board): the same fast-blink rhythm **after** the 1 Hz heartbeat would normally start, settling to 1 Hz later | **Warming** (US-1828) — boot completed; deterministic operations serve (passkey logins, OATH codes, signatures), creation-class operations refuse "warming — retry" until the rhythm settles. One rhythm, one meaning: entropy settling, pre- and post-boot. Same driver, same collision-tested rhythm |
 | Ladder, **dark ~20 s with no blink at all**, then a signature once | An **OTP** read refused (`read_otp_key_1`/`read_chipid`) — unchanged behaviour from 2026-10-11: silent window, immediate park. The blink is the discriminator between an entropy wait (blinking) and an OTP wait (dark) |
 
-The heartbeat (1 Hz) and the 400 ms draw notice (record-absent draw about to
-start) keep their existing readings; no pre-existing reading changed meaning.
+The heartbeat (1 Hz — now meaning *boot completed AND randomness ready*;
+while warming the same pin shows the wait rhythm instead) and the 400 ms
+draw notice (record-absent draw about to start) keep their existing
+readings. The pollable counterpart of the warming state is
+`TAG_ENTROPY_STATE` (0x0B) in the management config TLV (US-1827) —
+ready/warming flags plus the unfused-row warning, identical over all three
+interfaces.
 
 ## 1. The boot phase ladder
 
