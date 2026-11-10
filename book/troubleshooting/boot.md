@@ -4,15 +4,15 @@ When a board refuses to boot, USB is exactly the thing that does not work — so
 
 Watch the LED **from the moment you plug power in**. Every pattern below happens in the first seconds — except the entropy wait, which can legitimately run for up to about a minute (see [the blinking window](#the-blinking-window-the-board-is-working-not-stuck)).
 
-## The five things the LED can say
+## The six things the LED can say
 
 | what you see | what it is |
 |---|---|
 | short pulses, ~80 ms apart, then more pulses | the **boot ladder** — a progress counter; count them to locate a freeze |
 | one long flash (~1.2 s), a pause, then four shorter flashes | a **fatal signature** — the board refused to boot and is naming the reason |
 | a single ~0.4 s flash, longer than any ladder pulse | the **entropy-draw notice** — a first/fresh boot drawing randomness (normal, see [below](#the-04-s-flash-a-fresh-store-drawing-entropy)) |
-| a fast blink repeating — short flash, short dark gap, for up to ~1 minute | the **entropy wait** — the board is settling its randomness generator and is *working*; do not unplug (see [the blinking window](#the-blinking-window-the-board-is-working-not-stuck)) |
-| steady 1 Hz blink, forever | the **heartbeat** — boot completed; the board is alive and serving |
+| a fast blink repeating — short flash, short dark gap | the **entropy wait / warming state** — the board is settling its randomness generator and is *working*. Pre-boot it lasts up to ~1 minute (a first/fresh install); post-boot it can last longer (see [the warming state](#the-blinking-window-the-board-is-working-not-stuck)) — **reads work while it blinks; only creation waits** |
+| steady 1 Hz blink, forever | the **heartbeat** — boot completed *and* randomness ready; the board is alive and serving everything |
 
 These are separated by flash *length*, not just rhythm: a ladder pulse is lit for 25 ms, a wait-blink for 80 ms between 170 ms dark gaps, a signature bit for 200 ms, the draw notice for 400 ms, the heartbeat for 500 ms. You do not need a stopwatch — after one healthy boot you will recognize each by eye. A case over the board does not stop any of this being countable (all of the readings below were verified through a 3D-printed case on video).
 
@@ -85,7 +85,7 @@ On the first boot after a factory reset — or any boot where the secure store s
 Two things can follow it that are worth recognizing:
 
 - **a pause of up to ~1 minute with a fast blink** (short flash, short dark gap — see [below](#the-blinking-window-the-board-is-working-not-stuck)). That is the entropy draw being retried while the board shows it is working. It is not a hang and not a signature; let it finish.
-- if the draw exhausts the whole budget (~1 minute of blinking), the board **reboots itself and starts the boot over** — you will see it leave the bus and re-run the ladder from the top. It does this up to three times; only if the third retry also refuses does it emit signature `0011` (reason 3, above) and go dark. Power cycle with 5+ seconds off and try again — a fresh power episode gives the randomness generator a fresh chance, and after one success the record is stored permanently (the flash does not appear again until the next factory reset).
+- if a first/fresh install's draw exhausts the whole budget (~1 minute of blinking), the board **parks with signature `0011`** (reason 3, above). There is no reboot loop any more — a board that is already serving never blocks on entropy at all (its generator warms in the background while reads work), so the only place a blink window can still end in a park is a first/fresh install whose construction itself needs randomness. Power cycle with 5+ seconds off and try again — a fresh power episode gives the randomness generator a fresh chance, and after one success the record is stored permanently (the flash does not appear again until the next factory reset).
 
 ## The blinking window: the board is working, not stuck
 
