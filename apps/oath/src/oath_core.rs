@@ -2686,6 +2686,14 @@ impl OathApp {
     }
 
     fn cmd_set_code(&mut self, data: &[u8]) -> Sw {
+        // US-1823/US-1826 (WARM-BOOT-SERVE): SET_CODE refuses while Warming —
+        // it draws PIN salts from the pool, and an empty pool would serve
+        // the stretch-from-empty keystream as salt material for a secret
+        // that persists. Retryable (`SW_CONDITIONS_NOT_SATISFIED`) for the
+        // same reason VALIDATE refuses: "not right now", not "broken".
+        if self.rng_pool.is_empty() {
+            return SW_CONDITIONS_NOT_SATISFIED;
+        }
         if !self.validated {
             return SW_SECURITY_STATUS_NOT_SATISFIED;
         }
@@ -2739,6 +2747,19 @@ impl OathApp {
     }
 
     fn cmd_validate(&mut self, data: &[u8], resp: &mut HeaplessVec<u8, MAX_RESPONSE>) -> Sw {
+        // US-1823/US-1826 (WARM-BOOT-SERVE): VALIDATE refuses while the
+        // entropy bring-up is Warming. The session challenge is not redrawn
+        // from the empty pool (SELECT serves, or nothing in the OATH session
+        // could be reached), so during the warming window it is the
+        // stretch-from-empty constant — and a challenge-response proof over a
+        // constant challenge replays across boots. Refusing VALIDATE keeps
+        // the replay window closed for exactly the window in which no fresh
+        // challenge exists; the deterministic commands (CALCULATE, LIST)
+        // still serve. `SW_CONDITIONS_NOT_SATISFIED` is OATH's retryable
+        // word — "not right now", not "broken".
+        if self.rng_pool.is_empty() {
+            return SW_CONDITIONS_NOT_SATISFIED;
+        }
         let Some(chal) = nth_tlv(data, TAG_CHALLENGE, 0) else {
             return SW_INCORRECT_PARAMS;
         };

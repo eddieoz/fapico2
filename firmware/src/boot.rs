@@ -1087,6 +1087,17 @@ fn seed_drbg_attempt() -> Result<(), fapico2_platform::drbg::SeedError> {
 /// draw leaves the seed record absent (logged there, invisible without a
 /// probe), and the seed path fail-closes on it.
 pub fn seed_drbg_blocking() {
+    // Idempotent (US-1825 fix-up): the foreign-image wipe arm calls this
+    // after the legacy path may already have seeded — and on the legacy
+    // path it always has (the arm runs below `init_drbg_cell` +
+    // `seed_drbg_blocking`). Re-seeding a live cell is the
+    // `SeedError::AlreadySeeded` bug the cell asserts; retrying it for the
+    // whole budget would park a perfectly seeded board signed
+    // `DrbgRefused`. Already seeded → publish (no-op) and return.
+    if drbg_cell().is_ready() {
+        publish_entropy_ready();
+        return;
+    }
     if fapico2_firmware::otp_retry::retry(
         || seed_drbg_attempt().ok().map(drop),
         entropy_wait_sleep,

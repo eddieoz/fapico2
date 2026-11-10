@@ -1243,6 +1243,24 @@ impl FidoApp {
     ) -> Result<(), Err> {
         let rkeys = self.region_keys_for(store.as_deref());
         let req = parse_mc(data)?;
+
+        // US-1823/US-1826 (WARM-BOOT-SERVE): the whole makeCredential refuses
+        // while the entropy bring-up is Warming — the pool is empty until the
+        // background task fills it from the seeded DRBG cell, and an
+        // empty-pool non-resident draw is attacker-derivable (the
+        // stretch-from-empty keystream is SHA-256 over known bytes), which is
+        // a known private key, not merely a stale one. The resident arm
+        // consumes zero randomness and is technically servable; the whole
+        // command stays in the refusal class anyway — one reason, one code
+        // path (US-1823's recorded narrowing). The refusal word is
+        // `Ctap2Response::Other` (0x7F), the US-1007 entropy-starved precedent
+        // — python-fido2 surfaces it as a generic retryable failure, not as a
+        // broken device. The host twin (app.rs) carries no pool and draws
+        // from OS entropy that cannot starve, so this gate is
+        // device-path-only by construction — not a missed twin.
+        if self.rng_pool.is_empty() {
+            return Err(err(Ctap2Response::Other));
+        }
         let pin_set = self.keystore.pin_state.pin_hash.is_some();
 
         // Algorithm selection before the PIN check (C parity).

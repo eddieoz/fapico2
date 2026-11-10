@@ -1029,7 +1029,7 @@ fn the_device_path_derives_the_pin_cache_at_first_attach() {
         .expect("one device-shape test per process");
 
     let mut app = NostrApp::new();
-    app.install_providers(lazy_device_region, device_random, device_grant, None);
+    app.install_providers(lazy_device_region, Some(device_random), device_grant, None);
 
     // First command, GET_INFO: the cache reads the store, not the
     // constructor default.
