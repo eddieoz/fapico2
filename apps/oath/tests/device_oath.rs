@@ -1113,16 +1113,15 @@ fn device_id_is_not_a_shared_constant() {
     // re-derives must not get a different answer).
     assert_eq!(a, select_device_id(&select_with_chipid(Some(A))));
 
-    // The derivation is pinned: it is the US-103/R12 device-bound hash —
-    // `SHA-256(chipid BE)[..4]` — widened to the 8 bytes the OATH TLV
-    // carries, the same hash the USB serial and the management `TAG_SERIAL`
-    // use. Pinning it is what stops a later "simplification" from quietly
+    // The derivation is pinned: the US-103/R12 device-bound hash —
+    // `SHA-256(chipid BE)[..8]` — widened to the 8 bytes the OATH TLV
+    // carries. **Deliberately no longer tied to `serial_hash4`** (D-WB2,
+    // 2026-11-10): the serial surfaces moved to the 26-bit serial4 rule the
+    // PicoForge rescue decode expresses, while the device-id is a PBKDF2
+    // *salt* whose value must not move — a salt change would re-derive
+    // every existing OATH access key and orphan the credentials. Pinning
+    // the hash here is what stops a later "simplification" from quietly
     // substituting a different per-unit-looking value.
-    assert_eq!(
-        &a[..4],
-        &fapico2_platform::usb_ident::serial_hash4(A)[..],
-        "the device-id is the shared device-bound hash, widened to 8 bytes"
-    );
     assert_eq!(
         a,
         device_id_from_chipid(A).to_vec(),

@@ -249,12 +249,15 @@ pub const EMULATION_CHIPID: u64 = fapico2_platform::usb_ident::EMULATION_CHIPID;
 /// uniform, structure-free 8-byte encoding rather than the chip-id itself
 /// (whose low bits are not uniform). The hash is reused rather than a second
 /// one invented: [`fapico2_platform::ckey::serial_hash`] is the codebase's
-/// existing device-bound hash, and it is the *same* function
-/// `usb_ident::serial_hash4` feeds the chip-id for the USB serial and the
-/// management `TAG_SERIAL` (US-103/R12). All three device-bound identities
-/// are therefore one hash of one input and cannot drift apart; only the
-/// truncation length differs (8 bytes here, 4 for the management TLV, 8
-/// rendered as decimal digits for USB).
+/// existing device-bound hash.
+///
+/// **Deliberately not the USB serial any more** (D-WB2, 2026-11-10): the
+/// serial surfaces (USB descriptor, management `TAG_SERIAL`, rescue identity
+/// body) moved to the 26-bit serial4 rule PicoForge's rescue decode
+/// expresses, because a wider serial silently broke CCID pairing. This
+/// device-id is a PBKDF2 *salt* — moving it would re-derive every existing
+/// OATH access key and orphan the credentials — so it keeps its own hash
+/// derivation, pinned by `tests/device_oath.rs`.
 ///
 /// Deterministic and float-free — SHA-256 over 8 big-endian bytes, so the
 /// device (`thumbv8m`) and the host produce bit-identical bytes and no

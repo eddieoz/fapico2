@@ -89,9 +89,15 @@ use crate::ckey::serial_hash;
 /// Number of ASCII characters in the rendered USB serial.
 pub const SERIAL_DIGITS: usize = 8;
 
-/// Upper bound (exclusive) of the rendered serial's numeric value — 10^8, the
-/// size of the 8-decimal-digit space.
-pub const SERIAL_MODULUS: u64 = 100_000_000;
+/// Upper bound (exclusive) of the rendered serial's numeric value — 2^26, the
+/// space PicoForge's rescue-body serial decode can express (D-WB2): the client
+/// derives the CCID-side serial as `u32::from_be_bytes([body[4] & 0x03,
+/// body[5], body[6], body[7]])` of the rescue identity, a 26-bit read. A
+/// serial wider than that silently breaks CCID pairing (the 2026-11-10
+/// "Applet not available on any PicoFido or RS-Key reader" regression). 2^26
+/// still renders in 8 decimal digits, so `decimal8` and the USB descriptor
+/// shape are unchanged.
+pub const SERIAL_MODULUS: u64 = 0x0400_0000;
 
 /// Fixed emulation chipid — host/emulation builds have no OTP row, so a
 /// fixed stand-in (ASCII `"fapico2"` + `0x00`) keeps the derived serial
@@ -111,25 +117,32 @@ pub const SERIAL_MODULUS: u64 = 100_000_000;
 /// other board, which is the fingerprinting bug US-103 exists to remove.
 pub const EMULATION_CHIPID: u64 = 0x6661_7069_636F_3200;
 
-/// `SHA-256(chipid big-endian)[..4]` — the codebase's device-bound derivation
-/// (`ckey::serial_hash` is SHA-256 over the flash UID; this feeds it the OTP
-/// chipid), truncated to the 4 bytes the management `TAG_SERIAL` TLV carries.
+/// The **serial4-masked** serial: [`serial_value`] rendered big-endian, the
+/// byte shape the pico-keys-sdk rescue wire convention expects — byte 0
+/// carries only the top 2 serial bits (the value is below 2^26 by
+/// construction, so the mask is automatic), which is exactly the decode
+/// PicoForge applies to the rescue identity body to pair the CCID interface
+/// with the FIDO-side serial ("already serial4-masked by the firmware",
+/// their words).
 ///
-/// **Single source of truth.** `fapico2_mgmt::serial_from_chipid` calls this,
-/// so the applet's serial and the USB serial are the same hash by
-/// construction.
+/// **Single source of truth.** `fapico2_mgmt::serial_from_chipid` calls this
+/// (the management `TAG_SERIAL` TLV), the rescue identity body carries these
+/// bytes at `[4..8]`, and the USB descriptor renders [`serial_digits`] — one
+/// value, three surfaces, no pairing mismatch. The OATH device-id is
+/// deliberately **not** this value (it is a PBKDF2 salt and must not move):
+/// see `apps/oath`'s `device_id_from_chipid`.
 pub fn serial_hash4(chipid: u64) -> [u8; 4] {
-    let h = serial_hash(&chipid.to_be_bytes());
-    [h[0], h[1], h[2], h[3]]
+    (serial_value(chipid) as u32).to_be_bytes()
 }
 
 /// The scaled-truncation step: the 32-bit hash prefix mapped onto
-/// `0 ..= 99_999_999` (see the module docs for the rule and its collision
+/// `0 ..= 2^26 - 1` (see the module docs for the rule and its collision
 /// behaviour). Exposed so the mapping can be asserted directly rather than
 /// re-derived by the test.
 pub fn serial_value(chipid: u64) -> u64 {
-    let n = u32::from_be_bytes(serial_hash4(chipid)) as u64;
-    // (n * 10^8) fits a u64 with room to spare: max 2^32 * 10^8 ≈ 4.3e17
+    let h = serial_hash(&chipid.to_be_bytes());
+    let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64;
+    // (n * 2^26) fits a u64 with room to spare: max 2^32 * 2^26 = 2^58,
     // against u64::MAX ≈ 1.8e19. The shift is exact integer arithmetic.
     (n * SERIAL_MODULUS) >> 32
 }
@@ -156,9 +169,12 @@ pub fn decimal8(value: u64) -> [u8; SERIAL_DIGITS] {
     out
 }
 
-/// The device's USB serial: [`serial_hash4`]'s hash prefix rendered as 8
-/// decimal digits. Stable across reboots (pure function of the OTP chipid) and
-/// distinct per device up to the documented collision budget.
+/// The device's USB serial: the serial value rendered as 8 decimal digits.
+/// Stable across reboots (pure function of the OTP chipid) and distinct per
+/// device up to the documented collision budget. **Not** the string PicoForge
+/// pairs on — that comparison runs on the management `TAG_SERIAL` render
+/// versus the rescue-body decode, both of which are [`serial_value`] in
+/// plain decimal; the padded iSerial is host-visible identity only.
 pub fn serial_digits(chipid: u64) -> [u8; SERIAL_DIGITS] {
     decimal8(serial_value(chipid))
 }
