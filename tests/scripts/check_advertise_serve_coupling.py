@@ -62,7 +62,8 @@ now closed and both re-demonstrable by re-applying that one line:
   it against `cfg!`, so a backend in the table with its switch off fails the
   build that discriminates.
 
-And this gate is wired into CI (the `advertise-serve-gate` job). It was
+And this gate is wired into CI (a step of the `device` job in ci.yml; until
+2026-11-11 it had a job of its own, `advertise-serve-gate`). It was
 referenced by nothing outside its own docstring: the default half ran only by
 accident, through `cargo test --workspace` picking up the test, and the half
 that discriminates was never run by anything.
