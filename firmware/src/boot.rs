@@ -1005,8 +1005,23 @@ pub fn publish_entropy_ready() {
 /// first use would orphan everything created under the zero row — the
 /// fuse-vs-first-use ordering is ADR 0002's deferred provisioning epic's
 /// first story.
+///
+/// Reads the row from the write-once [`DRBG_OTP_KEY`] slot rather than the
+/// fuse window again: `init_drbg_cell` performed the (budgeted, park-on-
+/// refusal) read on the boot path, and the slot holds the same 32 bytes —
+/// a second register walk per boot bought nothing. Ordering is load-
+/// bearing: the sole caller (`main`, the US-1827 flag seeding) runs
+/// immediately after `init_drbg_cell`, so the slot is initialized.
 pub fn otp_row_unfused() -> bool {
-    matches!(read_otp_key_1(), Some(row) if row.iter().all(|&b| b == 0))
+    // SAFETY: `DRBG_OTP_KEY` is written exactly once by `init_drbg_cell`
+    // (boot path, before any task), the same read-once discipline
+    // `seed_drbg_attempt`'s shared-ref casts document; this is a shared
+    // read of already-initialized bytes, and the caller ordering above is
+    // the contract. A board whose row read failed parked in
+    // `init_drbg_cell` long before this ran, so the bit never lies about
+    // a read it cannot do.
+    let row: &[u8; 32] = unsafe { &*core::ptr::addr_of!(DRBG_OTP_KEY).cast::<[u8; 32]>() };
+    row.iter().all(|&b| b == 0)
 }
 
 /// Mint a fresh `&'static mut` handle to the DRBG cell.
