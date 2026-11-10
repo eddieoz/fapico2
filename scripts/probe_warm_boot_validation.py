@@ -124,6 +124,9 @@ def oath_challenge_is_constant() -> bool | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--assert-touch", action="store_true")
+    ap.add_argument("--pin", action="store_true",
+                    help="prompt for the FIDO PIN and run the ceremony with a "
+                         "pinUvAuthToken (required on a PIN-set board)")
     ap.add_argument("--max-wait", type=int, default=1800,
                     help="seconds to wait for attach/Ready before failing")
     args = ap.parse_args()
@@ -153,6 +156,12 @@ def main() -> int:
     # Claim 3: a makeCredential right at attach. While Warming the expected
     # answer is 0x7F; post-Ready (with no PIN and up=True) it either serves
     # (needs a touch) or asks for one.
+    # Claim 3: a makeCredential right at attach. While Warming the expected
+    # answer is 0x7F (the pool is empty, the gate is before the PIN policy).
+    # Once the pool is filled the gate passes and the request proceeds to the
+    # PIN policy — on a PIN-set board a no-token request answers 0x36 there,
+    # which is CORRECT post-pool-fill behavior, not a failure. Only 0x7F
+    # proves the warming window was caught; only an unexpected word fails.
     warming_at_attach = status is not None and not status["ready"]
     if warming_at_attach:
         try:
@@ -167,11 +176,19 @@ def main() -> int:
             log("makeCredential at attach: SERVED (unexpected while Warming)")
             failures.append("mc-served-while-warming")
         except CtapError as e:
-            log(f"makeCredential at attach: refused 0x{e.code:02X}"
-                + (" — the warming refusal, as designed" if e.code == 0x7F else ""))
-            if e.code != 0x2D:  # 0x2D = touch window; the gate passed
-                if e.code != 0x7F:
-                    failures.append(f"mc-refusal-word-0x{e.code:02X}")
+            if e.code == 0x7F:
+                log("makeCredential at attach: refused 0x7F — THE WARMING "
+                    "WINDOW WAS CAUGHT (the epic's claim 3, on the wire)")
+            elif e.code == 0x36:
+                log("makeCredential at attach: 0x36 PIN policy — the pool was "
+                    "already filled (the warming window was too short to catch; "
+                    "a longer dwell holds it open)")
+            elif e.code == 0x2D:
+                log("makeCredential at attach: touch window — pool filled, gate "
+                    "open (warming window too short to catch)")
+            else:
+                log(f"makeCredential at attach: unexpected refusal 0x{e.code:02X}")
+                failures.append(f"mc-refusal-word-0x{e.code:02X}")
 
     # Claim 5: the OATH challenge fingerprint.
     deadline = time.monotonic() + args.max_wait
@@ -200,8 +217,26 @@ def main() -> int:
         log("FAIL: entropy never reached Ready")
         failures.append("never-ready")
 
-    # Claims 1/2: a real creation + assertion ceremony once Ready.
+    # Claims 1/2: a real creation + assertion ceremony once Ready. On a
+    # PIN-set board the ceremony needs a pinUvAuthToken (--pin prompts for
+    # it; it is never printed or logged).
+    pin_token = None
+    client_pin = None
+    if args.pin:
+        import getpass
+        from fido2.ctap2.pin import ClientPin
+        pin = getpass.getpass("FIDO PIN (not echoed, not logged): ")
+        client_pin = ClientPin(ctap2)
+        pin_token = client_pin.get_pin_token(pin)
+        log("pinUvAuthToken minted (post-Ready — the clientPIN gate is open)")
+
     ev = threading.Event()
+    pin_uv_param = None
+    pin_proto = None
+    if pin_token is not None:
+        pin_proto = 1
+        pin_uv_param = client_pin.pin_uv_protocol_v1.calc_auth_params(
+            os.urandom(32), pin_token)
     try:
         att = ctap2.make_credential(
             os.urandom(32),
@@ -209,6 +244,8 @@ def main() -> int:
             {"id": os.urandom(16), "name": "us1831"},
             [{"type": "public-key", "alg": -7}],
             options={"up": True, "rk": False},
+            pin_uv_param=pin_uv_param,
+            pin_uv_protocol=pin_proto,
             event=ev,
         )
         log("makeCredential post-Ready: SERVED (touch given)")
@@ -218,6 +255,8 @@ def main() -> int:
             os.urandom(32),
             [{"type": "public-key", "id": aid}],
             options={"up": True},
+            pin_uv_param=pin_uv_param,
+            pin_uv_protocol=pin_proto,
             event=ev,
         )
         log("getAssertion post-Ready: SERVED — the deterministic path held")
@@ -225,6 +264,8 @@ def main() -> int:
         log(f"ceremony incomplete: 0x{e.code:02X} ({'touch not given' if e.code == 0x2D else 'error'})")
         if not args.assert_touch:
             log("(rerun with --assert-touch and press the button on the LED prompt)")
+        elif args.pin:
+            log("(check the PIN was typed correctly)")
 
     log(f"RESULT: {'PASS' if not failures else 'FAIL: ' + ', '.join(failures)}")
     return 0 if not failures else 1
