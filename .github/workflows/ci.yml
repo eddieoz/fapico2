@@ -1,26 +1,31 @@
 # CI pipeline (US-381) — one workflow gating every push.
 #
-# Five gates, per EPIC RUST-MIGRATION Phase 5:
-#   1. host-tests   cargo test --workspace      (host unit tests; device crate
-#                                                excluded — it is no_std + arm-only
-#                                                and has no host-testable lib)
-#   2. clippy       cargo clippy -- -D warnings (no warnings on any host crate)
-#   3. device-build cargo build --release       (RP2350 / thumbv8m device ELF)
-#                  + size gate (text <= 3.5 MiB flash ceiling, US-382)
-#   4. no-heap      heap gate: exactly one *sanctioned* #[global_allocator]
-#                  (platform/src/rsa_heap.rs, US-938) + the device firmware
-#                  is #![no_std] + nothing allocates before rsa_heap::init()
-#                  (US-383; rewritten US-961 when the token grep went red on
-#                  the sanctioned allocator)
-#   5. pytest-gate  full Phase 3 exit gate      (fapico2's own emulator suites:
-#                                                tests/pico-fido, tests/piv,
-#                                                tests/openpgp, tests/harness —
-#                                                see the job for what blocks)
+# Five JOBS (2026-11-11, consolidated from twelve — see docs/ci-evaluation-2026-11.md):
+#   1. host          cargo test --workspace + cargo clippy -D warnings + the
+#                    erase-budget gate (all three want the host toolchain and
+#                    nothing else; they shared a checkout and a toolchain
+#                    download three times before, and the tests are the critical
+#                    path — clippy now fails fast in front of them instead of
+#                    running as a parallel cold job that finished first and
+#                    said nothing about the tests)
+#   2. device        cargo build --release (RP2350 / thumbv8m device ELF)
+#                    + size gates + reproducible build + flash-budget ratchet
+#                    + the advertise/serve coupling gate (US-962/US-964 — the
+#                    default *and* the reduced build; it shells out to cargo,
+#                    and the toolchain is already warm here)
+#   3. gates-py      the structural gates that are plain python3 over the
+#                    checkout: heap (US-383/961), persist (US-429),
+#                    attestation (US-916), rng-path (US-1005), the
+#                    US-1042 assurance loop, the wiring half of the mutation
+#                    harness, and the boot-ladder classifier (US-1302)
+#   4. supply-chain  cargo-deny + crate graph + cargo-vet + SBOM + provenance
+#   5. pytest-gate   fapico2's own emulator suites (tests/pico-fido, tests/piv,
+#                    tests/openpgp, tests/harness — see the job for what blocks)
 #
-# Plus the standalone structural gates: persist-gate, attestation-gate, and
-# advertise-serve-gate (US-962/US-964 — the default *and* the reduced build of
-# the advertise/serve coupling check; it existed as a script nothing ran, which
-# is why a one-line manifest mutation kept every signal green).
+# Every job is still UNCONDITIONAL and there are still no `needs:` edges: a
+# check GitHub can mark as SKIPPED on a docs-only change set is not a check
+# (US-1042), and tests/scripts/test_gates.py --workflows-only (in gates-py)
+# parses this file and simulates a docs-only change to hold that line.
 #
 # Layout: fapico2 is checked out under $GITHUB_WORKSPACE/fapico2 and every gate
 # runs against THAT tree. There is no second checkout: the pytest suites and
@@ -34,6 +39,14 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+
+# A superseded push to the same ref cancels its own predecessor instead of
+# racing it for minutes on end: before this block, every "fix the CI" commit
+# ran on top of the previous push's twelve cold jobs. Cancellation is
+# deliberately pull_request-only — a push to main always runs to completion.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -149,24 +162,48 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1/4 — cargo test --workspace (host unit tests: platform, fido, oath,
-  #      openpgp, mgmt). The device crate (fapico2-firmware) is excluded here:
-  #      its BINARIES are a #[no_main] arm-only target and cannot build for the
+  # 1/5 — host: clippy first (fail fast in ~1 min), then cargo test --workspace
+  #      (host unit tests: platform, fido, oath, openpgp, mgmt). The device
+  #      crate (fapico2-firmware) is excluded from the workspace run: its
+  #      BINARIES are a #[no_main] arm-only target and cannot build for the
   #      host. Its LIBRARY can (`#![cfg_attr(not(test), no_std)]` plus a
   #      `default = ["device"]` feature set that resolves to host deps), and it
   #      is where the presence/ctap_hid/ccid_reasm unit tests live — so it gets
   #      its own step below. US-1021 added the first test in this tree that
   #      gates device-only behaviour, and a gate nothing runs is not a gate.
+  #
+  #      The erase-budget gate (US-1010) closes the job: it runs a `cargo test`
+  #      instrument, so it wants this toolchain, and it does not need a job of
+  #      its own (its 2026-11-11 move from a standalone job is recorded in
+  #      docs/ci-evaluation-2026-11.md; the gate itself is unchanged).
+  #
+  #      Cached: the cargo registry/git share and the workspace target dir
+  #      survive between runs (Swatinem/rust-cache), which is what turns this
+  #      job's ~11 min of cold compile into a minutes-cheaper warm run.
   # ---------------------------------------------------------------------------
-  host-tests:
-    name: cargo test --workspace
+  host:
+    name: cargo test + clippy (host workspace)
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: fapico2
+      # SHA-pinned to v2.9.3, the same posture as every other action in this
+      # file (see the supply-chain job's note on moving tags). Caches
+      # ~/.cargo (registry + git) and the workspace's target directory,
+      # cleaning the target of non-shared artifacts before saving. `workspaces`
+      # is needed because the checkout lands in the fapico2/ subdirectory.
+      # cache-on-failure is deliberate: the failing runs are exactly the ones
+      # this workflow exists to iterate on, and a PR series that pushes
+      # five "fix the gate" commits should not pay cold compile on each.
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+          cache-on-failure: true
       # No third-party action: `rustup` ships with the runner and the committed
       # rust-toolchain.toml pins the channel and target. dtolnay/rust-toolchain
       # resolves its toolchain from a *branch* (stable/nightly, both
@@ -182,9 +219,20 @@ jobs:
       # pinned to 1.99.0, the clippy job died with "'cargo-clippy' is not
       # installed for the toolchain '1.99.0'" (run 37308500832) while passing
       # locally, because clippy had been installed on `stable` instead.
-      - name: Set up Rust (pinned by rust-toolchain.toml)
+      # `clippy` is named here rather than left to the toolchain file so the
+      # component is visible at the step that needs it (this job runs clippy
+      # and the tests on ONE toolchain — the two old jobs installed it twice).
+      - name: Set up Rust (pinned + clippy)
         working-directory: fapico2
-        run: rustup toolchain install --profile minimal --no-self-update
+        run: rustup toolchain install --profile minimal --component clippy --no-self-update
+      # Strict lint gate (FX-416 standard, extended to the workspace): any new
+      # warning on a host-buildable crate turns the build red. The vendored
+      # `opcard` path dependency lints at its own `warn` level and is not part
+      # of this member gate. First step after setup: it is ~1 min and its red
+      # is the cheapest red to read.
+      - name: clippy (workspace, host target, all targets)
+        working-directory: fapico2
+        run: cargo clippy --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware --all-targets -- -D warnings
       - name: Workspace host unit tests
         working-directory: fapico2
         run: cargo test --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware
@@ -218,7 +266,7 @@ jobs:
       # US-1524, and the suite every pytest acceptance run and every emulator
       # suite in tests/ executes against. A gate that nothing runs is
       # not a gate — the same sentence this file already uses at the
-      # `advertise-serve-gate` job, reproduced one level up.
+      # advertise/serve step, reproduced one level up.
       #
       # A SECOND step, not a widened first one, for two reasons:
       #   * the step above is the SHIPPING configuration's gate and stays
@@ -238,54 +286,56 @@ jobs:
       - name: Firmware lib unit tests (emulation parity, US-1524)
         working-directory: fapico2
         run: cargo test -p fapico2-firmware --lib --features device,emulation --target x86_64-unknown-linux-gnu -- --test-threads=1
-
-  # ---------------------------------------------------------------------------
-  # 2/4 — cargo clippy -- -D warnings. A strict lint gate: any new warning on a
-  #      host-buildable crate turns the build red (matches the FX-416 standard
-  #      run_all_tests.sh already enforces for fido, extended to the workspace).
-  #      The vendored `opcard` path dependency lints at its own `warn` level and
-  #      is not part of this member gate.
-  # ---------------------------------------------------------------------------
-  clippy:
-    name: cargo clippy -D warnings
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      # No channel argument, for the reason on the first job's setup step:
-      # naming `stable` installs components on a toolchain that
-      # rust-toolchain.toml then does not select. `clippy` is named here rather
-      # than left to the toolchain file so the component is visible at the step
-      # that needs it.
-      - name: Set up Rust (pinned + clippy)
+      # Flash-erase budget gate (US-1010, RS-KEY-ADOPT Phase 2): a doc-agreement
+      # gate in the check_size_report.py style, but over a MEASUREMENT rather
+      # than a rebuilt ELF. It runs the host instrument in
+      # platform/tests/persist_sink.rs (the real FlashSlotSink over a NOR model,
+      # at the shipping slot geometry) and fails while docs/erase-budget.md
+      # disagrees with it. The instrument's unchanged-image control is what
+      # makes this a measurement of the code and not of the prose: a sink that
+      # lost its compare-then-write reports a non-zero erase count there and
+      # this goes red. (Moved into this job 2026-11-11 from its own job —
+      # it is a `cargo test`, so this is where its toolchain lives.)
+      - name: "Erase-budget gate — erases per persist vs docs/erase-budget.md"
         working-directory: fapico2
         run: |
-          rustup toolchain install --profile minimal --component clippy --no-self-update
-      - name: clippy (workspace, host target, all targets)
-        working-directory: fapico2
-        run: cargo clippy --workspace --target x86_64-unknown-linux-gnu --exclude fapico2-firmware --all-targets -- -D warnings
+          set -uo pipefail
+          echo "--- measuring the sink's erase budget and comparing it with the document ---"
+          if ! python3 tests/scripts/check_erase_budget.py; then
+            echo "::error::The flash erase budget has drifted from what FlashSlotSink::program actually does. Re-run the instrument (cargo test -p fapico2-platform --target x86_64-unknown-linux-gnu --test persist_sink erase_budget_figures -- --exact --nocapture) and update docs/erase-budget.md."
+            exit 1
+          fi
+          echo "ok: erase-budget gate green"
 
   # ---------------------------------------------------------------------------
-  # 3/4 — device integration gate (US-389): the RP2350 release build must be
+  # 2/5 — device integration gate (US-389): the RP2350 release build must be
   # size-bounded, clippy-clean with the device feature, heap-free, and the
-  # committed flashable artifact (firmware/fapico2.uf2) must match the build.
-  # The host-tests and no-heap jobs in this workflow cover the remaining gate
-  # assertions (`cargo test --workspace` green, no #[global_allocator]).
+  # flashable artifact (firmware/fapico2.uf2) must match the build. The host
+  # and gates-py jobs in this workflow cover the remaining gate assertions
+  # (`cargo test --workspace` green, the structural scans).
   # Cortex-M33 = ARMv8-M -> thumbv8m.main-none-eabi. Needs the ARM ELF linker
   # (gcc-arm-none-eabi) to link the bare-metal binary.
+  #
+  # The advertise/serve coupling gate (US-962/US-964) closes the job: it
+  # shells out to cargo for the default *and* the reduced build of
+  # tests/advertise_serve.rs, and the toolchain is already warm here. (Moved
+  # 2026-11-11 from its own job; the gate itself is unchanged.)
   # ---------------------------------------------------------------------------
-  device-build:
+  device:
     name: device integration gate (RP2350)
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: fapico2
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+          cache-on-failure: true
       # No channel argument, for the reason on the first job's setup step:
       # naming `stable` installs components on a toolchain that
       # rust-toolchain.toml then does not select. `clippy` is named here rather
@@ -338,7 +388,7 @@ jobs:
           fi
           echo "boot-chain gate PASS"
       # US-389: the device feature must be clippy-clean (-D warnings), same
-      # bar as the host clippy job.
+      # bar as the host clippy step.
       - name: "Clippy — device feature, -D warnings"
         working-directory: fapico2
         run: cargo clippy --target thumbv8m.main-none-eabi -- -D warnings
@@ -386,7 +436,7 @@ jobs:
       # summary, so nothing is hidden by the document no longer being a gate.
       # The document-equality check still exists, behind
       # `check_size_report.py --check-doc`; it is exercised by the mutation
-      # harness (the `gates` job runs the wiring half, `gates-mutation.yml` the
+      # harness (the gates-py job runs the wiring half, gates-mutation.yml the
       # full table). Refresh the document with
       # `python3 tests/scripts/check_size_report.py --update`.
       - name: "Size gate — text/bss budgets over the rebuilt ELF"
@@ -512,34 +562,22 @@ jobs:
         with:
           name: fapico2-rp2350-uf2
           path: fapico2/firmware/fapico2.uf2
-
-  # ---------------------------------------------------------------------------
-  # advertise/serve gate (US-962, wired US-964): the OpenPGP card must not
-  # advertise an algorithm group its dispatch does not serve, in BOTH
-  # configurations — the production one and the backend-free one. It is two
-  # `cargo test` invocations of tests/advertise_serve.rs plus a manifest check.
-  #
-  # US-964: this job did not exist. The script was referenced by nothing outside
-  # its own docstring, so only the default half of it ever ran — by accident,
-  # via the host-tests job's `cargo test --workspace` picking up the test — and
-  # the half that discriminates (the reduced build) was compiled by nothing.
-  # The reviewer proved the consequence: one line in apps/openpgp/Cargo.toml,
-  # re-acquiring `fapico2-platform` with default features, kept every signal
-  # green while the reduced build carried six backends and advertised four
-  # groups. A gate that nothing runs is not a gate.
-  # ---------------------------------------------------------------------------
-  advertise-serve-gate:
-    name: advertise/serve coupling gate (default + reduced)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: Set up Rust (pinned by rust-toolchain.toml)
-        working-directory: fapico2
-        run: rustup toolchain install --profile minimal --no-self-update
+      # ---------------------------------------------------------------------------
+      # advertise/serve gate (US-962, wired US-964): the OpenPGP card must not
+      # advertise an algorithm group its dispatch does not serve, in BOTH
+      # configurations — the production one and the backend-free one. It is two
+      # `cargo test` invocations of tests/advertise_serve.rs plus a manifest check.
+      #
+      # US-964: this gate did not exist as a wired step. The script was
+      # referenced by nothing outside its own docstring, so only the default
+      # half of it ever ran — by accident, via the host job's
+      # `cargo test --workspace` picking up the test — and the half that
+      # discriminates (the reduced build) was compiled by nothing. The reviewer
+      # proved the consequence: one line in apps/openpgp/Cargo.toml,
+      # re-acquiring `fapico2-platform` with default features, kept every signal
+      # green while the reduced build carried six backends and advertised four
+      # groups. A gate that nothing runs is not a gate.
+      # ---------------------------------------------------------------------------
       - name: "Gate: FA advertises exactly what the dispatch serves, in both configurations"
         working-directory: fapico2
         run: |
@@ -552,166 +590,8 @@ jobs:
           echo "ok: advertise/serve coupling gate green"
 
   # ---------------------------------------------------------------------------
-  # heap gate (US-383, rewritten US-961): structural proof that the device
-  # heap is either absent or EXACTLY the one sanctioned static allocator.
-  #
-  # US-961: this job was red on the branch. US-938 added the sanctioned
-  # allocator (platform/src/rsa_heap.rs — a 48 KiB linked_list_allocator
-  # LockedHeap behind the software-RSA backend, right-sized from measurement
-  # by US-956/US-957) and the US-383 grep had never been re-run, because CI
-  # had never run on this branch. The grep was not weakened and the allocator
-  # was not deleted: it was replaced by tests/scripts/check_heap_gate.py,
-  # which states the exemption precisely — exactly one `#[global_allocator]`
-  # in device source, it is the sanctioned one, and it is a LockedHeap over a
-  # fixed-size static; the device firmware is still #![no_std]; the heap is
-  # actually linked into the release image; and nothing may allocate before
-  # rsa_heap::init() goes live (the pre-boot invariant, which a linked
-  # allocator turns from "impossible" into "a dark boot"). A second,
-  # unsanctioned heap still fails, as does deleting the sanctioned one.
-  # ---------------------------------------------------------------------------
-  no-heap:
-    name: heap gate (one sanctioned allocator, nothing allocates pre-boot)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: "Heap gate: one sanctioned allocator + pre-boot allocation invariant"
-        working-directory: fapico2
-        run: |
-          set -uo pipefail
-          echo "--- exactly one sanctioned #[global_allocator]; #![no_std] device firmware; pre-boot ordering ---"
-          if ! python3 tests/scripts/check_heap_gate.py; then
-            echo "::error::Heap gate failed — device source must be heap-free except for platform/src/rsa_heap.rs, and nothing may allocate before rsa_heap::init()."
-            exit 1
-          fi
-          echo "ok: heap gate green"
-
-  # ---------------------------------------------------------------------------
-  # persist gate (US-429): structural proof that the one-persist-implementation
-  # invariant (plan Global Constraint #3) holds. A comment-aware grep over every
-  # Rust source (the two platform persist files exempt) for the deleted
-  # pre-split snapshot/program names (snapshot_secure_partition /
-  # persist_secure_partition / persist_partition_image). A code-level
-  # occurrence means a transport re-sequenced persistence instead of going
-  # through platform/src/persist.rs. Mirrors the no-heap gate style
-  # (checkout -> run the standalone gate script -> fail on non-zero).
-  # ---------------------------------------------------------------------------
-  persist-gate:
-    name: persist gate (one implementation)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: "Grep: one persist implementation (no code-level snapshot/program re-sequence)"
-        working-directory: fapico2
-        run: |
-          set -uo pipefail
-          echo "--- scanning all *.rs for the deleted pre-split persist names (comment-aware) ---"
-          if ! python3 tests/scripts/check_persist_gate.py; then
-            echo "::error::A code-level snapshot_/persist_secure_partition/persist_partition_image occurrence — a transport re-sequenced persistence instead of using platform/src/persist.rs."
-            exit 1
-          fi
-          echo "ok: one-persist-implementation gate green"
-
-  # ---------------------------------------------------------------------------
-  # Attestation gate (US-916): structural proof that the per-device
-  # attestation identity provisioning holds. A comment-aware scan asserting
-  # (a) the repo-committed attestation blobs (attestation_key.bin /
-  # attestation_cert.der) never reappear anywhere in the tree and (b) no
-  # code-level include_bytes! returns to apps/fido/src/attestation.rs — the
-  # identity is minted on device from the TRNG at first boot and persisted
-  # through the secure store, never shipped. Same gate style as the persist
-  # gate above (checkout -> run the standalone gate script -> fail on
-  # non-zero).
-  # ---------------------------------------------------------------------------
-  attestation-gate:
-    name: attestation gate (per-device provisioning)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: "Grep: no repo-committed attestation material (blobs gone, no include_bytes!)"
-        working-directory: fapico2
-        run: |
-          set -uo pipefail
-          echo "--- scanning the tree for the deleted attestation blobs / include_bytes! (comment-aware) ---"
-          if ! python3 tests/scripts/check_attestation_gate.py; then
-            echo "::error::Repo-committed attestation material reappeared — the attestation identity is minted on device (US-916); delete the blob / include_bytes!."
-            exit 1
-          fi
-          echo "ok: attestation-provisioning gate green"
-
-  # ---------------------------------------------------------------------------
-  # One-randomness-path gate (US-1005, RS-KEY-ADOPT Phase 1): a comment-aware
-  # scan asserting that no transport outside platform/src/trng.rs names a raw
-  # peripheral draw (blocking_fill_bytes / EmbTrng::new / Trng::new). Every
-  # nonce comes from platform::trng::DrbgTrng; the allowlist is the handful of
-  # bootstrap draws, each carrying a stated reason, and the script prints those
-  # reasons on every run so an unexplained entry is visible rather than
-  # silently permitted. Same gate style as the two above.
-  # ---------------------------------------------------------------------------
-  rng-path-gate:
-    name: rng path gate (every nonce via the DRBG)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: "Grep: no code-level peripheral draw outside platform/src/trng.rs"
-        working-directory: fapico2
-        run: |
-          set -uo pipefail
-          echo "--- scanning for raw TRNG draws that bypass the DRBG (comment-aware) ---"
-          if ! python3 tests/scripts/check_rng_path.py; then
-            echo "::error::A code-level blocking_fill_bytes / EmbTrng::new / Trng::new outside the allowlist — a caller is drawing from the peripheral instead of the DRBG. Take bytes from platform::trng::DrbgTrng."
-            exit 1
-          fi
-          echo "ok: one-randomness-path gate green"
-
-  # ---------------------------------------------------------------------------
-  # Flash-erase budget gate (US-1010, RS-KEY-ADOPT Phase 2): a doc-agreement
-  # gate in the check_size_report.py style, but over a MEASUREMENT rather than
-  # a rebuilt ELF. It runs the host instrument in
-  # platform/tests/persist_sink.rs (the real FlashSlotSink over a NOR model, at
-  # the shipping slot geometry) and fails while docs/erase-budget.md disagrees
-  # with it. The instrument's unchanged-image control is what makes this a
-  # measurement of the code and not of the prose: a sink that lost its
-  # compare-then-write reports a non-zero erase count there and this goes red.
-  # ---------------------------------------------------------------------------
-  erase-budget-gate:
-    name: erase budget gate (docs/erase-budget.md matches the measurement)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout fapico2
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          path: fapico2
-      - name: "Measure: erases per persist, and gate docs/erase-budget.md on it"
-        working-directory: fapico2
-        run: |
-          set -uo pipefail
-          echo "--- measuring the sink's erase budget and comparing it with the document ---"
-          if ! python3 tests/scripts/check_erase_budget.py; then
-            echo "::error::The flash erase budget has drifted from what FlashSlotSink::program actually does. Re-run the instrument (cargo test -p fapico2-platform --target x86_64-unknown-linux-gnu --test persist_sink erase_budget_figures -- --exact --nocapture) and update docs/erase-budget.md."
-            exit 1
-          fi
-          echo "ok: erase-budget gate green"
-
-  # ---------------------------------------------------------------------------
-  # Assurance gates (US-1042, RS-KEY-ADOPT Phase 5): the rest of the gate set,
-  # unconditionally.
+  # 3/5 — assurance gates (US-1042, RS-KEY-ADOPT Phase 5): the structural gate
+  # set, unconditionally, in ONE job.
   #
   # The skeptic pass this story comes from found a repository whose check job
   # was gated on `docs_only != 'true'`, where GitHub counts a SKIPPED required
@@ -722,7 +602,7 @@ jobs:
   # docs-only change skipped them — and so did every other change. A gate that
   # nothing runs is not a gate (US-964's finding, restated).
   #
-  # There is deliberately NO `if:` on this job or on its step, and no
+  # There is deliberately NO `if:` on this job or on its steps, and no
   # `paths:`/`paths-ignore:` on the workflow. Any future attempt to add one is
   # caught by tests/scripts/test_gates.py, which parses this file, evaluates
   # every job's and step's `if:` for a docs-only change set, and requires all
@@ -730,36 +610,109 @@ jobs:
   # invoked by a step that would actually run. It refuses to guess: a
   # condition it cannot evaluate is an error, not a pass.
   #
-  # The gates that need a device build or a cargo test are not repeated here —
-  # check_size_report / check_async_frame / check_boot_chain are in the
-  # device-build job, and the advertise/serve, heap, persist, attestation,
-  # erase-budget and rng-path gates each have their own job above. What is here
-  # is the set that had no job at all.
+  # 2026-11-11: the heap (US-383/961), persist (US-429), attestation (US-916)
+  # and rng-path (US-1005) gates moved here from jobs of their own. Each was
+  # paying a full cold checkout to run seconds of python3; the five moved
+  # steps' scripts are byte-identical, and `--workflows-only` below still
+  # proves every gate script is reachable on a docs-only change. The gates
+  # that need a device build or a cargo test are NOT here — check_size_report
+  # / check_async_frame / check_boot_chain are in the device job, and
+  # erase-budget (a cargo test) and advertise/serve (a cargo build pair) each
+  # joined the job whose toolchain they use.
   # ---------------------------------------------------------------------------
-  gates:
-    name: assurance gates (structural, no device build)
+  gates-py:
+    name: assurance gates (structural, no build)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: fapico2
-      # No Rust toolchain here, and that is deliberate: every script in the loop
-      # below is plain python3 over files in the checkout. This step used to
+      # No Rust toolchain here, and that is deliberate: every script in the
+      # loops below is plain python3 over files in the checkout. This used to
       # install stable, which cost ~30s of toolchain download per push for a
-      # job that never invoked cargo. (advertise-serve-gate DOES need Rust —
-      # its script shells out to cargo to measure the reduced build — so the
-      # toolchain stays there.)
+      # job that never invoked cargo.
+      #
+      # Heap gate (US-383, rewritten US-961): structural proof that the device
+      # heap is either absent or EXACTLY the one sanctioned static allocator
+      # (platform/src/rsa_heap.rs). A second, unsanctioned heap fails, as does
+      # deleting the sanctioned one, as does allocating before
+      # rsa_heap::init() goes live (the pre-boot invariant, which a linked
+      # allocator turns from "impossible" into "a dark boot").
+      - name: "Heap gate: one sanctioned allocator + pre-boot allocation invariant"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          echo "--- exactly one sanctioned #[global_allocator]; #![no_std] device firmware; pre-boot ordering ---"
+          if ! python3 tests/scripts/check_heap_gate.py; then
+            echo "::error::Heap gate failed — device source must be heap-free except for platform/src/rsa_heap.rs, and nothing may allocate before rsa_heap::init()."
+            exit 1
+          fi
+          echo "ok: heap gate green"
+      # Persist gate (US-429): structural proof that the
+      # one-persist-implementation invariant (plan Global Constraint #3) holds.
+      # A comment-aware grep over every Rust source (the two platform persist
+      # files exempt) for the deleted pre-split snapshot/program names
+      # (snapshot_secure_partition / persist_secure_partition /
+      # persist_partition_image). A code-level occurrence means a transport
+      # re-sequenced persistence instead of going through
+      # platform/src/persist.rs.
+      - name: "Grep: one persist implementation (no code-level snapshot/program re-sequence)"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          echo "--- scanning all *.rs for the deleted pre-split persist names (comment-aware) ---"
+          if ! python3 tests/scripts/check_persist_gate.py; then
+            echo "::error::A code-level snapshot_/persist_secure_partition/persist_partition_image occurrence — a transport re-sequenced persistence instead of using platform/src/persist.rs."
+            exit 1
+          fi
+          echo "ok: one-persist-implementation gate green"
+      # Attestation gate (US-916): structural proof that the per-device
+      # attestation identity provisioning holds. A comment-aware scan asserting
+      # (a) the repo-committed attestation blobs (attestation_key.bin /
+      # attestation_cert.der) never reappear anywhere in the tree and (b) no
+      # code-level include_bytes! returns to apps/fido/src/attestation.rs — the
+      # identity is minted on device from the TRNG at first boot and persisted
+      # through the secure store, never shipped.
+      - name: "Grep: no repo-committed attestation material (blobs gone, no include_bytes!)"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          echo "--- scanning the tree for the deleted attestation blobs / include_bytes! (comment-aware) ---"
+          if ! python3 tests/scripts/check_attestation_gate.py; then
+            echo "::error::Repo-committed attestation material reappeared — the attestation identity is minted on device (US-916); delete the blob / include_bytes!."
+            exit 1
+          fi
+          echo "ok: attestation-provisioning gate green"
+      # One-randomness-path gate (US-1005, RS-KEY-ADOPT Phase 1): a
+      # comment-aware scan asserting that no transport outside
+      # platform/src/trng.rs names a raw peripheral draw
+      # (blocking_fill_bytes / EmbTrng::new / Trng::new). Every nonce comes
+      # from platform::trng::DrbgTrng; the allowlist is the handful of
+      # bootstrap draws, each carrying a stated reason, and the script prints
+      # those reasons on every run so an unexplained entry is visible rather
+      # than silently permitted.
+      - name: "Grep: no code-level peripheral draw outside platform/src/trng.rs"
+        working-directory: fapico2
+        run: |
+          set -uo pipefail
+          echo "--- scanning for raw TRNG draws that bypass the DRBG (comment-aware) ---"
+          if ! python3 tests/scripts/check_rng_path.py; then
+            echo "::error::A code-level blocking_fill_bytes / EmbTrng::new / Trng::new outside the allowlist — a caller is drawing from the peripheral instead of the DRBG. Take bytes from platform::trng::DrbgTrng."
+            exit 1
+          fi
+          echo "ok: one-randomness-path gate green"
       - name: "Gates: the remaining gate scripts, unconditionally"
         working-directory: fapico2
         run: |
           set -uo pipefail
-          echo "--- structural gates with no workflow of their own (US-1042) ---"
+          echo "--- structural gates with no job of their own (US-1042) ---"
           # US-1534: check_flash_budget.py joins this list rather than
           # check_size_report.py's step on purpose. It parses two text files,
           # so it can run here and fail a pull request in seconds; inside the
-          # device-build job it would run only after a full release build of
+          # device job it would run only after a full release build of
           # the ELF, which is minutes per raise of the budget.
           #
           # 2026-10-07: check_acceptance_exit_code.py and
@@ -803,10 +756,11 @@ jobs:
       # that reason) and takes about a second.
       #
       # The full mutation half — every gate run twice on a copy, once with a
-      # nominated defect — pays cold device builds, so it runs on the path-
-      # filtered push job in `gates-mutation.yml` instead of on every PR. What
-      # must never happen again is the state this step ends: a harness that
-      # nothing ran, quietly holding two anchors that had rotted.
+      # nominated defect — pays cold device builds, so it runs in
+      # `gates-mutation.yml` (nightly + main push + dispatch, since
+      # 2026-11-11) instead of on every PR. What must never happen again is
+      # the state this step ends: a harness that nothing ran, quietly holding
+      # two anchors that had rotted.
       - name: "Gate falsifiability: the wiring half of tests/scripts/test_gates.py"
         working-directory: fapico2
         run: python3 tests/scripts/test_gates.py --workflows-only
@@ -817,10 +771,17 @@ jobs:
       # The runner image stopped shipping pytest for /usr/bin/python3 (it
       # broke this step on main on 2026-10-11: "No module named pytest"), so
       # the pytest this step needs is provided here rather than assumed —
-      # a tiny venv, ~5 s, and the job's no-toolchain property (about RUST)
+      # setup-python with pip caching (the same pinned action and 3.12 as the
+      # pytest-gate job), and the job's no-toolchain property (about RUST)
       # is unchanged. pytest loads tests/conftest.py for any run under
       # tests/, and that file imports fido2 at module level, so fido2 rides
       # along (the same >=2,<3 range tests/requirements.txt pins).
+      - name: Set up Python 3.12 (boot-ladder venv)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: fapico2/tests/requirements.txt
       - name: "Gate: the boot-ladder classifier (US-1302)"
         working-directory: fapico2
         run: |
@@ -832,8 +793,8 @@ jobs:
           echo "ok: boot-ladder classifier green"
 
   # ---------------------------------------------------------------------------
-  # Supply-chain provenance (US-1060, RS-KEY-ADOPT Phase 7). Two halves, and
-  # the split is the point:
+  # 4/5 — Supply-chain provenance (US-1060, RS-KEY-ADOPT Phase 7). Two halves,
+  # and the split is the point:
   #
   #   cargo-deny reads the RESOLVED THIRD-PARTY graph — sources, licences,
   #   advisories, duplicated versions, and the named `wrappers` allowlist.
@@ -850,21 +811,32 @@ jobs:
   # Unconditional, like every other gate job: a check GitHub can mark as
   # SKIPPED on a docs-only change set is not a check (US-1042).
   #
-  # The action is pinned to a full commit SHA. The rest of this workflow uses
-  # moving tags (`actions/checkout@v4` and friends), which is a divergence
-  # from RS-Key's "all CI actions pinned" property recorded in
-  # docs/supply-chain.md — the new jobs do the right thing and the old ones
-  # are left alone rather than being rewritten inside a CI story.
+  # The actions are pinned to full commit SHAs. 2026-11-11 added rust-cache
+  # (cargo registry/git — the cargo-deny action resolves its own tool) and a
+  # cache for the cargo-vet binary: it was compiled from source with --locked
+  # on every push, several minutes per run. The cache is keyed on the vet
+  # version in the key string — bump it when bumping cargo-vet.
   # ---------------------------------------------------------------------------
   supply-chain:
     name: supply chain (deny.toml graph assertions)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: fapico2
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+          cache-on-failure: true
+      - name: Cache the cargo-vet binary (v0.13.0)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-vet
+          key: cargo-vet-0.13.0-${{ runner.os }}
       - name: Set up Rust (pinned by rust-toolchain.toml)
         working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
@@ -886,11 +858,17 @@ jobs:
             exit 1
           fi
           echo "ok: crate-graph assertions green"
-      # US-1061: cargo-vet. Installed from source with --locked rather than
-      # through a third-party installer action, so this job depends on no
-      # action outside the two it already names.
+      # US-1061: cargo-vet. Installed from source with --locked (skipped when
+      # the cache above holds it) rather than through a third-party installer
+      # action, so the binary this gate runs is built from the locked source
+      # this repository resolves.
       - name: Install cargo-vet
-        run: cargo install cargo-vet --locked
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/cargo-vet" ]; then
+            cargo install cargo-vet --locked
+          else
+            echo "cargo-vet restored from cache"
+          fi
       - name: "Gate: vet coverage, exemption reasons, and the documented counts"
         working-directory: fapico2
         run: |
@@ -966,7 +944,7 @@ jobs:
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
-  # 4/4 — the pytest gate (Phase 3 exit config).
+  # 5/5 — the pytest gate (Phase 3 exit config).
   #
   #      fapico2's OWN suites, in this repository: tests/pico-fido (HID/CTAP2),
   #      tests/piv (CCID), tests/openpgp (CCID), tests/harness (relay, restart,
@@ -993,10 +971,13 @@ jobs:
   #
   #      `--suites-only` because clippy, `cargo test` and the gate scripts each
   #      already have their own job in this workflow; see run_tests.sh.
+  #      2026-11-11 added rust-cache (the emulator is a plain cargo debug
+  #      build) and pip caching on setup-python.
   # ---------------------------------------------------------------------------
   pytest-gate:
     name: pytest gate (fapico2 emulator suites)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout fapico2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1007,6 +988,8 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: fapico2/tests/requirements.txt
       # pyscard builds its C extension against the PC/SC headers, and
       # tests/pico-fido/utils.py imports the smartcard package unconditionally.
       - name: Install PC/SC headers (pyscard build dependency)
@@ -1016,6 +999,11 @@ jobs:
       - name: Set up Rust (pinned; host target for the emulator)
         working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+          cache-on-failure: true
       - name: Install Python test dependencies
         run: |
           python -m venv .test-venv

@@ -671,6 +671,23 @@ cargo test -p fapico2-fido --target x86_64-unknown-linux-gnu
 ./run_tests.sh --suites-only   # just the emulator suites — what ci.yml's pytest-gate runs
 ```
 
+**Run the pre-push parity check before pushing** (`scripts/pre_push_check.sh`, added
+2026-11-11 — `docs/ci-evaluation-2026-11.md` is the write-up). `run_tests.sh` by design
+never exercises the device-side gates, and those are what turn a locally green PR red on
+GitHub: the flash-budget ratchet, the task-arena stamp, and the size budgets over the
+release ELF.
+
+```bash
+./scripts/pre_push_check.sh          # ~2 min: stamp --check + the structural gates + clippy
+./scripts/pre_push_check.sh --full   # adds the device build + size/ratchet gates + the
+                                     # emulator suites; run this when firmware/, platform/
+                                     # or the manifests changed
+```
+
+A `--full` pass mirrors the device job's ratchet arithmetic exactly (same UF2, same
+`FIRMWARE_FLASH_BUDGET_KIB` read from ci.yml), so it means the ratchet step passes there.
+It does not replicate the reproducible-build double build — that one stays CI's job.
+
 **The task-arena stamp (US-956/US-964) — the thing that keeps blocking PRs.**
 `TASK_ARENA_DEMAND_B_STAMP` (`firmware/src/lib.rs`) is a byte-exact
 fingerprint over the firmware's whole source closure — it cannot tell a

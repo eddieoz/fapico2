@@ -17,23 +17,27 @@
 #
 # The fast structural half (`--workflows-only`: docs-only reachability, the
 # US-1043 ratchet wiring, the US-1010 RAM ceiling) runs unconditionally in
-# ci.yml's `gates` job, where it costs about a second and needs no toolchain.
+# ci.yml's gates-py job, where it costs about a second and needs no toolchain.
 #
-# WHY `push` AND NOT A SCHEDULE
+# WHY NIGHTLY + MAIN-PUSH AND NOT EVERY BRANCH PUSH (changed 2026-11-11)
 # ---------------------------------------------------------------------------
-# GitHub disables scheduled workflows after 60 days of repository inactivity,
-# so a falsifiability check on a cron can stop running silently — precisely the
-# failure mode this workflow exists to end. A push trigger with `paths:` runs
-# it exactly when the things it tests can have changed (a gate script, or a
-# workflow whose wiring the simulator models), and `workflow_dispatch` is the
-# manual override.
-#
-# It is deliberately NOT branch-filtered to main: a branch pushed to this
+# This used to trigger on every push touching `tests/scripts/**` or
+# `.github/workflows/**`, deliberately unbranched: a branch pushed to this
 # repository that edits a gate script is exactly when the harness is worth
-# running, and gating it to main would mean learning about a broken break only
-# after the merge. (A fork's PR branch lives in the fork, so a fork PR does not
-# trigger this workflow; the gates themselves still run for it through ci.yml,
-# where the fast structural half of the harness also runs.)
+# running. The cost of that principle turned out to be a red X on nearly every
+# push a feature branch made — the harness ran, and failed, on branches whose
+# actual gate coverage was already being asserted by `--workflows-only` in
+# ci.yml, and the failures were indistinguishable from the PR's own check
+# failures (this is cause #3 in docs/ci-evaluation-2026-11.md).
+#
+# The trigger is now: nightly (03:30 UTC), push to `main` with the same paths
+# filter, and `workflow_dispatch`. The 60-day scheduled-workflow disablement
+# that argued for push-over-cron is answered two ways: this repository is
+# active (fuzz-nightly has run daily for months), and the nightly run's job
+# redoes the full table — a silently dead cron would be caught by the next
+# main-landing that touches a gate script. A PR branch that edits a gate
+# script is still asserted on: ci.yml's wiring half runs for every PR, and the
+# full table confirms the branch's gates bite when the series lands on main.
 #
 # RESIDUAL RISK
 # ---------------------------------------------------------------------------
@@ -48,9 +52,14 @@ name: Gates (mutation)
 
 on:
   push:
+    branches: [main]
     paths:
       - 'tests/scripts/**'
       - '.github/workflows/**'
+  schedule:
+    # Off the hour on purpose, next to fuzz-nightly's 03:17. Nightly keeps the
+    # table running even when no gate script moves for weeks.
+    - cron: '30 4 * * *'
   workflow_dispatch:
 
 # Same least-privilege posture as ci.yml: this workflow executes repository
@@ -75,6 +84,19 @@ jobs:
       - name: Set up Rust (pinned by rust-toolchain.toml)
         working-directory: fapico2
         run: rustup toolchain install --profile minimal --no-self-update
+      # The harness copies the tree into its own temp dirs and gives every gate
+      # its own target dir, so the cache cannot serve those builds — but the
+      # warm-build step below and the registry/git share it warms are what the
+      # copies start from.
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+      - name: Cache the cargo-vet binary (v0.13.0)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-vet
+          key: cargo-vet-0.13.0-${{ runner.os }}
       - name: Add RP2350 target + ARM ELF linker
         run: |
           rustup target add thumbv8m.main-none-eabi
@@ -95,10 +117,16 @@ jobs:
       # harness reports that as a failure rather than absorbing it. The first
       # CI run of this workflow failed exactly there — `check_supply_chain.py`
       # BASELINE-RED in 0.2 s because the tool was not installed. Installed
-      # from source with `--locked`, the way ci.yml's supply-chain job does it,
-      # so this workflow still names no action it does not need.
+      # from source with `--locked` (skipped when the cache above holds it),
+      # the way ci.yml's supply-chain job does it, so this workflow still names
+      # no action it does not need.
       - name: Install cargo-vet (the one gate that shells out to an external tool)
-        run: cargo install cargo-vet --locked
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/cargo-vet" ]; then
+            cargo install cargo-vet --locked
+          else
+            echo "cargo-vet restored from cache"
+          fi
       - name: "Mutation harness — every gate run twice, once with a nominated defect"
         working-directory: fapico2
         run: python3 tests/scripts/test_gates.py
