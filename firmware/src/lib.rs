@@ -118,6 +118,10 @@ pub mod wait_blink;
 /// the device side in `boot.rs::entropy_reboot_or_park` owns the volatile
 /// access and the two exits).
 pub mod entropy_reset;
+/// US-1822/US-1823 (WARM-BOOT-SERVE): the entropy bring-up state machine —
+/// `Warming`/`Ready`, the operation-class split, and the per-operation gate.
+/// Pure, host-tested, no hardware types.
+pub mod entropy_bringup;
 /// US-922: the per-boot debug-drain channel derivation (pure, host-tested;
 /// the device bin seeds it from the TRNG at boot).
 pub mod dbg_cid;
