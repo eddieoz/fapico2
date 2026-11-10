@@ -125,6 +125,10 @@ pub enum TrngError {
     /// dark boot look like an entropy-source problem. See
     /// `docs/known-gate-divergences.md` (D-12).
     ClockStalled,
+    /// The generator has not been seeded yet (WARM-BOOT-SERVE bring-up
+    /// incomplete). Creation-class operations refuse with this; deterministic
+    /// operations never reach it.
+    NotSeeded,
 }
 
 impl fmt::Display for TrngError {
@@ -137,6 +141,7 @@ impl fmt::Display for TrngError {
                 "TRNG wait clock stalled: the wall clock did not advance during the \
                  wait, so the time budget was never in play"
             ),
+            TrngError::NotSeeded => write!(f, "TRNG not seeded: bring-up incomplete (WARM-BOOT-SERVE)"),
         }
     }
 }
@@ -2017,6 +2022,87 @@ impl<S: SeedSource> fmt::Debug for DrbgTrng<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DrbgTrng")
             .field("drbg", &self.drbg)
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// US-1824 (WARM-BOOT-SERVE): LazyDrbg — seed-once-then-serve cell
+// ---------------------------------------------------------------------------
+
+/// A generator that does not exist until the bring-up seeds it.
+///
+/// Under `WARM-BOOT-SERVE` the board serves deterministic operations while
+/// the TRNG warms; creation-class operations refuse until [`LazyDrbg::seed`]
+/// has run. The cell starts empty (`None`) and is seeded exactly once by the
+/// bring-up task (US-1825). A second seed is a bug and is asserted.
+///
+/// No DRBG output is produced before the seed: `try_random_bytes` refuses
+/// [`TrngError::NotSeeded`] and the infallible [`Trng::random_bytes`] leaves
+/// the caller's buffer untouched (D-9's discipline, now reachable pre-seed).
+pub struct LazyDrbg<S: SeedSource> {
+    inner: Option<DrbgTrng<S>>,
+}
+
+impl<S: SeedSource> LazyDrbg<S> {
+    /// An unseeded cell. The generator does not exist yet.
+    pub fn new() -> Self {
+        Self { inner: None }
+    }
+
+    /// Whether the bring-up has seeded the cell.
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Seed the cell once.
+    ///
+    /// Returns [`SeedError`] on a refused seed (and leaves the cell unseeded,
+    /// so the bring-up task can retry). A second seed on an already-seeded
+    /// cell is a bug: it returns [`SeedError::AlreadySeeded`] and trips a
+    /// debug assert. Seeded-once semantics are asserted here.
+    pub fn seed(&mut self, source: S) -> Result<(), SeedError> {
+        if self.inner.is_some() {
+            debug_assert!(false, "LazyDrbg::seed called twice — seeded-once violated");
+            return Err(SeedError::AlreadySeeded);
+        }
+        let drbg = DrbgTrng::try_new(source)?;
+        self.inner = Some(drbg);
+        Ok(())
+    }
+
+    /// Fallible draw. Refuses [`TrngError::NotSeeded`] until seeded.
+    pub fn try_random_bytes(&mut self, buf: &mut [u8]) -> Result<(), TrngError> {
+        match self.inner.as_mut() {
+            None => Err(TrngError::NotSeeded),
+            Some(d) => d.try_random_bytes(buf).map_err(|_| TrngError::Stalled),
+        }
+    }
+}
+
+impl<S: SeedSource> Default for LazyDrbg<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S: SeedSource> Trng for LazyDrbg<S> {
+    /// Infallible half: on an unseeded cell the buffer is left untouched
+    /// (D-9). The refusal is not reported (the trait cannot), so callers that
+    /// need it use [`LazyDrbg::try_random_bytes`].
+    fn random_bytes(&mut self, buf: &mut [u8]) {
+        let _ = self.try_random_bytes(buf);
+    }
+
+    fn try_random_bytes(&mut self, buf: &mut [u8]) -> Result<(), TrngError> {
+        self.try_random_bytes(buf)
+    }
+}
+
+impl<S: SeedSource> fmt::Debug for LazyDrbg<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LazyDrbg")
+            .field("ready", &self.inner.is_some())
             .finish_non_exhaustive()
     }
 }
