@@ -1257,7 +1257,12 @@ pub fn refill_pools_from_cell() {
     // (the legacy path fills it in `main`).
     unsafe {
         let pool = &mut *(*core::ptr::addr_of_mut!(NOSTR_RNG_POOL)).as_mut_ptr();
-        if pool.is_empty() {
+        // Capacity, not emptiness — the same reasoning as the FIDO/OATH
+        // refills above: a construction-time draw would stretch an empty
+        // pool into 32 constant bytes and defeat an is_empty check. Nostr
+        // has no construction draw today; the uniform condition keeps it
+        // that way by construction rather than by vigilance.
+        if pool.len() < 256 {
             let cell = drbg_cell();
             let drawn = fapico2_nostr::draw_boot_pool(cell);
             init_nostr_rng_pool(drawn);

@@ -160,6 +160,45 @@ fn oath_validate_and_set_code_carry_the_warming_gates() {
     );
 }
 
+/// US-1821, review P1 follow-up (WARM-BOOT-SERVE): the clientPIN half.
+/// The token MINT (getPinToken / getPinUvAuthTokenUsingPin) and the
+/// PERSISTED PIN SALTS (setPIN / changePIN) draw from the pool — a
+/// warming-window mint is an attacker-derivable pinUvAuthToken (a PIN
+/// bypass past Ready), and a warming-window salt makes the persisted PIN
+/// verifier brute-forceable offline. Both must refuse while the pool is
+/// empty; getRetries and getKeyAgreement stay ungated (deterministic — the
+/// client needs them to learn the refusal and to retry).
+#[test]
+fn client_pin_gates_the_token_mint_and_the_persisted_salts() {
+    let body = fn_body(DEVICE_CORE, "client_pin_inner")
+        .expect("the device clientPIN path exists");
+    // The gate must cover the four drawing subcommands by number, so a
+    // renumbered or half-covered list cannot slip through.
+    for sub in ["0x03", "0x04", "0x05", "0x09"] {
+        assert!(
+            body.contains(sub),
+            "clientPIN warming gate must name subcommand {sub} (setPIN,              changePIN, getPinToken, getPinUvAuthTokenUsingPin) — its draws              are a minted token or a PERSISTED salt, not ephemera"
+        );
+    }
+    // The deterministic subcommands stay ungated: the gate block must not
+    // refuse them (getRetries 0x01, getKeyAgreement 0x02).
+    let gate = body
+        .split("rng_pool.is_empty()")
+        .nth(1)
+        .unwrap_or("")
+        .split("match subcommand")
+        .next()
+        .unwrap_or("");
+    assert!(
+        !gate.is_empty(),
+        "the clientPIN warming gate block is missing entirely"
+    );
+    assert!(
+        !gate.contains("0x01") && !gate.contains("0x02"),
+        "getRetries (0x01) and getKeyAgreement (0x02) must stay servable          while Warming — they are deterministic and the client needs them          to learn the refusal"
+    );
+}
+
 /// US-1821: the Nostr half. The rng provider is an `Option<fn>` and the
 /// device install passes `None` while Warming (US-1826) — the applet's
 /// `None` arm is the refusal every draw-carrying command answers, on both

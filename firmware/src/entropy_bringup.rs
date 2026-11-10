@@ -132,6 +132,14 @@ pub enum OpClass {
     /// `froot`. No TRNG draw at serving time.
     GetAssertion,
     /// FIDO clientPIN verification: ECDH + HMAC over the persisted hkey.
+    ///
+    /// Recorded narrowing (review P1 follow-up): *verification* is
+    /// deterministic, but the clientPIN handler also MINTS — the
+    /// pinUvAuthToken (getPinToken/getPinUvAuthTokenUsingPin) and the
+    /// persisted PIN salts (setPIN/changePIN) draw from the pool, and a
+    /// warming-window salt makes the stored PIN verifier brute-forceable
+    /// offline. Those four subcommands refuse while Warming (see
+    /// `client_pin_inner`'s gate); getRetries and getKeyAgreement serve.
     ClientPinVerify,
     /// OATH TOTP/HOTP code computation.
     OathCalculate,
