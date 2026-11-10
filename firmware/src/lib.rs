@@ -31,10 +31,11 @@ compile_error!(
 /// | `button_poll_task` | 56 |
 /// | `ccid_task` | 8,600 |
 /// | `embassy_main` | 176 |
+/// | `entropy_bringup_task` | 56 |
 /// | `hid_task` | 4,720 |
 /// | `led_heartbeat_task` | 56 |
 /// | `usb_task` | 736 |
-/// | **total** | **14,344** |
+/// | **total** | **14,400** |
 ///
 /// The arena itself is `embassy-executor`'s `task-arena-size-32768` feature
 /// (`firmware/Cargo.toml`) = 32,768 B, i.e. **1.49x** this demand (floor
@@ -83,13 +84,13 @@ compile_error!(
 /// stable equivalent and the futures' types are anonymous, so their sizes are
 /// not readable from the ELF), which is why this is stamp-and-refuse rather
 /// than a compile-time re-derivation.
-pub const TASK_ARENA_DEMAND_B: usize = 14_344;
+pub const TASK_ARENA_DEMAND_B: usize = 14_400;
 
 /// US-964: the fingerprint of the sources [`TASK_ARENA_DEMAND_B`] was
 /// measured from — see `tests/scripts/arena_stamp.py` for exactly what it
 /// covers, and what it deliberately does not. Not a build input: the gate
 /// reads it, and refuses to believe the demand when it disagrees.
-pub const TASK_ARENA_DEMAND_B_STAMP: &str = "6999bf37e3f06189dff814ef98fee2f89c6e835c9df3b13df1c6a3433b2759b8";
+pub const TASK_ARENA_DEMAND_B_STAMP: &str = "3f9c911814846caec48f8e2892fccf35b25d3e523f1a0f8e1ef37609a72aac21";
 
 /// US-920: pure CCID bulk-OUT message reassembly with a park timeout
 /// (partial-message drop + resync, HAL-free, host-testable).

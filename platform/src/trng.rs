@@ -1804,6 +1804,11 @@ pub const RNG_ERR_RESEED_REQUIRED: u32 = rand_core::Error::CUSTOM_START;
 /// was refused because the peripheral produced no validated block.
 pub const RNG_ERR_RESEED_REFUSED: u32 = rand_core::Error::CUSTOM_START + 1;
 
+/// US-1824 (WARM-BOOT-SERVE): the cell has not been seeded yet — the entropy
+/// bring-up is incomplete. A caller polls the bring-up status and retries;
+/// this is not a device fault and not a re-seed condition.
+pub const RNG_ERR_NOT_SEEDED: u32 = rand_core::Error::CUSTOM_START + 2;
+
 impl fmt::Display for DrbgTrngError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

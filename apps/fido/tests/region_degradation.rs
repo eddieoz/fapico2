@@ -344,8 +344,21 @@ fn no_new_halt_site_is_reachable_from_the_key_region() {
     // new `fatal_boot` (the `Action::Park` arm) and parks legibly with the
     // same reason at the bound. Every other site is the one US-1558
     // measured, unchanged.
+    //
+    // **US-1825 (WARM-BOOT-SERVE) moved it again, deliberately.** 22 → 23,
+    // and the composition changed shape: `entropy_reboot_or_park` — the
+    // bounded-reboot machinery's single `fatal_boot` — is **deleted** (post-
+    // boot there is nothing to reboot; the bring-up task retries instead),
+    // while the legacy first-install path retains today's legible parks in
+    // its two blocking functions (`ensure_boot_entropy_blocking`,
+    // `seed_drbg_blocking`) exactly as the pre-epic sites had them. Net −1 + 2
+    // = +1. The identity parks (`OtpKeyRow`/`ChipId` in `init_drbg_cell`,
+    // the store key, the OATH seal, the migrations) are untouched — identity
+    // is not freshness; ADR 0004's domain shrinks only by the freshness
+    // carve-out, and on a provisioned board (no legacy path taken) none of
+    // the three entropy-adjacent sites is even reachable.
     let sites = all_halt_sites();
-    assert_eq!(sites.len(), 22, "the fatal_boot call-site count must not change without US-1808/1809's recorded delta:\n{}", sites.join("\n"));
+    assert_eq!(sites.len(), 23, "the fatal_boot call-site count must not change without US-1825's recorded delta:\n{}", sites.join("\n"));
 
     // **The second scenario's first clause, checked where it can actually
     // fail.** Not "the total is 22" — "there is no `fatal_boot` anywhere under

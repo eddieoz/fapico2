@@ -462,6 +462,21 @@ impl FidoApp {
         }
     }
 
+    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if (and
+    /// only if) it is empty, from the entropy bring-up task.
+    ///
+    /// On a provisioned board the pool has been empty at construction since
+    /// the fresh arm became conditional (`boot_in_place` fills only on a
+    /// fresh partition); the bring-up task calls this once the cell is
+    /// seeded, so pool-served ephemera draw DRBG output from then on. A
+    /// non-empty pool (the legacy fresh-install path, which fills at boot)
+    /// is left untouched — no second fill.
+    pub fn refill_rng_pool_if_empty<R: Trng>(&mut self, trng: &mut R) {
+        if self.rng_pool.is_empty() {
+            self.fill_rng_pool(trng);
+        }
+    }
+
     /// Boot the authenticator (US-387): load the persistent `hkey` from the
     /// platform [`SecureStore`] — the RP2350 secure partition on device, the
     /// in-memory store + partition image on host. On a fresh partition the

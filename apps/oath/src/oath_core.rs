@@ -2244,15 +2244,41 @@ impl OathApp {
     }
 
     /// Fill the TRNG pool (boot path; US-380 sole randomness source).
+    ///
+    /// US-1825 (WARM-BOOT-SERVE): tolerant of an unseeded generator. On the
+    /// bring-up path the applet constructs against the empty `LazyDrbg`
+    /// cell; installing 512 zero bytes here would be the D-9 defect served
+    /// as a SELECT challenge. So the fill probes the fallible seam first —
+    /// a refusal (`NotSeeded`) leaves the pool **empty**, and the bring-up
+    /// task fills it once the cell is seeded
+    /// ([`refill_rng_pool_if_empty`]). Creation-class OATH operations refuse
+    /// under Warming (US-1826), so nothing draws from the empty pool before
+    /// then; the stretch-from-empty semantics a drained pool already had
+    /// are unchanged.
     fn fill_rng_pool<R: Trng>(&mut self, trng: &mut R) {
         self.rng_pool.clear();
         self.rng_cursor = 0;
         let mut chunk = [0u8; 64];
-        for _ in 0..8 {
+        if trng.try_random_bytes(&mut chunk).is_err() {
+            return;
+        }
+        if self.rng_pool.extend_from_slice(&chunk).is_err() {
+            return;
+        }
+        for _ in 0..7 {
             trng.random_bytes(&mut chunk);
             if self.rng_pool.extend_from_slice(&chunk).is_err() {
                 break;
             }
+        }
+    }
+
+    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if (and
+    /// only if) it is empty, from the entropy bring-up task. A non-empty
+    /// pool (the legacy boot fill) is left untouched — no second fill.
+    pub fn refill_rng_pool_if_empty<R: Trng>(&mut self, trng: &mut R) {
+        if self.rng_pool.is_empty() {
+            self.fill_rng_pool(trng);
         }
     }
 
