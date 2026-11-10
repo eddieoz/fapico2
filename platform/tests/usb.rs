@@ -122,6 +122,19 @@ fn usb_config_carries_serial_number() {
 /// device. This test pins that relationship at the byte level: the ASCII digits
 /// are a pure function of the same `SHA-256(chipid)[..4]` the management applet
 /// serialises into its 4-byte TLV value.
+///
+/// US-1825 follow-up (WARM-BOOT-SERVE audit D-WB2): the value is scaled into
+/// **26 bits**, not 10^8 — the space PicoForge's rescue-body serial decode can
+/// express. PicoForge derives the CCID-side serial as
+/// `u32::from_be_bytes([body[4] & 0x03, body[5], body[6], body[7]])` of the
+/// rescue identity (the pico-keys-sdk wire convention: the body carries the
+/// platform serial id whose head *is* the serial), and pairs interfaces by
+/// comparing that against the TAG_SERIAL render. A serial wider than 26 bits
+/// cannot be expressed there, and the mismatch silently skips every CCID
+/// reader — the 2026-11-10 "Applet not available on any PicoFido or RS-Key
+/// reader" regression. Hence the two pins below: the value fits 26 bits, and
+/// `serial_hash4` returns exactly its big-endian bytes (the "already
+/// serial4-masked by the firmware" shape picoforge's comment expects).
 #[test]
 fn usb_serial_and_mgmt_serial_share_one_derivation() {
     let chipid = 0x0102_0304_0506_0708u64;
@@ -139,11 +152,33 @@ fn usb_serial_and_mgmt_serial_share_one_derivation() {
     // `serial_value`'s scaled truncation. Asserted here so a change to the
     // *rule* cannot silently desynchronise the two identities.
     assert_eq!(serial_digits(chipid), decimal8(serial_value(chipid)));
-    // The rule is exactly "shift the 32-bit prefix into the 10^8 space" — pinned
+    // The rule is exactly "shift the 32-bit prefix into the 2^26 space" — pinned
     // against the documented formula so a refactor to a different (still
-    // deterministic) rule has to update this test deliberately.
-    let n = u32::from_be_bytes(mgmt) as u64;
+    // deterministic) rule has to update this test deliberately. The prefix
+    // comes from the device-bound hash directly: `serial_hash4` is now the
+    // *output* (the serial4-masked bytes), so deriving `n` from it would be
+    // circular.
+    let n = u32::from_be_bytes(
+        fapico2_platform::ckey::serial_hash(&chipid.to_be_bytes())[0..4]
+            .try_into()
+            .unwrap(),
+    ) as u64;
     assert_eq!(serial_value(chipid), (n * SERIAL_MODULUS) >> 32);
+
+    // D-WB2: the serial must fit the 26-bit space PicoForge's rescue-body
+    // decode can express — a wider serial silently breaks CCID pairing.
+    assert!(
+        serial_value(chipid) < (1u64 << 26),
+        "serial_value must fit PicoForge's 26-bit rescue decode"
+    );
+    // …and `serial_hash4` returns exactly the serial4-masked bytes: byte 0
+    // carries only the top 2 serial bits (the mask is automatic below 2^26),
+    // so picoforge's `[b0 & 0x03, b1, b2, b3]` decode round-trips the value.
+    assert_eq!(
+        serial_hash4(chipid),
+        (serial_value(chipid) as u32).to_be_bytes(),
+        "serial_hash4 is the serial4-masked BE encoding of serial_value"
+    );
 }
 
 /// **Golden vectors** — the only assertions here that pin the actual output
@@ -162,7 +197,7 @@ fn usb_serial_and_mgmt_serial_share_one_derivation() {
 ///
 /// ```python
 /// n = int.from_bytes(hashlib.sha256(cid.to_bytes(8,'big')).digest()[:4],'big')
-/// f"{(n*100_000_000)>>32:08d}"
+/// f"{(n*(1<<26))>>32:08d}"
 /// ```
 ///
 /// If a vector here ever needs updating, that is a **behaviour change to a
@@ -173,23 +208,36 @@ fn usb_serial_and_mgmt_serial_share_one_derivation() {
 /// stays as injective-in-practice as it was.)
 #[test]
 fn golden_serial_vectors() {
-    // chipid, SHA-256(chipid BE)[..4] (big-endian u32), expected 8 digits
+    // chipid, SHA-256(chipid BE)[..4] (big-endian u32), expected 8 digits —
+    // the value scaled into the 26-bit space (D-WB2).
     let vectors: [(u64, u32, &str); 4] = [
-        (0x0102_0304_0506_0708, 0x6684_0DDA, "40045248"),
-        (0xDEAD_BEEF_CAFE_0001, 0x55FE_19BB, "33590851"),
+        (0x0102_0304_0506_0708, 0x6684_0DDA, "26873911"),
+        (0xDEAD_BEEF_CAFE_0001, 0x55FE_19BB, "22542438"),
         // The emulation stand-in: lands below 10^7, so it also pins the
         // zero-padding path (leading "0" must survive).
-        (EMULATION_CHIPID, 0x0D2D_FE68, "05148305"),
-        (0, 0xAF55_70F5, "68489747"),
+        (EMULATION_CHIPID, 0x0D2D_FE68, "03454969"),
+        (0, 0xAF55_70F5, "45962691"),
     ];
 
     for (chipid, hash4, expected) in vectors {
         // The hash half: confirms the derivation feeds the documented SHA-256
-        // prefix, in the documented byte order.
+        // prefix, in the documented byte order — recomputed from the raw hash
+        // (serial_hash4 is the scaled *output*, not the prefix).
+        let prefix = u32::from_be_bytes(
+            fapico2_platform::ckey::serial_hash(&chipid.to_be_bytes())[0..4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(
-            u32::from_be_bytes(serial_hash4(chipid)),
-            hash4,
+            prefix, hash4,
             "hash prefix changed for chipid {chipid:#018x}"
+        );
+        // The serial4 half (D-WB2): the bytes the rescue body and the
+        // management TAG_SERIAL carry are the scaled value, big-endian.
+        assert_eq!(
+            serial_hash4(chipid),
+            (serial_value(chipid) as u32).to_be_bytes(),
+            "serial4 changed for chipid {chipid:#018x}"
         );
         // The output half: the literal 8 characters the host will read.
         assert_eq!(
@@ -212,11 +260,11 @@ fn decimal8_is_fixed_width_zero_padded() {
     assert_eq!(decimal8(1), *b"00000001");
     assert_eq!(decimal8(9), *b"00000009");
     assert_eq!(decimal8(10), *b"00000010");
-    assert_eq!(decimal8(99_999_999), *b"99999999");
-    // The full 32-bit input range of the hash prefix must stay inside 8
-    // digits — the rule truncates, it does not overflow into a 9th digit.
-    assert_eq!(decimal8(u32::MAX as u64), *b"99999999");
-    assert_eq!(decimal8(SERIAL_MODULUS - 1), *b"99999999");
+    // The 26-bit space (D-WB2): the top of the range renders as its own
+    // digits, and every wider input saturates at MODULUS-1 = 67108863.
+    assert_eq!(decimal8(99_999_999), *b"67108863");
+    assert_eq!(decimal8(u32::MAX as u64), *b"67108863");
+    assert_eq!(decimal8(SERIAL_MODULUS - 1), *b"67108863");
     for v in [0u64, 1, 42, 1_234_567, 99_999_998, SERIAL_MODULUS - 1] {
         let d = decimal8(v);
         assert_eq!(d.len(), 8);

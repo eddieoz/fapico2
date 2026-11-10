@@ -377,13 +377,18 @@ fn the_aid_is_the_one_the_client_selects() {
 /// which the client derives a serial out of `[4..7]` with the top two bits of
 /// byte 4 masked off (`ops.rs:234-236`).
 #[test]
-fn select_block_carries_the_chipid_big_endian() {
+fn select_block_carries_the_serial_id_big_endian() {
     let mut h = Harness::wired();
     let (data, _) = h.select();
-    assert_eq!(&data[4..12], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-    // The client's serial derivation, transcribed rather than imported.
+    // serial4 head: serial_value(0x1122334455667788) = 7,813,528 -> 0x00773998
+    // (the serial4-masked bytes; byte 0 self-masks below 2^26). Tail:
+    // SHA-256(chipid BE)[4..8] = 591efb43 — both computed independently.
+    assert_eq!(&data[4..12], &[0x00, 0x77, 0x39, 0x98, 0x59, 0x1e, 0xfb, 0x43]);
+    // The client's serial derivation, transcribed rather than imported: the
+    // value PicoForge pairs the CCID interface on must equal the serial the
+    // FIDO side reports (the same bytes in the management TAG_SERIAL).
     let serial = u32::from_be_bytes([data[4] & 0x03, data[5], data[6], data[7]]);
-    assert_eq!(serial, 0x0122_3344, "the client's masked serial, computed here");
+    assert_eq!(serial, 0x0077_3998, "the client's masked serial, computed here");
 }
 
 // ── US-161a: READ FlashInfo ───────────────────────────────────────────────

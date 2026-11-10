@@ -1035,7 +1035,18 @@ impl RescueApp {
         out[1] = PRODUCT_TYPE_FIDO;
         out[2] = RSKEY_SDK_MAJOR;
         out[3] = RSKEY_SDK_MINOR;
-        out[4..SELECT_BLOCK_LEN].copy_from_slice(&self.chipid.to_be_bytes());
+        // US-1825 follow-up (D-WB2): bytes [4..8] are the **serial4** — the
+        // masked serial PicoForge's rescue decode reads to pair the CCID
+        // interface with the FIDO side — not the raw chipid. The reference
+        // (`pico-keys-sdk` rescue.c) puts the platform serial id here, whose
+        // head encodes the serial; carrying the raw chipid made our
+        // CCID-derived serial differ from the TAG_SERIAL the FIDO side
+        // reports, and picoforge's serial filter silently skipped every
+        // reader. `[8..12]` keeps an 8-byte device-unique id shape:
+        // `SHA-256(chipid)[4..8]`.
+        out[4..8].copy_from_slice(&fapico2_platform::usb_ident::serial_hash4(self.chipid));
+        let h = fapico2_platform::ckey::serial_hash(&self.chipid.to_be_bytes());
+        out[8..SELECT_BLOCK_LEN].copy_from_slice(&h[4..8]);
         out
     }
 
