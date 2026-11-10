@@ -44,7 +44,7 @@ The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID devic
 
 ## USB identity
 
-The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community", product "fapico2". `0xFA20` is not a USB-IF-registered vendor ID, so Linux and macOS need the libccid `Info.plist` allowlist edited before `pcscd` sees the CCID reader (CTAP-HID is unaffected everywhere). Production deployments need a registered VID — see the [USB identity how-to](../how-to/usb-identity.md) for changing it on a running board.
+The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community", product "fapico2" — with an 8-digit serial derived from the OTP chipid (the same value the management applet and the rescue identity report, so PicoForge's interface pairing always agrees). `0xFA20` is not a USB-IF-registered vendor ID, so Linux and macOS need the libccid `Info.plist` allowlist edited before `pcscd` sees the CCID reader (CTAP-HID is unaffected everywhere). Production deployments need a registered VID — see the [USB identity how-to](../how-to/usb-identity.md) for changing it on a running board. Firmware updated from a 2026-11-10-or-earlier build changes the serial **once**; the host re-enumerates the board as a different device and PicoForge re-pairs.
 
 ## First steps after flashing
 
