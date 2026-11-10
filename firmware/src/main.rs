@@ -807,10 +807,21 @@ async fn main(spawner: Spawner) -> ! {
     // fill leaves the pool empty until the task fills it. The *request*
     // path (opcard's entropy, via `DeviceBackend::boot` below) serves from
     // the same cell through the platform's `Rp2350Rng`.
+    //
+    // **Ordering is load-bearing** (US-1825 fix-up, found on hardware
+    // 2026-11-10): `init_drbg_cell` writes the cell slot AND the four
+    // seed-source slots; `seed_drbg_blocking`'s attempts read them through
+    // `drbg_cell()`. Seeding before initializing was
+    // `assume_init_mut` on `MaybeUninit::uninit()` statics — undefined
+    // behaviour that killed the legacy path silently between the entropy
+    // draw and USB (the 2026-11-10 19:09 video: draw window completes at
+    // 6.6 s, then dark, no USB, no park signature — a hard fault, not a
+    // park). `init_drbg_cell` first, `seed_drbg_blocking` second; the
+    // borrow of `seed_probe` above ends before the move below.
+    let drbg_cell = unsafe { boot::init_drbg_cell(seed_probe) };
     if legacy_bringup {
         boot::seed_drbg_blocking();
     }
-    let drbg_cell = unsafe { boot::init_drbg_cell(seed_probe) };
     bphase!(crate::dbg::P_DRBG);
     // Boot-phase rung 5: the DRBG cell exists. On the legacy path it is
     // seeded; on the bring-up path it is empty and everything below this
@@ -1304,9 +1315,17 @@ async fn main(spawner: Spawner) -> ! {
     // US-1658: the applet now lives behind `nostr_shared::NOSTR_APP`'s shared Mutex
     // (both transports reach it), so the boot path installs the providers
     // through the lock instead of consuming a builder by value.
+    // US-1823/US-1826 (WARM-BOOT-SERVE): the rng provider is `None` on the
+    // bring-up path — every draw-carrying Nostr command (GENERATE, SIGN,
+    // NIP-44) refuses via the applet's `None` arm until the entropy bring-up
+    // task re-installs the provider after seeding the cell and filling the
+    // pool. The legacy path installs the provider directly (the pool was
+    // filled at boot). The grant argument stays the strict
+    // presence gate — pinned by apps/nostr/tests/presence.rs at this very
+    // statement.
     fapico2_firmware::nostr_shared::install_nostr_providers(
         nostr_region,
-        nostr_random,
+        if legacy_bringup { Some(nostr_random) } else { None },
         fapico2_firmware::presence::nostr_grant,
     );
 
@@ -1554,6 +1573,24 @@ async fn led_heartbeat_task() {
     // places a trussed request can run).
     let led: &'static mut Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(boot::LED_OUT)).assume_init_mut() };
+    // US-1828 (WARM-BOOT-SERVE): while the entropy bring-up is Warming, the
+    // heartbeat drives the US-1803 wait rhythm (`.--.--.--.`, 80/170) instead
+    // of the 1 Hz heartbeat — **one rhythm, one meaning: entropy settling**,
+    // pre- and post-boot. The alternative (keep 1 Hz, client-only status)
+    // loses the no-client reading the owner relies on and was rejected by
+    // default. Collision review (re-run): the 80 ms on / 250 ms period is
+    // pinned by `wait_blink`'s collision test as producible by exactly one
+    // driver; the serving-path drivers (trussed `LedUi` status codes, the
+    // touch-prompt presence window) run only inside synchronous request
+    // sections and override the heartbeat while they run — the warming
+    // rhythm is the *idle* reading, and every pre-existing reading kept its
+    // meaning. On Ready the task settles into the 1 Hz loop.
+    while !boot::entropy_ready() {
+        led.set_high();
+        Timer::after_millis(fapico2_firmware::wait_blink::WAIT_BLINK_ON_MS).await;
+        led.set_low();
+        Timer::after_millis(fapico2_firmware::wait_blink::WAIT_BLINK_OFF_MS).await;
+    }
     loop {
         led.set_high(); // ON (active-high)
         Timer::after_millis(500).await;
@@ -1612,6 +1649,15 @@ async fn entropy_bringup_task() {
                 // Fill them BEFORE publishing Ready, so no pool-served
                 // ephemera can observe an empty pool post-Ready.
                 boot::refill_pools_from_cell();
+                // US-1826: re-install the Nostr rng provider — `None` was
+                // installed at boot on this path, and the applet's draw arm
+                // refused every creation command while Warming. The same
+                // region/grant fns the boot installed, unchanged.
+                fapico2_firmware::nostr_shared::install_nostr_providers(
+                    nostr_region,
+                    Some(nostr_random),
+                    fapico2_firmware::presence::nostr_grant,
+                );
                 boot::publish_entropy_ready();
                 defmt::info!("entropy bring-up: ready — creation-class operations unblocked");
                 return;

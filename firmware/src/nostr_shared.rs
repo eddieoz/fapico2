@@ -195,7 +195,11 @@ impl crate::hid_serve::NostrDispatch for NostrViaMutex {
 /// there, the same asymmetry §8 records for the vendor-HID path.
 pub fn install_nostr_providers(
     region: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
-    rng: fn(&mut [u8]),
+    // US-1823/US-1826 (WARM-BOOT-SERVE): `None` installs the warming
+    // posture — every draw-carrying command refuses (device `None` arm)
+    // until the bring-up task re-installs `Some(provider)` after refilling
+    // the pool. The legacy boot path installs `Some` directly.
+    rng: Option<fn(&mut [u8])>,
     grant: fn(u32) -> bool,
 ) {
     #[cfg(all(feature = "device", target_arch = "arm"))]
@@ -286,7 +290,7 @@ mod us1658_shared_ownership {
         FileKeyRegion::create(&path, TOTAL_SLOTS).expect("a fresh region file");
 
         GRANT_CALLS.store(0, Ordering::SeqCst);
-        super::install_nostr_providers(region_fixture, rng_constant, grant_refuse_after_first);
+        super::install_nostr_providers(region_fixture, Some(rng_constant), grant_refuse_after_first);
 
         // --- client A: the CCID proxy. Select, then GENERATE (granted).
         let mut proxy = NostrViaMutex;

@@ -723,13 +723,20 @@ impl NostrApp {
     pub fn install_providers(
         &mut self,
         region_provider: fn() -> Option<fapico2_platform::keyregion::nostr_store::NostrRegion>,
-        rng: fn(&mut [u8]),
+        // US-1823/US-1826 (WARM-BOOT-SERVE): `None` wires the refuse path —
+        // on a device build `draw_random`'s `None` arm answers the warming
+        // refusal (arm `platform_random` is the device `None`), and the
+        // bring-up task re-installs `Some(provider)` once the DRBG cell is
+        // seeded and the pool filled. GENERATE, SIGN and NIP-44 draw through
+        // this Option, so a `None` install is the warming posture for every
+        // command that draws, on both transports at once.
+        rng: Option<fn(&mut [u8])>,
         grant: fn(u32) -> bool,
         custody_otp: Option<&'static dyn fapico2_platform::otp_cus::OtpAccess>,
     ) {
         self.provider = Some(region_provider);
         self.region_source = Some(region_provider);
-        self.rng = Some(rng);
+        self.rng = rng;
         self.presence_grant = Some(grant);
         self.custody_otp = custody_otp;
     }
