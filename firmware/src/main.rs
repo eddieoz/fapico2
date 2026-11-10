@@ -774,41 +774,49 @@ async fn main(spawner: Spawner) -> ! {
     let mut store_handle = boot::store_handle();
     let store = &mut store_handle;
 
-    // US-918: guarantee the boot-entropy slot before ANY path that derives
-    // the bound device root (first-boot C→Rust migration below, the
-    // migration authority / capture restore, and every app boot). Absence →
-    // draw from the TRNG; the write rides the boot persist gate so the
-    // record lands inside the sealed v3 store image. Fail-closed: without
-    // the slot, bound derivations refuse (never the legacy fallback).
-    boot::ensure_boot_entropy(&mut seed_probe, store);
+    // US-1825 (WARM-BOOT-SERVE): the boot path no longer blocks on the TRNG
+    // for freshness. The discriminator is a pair of deterministic **store
+    // reads** (no peripheral draw): on a provisioned board — entropy record
+    // AND hkey present, the 2026-11-10 measured case — the boot performs no
+    // peripheral draw at all and the background bring-up task warms the
+    // TRNG while USB serves. On a fresh install (or a repair boot that lost
+    // either) construction itself needs randomness, so the legacy inline
+    // sequence runs exactly as the pre-epic boot did — same budgets, same
+    // blink window, same legible park.
+    let legacy_bringup = boot::boot_needs_legacy_bringup(store);
+    if legacy_bringup {
+        boot::ensure_boot_entropy_blocking(&mut seed_probe, store);
+    }
     bphase!(crate::dbg::P_BOOT_ENTROPY);
 
-    // US-1005: the device DRBG. **After** `ensure_boot_entropy` — the seed
-    // source reads the record that call writes, and a missing record is the
-    // fail-closed `MissingBootEntropy` refusal. It takes the bounded probe
-    // handle built at the top of `main` and hands back the sole `&'static
-    // mut` the trussed backend serves nonces from. A refusal is fatal: see
-    // `boot::init_drbg` for why there is deliberately no fallback.
+    // US-1825: the DRBG **cell** — empty on the bring-up path (the task
+    // seeds it), seeded inline on the legacy path. The OTP identity reads
+    // inside keep their budget, silence and park: identity is not freshness.
+    // It takes the bounded probe handle built at the top of `main` and
+    // installs the seed-source slots; the cell is the one generator the
+    // trussed backend serves nonces from, through `boot::drbg_cell()`
+    // handles. A legacy-path seed refusal is fatal: see
+    // `boot::seed_drbg_blocking` for why there is deliberately no fallback.
     //
     // The boot-path `trng` above is still used directly for
-    // `ensure_fw_manifest` — and, until the D-10 fix, for the migration
-    // handler. The manifest is a bootstrap draw US-1005 cannot route (a DRBG
-    // needs a seed record, and the first thing this firmware does with a
-    // seed record is create it). The migration handler was *not* a bootstrap
-    // draw — it ran inside a CCID request — and it now goes through the
-    // bounded `boot::MIG_PROBE` instead, so nothing on the request path
-    // touches this unbounded handle any more. **Both app boots
-    // (`boot_fido`, `boot_oath`) are served from the DRBG**, FIDO since
-    // US-1005 and OATH from this fix; the review that prompted it found the
-    // two call sites identical in a diff and only one of them routed.
-    // Once the DRBG exists, the *request* path (opcard's entropy, via
-    // `DeviceBackend::boot` below) no longer touches the peripheral per
-    // request: it stretches one block across `RESEED_INTERVAL` of them.
-    let drbg = unsafe { boot::init_drbg(seed_probe) };
+    // `ensure_fw_manifest`. **Both app boots (`boot_fido`, `boot_oath`) are
+    // served from the cell** — on the legacy path it is already seeded (so
+    // the fresh arm's construction draws work as before); on the bring-up
+    // path it refuses `NotSeeded`, which is exactly the warming posture:
+    // a provisioned board's construction draws nothing, and OATH's pool
+    // fill leaves the pool empty until the task fills it. The *request*
+    // path (opcard's entropy, via `DeviceBackend::boot` below) serves from
+    // the same cell through the platform's `Rp2350Rng`.
+    if legacy_bringup {
+        boot::seed_drbg_blocking();
+    }
+    let drbg_cell = unsafe { boot::init_drbg_cell(seed_probe) };
     bphase!(crate::dbg::P_DRBG);
-    // Boot-phase rung 5: a DRBG exists. Everything below this rung draws
-    // through it, so a freeze below it cannot be an unbounded-peripheral
-    // draw (US-1001/US-1005).
+    // Boot-phase rung 5: the DRBG cell exists. On the legacy path it is
+    // seeded; on the bring-up path it is empty and everything below this
+    // rung that draws from it either serves deterministically or refuses
+    // with the warming answer (US-1826). A freeze below this rung cannot be
+    // an unbounded-peripheral draw (US-1001/US-1005) either way.
     mark!(fapico2_firmware::bootphase::RUNG_DRBG);
 
     // US-919: foreign-image boot admission (EPIC `security-hardening`, R9):
@@ -877,16 +885,22 @@ async fn main(spawner: Spawner) -> ! {
     // `Trng`, so this is a change of argument rather than of type — and it
     // matters, because this is the app whose credential keys are generated
     // here, on the boot path, before any request has arrived.
-    let fido_app = boot_fido(&mut *drbg, store);
+    let fido_app = boot_fido(&mut *drbg_cell, store);
     bphase!(crate::dbg::P_BOOT_FIDO);
-    // US-1644: the Nostr applet's boot-time RNG pool. This is the last
-    // point the DRBG is borrowable — `boot::take_drbg`, further down, hands
-    // the generator to the trussed platform by value — so the applet draws
-    // from a pool filled here (the OATH app's `fill_rng_pool` pattern: every
-    // random byte on the device comes from the DRBG). The draw lives in the
-    // applet (`draw_boot_pool`), because boot.rs's RNG-gate cap for the
-    // infallible seam is zero.
-    unsafe { boot::init_nostr_rng_pool(fapico2_nostr::draw_boot_pool(&mut *drbg)) };
+    // US-1644: the Nostr applet's boot-time RNG pool. US-1825: on the
+    // legacy path the DRBG is still borrowable and the pool is filled here
+    // (the OATH app's `fill_rng_pool` pattern: every random byte on the
+    // device comes from the DRBG; the draw lives in the applet
+    // (`draw_boot_pool`), because boot.rs's RNG-gate cap for the infallible
+    // seam is zero). On the bring-up path the cell is empty — installing an
+    // EMPTY pool here (never uninitialized memory) and letting the bring-up
+    // task fill it once the cell is seeded; Nostr creation-class operations
+    // refuse under Warming (US-1826), so nothing draws before then.
+    if legacy_bringup {
+        unsafe { boot::init_nostr_rng_pool(fapico2_nostr::draw_boot_pool(&mut *drbg_cell)) };
+    } else {
+        unsafe { boot::init_nostr_rng_pool(heapless::Vec::new()) };
+    }
     // US-921: the shared presence runtime is the FIDO user-presence grant
     // path — one pending-request slot bound to the BOOTSEL latch; a press
     // with no pending request never arms anything. The gate is
@@ -922,7 +936,7 @@ async fn main(spawner: Spawner) -> ! {
     // comment above) — after `boot::take_drbg` there is no DRBG borrow left.
     // Both app boots only *read* the store, so hoisting OATH next to FIDO
     // does not perturb the boot persist gate below.
-    let oath_app = boot_oath(&mut *drbg, store, device_chipid);
+    let oath_app = boot_oath(&mut *drbg_cell, store, device_chipid);
     bphase!(crate::dbg::P_BOOT_OATH);
     // US-903/US-921: the board button is the user-presence source for
     // RESET (INS 0x04) and SET_CODE-clear (INS 0x03) — through the
@@ -1074,7 +1088,11 @@ async fn main(spawner: Spawner) -> ! {
                 // shape as `take_client`). Nothing holds a reference to it
                 // after this point, so the CCID task's synchronous sections
                 // are the only accessors — single-core, cooperative executor.
-                boot::take_drbg(),
+                // US-1825: the minted cell handle (the platform holds it
+                // by the documented-duplication discipline; the bring-up
+                // task seeds the same static). `boot::take_drbg` is gone —
+                // the generator is never moved out of its static again.
+                boot::drbg_cell(),
                 (*core::ptr::addr_of_mut!(boot::LED_OUT)).as_mut_ptr(),
                 boot::migration_authority(),
             )
@@ -1474,6 +1492,16 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(led_heartbeat_task()).unwrap();
     // US-702: the button poll task latches short-presses for user presence.
     spawner.spawn(button::button_poll_task()).unwrap();
+    // US-1825 (WARM-BOOT-SERVE): the entropy bring-up task. Spawned with the
+    // serve loops — USB serving has started (or starts with the first
+    // executor poll), and the boot path on a provisioned board drew nothing
+    // from the TRNG. From here the task warms the TRNG, seeds the DRBG cell,
+    // refills the three boot pools and publishes Ready while the board
+    // serves every deterministic operation; creation-class operations refuse
+    // with the warming answer (US-1826) until it completes. On the legacy
+    // (fresh-install) path the cell was already seeded inline and Ready
+    // published before any task existed, so the task exits on its first poll.
+    spawner.spawn(entropy_bringup_task()).unwrap();
 
     // US-929 boot ladder, stage 4 (dbg-log builds only): all serve-loop
     // tasks are spawned and main() parks into the executor loop — the 1 Hz
@@ -1531,6 +1559,68 @@ async fn led_heartbeat_task() {
         Timer::after_millis(500).await;
         led.set_low(); // OFF
         Timer::after_millis(500).await;
+    }
+}
+
+/// US-1825 (WARM-BOOT-SERVE): the background entropy bring-up task.
+///
+/// On the bring-up path (provisioned board: entropy record and hkey present,
+/// the 2026-11-10 measured case) the boot path performed **no peripheral
+/// draw** and left the DRBG cell empty. This task warms the TRNG in the
+/// background while the board serves every deterministic operation:
+///
+/// 1. one seeding attempt per iteration — the fresh draw inside
+///    `FuseSeedSource::seed` is the probe, bounded on the [`otp_retry`]
+///    budget semantics (US-1802: each attempt is a fresh roll of the
+///    peripheral; a refusal scrubs the buffer). The record itself is
+///    already present — the boot discriminator guaranteed it — so the
+///    attempt is exactly record-read → seed-derivation → fresh-draw;
+/// 2. on success: refill the three boot RNG pools from the seeded cell
+///    (FIDO/OATH constructed with empty pools on this path; Nostr's was
+///    installed empty), then publish **Ready** — the pollable bit
+///    [`boot::entropy_ready`] reads (US-1827) and the heartbeat's warming
+///    rhythm ends on (US-1828);
+/// 3. on refusal: sleep one [`fapico2_firmware::otp_retry::STEP_MS`] step
+///    and retry. **No reboot, no park** — post-boot there is nothing to
+///    reboot (the bounded-reboot machinery is deleted); the task outlives
+///    any stall and the owner's power cycle is the recovery, while the
+///    pollable status says what is happening.
+///
+/// On the legacy (fresh-install) path the cell was seeded inline before any
+/// task existed and Ready is already published, so the task exits on its
+/// first poll without touching the peripheral.
+///
+/// # Sharing discipline
+///
+/// Every call into [`boot`] from here is synchronous with no yield point
+/// (the seed attempt, the pool refills, the publish), so the minted
+/// `&'static mut` handles to the cell, the store and the app slots follow
+/// the documented-duplication pattern — at most one accessor inside a
+/// synchronous section at any moment on this single-core cooperative
+/// executor. The `.await` points sit only between attempts.
+#[task]
+async fn entropy_bringup_task() {
+    // Legacy path: seeding happened inline on the boot path; nothing to do.
+    if boot::entropy_ready() {
+        return;
+    }
+    defmt::info!("entropy bring-up: task started — warming the TRNG in the background");
+    loop {
+        match boot::try_seed_drbg_once() {
+            Ok(()) => {
+                // Seed succeeded: the pools can draw real DRBG output now.
+                // Fill them BEFORE publishing Ready, so no pool-served
+                // ephemera can observe an empty pool post-Ready.
+                boot::refill_pools_from_cell();
+                boot::publish_entropy_ready();
+                defmt::info!("entropy bring-up: ready — creation-class operations unblocked");
+                return;
+            }
+            Err(_) => {
+                defmt::warn!("entropy bring-up: TRNG still warming — retrying");
+                Timer::after_millis(fapico2_firmware::otp_retry::STEP_MS).await;
+            }
+        }
     }
 }
 

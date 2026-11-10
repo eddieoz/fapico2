@@ -38,7 +38,7 @@ use trussed::types::CoreContext;
 use trussed::{ClientImplementation, Service};
 use trussed_core::types::reboot;
 
-use crate::trng::DrbgTrng;
+use crate::trng::{DrbgTrng, LazyDrbg};
 
 use super::dispatch::OpcardDispatch;
 use super::runner::{Backends, Client, SyscallRunner};
@@ -174,17 +174,29 @@ const _: () = assert!(
      borrowed inputs (no cached seed, no cached draw)"
 );
 
-pub struct Rp2350Rng(DeviceDrbg);
+/// US-1824/US-1825 (WARM-BOOT-SERVE): the platform's `Rng` holds the
+/// seed-once-then-serve **cell**, not a generator taken by value at boot.
+/// The cell starts unseeded on the bring-up path (a provisioned board boots
+/// and serves deterministic operations while the background task warms the
+/// TRNG); the firmware's bring-up task seeds it through
+/// `firmware::boot::drbg_cell()` — the same static this handle aliases, so
+/// `try_fill_bytes` refuses `NotSeeded` until the task has published Ready.
+///
+/// The `'static mut` is one of the tree's documented-duplication handles
+/// (the `FLASH_DEV`/key-region pattern): minted from the boot-owned static
+/// in `boot.rs`, single-core, and every method on it is synchronous with no
+/// yield point, so at most one accessor is inside the cell at any moment.
+pub struct Rp2350Rng(&'static mut LazyDrbg<DeviceSeedSource>);
 
 impl Rp2350Rng {
-    /// Wrap an already-seeded generator.
+    /// Wrap the cell handle.
     ///
-    /// Construction of the generator is the caller's, not this type's: a
-    /// refusal to seed is a boot-time decision with its own diagnostics (see
-    /// `firmware::boot::init_drbg`), and a constructor here that could fail
-    /// would push that decision somewhere it cannot be reported from.
-    pub fn new(drbg: DeviceDrbg) -> Self {
-        Self(drbg)
+    /// Construction and seeding of the generator are the caller's, not this
+    /// type's: the cell starts empty on the bring-up path and the firmware's
+    /// background task seeds it; a refusal to seed is the task's retry, not
+    /// a boot-time fatal.
+    pub fn new(cell: &'static mut LazyDrbg<DeviceSeedSource>) -> Self {
+        Self(cell)
     }
 }
 
@@ -233,12 +245,13 @@ impl RngCore for Rp2350Rng {
     /// The fallible half — genuinely fallible, which is what the old
     /// `Ok(())` was not.
     ///
-    /// The two [`DrbgTrngError`] variants get **distinct** `rand_core` error
-    /// codes rather than being collapsed into one. In `no_std` that type is
-    /// an opaque `NonZeroU32`, so the code is the only channel a caller has
-    /// to tell "budget spent" from "the peripheral stopped answering" — and
-    /// those call for different operator responses (retry later vs. reset the
-    /// device). Both sit at or above `rand_core::Error::CUSTOM_START`, the
+    /// Three conditions get **distinct** `rand_core` error codes rather than
+    /// being collapsed into one. In `no_std` that type is an opaque
+    /// `NonZeroU32`, so the code is the only channel a caller has to tell
+    /// "bring-up not finished yet" from "budget spent" from "the peripheral
+    /// stopped answering" — and those call for different operator responses
+    /// (poll the bring-up status and retry vs. retry later vs. reset the
+    /// device). All sit at or above `rand_core::Error::CUSTOM_START`, the
     /// documented range for user-defined codes, so they cannot collide with
     /// `rand` / `getrandom`'s.
     fn try_fill_bytes(
@@ -248,10 +261,16 @@ impl RngCore for Rp2350Rng {
         self.0.try_random_bytes(buf).map_err(|e| {
             #[cfg(all(feature = "device", target_arch = "arm"))]
             match e {
-                crate::trng::DrbgTrngError::ReseedRequired => {
+                crate::trng::TrngError::NotSeeded => {
+                    defmt::error!(
+                        "Rp2350Rng: DRBG not seeded — entropy bring-up incomplete; \
+                         deterministic operations serve, creation-class refuse (WARM-BOOT-SERVE)"
+                    );
+                }
+                crate::trng::TrngError::Stalled => {
                     defmt::error!("Rp2350Rng: DRBG re-seed required, budget spent");
                 }
-                crate::trng::DrbgTrngError::Reseed(_) => {
+                _ => {
                     defmt::error!("Rp2350Rng: DRBG re-seed refused (peripheral)");
                 }
             }
@@ -259,12 +278,13 @@ impl RngCore for Rp2350Rng {
             let _ = e;
             // `rand_core::Error` has no public `from_code`; the documented
             // constructor in the 0.6 line is the `From<NonZeroU32>` impl.
-            // SAFETY of the unwrap: both constants are non-zero (they are
-            // `CUSTOM_START` and `CUSTOM_START + 1`, and `CUSTOM_START` is a
-            // compile-time non-zero constant), so `new` cannot return `None`.
+            // SAFETY of the unwrap: all three constants are non-zero (they
+            // are `CUSTOM_START` .. `CUSTOM_START + 2`), so `new` cannot
+            // return `None`.
             rand_core::Error::from(core::num::NonZeroU32::new(match e {
-                crate::trng::DrbgTrngError::ReseedRequired => crate::trng::RNG_ERR_RESEED_REQUIRED,
-                crate::trng::DrbgTrngError::Reseed(_) => crate::trng::RNG_ERR_RESEED_REFUSED,
+                crate::trng::TrngError::NotSeeded => crate::trng::RNG_ERR_NOT_SEEDED,
+                crate::trng::TrngError::Stalled => crate::trng::RNG_ERR_RESEED_REQUIRED,
+                _ => crate::trng::RNG_ERR_RESEED_REFUSED,
             })
             .expect("CUSTOM_START is non-zero by construction"))
         })
@@ -1210,13 +1230,13 @@ impl DevicePlatform {
     /// access per the shared-pin contract on [`DeviceBackend::boot`].
     pub unsafe fn new(
         flash: DevFlash,
-        drbg: DeviceDrbg,
+        rng: &'static mut LazyDrbg<DeviceSeedSource>,
         led: *mut Output<'static>,
     ) -> Self {
         // SAFETY: upheld by the caller (`DeviceBackend::boot`) per the
         // `# Safety` contract above.
         Self {
-            rng: Rp2350Rng::new(drbg),
+            rng: Rp2350Rng::new(rng),
             store: DeviceFsStore::boot(flash),
             ui: LedUi::new(led),
         }
@@ -1290,7 +1310,7 @@ impl DeviceBackend {
     #[inline(never)]
     pub unsafe fn boot(
         flash: DevFlash,
-        drbg: DeviceDrbg,
+        rng: &'static mut LazyDrbg<DeviceSeedSource>,
         led: *mut Output<'static>,
         migration: Option<&'static dyn super::dispatch::MigrationPinAuthority>,
     ) -> &'static mut Client<'static, DevicePlatform, OpcardDispatch<'static>> {
@@ -1306,7 +1326,7 @@ impl DeviceBackend {
         #[cfg(feature = "rsa-backend")]
         crate::rsa_heap::init();
 
-        let platform = DevicePlatform::new(flash, drbg, led);
+        let platform = DevicePlatform::new(flash, rng, led);
         let (requester, responder) =
             CHANNEL.split().expect("trusted backend: channel must split at boot");
         let ep = ServiceEndpoint::new(

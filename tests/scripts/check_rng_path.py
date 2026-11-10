@@ -659,6 +659,19 @@ _ALLOWED = (
         "inventory rather than silently exempt.",
     ),
     (
+        ("platform", "tests", "lazy_drbg.rs"),
+        {"Trng::random_bytes": 1},
+        "host test target, US-1824 (WARM-BOOT-SERVE): the one site is "
+        "unseeded_infallible_leaves_buffer_untouched, which drives the "
+        "cell's OWN Trng impl against the D-9 contract — an unseeded "
+        "LazyDrbg must refuse NotSeeded on the fallible seam and leave the "
+        "caller's buffer untouched on the infallible one. Not a caller "
+        "reaching randomness: the test defines the cell under test, the "
+        "same shape as the device_random_fallible.rs entry. A second "
+        "occurrence here would be a new constructed source, not a new "
+        "consumer.",
+    ),
+    (
         ("platform", "tests", "ckey_aead.rs"),
         {"Trng::random_bytes": 1},
         "host test target: a per-test HostTrng salt. Not shipped code.",

@@ -954,253 +954,286 @@ pub static mut DRBG_SEED_PROBE: core::mem::MaybeUninit<
     fapico2_platform::trng::Rp2350Probe<'static>,
 > = core::mem::MaybeUninit::uninit();
 
-/// The one DRBG the trussed backend serves nonces from (US-1005/US-1006).
+/// The one DRBG the trussed backend serves nonces from (US-1005/US-1006),
+/// now behind the US-1824 seed-once-then-serve cell (WARM-BOOT-SERVE).
 ///
 /// A `static mut` for the same reason as every other large boot-path object
-/// here: it must not transit the async-main frame. `Drbg` is 80 bytes and the
-/// source is four pointers, so the frame cost would be tolerable — but
-/// keeping it out of the frame is the established discipline for anything
-/// living past boot, and a reseed must be callable from a CCID task later.
-pub static mut DRBG: core::mem::MaybeUninit<
-    fapico2_platform::trng::DrbgTrng<
-        fapico2_platform::drbg_seed::FuseSeedSource<
-            'static,
-            DeviceStore,
-            fapico2_platform::trng::Rp2350Probe<'static>,
-        >,
-    >,
+/// here: it must not transit the async-main frame. The cell starts **empty**
+/// on the bring-up path (US-1825: a provisioned board boots and serves
+/// deterministic operations with the TRNG unstarted) and the background
+/// bring-up task seeds it exactly once. On the legacy first-install path
+/// (`boot_needs_legacy_bringup`) the boot path seeds it inline, exactly as
+/// the pre-epic boot did.
+///
+/// Access is the tree's documented-duplication handle pattern
+/// ([`drbg_cell`]): single core, every method synchronous with no yield
+/// point, so at most one accessor is inside the cell at any moment.
+pub static mut DRBG_CELL: core::mem::MaybeUninit<
+    fapico2_platform::trng::LazyDrbg<fapico2_platform::trusted_backend::device::DeviceSeedSource>,
 > = core::mem::MaybeUninit::uninit();
 
-/// Build the device DRBG and install it in [`DRBG`] (US-1005).
+/// US-1825/US-1827: published by the bring-up task (or the legacy boot path)
+/// once the cell is seeded and the pools are filled. The pollable status
+/// (`mgmt` READ_CONFIG, US-1827) and the heartbeat's warming rhythm
+/// (US-1828) both read this.
+pub static ENTROPY_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the entropy bring-up has completed (US-1827's pollable bit).
+pub fn entropy_ready() -> bool {
+    ENTROPY_READY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish Ready (the bring-up task's last step, or the legacy boot path's).
+pub fn publish_entropy_ready() {
+    ENTROPY_READY.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Mint a fresh `&'static mut` handle to the DRBG cell.
 ///
-/// Call **after** `ensure_boot_entropy`: the seed source reads the very record
-/// that function writes, and a missing record is
-/// `CKeyError::MissingBootEntropy` — the fail-closed refusal US-1003 defines.
-/// Ordering it before would make every device look unprovisioned.
+/// The same discipline as [`store_handle`] and [`key_region`]: each call
+/// mints a fresh handle; sound under this tree's single-core cooperative
+/// executor because **no cell method ever yields** — `seed`,
+/// `try_random_bytes` and `is_ready` are synchronous — so at most one
+/// caller is inside the cell at any moment. A caller that stores the handle
+/// across an `.await` breaks that.
+pub fn drbg_cell() -> &'static mut fapico2_platform::trng::LazyDrbg<
+    fapico2_platform::trusted_backend::device::DeviceSeedSource,
+> {
+    // SAFETY: `DRBG_CELL` is written exactly once by `init_drbg_cell` on the
+    // boot path before any task exists, and every accessor afterwards is a
+    // synchronous minted handle (single-core, no yield inside).
+    unsafe { (&mut *core::ptr::addr_of_mut!(DRBG_CELL)).assume_init_mut() }
+}
+
+/// US-1825 (WARM-BOOT-SERVE): construct the DRBG **cell** — empty, no draws.
 ///
-/// A refusal here is **fatal**, and deliberately so. The alternatives were
-/// considered:
+/// The boot path no longer seeds the generator. This function does the two
+/// OTP identity reads (which keep their budget, their silence and their
+/// immediate park — identity is not freshness, ADR 0004's domain is
+/// untouched), initializes the four write-once slots the seed source borrows
+/// ([`DRBG_OTP_KEY`], [`DRBG_UID`], [`DRBG_SEED_STORE`], [`DRBG_SEED_PROBE`]),
+/// and installs an **empty** [`fapico2_platform::trng::LazyDrbg`] in
+/// [`DRBG_CELL`]. No peripheral draw happens here: a provisioned board (the
+/// 2026-11-10 measured case) reaches serving with the TRNG unstarted, and
+/// the background bring-up task (US-1825) seeds the cell while USB serves.
 ///
-/// * *Continue with a peripheral-only source* — reinstates exactly the
-///   arrangement US-1003 exists to end, and puts an unbounded wait back on
-///   the request path.
-/// * *Continue with the fuse seed alone* — the cross-boot nonce-reuse defect,
-///   and a private-key-recovery bug for any ECDSA signature made across two
-///   boots.
-///
-/// A card that cannot reach a validated entropy block is a card that cannot
-/// sign, and saying so at boot with one line of defmt is better than
-/// discovering it on a customer's first signature.
-///
-/// # The consequence, stated as US-1008 requires
-///
-/// **A TRNG wedge at boot bricks the device until a hardware reset.** That is
-/// the cost of this policy, stated in the form the story asks for rather than
-/// in the euphemism "fails closed": the device does not enumerate over CCID
-/// or CTAP-HID, `fatal_boot` is a `loop {}` after one `defmt::error!`, and a
-/// power cycle re-runs the same failing check, so **no software action
-/// recovers it**. The only recoveries are a hardware reset or a reflash, and
-/// a reflash does not help because the failure is in the peripheral, not the
-/// image.
-///
-/// It is paid deliberately, and the currency is availability rather than
-/// security, because every alternative trades the other way — see the two
-/// bullets above. A degraded mode would be worse than an outage: it would
-/// look like a working token.
-///
-/// # This is the *only* entropy fatal site, and that is US-1008's other half
-///
-/// The branch has several unconditional pre-USB `fatal_boot` calls, and the
-/// review's finding was that one of them — `main.rs`'s boot sanity draw — was
-/// a **diagnostic** that could end the boot. It is now a `defmt::warn!`. The
-/// rule this function's presence establishes:
-///
-/// > A refusal is fatal here because requiring a seeded generator **is** this
-/// > function's job. Everywhere else on the boot path, a refusal is
-/// > something to report, and the *next* site decides whether it is also
-/// > something to refuse on.
-///
-/// The pre-USB fatal sites and why each is entitled to be one:
-///
-/// | site | condition | entitled because |
-/// |---|---|---|
-/// | `init_drbg` (this) | seed refused | requiring a generator is the function's whole job |
-/// | `main.rs` `boot_fido` / `boot_oath` | keystore boot failed | a device that cannot read its own keystore cannot serve a correct one; serving anyway is silently wrong |
-/// | `main.rs` `device chipid` | chipid unavailable | the boot store key is `fuse ⊕ chipid`; without it every stored secret is unopenable |
-/// | `boot.rs` `boot_slot_decision` | untrusted image content | signed-boot enforcement (US-915); an unverified image is exactly what the fuse exists to prevent |
-/// | `boot.rs` migration paths | migration failed | the module's own documented rule: a migration that cannot complete must not leave a *partially* destructively-bootable backend |
-/// | `main.rs` secure-partition persist | boot persist failed | same as the keystore row, one layer down |
-/// | `main.rs` OATH seal (via `boot.rs`) | OTP key row / chipid unavailable | same inputs as the store key; the OATH seal is unopenable without them |
-///
-/// The site that is **not** on that list is the entropy *diagnostic*, and
-/// keeping it off the list is what this commit changed. Two of the rows are
-/// seed-adjacent and worth naming: `init_drbg`'s own `read_otp_key_1` /
-/// `chipid` reads and `Rp2350Timer::require_advancing` in `main.rs` are
-/// fatal, and both should be — they are not "the entropy source is
-/// unhealthy", they are "a required input is absent", which is a different
-/// condition with a different fix.
-///
-/// The two properties that make the policy real rather than aspirational are
-/// pinned by `platform/tests/drbg_seed_stall.rs`: a refused seed yields **no
-/// generator** (there is no infallible constructor to reach for instead), and
-/// the refusal is **prompt** — bounded by the same wall-clock budget the
-/// device applies, so "fatal" is a decision the firmware made and can report
-/// rather than a hang. That second one is the property the 2026-09-29 dark
-/// boot turned on: a wait whose clock was not running made the budget
-/// unreachable, and a healthy part reported a stall.
-///
-/// # What this policy does not settle
-///
-/// The branch is parked dark on hardware and the cause is not established.
-/// Nothing here claims to have found it. What US-1008 changes is that one of
-/// the two entropy sites that could have been the cause can no longer be
-/// one, and the remaining one is observable in the order it happens.
+/// Only the legacy first-install path (`main.rs`, gated by
+/// [`boot_needs_legacy_bringup`]) seeds inline, via [`seed_drbg_blocking`].
 ///
 /// # Safety
 /// Single-core, boot path only; each slot is written exactly once here, before
 /// any task exists (the [`init_static_slot`] contract).
 #[inline(never)]
-pub unsafe fn init_drbg(
+pub unsafe fn init_drbg_cell(
     probe: fapico2_platform::trng::Rp2350Probe<'static>,
-) -> &'static mut fapico2_platform::trng::DrbgTrng<
-    fapico2_platform::drbg_seed::FuseSeedSource<
-        'static,
-        DeviceStore,
-        fapico2_platform::trng::Rp2350Probe<'static>,
-    >,
+) -> &'static mut fapico2_platform::trng::LazyDrbg<
+    fapico2_platform::trusted_backend::device::DeviceSeedSource,
 > {
-    // The two OTP identity legs are deliberately NOT rewired to the bounded
-    // reboot: they keep the OTP budget, the silent window and the immediate
-    // park (ADR 0004 — §22's escalated lock recovers by neither retry nor
-    // reset, so there is nothing for a reboot to re-roll). Only the DRBG seed
-    // draw below — the measured 2026-11-09 site — is a boot-entropy site.
     let otp = read_otp_key_1()
         .unwrap_or_else(|| fatal_boot("drbg: OTP key row unavailable (cannot seed)", fatal_sig::Reason::OtpKeyRow));
     let chipid = read_chipid()
         .unwrap_or_else(|| fatal_boot("drbg: chipid unavailable (cannot seed)", fatal_sig::Reason::ChipId));
 
-    let otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
-    let uid: &'static mut [u8; 8] =
+    let _otp: &'static mut [u8; 32] = init_static_slot(core::ptr::addr_of_mut!(DRBG_OTP_KEY), otp);
+    let _uid: &'static mut [u8; 8] =
         init_static_slot(core::ptr::addr_of_mut!(DRBG_UID), chipid.to_be_bytes());
-    // Initialized once here; the per-attempt borrows below are re-derived
-    // from the slots rather than from these handles, because each retry
-    // attempt builds its own `FuseSeedSource` (see below).
     init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_STORE), store_handle());
     init_static_slot(core::ptr::addr_of_mut!(DRBG_SEED_PROBE), probe);
 
-    // Fail-closed: no constructor hands back an unseeded generator, and a
-    // refusal is fatal at boot (see the doc comment above).
-    //
-    // Fatal, but not on the first miss. The seed path's own draw
-    // (`FuseSeedSource::seed` → `probe_bytes`, 32 bytes = two EHR blocks) is
-    // the second boot-fatal entropy site, and the 2026-10-31 14:16 incident
-    // (docs/audits/2026-10-31-boot-dark-trng-refused.md §7) is it firing: the
-    // store was intact so `ensure_boot_entropy` skipped its draw entirely,
-    // and the *very next* peripheral touch — this one — missed the budget on
-    // a cold power episode and parked the board with signature 0100. Same
-    // class as the site `ensure_boot_entropy` used to be, so the same
-    // treatment: retry the whole construction on the [`otp_retry`] budget.
-    // Each attempt rebuilds the source over the same write-once slots (the
-    // previous attempt's source was consumed and dropped inside `try_new`,
-    // so the re-derived borrows never alias) and takes a *fresh* draw — a
-    // retry is a new roll of the peripheral, not a replay of the failed one.
-    // The record read and the seed derivation re-run per attempt too; the
-    // derivation is deterministic and the draw is the only part that can
-    // differ, so this changes no seed content on success.
-    let drbg = fapico2_firmware::otp_retry::retry(
-        || {
-            // SAFETY: the slots were initialized exactly once above, on this
-            // pre-task boot path; the previous attempt's source (holding the
-            // prior borrows) was consumed and dropped inside `try_new` before
-            // its `Err` reached this closure's caller, so no two live values
-            // alias the same slot. Single core, no executor task exists.
-            let store: &'static mut DeviceStore = unsafe {
-                (&mut *core::ptr::addr_of_mut!(DRBG_SEED_STORE)).assume_init_mut()
-            };
-            let probe: &'static mut fapico2_platform::trng::Rp2350Probe<'static> = unsafe {
-                (&mut *core::ptr::addr_of_mut!(DRBG_SEED_PROBE)).assume_init_mut()
-            };
-            let source = fapico2_platform::drbg_seed::FuseSeedSource::new(otp, uid, store, probe);
-            fapico2_platform::trng::DrbgTrng::try_new(source).ok()
-        },
+    init_static_slot(
+        core::ptr::addr_of_mut!(DRBG_CELL),
+        fapico2_platform::trng::LazyDrbg::new(),
+    )
+}
+
+/// One seeding attempt over the write-once slots, shared by the legacy boot
+/// path and the bring-up task: build the source over the slots and seed the
+/// cell. The source is consumed by `seed` (successful or not), so no two
+/// live values alias the slots. Seeded-once semantics are the cell's
+/// (`LazyDrbg::seed` refuses and debug-asserts a second seed).
+fn seed_drbg_attempt() -> Result<(), fapico2_platform::drbg::SeedError> {
+    // SAFETY: the slots were initialized exactly once by `init_drbg_cell`;
+    // each attempt's source is consumed inside `seed` before the next attempt
+    // builds a new one, so no two live values alias the same slot.
+    let otp: &'static [u8; 32] = unsafe {
+        &*core::ptr::addr_of!(DRBG_OTP_KEY).cast::<[u8; 32]>()
+    };
+    let uid: &'static [u8; 8] = unsafe {
+        &*core::ptr::addr_of!(DRBG_UID).cast::<[u8; 8]>()
+    };
+    let store: &'static mut DeviceStore = unsafe {
+        (&mut *core::ptr::addr_of_mut!(DRBG_SEED_STORE)).assume_init_mut()
+    };
+    let probe: &'static mut fapico2_platform::trng::Rp2350Probe<'static> = unsafe {
+        (&mut *core::ptr::addr_of_mut!(DRBG_SEED_PROBE)).assume_init_mut()
+    };
+    let source = fapico2_platform::drbg_seed::FuseSeedSource::new(otp, uid, store, probe);
+    drbg_cell().seed(source)
+}
+
+/// The **legacy** inline seed (US-1825): the pre-epic `init_drbg` body,
+/// retained for the first-install path only. A fresh board's construction
+/// draws (hkey, attestation, keystore) still need a live generator before
+/// the applets can boot, so this path blocks on the [`otp_retry`] budget
+/// exactly as the pre-epic boot did, and parks legibly on a refusal across
+/// the whole budget — the bounded-reboot machinery is deleted (post-boot
+/// there is nothing to reboot, and on the boot path a park is the legible
+/// outcome ADR 0004 demands; the 2026-11-10 measurement showed the reboots
+/// bought nothing).
+///
+/// The message still names the site, and names the one deterministic
+/// non-TRNG cause worth ruling out: a failed `store.write` in the record
+/// draw leaves the seed record absent (logged there, invisible without a
+/// probe), and the seed path fail-closes on it.
+pub fn seed_drbg_blocking() {
+    if fapico2_firmware::otp_retry::retry(
+        || seed_drbg_attempt().ok().map(drop),
         entropy_wait_sleep,
         fapico2_firmware::otp_retry::STEP_MS,
         fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
     )
-    .unwrap_or_else(|| {
-        // US-1809: no longer a park on the spot — bounded reboot per ADR 0004
-        // amendment 3 (parks legibly with this same reason at the bound). The
-        // message still names the site, and names the one deterministic
-        // non-TRNG cause worth ruling out: a failed `store.write` in
-        // `ensure_boot_entropy` leaves the seed record absent (logged there,
-        // invisible without a probe), and the seed path fail-closes on it —
-        // retrying a deterministic failure for the whole budget, then parking
-        // signed DrbgRefused, would misattribute the root cause.
-        entropy_reboot_or_park(
+    .is_none()
+    {
+        fatal_boot(
             "drbg: seed refused across the whole retry budget — no generator \
              (if the TRNG reads healthy, check whether boot.entropy.v1 persisted)",
             fatal_sig::Reason::DrbgRefused,
-        )
-    });
-    let drbg = init_static_slot(core::ptr::addr_of_mut!(DRBG), drbg);
-    // US-1809: the counter clears here — the first point at which *both*
-    // entropy sites have succeeded in one boot, not the boot's very top. A
-    // counter bumped by a refused boot survives until a boot genuinely
-    // reaches serving entropy, so a hard wedge still walks the bound and
-    // parks; see [`entropy_reset_clear`].
-    entropy_reset_clear();
-    drbg
+        );
+    }
+    publish_entropy_ready();
 }
 
-/// Move the device DRBG out of [`DRBG`] by value, exactly once (US-1006).
+/// One seeding attempt for the bring-up task (US-1825): the same
+/// [`seed_drbg_attempt`] the legacy path retries, surfaced so the
+/// background task can probe-and-seed on its own loop — bounded (the fresh
+/// draw inside `FuseSeedSource::seed` rides the bounded
+/// [`fapico2_platform::trng::Rp2350Probe`], US-1802 budget semantics), with
+/// the retry cadence owned by the task instead of the boot path. No reboot,
+/// no park: a refusal here is "still warming", and the task outlives any
+/// stall.
+pub fn try_seed_drbg_once() -> Result<(), fapico2_platform::drbg::SeedError> {
+    seed_drbg_attempt()
+}
+
+/// Whether the boot-entropy record reads back at the right length.
 ///
-/// The trussed platform takes its `Rng` **by value** — `Rp2350Rng` owns the
-/// generator, and its `try_fill_bytes` re-seeds through the source it holds —
-/// so the generator has to be handed over rather than shared. This is the same
-/// "take by value exactly once" shape as
-/// [`take_client`](fapico2_platform::trusted_backend::take_client): the slot
-/// is left `MaybeUninit::uninit()` and a second call panics.
+/// A deterministic store read — no TRNG involvement — so the boot path can
+/// decide between the legacy inline bring-up and the background task without
+/// touching the peripheral (US-1825).
+pub fn boot_entropy_record_present(store: &mut DeviceStore) -> bool {
+    use fapico2_platform::ckey;
+    let mut buf = [0u8; ckey::BOOT_ENTROPY_LEN];
+    matches!(
+        store.read(migration::SLOT_BOOT_ENTROPY, &mut buf),
+        Ok(n) if n == ckey::BOOT_ENTROPY_LEN
+    )
+}
+
+/// Whether the FIDO persistent hkey reads back a 32-byte scalar.
 ///
-/// # Safety
+/// The other half of the [`boot_needs_legacy_bringup`] discriminator: a
+/// board with an hkey has provisioned keys, and every operation its serving
+/// path needs is deterministic — it can serve while the TRNG warms. A board
+/// without one is a fresh install whose construction still needs the
+/// generator, so it keeps the legacy inline bring-up.
+pub fn hkey_present(store: &mut DeviceStore) -> bool {
+    const HKEY_KEY: &[u8] = fapico2_fido::device_app::HKEY_KEY;
+    let mut buf = [0u8; 32];
+    matches!(store.read(HKEY_KEY, &mut buf), Ok(32))
+}
+
+/// The US-1825 boot-path discriminator: does this boot need the legacy
+/// inline entropy bring-up?
 ///
-/// Call at most once, on the boot path, before any task exists. A second call
-/// reads an uninitialized slot, hence the assert. Between `init_drbg` and
-/// this call there are exactly **two** borrowers, and both are named here
-/// because a SAFETY justification is only as good as its enumeration of
-/// aliases — a list one entry out of date gets trusted past the point where
-/// it stopped being true, which is how the second one was added without this
-/// paragraph being reopened.
-///
-/// * `boot_fido` (`main.rs`), which takes `&mut` and releases it at the end
-///   of the call;
-/// * `boot_oath` (`main.rs`), added by the whole-branch review's I-1 fix,
-///   which takes `&mut *drbg` to serve the OATH boot pool.
-///
-/// Both release before returning, so the by-value move is not overlapping any
-/// live borrow. A **third** borrower must be added to this list in the same
-/// change that introduces it.
-pub fn take_drbg() -> fapico2_platform::trusted_backend::device::DeviceDrbg {
-    static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    assert!(
-        !TAKEN.swap(true, core::sync::atomic::Ordering::Relaxed),
-        "trusted backend: the DRBG was already taken (the platform owns it)"
-    );
-    // SAFETY: single-core boot path. `init_drbg` wrote the slot exactly once,
-    // before any task existed; `boot_fido`'s `&mut` borrow ended before this
-    // call; the slot is reset to `uninit` immediately, and `TAKEN` keeps a
-    // second call from reading it.
-    //
-    // The reset is a raw `ptr::write` rather than `MaybeUninit::write`
-    // because `(*slot).write(..)` resolves to `DrbgTrng::write`-style
-    // inherent-method lookup on the *pointee* rather than to
-    // `MaybeUninit::write` on the slot.
-    unsafe {
-        let slot = core::ptr::addr_of_mut!(DRBG);
-        let value = core::ptr::read((*slot).as_mut_ptr());
-        core::ptr::write(slot, core::mem::MaybeUninit::uninit());
-        value
+/// `false` (the common case — every boot after first install) means both the
+/// entropy record and the hkey are present: the board can serve everything
+/// deterministic while the background task warms the TRNG, and the boot path
+/// performs **no peripheral draw at all**. `true` means a fresh install (or
+/// a repair boot: a different image reflash that kept the keystore but lost
+/// the record, or the reverse) — construction itself needs randomness, so
+/// the legacy inline sequence runs exactly as the pre-epic boot did.
+pub fn boot_needs_legacy_bringup(store: &mut DeviceStore) -> bool {
+    !(boot_entropy_record_present(store) && hkey_present(store))
+}
+
+/// The legacy inline record draw (US-1825): the pre-epic `ensure_boot_entropy`
+/// body, retained for the first-install path only. Same budgets, same
+/// blink window, same `entropy_draw_notice`; the bounded reboot is deleted —
+/// a refusal across the whole budget parks legibly with the same signature
+/// this site has always emitted (`0011`), and VBUS removal (the 2026-11-10
+/// measured fix) clears the episode.
+// US-939: `#[inline(never)]` -- async-main frame discipline.
+#[inline(never)]
+pub fn ensure_boot_entropy_blocking(
+    probe: &mut impl fapico2_platform::trng::TrngProbe,
+    store: &mut DeviceStore,
+) {
+    use fapico2_platform::ckey;
+    let mut buf = [0u8; ckey::BOOT_ENTROPY_LEN];
+    match store.read(migration::SLOT_BOOT_ENTROPY, &mut buf) {
+        Ok(n) if n == ckey::BOOT_ENTROPY_LEN => return,
+        Ok(_) | Err(SecureStoreError::NotFound) => {} // draw below
+        Err(_) => {
+            defmt::error!("boot entropy: slot unreadable; refusing to redraw (US-918)");
+            return;
+        }
+    }
+    entropy_draw_notice();
+    if fapico2_firmware::otp_retry::retry(
+        || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
+        entropy_wait_sleep,
+        fapico2_firmware::otp_retry::STEP_MS,
+        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
+    )
+    .is_none()
+    {
+        fatal_boot(
+            "boot entropy: TRNG refused across the whole retry budget; nothing to \
+             guarantee the slot with",
+            fatal_sig::Reason::TrngRefused,
+        );
+    }
+    if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
+        defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
     }
 }
+
+/// US-1825: fill the three boot RNG pools from the (now seeded) DRBG cell.
+///
+/// The pools are boot-time DRBG output (the consumer map, US-1821): on the
+/// bring-up path the applets construct with an **empty** pool — FIDO's
+/// already was, on a provisioned board (`fill_rng_pool` ran only on the
+/// fresh arm) — and the task fills them once the cell is seeded. Each applet
+/// refuses creation-class operations while Warming (US-1826), so nothing
+/// draws from an empty pool before this runs.
+///
+/// Called from the bring-up task; synchronous, no yield point inside, so the
+/// minted applet handles follow the documented-duplication discipline.
+pub fn refill_pools_from_cell() {
+    // SAFETY: the app slots were written exactly once by the boot path
+    // before any task was spawned; the minted handles are synchronous,
+    // single-core, and no method called here yields.
+    unsafe {
+        let cell = drbg_cell();
+        let fido = (&mut *core::ptr::addr_of_mut!(FIDO_APP)).assume_init_mut();
+        fido.refill_rng_pool_if_empty(cell);
+        let cell = drbg_cell();
+        let oath = (&mut *core::ptr::addr_of_mut!(OATH_APP)).assume_init_mut();
+        oath.refill_rng_pool_if_empty(cell);
+    }
+    // The Nostr pool: filled only if the boot path did not already fill it
+    // (the legacy path fills it in `main`).
+    unsafe {
+        let pool = &mut *(*core::ptr::addr_of_mut!(NOSTR_RNG_POOL)).as_mut_ptr();
+        if pool.is_empty() {
+            let cell = drbg_cell();
+            let drawn = fapico2_nostr::draw_boot_pool(cell);
+            init_nostr_rng_pool(drawn);
+        }
+    }
+}
+
 
 
 impl fapico2_mgmt::MigrationHandler for DeviceMigrationHandler {
@@ -1853,112 +1886,6 @@ pub fn derive_oath_seal() -> OathSeal {
     OathSeal::derive(&otp_key_1, &chipid.to_be_bytes())
 }
 
-/// US-918: guarantee the boot-entropy slot
-/// ([`migration::SLOT_BOOT_ENTROPY`]) exists before anything derives the
-/// bound device root ([`fapico2_platform::ckey::derive_kbase`]). Absence →
-/// draw [`fapico2_platform::ckey::BOOT_ENTROPY_LEN`] bytes from the TRNG and
-/// write; the write rides the boot persist gate, so once the store is
-/// persisted the record is authenticated by the sealed v3 image and stable
-/// across boots. A present record is left untouched (determinism —
-/// re-drawing would change the bound root and orphan everything derived
-/// under it); a wrong-length record is treated as corrupt and redrawn
-/// (a wrong-length slot never produced a successful derivation). A failed
-/// write is logged and NOT fatal here: fail-closed happens at the
-/// derivation site, which refuses without the slot (no legacy fallback).
-///
-/// # Why the draw is BOUNDED, and when that mattered
-///
-/// The draw used to take `&mut impl Trng` — the unbounded `Rp2350Trng`,
-/// whose `embassy-rp` driver (`trng.rs:220-243`) contains two loops with no
-/// exit: `while trng_busy { }`, and `while !success`, which on an
-/// autocorrelation error soft-resets the peripheral and retries **forever**.
-/// The datasheet, quoted in that same file, names the condition a soft reset
-/// does not clear: *"When set, RNG ceases functioning until next reset"* —
-/// meaning until a power-on reset. A peripheral that lands there wedges the
-/// boot from inside a driver call, forever, and no difference in the flash
-/// content between a reflash and a power cycle explains it.
-///
-/// This was the last unbounded spin left on the release boot path, and it is
-/// reached on exactly the boot this investigation is about: the slot is
-/// absent only after US-919 has wiped the store — the first boot after a
-/// reflash of a different image. Every other draw was rerouted to
-/// `Rp2350Probe` by US-1005 (the boot sanity draw, the DRBG seed) and the
-/// D-10 fix (the migration nonce). This one was missed because the diff that
-/// found the second occurrence saw two identical call sites and rerouted one.
-///
-/// The draw is now a [`fapico2_platform::trng::TrngProbe`], whose wait
-/// carries the named budget, and a refusal carries a message naming this
-/// site — since US-1808 that refusal reboots boundedly rather than parking
-/// (ADR 0004 amendment 3), and the window blinks while it waits
-/// ([`entropy_wait_sleep`]). The trade is the one US-1008 made for the
-/// sanity draw, and the
-/// reasoning is different in the one way that matters: that site was a
-/// *diagnostic*, and a diagnostic that can kill the boot belongs somewhere
-/// else. This site is not a diagnostic — without the slot every bound
-/// derivation refuses anyway, so halting here changes no outcome. It only
-/// turns "dark board, spinning peripheral, no explanation" into "dark board
-/// with a message that says which entropy site refused", which is the
-/// difference between a bug that can be argued about and one that can be
-/// reproduced.
-// US-939: `#[inline(never)]` -- async-main frame discipline.
-#[inline(never)]
-pub fn ensure_boot_entropy(
-    probe: &mut impl fapico2_platform::trng::TrngProbe,
-    store: &mut DeviceStore,
-) {
-    use fapico2_platform::ckey;
-    let mut buf = [0u8; ckey::BOOT_ENTROPY_LEN];
-    match store.read(migration::SLOT_BOOT_ENTROPY, &mut buf) {
-        Ok(n) if n == ckey::BOOT_ENTROPY_LEN => return,
-        Ok(_) | Err(SecureStoreError::NotFound) => {} // draw below
-        Err(_) => {
-            defmt::error!("boot entropy: slot unreadable; refusing to redraw (US-918)");
-            return;
-        }
-    }
-    // The store came up without the record: say so on the LED before the
-    // first draw. One 400 ms lit pulse — a duration no other pre-release
-    // pin driver uses (ladder pulse 25 ms, signature bit 200 ms, heartbeat
-    // on-time 500 ms, signature preamble 1200 ms, and the heartbeat cannot
-    // run before the executor anyway). The 2026-10-31 dark boots decoded to
-    // `TrngRefused` from this function
-    // (docs/audits/2026-10-31-boot-dark-trng-refused.md), and the one reading
-    // the ladder alone cannot give is *why* the record was absent: a boot
-    // that shows this pulse reached the draw; a fatal that does not, died
-    // elsewhere. It fires once per boot, before the first attempt.
-    entropy_draw_notice();
-    // The draw is retried on a stepped budget of its own since US-1802: the
-    // OTP reads' 20 s sized a fuse rail; the 2026-11-09 decode
-    // (docs/audits/2026-11-09-cold-boot-entropy-window.md) measured a cold
-    // power episode's TRNG settling at >= 20.4 s — the old budget consumed in
-    // full, the draw succeeding on the deadline's tail — so the entropy sites
-    // get `ENTROPY_DEADLINE_MS` (60 s, >= 2x the measured floor). Each
-    // attempt is a full enable/wait/read cycle
-    // ([`fapico2_platform::trng::draw_blocks`]), so a retry is a fresh roll
-    // of the peripheral, not a prolongation of the failed one; a refusal
-    // scrubs the buffer (`try_fresh_bytes`'s contract), so no attempt
-    // inherits another's contents. The window blinks while it waits
-    // ([`entropy_wait_sleep`]). A refusal across the whole budget no longer
-    // parks on the spot: it reboots boundedly (ADR 0004 amendment 3,
-    // [`entropy_reboot_or_park`]) and parks legibly — the same signature this
-    // site would have emitted on the first miss — only at the bound.
-    if fapico2_firmware::otp_retry::retry(
-        || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
-        entropy_wait_sleep,
-        fapico2_firmware::otp_retry::STEP_MS,
-        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
-    )
-    .is_none()
-    {
-        // US-1808: no longer a park on the spot — bounded reboot per ADR 0004
-        // amendment 3 (`entropy_reboot_or_park` parks legibly with this same
-        // reason at the bound). The message still names the site.
-        entropy_reboot_or_park("boot entropy: TRNG refused across the whole retry budget; nothing to guarantee the slot with", fatal_sig::Reason::TrngRefused);
-    }
-    if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
-        defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
-    }
-}
 
 /// One 400 ms lit pulse on the board LED: the store mounted without the
 /// boot-entropy record, and [`ensure_boot_entropy`] is about to draw.
@@ -2031,119 +1958,6 @@ fn entropy_wait_sleep(ms: u64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// US-1807: the retained refusal counter and the bounded reboot.
-//
-// ADR 0004 amendment 3: a refusal at either entropy site no longer parks on
-// the spot — it reboots and re-rolls, bounded by this counter, and parks
-// legibly (same `fatal_boot`, same signature) only at
-// [`fapico2_firmware::entropy_reset::MAX_REFUSED_BOOTS`]. The decision
-// arithmetic is [`fapico2_firmware::entropy_reset`]'s (pure, host-tested);
-// this block owns the SRAM the counter lives in and the two exits.
-// ---------------------------------------------------------------------------
-
-/// The retained refusal counter, in the `.retain (NOLOAD)` section
-/// (`memory.x`, rendered by `platform/board_def.rs`).
-///
-/// `SCB::sys_reset` preserves SRAM but the Rust runtime zero-inits `.bss` on
-/// every boot — including the rebooted one — so the counter lives outside the
-/// crt0 zero/copy ranges, in a NOLOAD section nothing writes at init. The
-/// initializer below is therefore never *loaded*: power-on leaves the bytes
-/// undefined, which is why every access goes through [`fapico2_firmware::entropy_reset::RETAIN_MAGIC`]
-/// and why the reads and writes are volatile through `addr_of!` — a `static
-/// mut` with a known initializer in a NOLOAD section can otherwise be
-/// const-folded to that initializer by LLVM, which would make the counter
-/// read as fresh across a reboot and turn the bound into an unbounded loop.
-///
-/// SAFETY (static mut): single-core, boot path only; the counter is read
-/// once per refusal decision and written by that decision or by the
-/// success clear, all before any task exists.
-#[repr(C, align(4))]
-struct RetainedCounter {
-    magic: u32,
-    attempts: u32,
-}
-
-#[link_section = ".retain"]
-#[used]
-static mut RETAINED_COUNTER: RetainedCounter = RetainedCounter { magic: 0, attempts: 0 };
-
-/// Volatile read of the retained counter — [`fapico2_firmware::entropy_reset::Retained`]'s
-/// exact layout (`repr(C, align(4))`, two `u32`s), see [`RETAINED_COUNTER`].
-fn retained_read() -> (u32, u32) {
-    // SAFETY: see [`RETAINED_COUNTER`]; volatile to defeat const-folding of
-    // the initializer (a rebooted boot must read what the previous boot wrote).
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(RETAINED_COUNTER);
-        (
-            core::ptr::addr_of!((*ptr).magic).read_volatile(),
-            core::ptr::addr_of!((*ptr).attempts).read_volatile(),
-        )
-    }
-}
-
-/// Volatile write of the retained counter.
-fn retained_write(state: fapico2_firmware::entropy_reset::Retained) {
-    // SAFETY: see [`RETAINED_COUNTER`].
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(RETAINED_COUNTER);
-        core::ptr::addr_of_mut!((*ptr).magic).write_volatile(state.magic);
-        core::ptr::addr_of_mut!((*ptr).attempts).write_volatile(state.attempts);
-    }
-}
-
-/// A boot-entropy refusal: reboot and re-roll, bounded, or park legibly.
-///
-/// The device side of [`fapico2_firmware::entropy_reset::decide`]. On
-/// [`fapico2_firmware::entropy_reset::Action::Park`] this is the *same*
-/// [`fatal_boot`] path the sites used before the bounded reboot existed — the
-/// signature (`0011` `TrngRefused` / `0100` `DrbgRefused`) still names the
-/// cause and the park is still permanent, which is ADR 0004's whole concern.
-/// On [`fapico2_firmware::entropy_reset::Action::Reboot`] the bumped counter
-/// is written (volatile, before the reset — `sys_reset` preserves it) and
-/// `SCB::sys_reset()` restarts boot from the top: the ladder re-runs and the
-/// owner sees attempt 2 or 3. The rebooted boot's window is **not** shorter
-/// — measured 2026-11-10 (US-1813): `sys_reset` does not clear the settle,
-/// and all four windows of a long-dwell episode refused their whole budgets;
-/// only VBUS removal cleared it. The reboot's value is the re-roll, not the
-/// warmth.
-pub fn entropy_reboot_or_park(msg: &str, reason: fatal_sig::Reason) -> ! {
-    let (magic, attempts) = retained_read();
-    match fapico2_firmware::entropy_reset::decide(magic, attempts) {
-        fapico2_firmware::entropy_reset::Action::Park => fatal_boot(msg, reason),
-        fapico2_firmware::entropy_reset::Action::Reboot => {
-            // Log from the *bumped* state, not the raw read: on a fresh
-            // power-on boot the retained bytes are undefined, so the raw
-            // count is garbage — `attempts + 1` has overflowed u32 on it
-            // (0xFFFF_FFFF is exactly the pattern the magic guard exists
-            // for) and would read as a nonsense retry number at best and a
-            // panic mid-boot at worst.
-            let next = fapico2_firmware::entropy_reset::bumped(magic, attempts);
-            retained_write(next);
-            defmt::error!(
-                "{} — rebooting for retry {} of {}",
-                msg,
-                next.attempts,
-                fapico2_firmware::entropy_reset::MAX_REFUSED_BOOTS
-            );
-            cortex_m::peripheral::SCB::sys_reset()
-        }
-    }
-}
-
-/// Clear the retained refusal counter after a boot in which *both* entropy
-/// sites succeeded.
-///
-/// Called at the end of [`init_drbg`] — the first point both sites have
-/// succeeded in one boot, not the boot's very top: a counter bumped by a
-/// refused boot must survive until a boot genuinely reaches serving entropy,
-/// or three refusals followed by one mid-window success would lose the
-/// history and let a hard wedge loop forever. Writes the cleared state
-/// ([`fapico2_firmware::entropy_reset::cleared`]) so the next refusal starts
-/// from one.
-pub fn entropy_reset_clear() {
-    retained_write(fapico2_firmware::entropy_reset::cleared());
-}
 
 // ---------------------------------------------------------------------------
 // US-919: foreign-image boot admission (EPIC `security-hardening`, R9/R6).
@@ -2354,7 +2168,13 @@ pub fn ensure_fw_manifest(store: &mut DeviceStore) -> fw_manifest::ForeignImageD
                 // The wipe took the boot-entropy slot too; the bound
                 // derivations (US-918) refuse without it — redraw so the
                 // fresh store boots apps (a fresh root is the point).
-                ensure_boot_entropy(spare_probe(), store);
+                ensure_boot_entropy_blocking(&mut spare_probe(), store);
+                // US-1825: the wipe also destroyed the hkey, so this boot is
+                // now a fresh install whose construction needs a live
+                // generator — seed the cell inline (the legacy path), which
+                // the boot discriminator ran before this wipe could not
+                // have known to do.
+                seed_drbg_blocking();
             }
             #[cfg(not(FAPICO2_FOREIGN_IMAGE_WIPE))]
             {
