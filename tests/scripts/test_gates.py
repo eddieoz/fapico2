@@ -259,7 +259,7 @@ _B_DEBUG_STRIP = Break(
 # variable and the window was a Rust literal, and nothing read both.
 _B_FLASH_BUDGET = Break(
     ".github/workflows/ci.yml",
-    "  FIRMWARE_FLASH_BUDGET_KIB: 1696",
+    "  FIRMWARE_FLASH_BUDGET_KIB: 1697",
     "  FIRMWARE_FLASH_BUDGET_KIB: 2200",
     "the flash-budget ratchet is raised to 2,200 KiB — past the 2,048 KiB "
     "growth boundary, so an image the ratchet accepts could link over the "
@@ -331,18 +331,25 @@ _B_ASYNC_FRAME = Break(
 
 _B_BOOT_CHAIN = Break(
     "firmware/src/tasks.rs",
-    "    let mut ccid_in = ccid_in;\n",
-    "    /// US-1041 nominated break: device-side static growth, with the\n"
-    "    /// task-arena demand constant left exactly as it was measured.\n"
-    "    static __US1041_ARENA_GROWTH: [u8; 512] = [0u8; 512];\n"
-    "    let _ = __US1041_ARENA_GROWTH[0];\n"
-    "    let mut ccid_in = ccid_in;\n",
-    "the inputs `TASK_ARENA_DEMAND_B` was measured from have changed and the "
+    "    let mut pkt = [0u8; CCID_IN_MAX_PACKET];\n",
+    "    // US-1041 nominated break, RE-NOMINATED 2026-11-10 (D-WB2 session):\n"
+    "    // a task-FUTURE growth. The previous nomination injected a static;\n"
+    "    // the gate's sanctioned self-heal re-measures the task-future demand\n"
+    "    // (which a static does not move) and passed, making the break\n"
+    "    // ineffective-by-design-change — verified: the self-heal re-stamped a\n"
+    "    // green gate over the injected static. A future growth is the defect\n"
+    "    // class the gate exists to catch: 512 B held across the ccid await\n"
+    "    // moved the measured demand 14,400 → 14,912 B, and the gate must fail\n"
+    "    // until the constant is re-measured in the open.\n"
+    "    let mut pkt = [0u8; CCID_IN_MAX_PACKET + 512];\n",
+    "the task-future demand the stamp was measured from has moved and the "
     "measurement was not redone, so the headroom figure the gate would "
-    "publish describes a build that no longer exists (US-964). A statics or "
-    "task-future change is the same class: the stamp is a proxy for 'the "
-    "measurement still describes this tree', and its whole job is to make a "
-    "stale number a FAIL instead of a reassuring ratio",
+    "publish describes a build that no longer exists (US-964). The previous "
+    "nomination (a static) became ineffective when the gate gained the "
+    "sanctioned self-heal — a static does not move the demand — so the "
+    "nominated defect is now the class that actually moves it: a task "
+    "future grown by 512 B held across the ccid await (verified: the "
+    "measured demand 14,400 → 14,912 B).",
 )
 
 _B_SIZE_REPORT = Break(

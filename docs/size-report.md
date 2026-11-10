@@ -110,6 +110,18 @@ elastic margin, far more than the 6,316 B the worst *chain* actually uses.
 remains. Nothing on the board dark-locks; the criterion is simply not met by
 this number, and the number is 336.
 
+**Date: 2026-11-10 (WARM-BOOT-SERVE — the entropy bring-up moves behind serving).**
+
+`text` 889,348 → **900,852 B (+11,504)**: the entropy bring-up task, the
+warming gates (makeCredential, clientPIN mint/salts, OATH, Nostr, the
+custody ceremony), the pollable status TLV and the serial-coherence code.
+Berkeley `.bss` 402,024 → **401,892 B (−132)**. Task arena demand
+**14,400 B** (the bring-up task adds 56 B; stamp refreshed). The flash
+ratchet was raised for it on purpose: **1696 → 1697 KiB** (`raise_flash_budget.py`
+refused to run twice on the same value — the reason is in `ci.yml`).
+Shipping UF2 **3,394 blocks**, sha256 `e3a211be3fcc1f31226bd4f69f61418ab53562042106103b4b86922b38b1924c`.
+`check_boot_chain.py` worst call chain **93,572 ≤ 98,304 B**.
+
 <!-- BEGIN measured ELF sections (check_size_report.py) -->
 | section | bytes | addr | in RAM? |
 |---|---:|---:|:---:|
