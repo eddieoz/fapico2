@@ -41,7 +41,7 @@ reasons:
 |---|---|---|---|---|
 | **OpenPGP** | **yes** | **yes** | `0xC0` GET RESPONSE | the reference implementation — `apps/openpgp/src/device_shell.rs:556-578` |
 | **OATH** | **yes**, `CALCULATE ALL` only | **no** | `0xA5` SEND REMAINING | chunks at its own cap; see below |
-| `mgmt` | no | no | — | `READ CONFIG` is 29 B; nothing to page |
+| `mgmt` | no | no | — | `READ CONFIG` is 33 B (US-1827 added the 4-byte entropy-state TLV); nothing to page |
 | `otp` | no | no | — | nothing to page; a factory card has no slot (`9000`, empty body) |
 | `piv` | no | no | — | **the one gap** — see below |
 | `vendor_led` | no | no | — | 17 B (`apps/vendor_led/src/lib.rs:115-120`) |
@@ -739,7 +739,7 @@ def test_paged_responses_honour_6c_and_61(emu):
     # numbers the module docstring's table quotes. `otp` is 0 because a
     # factory card has no slot to report on — asserted as `9000` so the row
     # cannot silently become an error SW that proves nothing.
-    assert max_len["mgmt READ CONFIG"] == 29, max_len
+    assert max_len["mgmt READ CONFIG"] == 33, max_len  # US-1827: the entropy-state TLV took the body from 29 to 33 bytes
     assert max_len["vendor_led GET"] == 17, max_len
     assert max_len["rescue READ SecureBootStatus"] == 20, max_len
     assert max_len["otp EXTENDED STATUS (INS 01 P1 14)"] == 0, max_len

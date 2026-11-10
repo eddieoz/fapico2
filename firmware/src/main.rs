@@ -1681,7 +1681,7 @@ async fn entropy_bringup_task() {
             }
             Err(_) => {
                 attempts += 1;
-                if attempts == 1 || attempts % 16 == 0 {
+                if attempts == 1 || attempts.is_multiple_of(16) {
                     defmt::warn!(
                         "entropy bring-up: TRNG still warming — attempt {}",
                         attempts
