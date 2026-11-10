@@ -116,7 +116,7 @@ failure above. The measurement behind it is
 | What you see | What it means |
 |---|---|
 | Ladder, then a **fast-blink window** (`.--.--.--.` — 80 ms lit / 170 ms dark, one pair per 250 ms retry step, up to ~60 s), then the boot continues | Entropy settling — the TRNG of a cold power episode can take ≥ 20.4 s to settle (measured 2026-11-09). The board is **working; do not unplug**. This rhythm is driven by exactly one driver (`firmware/src/wait_blink.rs`, collision-tested) — nothing else on the pin can produce it |
-| Ladder, blink window, board **leaves the bus and re-runs the ladder from the top** | A window refused at its 60 s deadline; the board is on attempt 2 or 3 of 3 (bounded reboot, ADR 0004 amendment 3). The settling clock ran through the whole blinking window, so the rebooted boot's window is expected to be short |
+| Ladder, blink window, board **leaves the bus and re-runs the ladder from the top** | A window refused at its 60 s deadline; the board is on attempt 2 or 3 of 3 (bounded reboot, ADR 0004 amendment 3). Measured 2026-11-10: the rebooted boot's window is **the same length** — `sys_reset` does not clear the settling; only VBUS removal does |
 | Three refused windows, then **one** long-flash signature (`0011`/`0100`) | The bound expired — the stall is not transient. Park, permanent, exactly as pre-2026-11-09 builds parked; power-cycle-5 s is the recovery |
 | Ladder, **dark ~20 s with no blink at all**, then a signature once | An **OTP** read refused (`read_otp_key_1`/`read_chipid`) — unchanged behaviour from 2026-10-11: silent window, immediate park. The blink is the discriminator between an entropy wait (blinking) and an OTP wait (dark) |
 

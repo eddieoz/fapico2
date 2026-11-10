@@ -2093,9 +2093,12 @@ fn retained_write(state: fapico2_firmware::entropy_reset::Retained) {
 /// cause and the park is still permanent, which is ADR 0004's whole concern.
 /// On [`fapico2_firmware::entropy_reset::Action::Reboot`] the bumped counter
 /// is written (volatile, before the reset — `sys_reset` preserves it) and
-/// `SCB::sys_reset()` restarts boot from the top: the ladder re-runs, the
-/// owner sees attempt 2 or 3, and the settling clock has been running through
-/// the whole blinking window, so the rebooted boot's draw is warm.
+/// `SCB::sys_reset()` restarts boot from the top: the ladder re-runs and the
+/// owner sees attempt 2 or 3. The rebooted boot's window is **not** shorter
+/// — measured 2026-11-10 (US-1813): `sys_reset` does not clear the settle,
+/// and all four windows of a long-dwell episode refused their whole budgets;
+/// only VBUS removal cleared it. The reboot's value is the re-roll, not the
+/// warmth.
 pub fn entropy_reboot_or_park(msg: &str, reason: fatal_sig::Reason) -> ! {
     let (magic, attempts) = retained_read();
     match fapico2_firmware::entropy_reset::decide(magic, attempts) {

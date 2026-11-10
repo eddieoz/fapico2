@@ -91,7 +91,7 @@ Two things can follow it that are worth recognizing:
 
 On a cold boot after the board has been unplugged for a long time, the board's randomness generator can take tens of seconds to settle (measured on hardware: at least ~20 seconds, sometimes more). Instead of sitting dark and silent through that wait — which looks exactly like a dead board — the firmware **blinks**: a short flash every quarter of a second, repeating for up to about a minute.
 
-That pattern means the board is **working — do not unplug it.** It is re-rolling the draw every quarter second, and every blink is one more roll. If the generator settles inside the minute, boot continues normally and you will see the ladder resume. If it does not, the board reboots and tries the whole boot again (you will see the ladder run from the top) — up to three times, and only then parks with a signature.
+That pattern means the board is **working — do not unplug it.** It is re-rolling the draw every quarter second, and every blink is one more roll. If the generator settles inside the minute, boot continues normally and you will see the ladder resume. If it does not, the board reboots and tries the whole boot again (you will see the ladder run from the top) — up to three times, and only then parks with a signature. Measured on hardware: **each retry's window is the same length, not shorter** — a reboot does not clear the settling, only unplugging does, so after the second or third window you already know how this ends and can save yourself the wait.
 
 What the window is **not**:
 

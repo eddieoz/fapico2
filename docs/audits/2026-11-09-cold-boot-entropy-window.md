@@ -108,8 +108,9 @@ two boot-entropy sites:
 | three refused windows, then `0011`/`0100` once | the bound expired; park, legible as before — power-cycle-5 s per `docs/boot-freeze.md` |
 | ladder, dark ~20 s (blink-free), `0100`/`0011` once | an **OTP** read refused — unchanged behaviour, park immediate |
 
-The hardware validation leg (US-1813) records the actual decode of the
-fixed build in §6 below when it is run.
+The hardware validation leg (US-1813) is §6 below: the 1-minute-dwell
+observation (warm path unchanged) and the long-dwell episode that answers
+the epic's open question.
 
 ## 6. Hardware validation (fixed build)
 
@@ -151,12 +152,65 @@ as 1–2 frames and flickers across the threshold).
    identical to the pre-fix image's warm boots. No regression on the path
    every normal boot takes.
 
-**Still to observe on hardware** (this section grows when filmed):
+### The long-dwell episode (2026-11-10 09:05, US-1813 — the video that answers the epic)
 
-- the blinking window itself (`.--.--.--.`, 80/170) during a genuine
-  long-dwell cold episode;
-- a refusal across the 60 s budget — the board leaving the bus and re-running
-  the ladder (attempt 2 of 3), which answers the open question: does
-  `SCB::sys_reset` clear the settling (rebooted boot's window short), or
-  only VBUS removal (the bound catches a hard wedge);
-- the bound parking with `0011`/`0100` after `MAX_REFUSED_BOOTS`.
+The board unplugged overnight (~8 h), filmed from the replug
+(`20261110_090552.mp4`, 60 fps, 284.4 s; owner-cropped LED view
+`lv_0_20261110094401.mp4` decoded — green-dominance channel, the white
+keyboard backlight rejected; the cropped video's framing put the LED under
+30 fps, so ladder pulses read as 1-frame LITs and are distinguishable from
+the blink's 3-frame LITs). The owner's account: it did not initialize on
+the first try; the recording ends with the device going dark; after a few
+power cycles it initialized correctly, the blinking window preceding the
+successful boot.
+
+| time (s) | LED | decoded |
+|---|---|---|
+| 0.00–1.27 | dark | power-on, pre-ladder |
+| 1.27–2.07 | 10 pulses (1-frame LITs) | **boot 1 ladder** — cumulative through `RUNG_STORE`, no draw notice: record present, window is `init_drbg`'s |
+| 2.13–~65 | `.--.--.--.` (3f LIT / 5f dark) | **window 1** — wait-blink 80/170, one pair per 250 ms step |
+| 67.07–67.87 | 10 pulses | **boot 2 ladder** — refusal #1, bounded reboot, re-run from the top |
+| ~67.9–~131 | `.--.--.--.` | **window 2** — same length as window 1 |
+| 132.87–133.67 | 10 pulses | **boot 3 ladder** — refusal #2 |
+| ~133.7–~197 | `.--.--.--.` | **window 3** |
+| 198.43–199.47 | 10 pulses | **boot 4 ladder** — refusal #3, the bound |
+| ~199.5–264.3 | `.--.--.--.` | **window 4** |
+| 264.50–265.70 | LIT 1.20 s | fatal-signature preamble |
+| 266.30, 267.10, 267.50, 268.30 | 4 × 200 ms bits, gaps 0.6 / 0.2 / 0.6 / ∞ | bits `0,1,0,+0` → **`0100` = id 4, `DrbgRefused`** |
+| 268.50 → end | dark | **the park** — permanent until VBUS removal |
+
+**Every US-1813 assertion is met, and the open question is answered:**
+
+1. **The window blinks instead of sitting dark** — four windows, the exact
+   80/170 rhythm, `.--.--.--.` from the first failed attempt of each boot
+   to its last; the owner watched a working board for 4½ minutes instead
+   of a dead one.
+2. **A refusal reboots and re-runs the ladder** — three of them, decoded
+   at 67.07, 132.87, 198.43; the board leaves the bus, the ladder runs
+   from the top, the owner sees attempt 2, 3, 4.
+3. **`SCB::sys_reset` does not clear the settling.** The rebooted boots'
+   windows are all the same length (~63–65 s each — the 60 s sleep budget
+   plus per-attempt wall time). Four consecutive boots spanning ~4.4
+   minutes all refused their whole budgets; only the owner's VBUS power
+   cycles cleared the episode. The reboot buys re-rolls, not warmth —
+   the bound is not an optimization but the load-bearing half of the
+   design, and this episode is exactly the wedge it exists for.
+4. **The bound parks legibly** — signature `0100` (`DrbgRefused`), the
+   same id the 2026-10-31 14:16 park emitted, emitted once, then dark.
+   An operator with the pre-fix firmware would have seen one 20 s dark
+   window and the same signature 3½ minutes sooner — but an operator
+   *watching* the pre-fix firmware would have seen a dead board for 20 s
+   and had to power-cycle blind. Here the board told the owner what it
+   was doing the whole time, tried everything it could on its own, and
+   then said precisely why it stopped.
+5. **The settle can outlast minutes, not seconds** — this episode's
+   settle exceeded four ~63 s windows (~4.4 min of episode time), far
+   beyond the 2026-11-09 success-tail's ≥ 20.4 s. The D-8 note gains the
+   data point; the upper bound remains unmeasured.
+
+The window-vs-budget arithmetic: each window is ~63–65 s against the
+60 s `ENTROPY_DEADLINE_MS` because `otp_retry::retry` counts *sleep* time,
+and each attempt's own wall time (the DRBG construction's record read and
+seed derivation, ~10–20 ms) rides on top — 240 attempts × overhead ≈ 3–5 s.
+Recorded rather than "fixed": the deadline's unit is documented as a sleep
+budget, and the blink's duty cycle makes the wall time legible on the pin.
