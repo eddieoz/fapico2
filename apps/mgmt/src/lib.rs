@@ -156,6 +156,43 @@ const TAG_FORM_FACTOR: u8 = 0x04;
 const TAG_VERSION: u8 = 0x05;
 const TAG_DEVICE_FLAGS: u8 = 0x08;
 const TAG_CONFIG_LOCK: u8 = 0x0A;
+/// US-1827 (WARM-BOOT-SERVE): the entropy bring-up state, in the shared
+/// `default_config_tlv` body — which is what makes the status read the
+/// SAME over all three interfaces (CCID `READ_CONFIG` 0x1D, CTAPHID
+/// `CTAP_READ_CONFIG` 0x42, YubiOTP `SLOT_YK4_CAPABILITIES` 0x13) with no
+/// per-interface wiring: every interface calls this one builder.
+const TAG_ENTROPY_STATE: u8 = 0x0B;
+
+/// US-1827 flag: the entropy bring-up has completed — the DRBG cell is
+/// seeded, the pools are filled, and creation-class operations serve.
+pub const ENTROPY_FLAG_READY: u8 = 0x01;
+/// US-1827 flag: the OTP key row reads back all-zero — a never-written row
+/// (the US-1710/1711 erased-reads-zero convention). The at-rest binding is
+/// degenerate (`{0³², chipid}` is public); the board works, and the bit
+/// makes that state visible instead of silent. **No burn is added here** —
+/// fusing after first use would orphan everything created under the zero
+/// row (ADR 0002's deferred provisioning epic owns the ordering).
+pub const ENTROPY_FLAG_ROW_UNFUSED: u8 = 0x02;
+
+/// The entropy-state flags the shared config TLV carries (US-1827).
+///
+/// Default is READY: only the device boot path clears it (a board boots
+/// Warming on the bring-up path), and [`boot`-side `publish_entropy_ready`]
+/// sets it again when the bring-up completes. Host and emulation builds —
+/// which have no warming concept — never touch it and correctly read ready.
+static ENTROPY_FLAGS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(ENTROPY_FLAG_READY);
+
+/// Set the entropy-state flags (device boot path, US-1827). Read-modify-
+/// write at the callers; this is a plain store.
+pub fn set_entropy_flags(flags: u8) {
+    ENTROPY_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current entropy-state flags (US-1827).
+pub fn entropy_flags() -> u8 {
+    ENTROPY_FLAGS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 // Command INS bytes (matches `management.c`).
 const INS_READ_CONFIG: u8 = 0x1D;
@@ -401,6 +438,16 @@ pub fn default_config_tlv(serial: [u8; 4], out: &mut HeaplessVec<u8, MAX_RESPONS
     out.extend_from_slice(&[TAG_DEVICE_FLAGS, 1, 0x80]).ok();
     // TAG_CONFIG_LOCK = unlocked.
     out.extend_from_slice(&[TAG_CONFIG_LOCK, 1, 0x00]).ok();
+    // US-1827: the entropy bring-up state. Byte 0 = flags (READY bit set =
+    // creation-class operations serve; ROW_UNFUSED bit set = the OTP key row
+    // is a never-written row). Byte 1 = the machine-readable retry hint in
+    // bring-up retry steps (~250 ms each, the task's cadence): 0 when ready,
+    // 1 while warming — a provisioning client polls this tag instead of
+    // failing, which is the "warming, not broken" answer the epic's
+    // first-install UX asks for.
+    let flags = entropy_flags();
+    let hint = if flags & ENTROPY_FLAG_READY != 0 { 0 } else { 1 };
+    out.extend_from_slice(&[TAG_ENTROPY_STATE, 2, flags, hint]).ok();
     if !out.is_empty() {
         let total = out.len();
         out[0] = (total - 1) as u8;
@@ -670,6 +717,44 @@ mod tests {
         // feature-gated, so a trimmed build legitimately omits them — check the
         // other four).
         assert_eq!(word & CAPS_BASE, CAPS_BASE);
+    }
+
+    /// US-1827 (WARM-BOOT-SERVE): READ_CONFIG carries the entropy bring-up
+    /// state TLV — flags (ready / row_unfused) plus the retry hint — and the
+    /// setter flips what the next READ_CONFIG reports.
+    #[test]
+    fn read_config_carries_the_entropy_state_tlv() {
+        let mut app = ManagementApp::new();
+        // Default (host/emulator): READY, no unfused row, no retry hint.
+        let (data, sw) = drive(&mut app, &[0x00, INS_READ_CONFIG, 0x00, 0x00, 0x00]);
+        assert_eq!(sw, SW_OK);
+        let pos = data
+            .windows(2)
+            .position(|w| w == [TAG_ENTROPY_STATE, 2])
+            .expect("the entropy-state TLV is present in the shared config body");
+        let flags = data[pos + 2];
+        let hint = data[pos + 3];
+        assert_eq!(
+            flags & ENTROPY_FLAG_READY,
+            ENTROPY_FLAG_READY,
+            "host default is Ready — only the device boot path clears the bit"
+        );
+        assert_eq!(hint, 0, "ready carries no retry hint");
+
+        // Warming board: the READY bit cleared, hint = one ~250 ms step.
+        set_entropy_flags(ENTROPY_FLAG_ROW_UNFUSED);
+        let (data, _) = drive(&mut app, &[0x00, INS_READ_CONFIG, 0x00, 0x00, 0x00]);
+        let pos = data
+            .windows(2)
+            .position(|w| w == [TAG_ENTROPY_STATE, 2])
+            .unwrap();
+        let flags = data[pos + 2];
+        let hint = data[pos + 3];
+        assert_eq!(flags & ENTROPY_FLAG_READY, 0, "warming: READY cleared");
+        assert_eq!(flags & ENTROPY_FLAG_ROW_UNFUSED, ENTROPY_FLAG_ROW_UNFUSED);
+        assert_eq!(hint, 1, "warming: retry after one bring-up step");
+        // Restore the default so unrelated tests read the same static.
+        set_entropy_flags(ENTROPY_FLAG_READY);
     }
 
     /// R12: two different chipids derive two different serials, and the
