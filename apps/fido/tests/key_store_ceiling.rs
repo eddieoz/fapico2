@@ -195,6 +195,13 @@ fn booted() -> (FidoApp, Rp2350SecureStore, HostTrng) {
     let mut store = soak_store();
     let mut app = FidoApp::boot(&mut trng, &mut store).unwrap();
     app.set_presence_grant(|_tag| true);
+    // US-1825/US-1826 (WARM-BOOT-SERVE): a provisioned boot leaves the RNG
+    // pool empty until the background bring-up task refills it at Ready —
+    // and while it is empty, makeCredential refuses 0x7F (the warming
+    // refusal; an empty-pool keypair is attacker-derivable). These tests
+    // exercise the POST-Ready state, so the fixture performs the same
+    // refill the task does, with the same primitive.
+    app.refill_rng_pool_if_empty(&mut trng);
     (app, store, trng)
 }
 

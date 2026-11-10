@@ -450,11 +450,25 @@ impl FidoApp {
     }
 
     /// Fill the TRNG pool (boot path; US-380 sole randomness source).
+    ///
+    /// US-1825 (WARM-BOOT-SERVE): tolerant of an unseeded generator, in the
+    /// exact shape `oath_core::fill_rng_pool` established — the first chunk
+    /// probes the fallible seam, and a refusal (`NotSeeded`, the bring-up
+    /// path's empty cell) leaves the pool **empty** for the bring-up task's
+    /// `refill_rng_pool_if_empty`. An infallible 8 x 64 B loop here would
+    /// install 512 zero bytes on an unseeded cell — the D-9 defect served
+    /// as key material.
     fn fill_rng_pool<R: Trng>(&mut self, trng: &mut R) {
         self.rng_pool.clear();
         self.rng_cursor = 0;
         let mut chunk = [0u8; 64];
-        for _ in 0..8 {
+        if trng.try_random_bytes(&mut chunk).is_err() {
+            return;
+        }
+        if self.rng_pool.extend_from_slice(&chunk).is_err() {
+            return;
+        }
+        for _ in 0..7 {
             trng.random_bytes(&mut chunk);
             if self.rng_pool.extend_from_slice(&chunk).is_err() {
                 break;
@@ -604,8 +618,15 @@ impl FidoApp {
         core::ptr::addr_of_mut!((*app).presence).write(None);
         core::ptr::addr_of_mut!((*app).presence_grant).write(None);
         let app = &mut *app;
+        // US-1825: the pool fill is unconditional (OATH parity) — on a
+        // provisioned board it has been empty since the fill became
+        // fresh-only, which meant every non-resident draw served
+        // stretch-from-empty keystream. On the bring-up path the cell is
+        // unseeded and the fill leaves the pool empty (the task refills);
+        // on the legacy path and every host twin the cell is live and the
+        // fill lands real DRBG output.
+        app.fill_rng_pool(trng);
         if fresh_partition {
-            app.fill_rng_pool(trng);
             app.keystore.persist(store).ok();
         }
         Ok(app)
