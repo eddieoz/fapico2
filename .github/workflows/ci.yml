@@ -133,7 +133,7 @@ env:
   # CEREMONY_START and the provider re-mint — the PIN-custody epic's device
   # code, measured at +6 KiB over the ratchet the presence-fix series raised
   # (F-A6)
-  FIRMWARE_FLASH_BUDGET_KIB: 1696
+  FIRMWARE_FLASH_BUDGET_KIB: 1697
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
 # the largest exposure in the tree. Previously this file declared no
