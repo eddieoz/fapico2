@@ -214,3 +214,40 @@ and each attempt's own wall time (the DRBG construction's record read and
 seed derivation, ~10–20 ms) rides on top — 240 attempts × overhead ≈ 3–5 s.
 Recorded rather than "fixed": the deadline's unit is documented as a sleep
 budget, and the blink's duty cycle makes the wall time legible on the pin.
+
+## 7. WARM-BOOT-SERVE hardware evidence (2026-11-10 session)
+
+The warm-boot epic's fixed firmware, observed on this board over the
+2026-11-10 implementation session. The §6 "still to observe" list's
+successor evidence, banked from real hardware runs; the one slot that
+needs a long-dwell episode is marked open.
+
+| Claim | Evidence | Status |
+|---|---|---|
+| A cold board enumerates and serves deterministically within normal boot time | Fresh-install board (nuked store) booted to USB serving in ~5 s post-flash; the legacy entropy draw completed its blink window at 6.6 s (video-decoded, `/home/eddieoz/Downloads/20261110_190901.mp4`) and the board served GetInfo/OATH immediately | **banked** |
+| A getAssertion succeeds while the TRNG is unavailable | MC+GA ceremony served with real attestation/assertion signatures (70-byte each) on the fresh board; the OATH SELECT challenge was verified DRBG output (the `SHA-256(b"")` empty-pool fingerprint absent) | **banked** |
+| The warming refusal answers on the wire | The bring-up path's gates exercised live: status TLV read `warming` (hint=1) at attach on a replug, flipping `ready` 5 s later; the makeCredential `0x7F` refusal during the window requires a longer dwell to catch on the wire — the short-dwell run's pool refilled between the status read and the request | **partially banked — long-dwell slot open** |
+| The status TLV works live (US-1827) | `TAG_ENTROPY_STATE` (0x0B) polled over CCID: `warming` → `ready` flip observed; `row_unfused=False` on this fused board | **banked** |
+| The serial surfaces pair picoforge (D-WB2) | USB iSerial `07904452` = TAG_SERIAL render = rescue-body decode (`7904452`); **owner-confirmed: picoforge's CCID applets come online** | **banked** |
+| The LED warming reading (US-1828) | Rhythm shipped and collision-tested; the on-film reading is part of the open long-dwell slot | **partially banked — long-dwell slot open** |
+
+### The 2026-11-10 session's incidental finding (recorded, fixed)
+
+The long-dwell park of §6 was **not** reachable on the fixed build — but a
+related failure was found and fixed the same day: the legacy first-install
+path seeded an **uninitialized** DRBG cell (`seed_drbg_blocking` ran before
+`init_drbg_cell`), killing fresh boards silently between the entropy draw
+and USB (decoded from the 19:09 video: draw window completes at 6.6 s,
+then dark, no USB, no park signature — UB, not a park). Fixed with the
+ordering + idempotent re-seed; the incident is the reason the §6 bounded-
+reboot readings are superseded (ADR 0004 amendment 4).
+
+### The open slot
+
+**US-1831/1832's full acceptance** ("the epic's goal sentence, on video")
+needs the long-dwell cold episode filmed with the turnkey probe rolling:
+`scripts/probe_warm_boot_validation.py --assert-touch --pin --max-wait
+3600` (run before power-on; PicoForge closed; PIN prompted; button on the
+LED prompt). Everything the probe claims is already exercised by the
+suites; what the film adds is the owner-visible reading of the warming
+window on a genuinely cold episode.
