@@ -17,6 +17,30 @@ Every tool below has been driven against real hardware; the [hardware matrix](ht
 
 Not served: **U2F/CTAP1** (every current client speaks CTAP2), **PIV** (deferred out of v1.0.0), and there is **no NFC** — a Pico 2 has no radio, so phone use always means a USB OTG cable.
 
+## Randomness warming and the entropy status (2026-11-10)
+
+The board serves every deterministic operation (passkey logins, OATH codes,
+signatures) the moment it enumerates; only **creation-class** operations
+(registering a passkey, on-card key generation, SET_CODE, Nostr key
+generation) can answer *"warming — retry"* while the randomness generator
+settles (rare; the [boot troubleshooting table](../troubleshooting/boot.md)
+has the LED readings).
+
+Provisioning clients read the state instead of guessing: the management
+config carries **tag `0x0B`** (`TAG_ENTROPY_STATE`) over all three
+interfaces (CCID `READ_CONFIG` 0x1D, CTAPHID config read 0x42, OTP
+capabilities 0x13 — one body, three surfaces). Flags byte: bit 0 =
+**ready**, bit 1 = **row-unfused** warning (the OTP key row was never
+written — informational, no action required). Hint byte: retry-after-one-
+~250 ms-step while warming, `0` when ready.
+
+**PicoForge pairs interfaces by serial** (fixed 2026-11-10, D-WB2): the
+management `TAG_SERIAL`, the rescue identity body and the USB `iSerial`
+all derive from one 26-bit chipid value, so PicoForge's interface pairing
+holds. Firmware updated from a pre-2026-11-10 build changes the serial
+**once** — the host re-enumerates the board as a different device and
+PicoForge re-pairs; nothing else moves.
+
 ## On a phone
 
 The board has no radio. Everything a phone sees arrives over a USB OTG cable, and it is the same CCID and CTAP2 surfaces the desktop uses — no separate phone firmware, nothing to install on the board. What the phone apps *do* care about is who the board claims to be: Android clients in this space are built around YubiKeys, and several filter on the USB identity. **Switch the identity to a Yubico pair (`1050:0407`) before reaching for a phone** — the [USB identity how-to](../how-to/usb-identity.md#phones-need-a-yubico-identity) is the five-minute version, and the change survives a reflash.
