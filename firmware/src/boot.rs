@@ -917,6 +917,14 @@ fn log_migration_nonce_refusal(e: fapico2_platform::trng::TrngError) {
             "migration: nonce refused — the TRNG reported a block carrying no \
              entropy; the migration was NOT started"
         ),
+        // Unreachable at this site (`probe_bytes` never produces it — it is
+        // the LazyDrbg's pre-seed refusal), but the match is exhaustive by
+        // design: a new TrngError variant must be classified here, not
+        // silently folded into a wildcard.
+        TrngError::NotSeeded => defmt::error!(
+            "migration: nonce refused — generator not seeded (cannot happen at \
+             this site); the migration was NOT started"
+        ),
     }
 }
 
