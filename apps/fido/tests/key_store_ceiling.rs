@@ -201,7 +201,7 @@ fn booted() -> (FidoApp, Rp2350SecureStore, HostTrng) {
     // refusal; an empty-pool keypair is attacker-derivable). These tests
     // exercise the POST-Ready state, so the fixture performs the same
     // refill the task does, with the same primitive.
-    app.refill_rng_pool_if_empty(&mut trng);
+    app.refill_rng_pool_if_below_capacity(&mut trng);
     (app, store, trng)
 }
 
