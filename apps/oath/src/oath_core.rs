@@ -2251,7 +2251,7 @@ impl OathApp {
     /// as a SELECT challenge. So the fill probes the fallible seam first —
     /// a refusal (`NotSeeded`) leaves the pool **empty**, and the bring-up
     /// task fills it once the cell is seeded
-    /// ([`refill_rng_pool_if_empty`]). Creation-class OATH operations refuse
+    /// ([`refill_rng_pool_if_below_capacity`]). Creation-class OATH operations refuse
     /// under Warming (US-1826), so nothing draws from the empty pool before
     /// then; the stretch-from-empty semantics a drained pool already had
     /// are unchanged.
@@ -2273,11 +2273,18 @@ impl OathApp {
         }
     }
 
-    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if (and
-    /// only if) it is empty, from the entropy bring-up task. A non-empty
+    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if it
+    /// is below capacity, from the entropy bring-up task. A non-empty
     /// pool (the legacy boot fill) is left untouched — no second fill.
-    pub fn refill_rng_pool_if_empty<R: Trng>(&mut self, trng: &mut R) {
-        if self.rng_pool.is_empty() {
+    pub fn refill_rng_pool_if_below_capacity<R: Trng>(&mut self, trng: &mut R) {
+        // Capacity, not emptiness: OATH's construction-time challenge draw
+        // STRETCHES an empty pool into 32 constant bytes (SHA-256 over the
+        // empty keystream), so `is_empty()` is false on exactly the boards
+        // this refill exists for — the warming posture would survive Ready
+        // as 32 bytes of computable material. Refilling to full capacity
+        // at Ready overwrites the artifact; after Ready the task never
+        // calls this again, so a legitimately drained pool is untouched.
+        if self.rng_pool.len() < 512 {
             self.fill_rng_pool(trng);
         }
     }

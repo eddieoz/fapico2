@@ -455,7 +455,7 @@ impl FidoApp {
     /// exact shape `oath_core::fill_rng_pool` established — the first chunk
     /// probes the fallible seam, and a refusal (`NotSeeded`, the bring-up
     /// path's empty cell) leaves the pool **empty** for the bring-up task's
-    /// `refill_rng_pool_if_empty`. An infallible 8 x 64 B loop here would
+    /// `refill_rng_pool_if_below_capacity`. An infallible 8 x 64 B loop here would
     /// install 512 zero bytes on an unseeded cell — the D-9 defect served
     /// as key material.
     fn fill_rng_pool<R: Trng>(&mut self, trng: &mut R) {
@@ -476,8 +476,8 @@ impl FidoApp {
         }
     }
 
-    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if (and
-    /// only if) it is empty, from the entropy bring-up task.
+    /// US-1825 (WARM-BOOT-SERVE): fill the pool from the DRBG cell if it
+    /// is below capacity, from the entropy bring-up task.
     ///
     /// On a provisioned board the pool has been empty at construction since
     /// the fresh arm became conditional (`boot_in_place` fills only on a
@@ -485,8 +485,15 @@ impl FidoApp {
     /// seeded, so pool-served ephemera draw DRBG output from then on. A
     /// non-empty pool (the legacy fresh-install path, which fills at boot)
     /// is left untouched — no second fill.
-    pub fn refill_rng_pool_if_empty<R: Trng>(&mut self, trng: &mut R) {
-        if self.rng_pool.is_empty() {
+    pub fn refill_rng_pool_if_below_capacity<R: Trng>(&mut self, trng: &mut R) {
+        // Capacity, not emptiness: OATH's construction-time challenge draw
+        // STRETCHES an empty pool into 32 constant bytes (SHA-256 over the
+        // empty keystream), so `is_empty()` is false on exactly the boards
+        // this refill exists for — the warming posture would survive Ready
+        // as 32 bytes of computable material. Refilling to full capacity
+        // at Ready overwrites the artifact; after Ready the task never
+        // calls this again, so a legitimately drained pool is untouched.
+        if self.rng_pool.len() < 512 {
             self.fill_rng_pool(trng);
         }
     }

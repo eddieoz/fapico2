@@ -1248,10 +1248,10 @@ pub fn refill_pools_from_cell() {
     unsafe {
         let cell = drbg_cell();
         let fido = (&mut *core::ptr::addr_of_mut!(FIDO_APP)).assume_init_mut();
-        fido.refill_rng_pool_if_empty(cell);
+        fido.refill_rng_pool_if_below_capacity(cell);
         let cell = drbg_cell();
         let oath = (&mut *core::ptr::addr_of_mut!(OATH_APP)).assume_init_mut();
-        oath.refill_rng_pool_if_empty(cell);
+        oath.refill_rng_pool_if_below_capacity(cell);
     }
     // The Nostr pool: filled only if the boot path did not already fill it
     // (the legacy path fills it in `main`).
