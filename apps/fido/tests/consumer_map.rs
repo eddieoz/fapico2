@@ -217,6 +217,32 @@ fn nostr_provider_is_option_gated() {
     );
 }
 
+/// US-1821, audit A1 (WARM-BOOT-SERVE): the custody CEREMONY is gated. It
+/// burns OTP rows with pool-drawn words — the one Nostr command whose
+/// warming-window zero-word draw has a DESTRUCTIVE fail path (torn
+/// custody rows), not merely predictable ephemera. `ceremony_start` must
+/// refuse while the provider is `None` before any OTP leg is touched.
+#[test]
+fn nostr_ceremony_start_gates_the_otp_burn() {
+    let body = fn_body(NOSTR, "ceremony_start").expect("ceremony_start exists");
+    assert!(
+        body.contains("self.rng.is_none()"),
+        "ceremony_start must refuse while the rng provider is None \
+         (the device warming posture) — a zero entropy word burns \
+         verify-fail into torn custody rows"
+    );
+    // The gate precedes the OTP leg: the burn's word closure must come
+    // after the gate in source order.
+    let gate = body.find("self.rng.is_none()").unwrap();
+    // The actual call site, not prose: a comment naming `custody::burn`
+    // must not satisfy the ordering half of this pin.
+    let burn = body.find("custody::burn(otp").expect("the ceremony burns");
+    assert!(
+        gate < burn,
+        "the warming gate must sit before custody::burn in ceremony_start"
+    );
+}
+
 /// US-1821 scenario: "every random_bytes site is known and gated" — the
 /// quarantine coverage list. Every production file that carries a
 /// randomness consumer is named here; a consumer added anywhere else is a
