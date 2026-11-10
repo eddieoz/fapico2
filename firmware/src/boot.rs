@@ -987,6 +987,26 @@ pub fn entropy_ready() -> bool {
 /// Publish Ready (the bring-up task's last step, or the legacy boot path's).
 pub fn publish_entropy_ready() {
     ENTROPY_READY.store(true, core::sync::atomic::Ordering::Relaxed);
+    // US-1827: the wire-visible bit flips with it, preserving any other
+    // flag (row_unfused) the boot set. Read-modify-write; Relaxed, same as
+    // the state bit — the status is advisory, and the mgmt static is the
+    // one body all three interfaces read.
+    let f = fapico2_mgmt::entropy_flags();
+    fapico2_mgmt::set_entropy_flags(f | fapico2_mgmt::ENTROPY_FLAG_READY);
+}
+
+/// US-1827: whether the OTP key row reads back all-zero — a never-written
+/// row (the US-1710/1711 measured erased-reads-zero convention). A
+/// browser-only first install boots, sets a PIN and creates passkeys with
+/// a zero row (no self-fusing path exists in this tree), so an owner can
+/// use a fully-functional board whose at-rest binding is degenerate
+/// (`{0³², chipid}` is public). The bit makes that state visible over the
+/// config TLV instead of silent. **No burn is added here**: fusing after
+/// first use would orphan everything created under the zero row — the
+/// fuse-vs-first-use ordering is ADR 0002's deferred provisioning epic's
+/// first story.
+pub fn otp_row_unfused() -> bool {
+    matches!(read_otp_key_1(), Some(row) if row.iter().all(|&b| b == 0))
 }
 
 /// Mint a fresh `&'static mut` handle to the DRBG cell.

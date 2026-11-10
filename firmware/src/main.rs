@@ -819,6 +819,16 @@ async fn main(spawner: Spawner) -> ! {
     // park). `init_drbg_cell` first, `seed_drbg_blocking` second; the
     // borrow of `seed_probe` above ends before the move below.
     let drbg_cell = unsafe { boot::init_drbg_cell(seed_probe) };
+    // US-1827: seed the wire-visible entropy flags — WARMING (the READY bit
+    // the mgmt static defaults to is cleared here; the bring-up task or the
+    // legacy seed below re-publishes it) plus the unfused-row warning, read
+    // off the same OTP row the identity derivations used. One TLV, three
+    // interfaces, one body — the shared builder carries it.
+    let mut entropy_flags = 0u8;
+    if boot::otp_row_unfused() {
+        entropy_flags |= fapico2_mgmt::ENTROPY_FLAG_ROW_UNFUSED;
+    }
+    fapico2_mgmt::set_entropy_flags(entropy_flags);
     if legacy_bringup {
         boot::seed_drbg_blocking();
     }
