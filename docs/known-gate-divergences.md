@@ -2775,10 +2775,13 @@ first produces `TrngError::Stalled`.
 > unconnected for a long time), the *episode-level* settling of the TRNG is
 > **≥ 20.4 s** — a boot filmed on 2026-11-09 shows the `otp_retry` budget
 > (20 s) consumed in full inside `init_drbg`'s TRNG nonce draw and the draw
-> succeeding on the deadline's final attempts. **Dwell bound (2026-11-10,
-> US-1813):** a 1-minute unpowered dwell does *not* re-arm it — the first
-> filmed boot of the fixed build drew warm, no window, ~6.7 s to serving.
-> The trigger is a *long*-dwell cold episode, not every power gap. This is
+> succeeding on the deadline's final attempts. **Dwell bounds (2026-11-10,
+> US-1813):** a 1-minute unpowered dwell does *not* re-arm it (draw warm,
+> ~6.7 s to serving), and an ~8-hour dwell re-armed it so hard that the
+> settle outlasted **four ~63 s entropy windows across three reboots**
+> (~4.4 min of episode time) — `sys_reset` does not clear it; only VBUS
+> removal did. The trigger is a *long*-dwell cold episode, not every power
+> gap; the upper bound remains unmeasured. This is
 > the per-*block* budget's episode-scale sibling: the 20 ms
 > `MAX_ENTROPY_WAIT` itself is still unmeasured. Decode, site-naming, the
 > success-tail variant and the fixed-build validation table are in

@@ -6,12 +6,21 @@
 //! watchdog because it would convert a *legible* park — a signature that
 //! names the cause, held until the owner intervenes — into an illegible
 //! reboot loop. But the ADR itself wrote the carve-out: *"A watchdog would
-//! be in scope for a transient hang mode — one a reset actually clears."*
-//! The cold-boot entropy stall is precisely that mode: a settling ring
-//! oscillator clears by waiting (the 2026-11-09 decode shows it succeeding
-//! at the deadline's tail), and a reboot re-rolls the draw with the settling
-//! clock already warm. An immediate park turns a recoverable stall into a
-//! brick only the owner's power cycle fixes.
+//! be in scope for a *transient* hang mode — one a reset actually clears."*
+//! The cold-boot entropy stall is that mode's *candidate*: a settling ring
+//! oscillator can clear by waiting (the 2026-11-09 decode shows it
+//! succeeding at the deadline's tail), so a reboot re-rolls the draw instead
+//! of parking on the first miss — and if the stall is *not* transient, the
+//! bound parks legibly after [`MAX_REFUSED_BOOTS`] re-rolls. An immediate
+//! park turns a recoverable stall into a brick only the owner's power cycle
+//! fixes.
+//!
+//! **Measured (2026-11-10, US-1813): `sys_reset` does *not* clear the
+//! settle** — a long-dwell episode ran four ~63 s windows, three reboots
+//! between them, and every window refused its whole budget; only VBUS
+//! removal cleared it. The reboot is worth its cost anyway: it converts a
+//! park into a chance, bounded, and the park it eventually takes is the
+//! legible one ADR 0004 demanded.
 //!
 //! So the refusal policy at the two entropy sites becomes: **reboot and
 //! re-roll, a bounded number of times, then park legibly.** The bound lives

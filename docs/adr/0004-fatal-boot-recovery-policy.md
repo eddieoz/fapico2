@@ -263,8 +263,13 @@ for a reset to re-roll. Their budget, their silence, and their park are
 unchanged, and the reboot loop is scoped to `TrngRefused` and `DrbgRefused`
 and to nothing else.
 
-**The open question the hardware leg answers** (US-1813, recorded in the
-audit doc's validation section when it runs): does `sys_reset` clear the
-settling — so the rebooted boot's window is short — or does only VBUS removal,
-in which case the bound is what catches a hard autocorrelation wedge. The
-bound covers both answers; that is why it exists.
+**The open question, answered by the hardware leg** (US-1813, 2026-11-10 —
+decode in the audit doc's validation section): **`sys_reset` does not clear
+the settling.** A long-dwell cold episode ran four ~63 s blinking windows
+with three bounded reboots between them, and every window refused its whole
+budget — the rebooted boots' windows were the same length as the first.
+Only VBUS removal cleared the episode (the owner's power cycles). The
+bound is therefore not an optimization but the load-bearing half of the
+design: on this hardware the reboot buys re-rolls, not warmth, and the
+third refused re-roll is what turns an interminable blink into a legible
+park. This is exactly the case the bound exists for.
