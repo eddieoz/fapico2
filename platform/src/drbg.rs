@@ -303,6 +303,8 @@ pub enum SeedError {
     /// is a device that cannot sign until it is reset. That is the correct
     /// outcome and it is the whole contract.
     Trng(TrngError),
+    /// The cell was already seeded (WARM-BOOT-SERVE: seeded-once violation).
+    AlreadySeeded,
 }
 
 impl fmt::Display for SeedError {
@@ -314,6 +316,7 @@ impl fmt::Display for SeedError {
                 write!(f, "DRBG seed source is present but carries no entropy")
             }
             SeedError::Trng(e) => write!(f, "DRBG seed source drew no fresh entropy: {e}"),
+            SeedError::AlreadySeeded => write!(f, "LazyDrbg already seeded (seeded-once violation)"),
         }
     }
 }
