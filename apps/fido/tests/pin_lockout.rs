@@ -402,7 +402,11 @@ mod device_twin {
         let mut restored = HostSecureStore::new();
         restored.from_partition_image(&image);
         let mut trng2 = HostTrng::new();
-        let app = FidoApp::boot(&mut trng2, &mut restored).unwrap();
+        let mut app = FidoApp::boot(&mut trng2, &mut restored).unwrap();
+        // US-1825 (WARM-BOOT-SERVE): a provisioned boot leaves the RNG pool
+        // empty until the bring-up task refills it; this fixture exercises
+        // the post-Ready state, so it performs the same refill.
+        app.refill_rng_pool_if_empty(&mut trng2);
         let mut client2 = Client {
             app,
             hmac_key: [0; 32],
