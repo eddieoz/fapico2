@@ -273,3 +273,56 @@ bound is therefore not an optimization but the load-bearing half of the
 design: on this hardware the reboot buys re-rolls, not warmth, and the
 third refused re-roll is what turns an interminable blink into a legible
 park. This is exactly the case the bound exists for.
+
+## Amendment 4, 2026-11-10 — the park domain shrinks to identity: freshness degrades, it does not park (WARM-BOOT-SERVE, US-1829)
+
+**Decision:** entropy-*freshness* failures no longer park, and no longer
+exist on the boot path at all. The boot completes to serving with the TRNG
+unstarted-or-unverified; a background bring-up task warms the TRNG, draws
+the boot-entropy record (if absent), seeds the DRBG cell and publishes
+**Ready**. Until Ready, creation-class operations refuse with one honest,
+pollable answer (`TAG_ENTROPY_STATE` in the shared config TLV, US-1827) —
+*the randomness source is warming — retry* — while every deterministic
+operation (assertions, PIN verification, OATH codes, OpenPGP/PIV signing)
+serves. **Identity failures park as before**: `OtpKeyRow`/`ChipId`/store/
+manifest refusals keep their budget, silence and immediate park. The
+carve-out ADR 0004 amendment 3 made for entropy is superseded: freshness
+degrades, identity parks.
+
+**Citation.** The 2026-11-10 measurement (US-1813's consumer-map audit,
+[`docs/audits/2026-11-09-cold-boot-entropy-window.md`](../audits/2026-11-09-cold-boot-entropy-window.md)
+§6) proved the bounded reboot bought nothing: four refused windows across
+three reboots, every window refusing its whole budget, `sys_reset` clearing
+nothing — and, decisive for this amendment, **the board was one signature
+away from fully functional**: OTP identity reads succeeded, the store
+mounted, the ladder ran. The stall touches only *freshness* (the DRBG seed
+nonce, the record draw) — and every serving-path operation a cold morning
+needs is deterministic (US-1821's consumer map). Blocking USB enumeration
+on freshness was spending the epic's most expensive currency — a dark
+board — on the one failure the board can ride out.
+
+**The interim design is deleted with honor.** The bounded-reboot machinery
+(`entropy_reboot_or_park`, the `.retain` refusal counter, `MAX_REFUSED_BOOTS`)
+was `COLD-BOOT-ENTROPY-WINDOW`'s answer, and the 2026-11-10 decode
+(**US-1813**) is why it is superseded: the measurement showed the reboots
+bought nothing, and the bring-up task's post-boot retry has no reboot to
+re-roll *because there is nothing left to reboot past* — the board is
+already serving. The task retries forever (no bound: a wedged TRNG keeps
+the board Warming and serving deterministic operations; the owner's power
+cycle is the recovery, and the pollable status says so). `entropy_reset.rs`
+remains in the tree as the recorded decision arithmetic of the interim
+design; its device-side callers are gone.
+
+**Fresh installs keep a blocking boot, deliberately staged.** A fresh board
+(record absent or hkey absent) runs the legacy inline sequence — same
+budgets, same blink window, same legible park — because its construction
+itself draws randomness (hkey, keystore, attestation). Deferring the
+fresh-install serving story (a fresh board enumerating *warming* and
+provisioning through PicoForge) is recorded in the epic as the follow-up;
+US-1827's status TLV and the refusals are this amendment's whole wire
+obligation to it today.
+
+**The park domain after this amendment:** OTP rows, chipid, store mount,
+manifest, keystore boot — identity and integrity. Not freshness. A cold
+morning can no longer make the device invisible; it can only make it
+wait for randomness, visibly, while serving everything deterministic.
