@@ -17,7 +17,7 @@ use fapico2_nostr::{
     crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, BYPASS_SESSION_MS,
     INS_GET_AUDIT, INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN,
     INS_SIGN, INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_SESSION_REQUIRED,
-    SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
+    SW_TOUCH_REQUIRED,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -324,7 +324,7 @@ fn deselect_preserves_the_accounting_state() {
 /// consulted.
 #[test]
 fn thirty_two_bypassed_signs_run_grant_free() {
-    let (mut app, path) = pin_app("cap-signs");
+    let (app, path) = pin_app("cap-signs");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for i in 0..BYPASS_CAP {
@@ -341,7 +341,7 @@ fn thirty_two_bypassed_signs_run_grant_free() {
 /// the refusal is [`SW_TOUCH_REQUIRED`].
 #[test]
 fn the_thirty_third_requires_the_press() {
-    let (mut app, path) = pin_app("cap-33rd");
+    let (app, path) = pin_app("cap-33rd");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for _ in 0..BYPASS_CAP {
@@ -359,7 +359,7 @@ fn the_thirty_third_requires_the_press() {
 /// the budget stays at 0 (saturating, never wrapping).
 #[test]
 fn a_pressed_33rd_succeeds_and_does_not_go_negative() {
-    let (mut app, path) = pin_app("cap-press");
+    let (app, path) = pin_app("cap-press");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for _ in 0..BYPASS_CAP {
@@ -377,7 +377,7 @@ fn a_pressed_33rd_succeeds_and_does_not_go_negative() {
 /// per verb: 16 ENC + 16 DEC spend it, and the 17th ENC needs the touch.
 #[test]
 fn the_cap_counts_enc_and_dec_too() {
-    let (mut app, path) = pin_app("cap-encdec");
+    let (app, path) = pin_app("cap-encdec");
     let mut app = app
         .with_presence_grant(counting_deny)
         .with_rng_provider(|out| out.fill(0x42));
@@ -404,7 +404,7 @@ fn the_cap_counts_enc_and_dec_too() {
 /// [`BYPASS_SESSION_MS`], the armed session runs grant-free.
 #[test]
 fn inside_the_window_the_bypass_still_exempts() {
-    let (mut app, path) = pin_app("exp-inside");
+    let (app, path) = pin_app("exp-inside");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true); // armed at the clock's 0
     advance(BYPASS_SESSION_MS - 1);
@@ -419,7 +419,7 @@ fn inside_the_window_the_bypass_still_exempts() {
 /// so the very next GET_INFO reports the bypass down.
 #[test]
 fn past_the_window_the_press_is_required_and_the_flag_is_cleared() {
-    let (mut app, path) = pin_app("exp-past");
+    let (app, path) = pin_app("exp-past");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     advance(BYPASS_SESSION_MS);
@@ -441,7 +441,7 @@ fn past_the_window_the_press_is_required_and_the_flag_is_cleared() {
 /// can arm again; the new session starts whole.
 #[test]
 fn re_arming_after_expiry_resets_the_budget_and_the_timestamp() {
-    let (mut app, path) = pin_app("exp-rearm");
+    let (app, path) = pin_app("exp-rearm");
     let mut app = app.with_presence_grant(counting_allow);
     app.set_touch_bypass(true);
     advance(BYPASS_SESSION_MS);
@@ -458,7 +458,7 @@ fn re_arming_after_expiry_resets_the_budget_and_the_timestamp() {
 /// a half-spent session re-armed by the verb's press starts whole again.
 #[test]
 fn re_arming_while_live_also_resets_the_budget() {
-    let (mut app, path) = pin_app("exp-live");
+    let (app, path) = pin_app("exp-live");
     let mut app = app.with_presence_grant(counting_allow);
     app.set_touch_bypass(true);
     for _ in 0..5 {
@@ -470,6 +470,32 @@ fn re_arming_while_live_also_resets_the_budget() {
     assert_eq!(sw, SW_OK, "the verb's press re-arms");
     assert_eq!(app.bypass_budget(), BYPASS_CAP, "the budget is whole again");
     assert_eq!(app.bypass_armed_at_ms(), 100, "the stamp is the new clock value");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A stale session reads as gone** (the final review's Important finding):
+/// the expiry must not live only in the signing guards — GET_INFO and
+/// GET_AUDIT run the same leg, or ten idle minutes leave the popup
+/// advertising "bypass armed — 32 left" over a session the very next
+/// signature will refuse. The dead session's ring reads as gone with it,
+/// the same rule every other session death obeys (LOCK, failed verify,
+/// wipe): the ring accounts the *live* session.
+#[test]
+fn a_stale_session_reads_as_gone() {
+    let (app, path) = pin_app("stale-read");
+    let mut app = app.with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    advance(BYPASS_SESSION_MS + 1);
+    // No signing command in between — the read paths must decide.
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(data[7] & 0x08, 0, "GET_INFO must not advertise a dead session");
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, records) = parse_audit_body(&data);
+    assert_eq!(budget, 0, "the stale budget reads as gone");
+    assert!(records.is_empty(), "the dead session's ring reads as gone");
     std::fs::remove_file(&path).ok();
 }
 
@@ -491,7 +517,7 @@ fn digest16(data: &[u8]) -> [u8; 16] {
 /// clock at operation time, and the digest of what was signed.
 #[test]
 fn each_bypassed_sign_appends_one_record() {
-    let (mut app, path) = pin_app("ring-sign");
+    let (app, path) = pin_app("ring-sign");
     let mut app = app
         .with_presence_grant(counting_deny)
         .with_now_provider(fake_now);
@@ -521,7 +547,7 @@ fn each_bypassed_sign_appends_one_record() {
 /// consent artifact; the ring is bypass accounting, not an operation log.
 #[test]
 fn the_touched_33rd_writes_no_record() {
-    let (mut app, path) = pin_app("ring-touched");
+    let (app, path) = pin_app("ring-touched");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for _ in 0..BYPASS_CAP {

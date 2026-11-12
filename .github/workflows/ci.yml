@@ -146,7 +146,13 @@ env:
   # CEREMONY_START and the provider re-mint — the PIN-custody epic's device
   # code, measured at +6 KiB over the ratchet the presence-fix series raised
   # (F-A6)
-  FIRMWARE_FLASH_BUDGET_KIB: 1697
+  # 2026-11-12 raised this from 1697 to 1704 KiB, on purpose, with the reason
+  # recorded here because the number is the layout's argument: the
+  # bypass-accounting epic (US-1837..1847): the audit ring, the GET_AUDIT verb
+  # and the expiry leg grew the shipping image by 3,072 B over the 1697 KiB
+  # anchor; 1704 carries 4 KiB of deliberate headroom above the 1700.0 KiB
+  # image
+  FIRMWARE_FLASH_BUDGET_KIB: 1704
 # Least privilege by default. This workflow runs on `pull_request`, which
 # EXECUTES UNTRUSTED FORK CODE, so the GITHUB_TOKEN it hands to every job is
 # the largest exposure in the tree. Previously this file declared no
