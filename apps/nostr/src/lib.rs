@@ -1245,7 +1245,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1257,7 +1257,13 @@ impl NostrApp {
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and SIGN runs grant-free. The
         // gate order is otherwise untouched: shape → gate → state → touch.
-        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
+        // US-1839: the exemption is *budgeted* — an armed session with budget
+        // left runs grant-free and spends one per operation; a spent session
+        // behaves exactly as bypass-off, and the press is the fallback, never
+        // an error. The spend lands after the response is written, so a
+        // failed operation never burns budget.
+        let bypassed = *touch_bypass && *bypass_budget > 0;
+        if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -1271,6 +1277,9 @@ impl NostrApp {
                 resp.extend_from_slice(&id.npub).ok();
                 resp.extend_from_slice(&sig).ok();
                 write_sw(resp, SW_OK);
+                if bypassed {
+                    *bypass_budget = bypass_budget.saturating_sub(1);
+                }
             }
             // A stored scalar that would not sign is a record this device
             // cannot honour; refusing beats answering with fiction.
@@ -1317,7 +1326,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1328,7 +1337,9 @@ impl NostrApp {
         };
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_ENC runs grant-free.
-        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
+        // US-1839: budgeted like SIGN — spent means bypass-off, press again.
+        let bypassed = *touch_bypass && *bypass_budget > 0;
+        if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -1364,6 +1375,9 @@ impl NostrApp {
             Ok(len) => {
                 debug_assert_eq!(len, total);
                 write_sw(resp, SW_OK);
+                if bypassed {
+                    *bypass_budget = bypass_budget.saturating_sub(1);
+                }
             }
             // Unreachable under the caps above; a fault beats a wrong answer.
             Err(_) => {
@@ -1424,7 +1438,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, presence_grant, touch_bypass, .. } = self;
+        let Self { region, provider, presence_grant, touch_bypass, bypass_budget, .. } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1435,7 +1449,9 @@ impl NostrApp {
         };
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_DEC runs grant-free.
-        if !*touch_bypass && !user_present(*presence_grant, p1 as u16) {
+        // US-1839: budgeted like SIGN — spent means bypass-off, press again.
+        let bypassed = *touch_bypass && *bypass_budget > 0;
+        if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
             return;
         }
@@ -1457,6 +1473,9 @@ impl NostrApp {
                 // remainder of the scratch region is padded garbage.
                 resp.truncate(unpadded_len);
                 write_sw(resp, SW_OK);
+                if bypassed {
+                    *bypass_budget = bypass_budget.saturating_sub(1);
+                }
             }
             Err(_) => {
                 resp.clear();
@@ -1943,7 +1962,16 @@ impl NostrApp {
                     write_sw(resp, SW_TOUCH_REQUIRED);
                     return;
                 }
+                // US-1839: arming the flag through the verb arms the whole
+                // privilege — the budget fills to [`BYPASS_CAP`], the
+                // timestamp stamps from the wired clock (US-1837; unwired it
+                // reads 0, which only means the session never expires). A
+                // flag armed without a budget would be a lie the guards
+                // refuse: `bypassed` would be false and every "grant-free"
+                // sign would cost a press.
                 self.touch_bypass = true;
+                self.bypass_budget = BYPASS_CAP;
+                self.bypass_armed_at_ms = (self.now_provider)();
                 write_sw(resp, SW_OK);
             }
             _ => write_sw(resp, SW_WRONG_P1_P2),

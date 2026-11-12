@@ -14,8 +14,9 @@
 //! GET_AUDIT verb — each story's scenarios land here RED-first.
 
 use fapico2_nostr::{
-    crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, INS_LOCK, INS_SET_PIN,
-    INS_VERIFY_PIN, SW_PIN_SESSION_REQUIRED, SW_WRONG_P1_P2,
+    crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, INS_LOCK, INS_NIP44_DECRYPT,
+    INS_NIP44_ENCRYPT, INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN, SW_PIN_SESSION_REQUIRED,
+    SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -37,6 +38,51 @@ fn advance(ms: u64) {
 
 thread_local! {
     static FAKE_MS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The counting grant closures — the touch_bypass.rs `PRESSES` pattern.
+/// `counting_deny` counts the consult and refuses; `counting_allow` counts
+/// and grants. `presses()` reads the ledger.
+fn presses() -> u32 {
+    PRESSES.with(|p| p.get())
+}
+
+fn counting_deny(_tag: u32) -> bool {
+    PRESSES.with(|p| p.set(p.get() + 1));
+    false
+}
+
+fn counting_allow(_tag: u32) -> bool {
+    PRESSES.with(|p| p.set(p.get() + 1));
+    true
+}
+
+thread_local! {
+    static PRESSES: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+// ---------------------------------------------------------------------------
+// NIP-44 APDU fixtures (the touch_bypass.rs shape)
+// ---------------------------------------------------------------------------
+
+/// A valid curve point that is not the identity — the NIP-44 peer.
+fn peer_x() -> [u8; 32] {
+    let peer_scalar: [u8; 32] = core::array::from_fn(|i| 0x71u8.wrapping_add(i as u8));
+    crypto::xonly_pubkey(&peer_scalar).expect("a valid peer scalar")
+}
+
+fn apdu_nip44_encrypt(idx: u8, plaintext: &[u8]) -> HeaplessVec<u8, 300> {
+    let mut d = Vec::new();
+    d.extend_from_slice(&peer_x());
+    d.extend_from_slice(plaintext);
+    apdu(INS_NIP44_ENCRYPT, idx, &d)
+}
+
+fn apdu_nip44_decrypt(idx: u8, payload: &[u8]) -> HeaplessVec<u8, 300> {
+    let mut d = Vec::new();
+    d.extend_from_slice(&peer_x());
+    d.extend_from_slice(payload);
+    apdu(INS_NIP44_DECRYPT, idx, &d)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,5 +306,86 @@ fn deselect_preserves_the_accounting_state() {
     App::deselect(&mut app);
     assert_eq!(app.bypass_budget(), BYPASS_CAP, "the budget survives deselect");
     assert_eq!(app.bypass_armed_at_ms(), 10, "the timestamp survives deselect");
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1839 — the cap
+// ---------------------------------------------------------------------------
+
+/// **Thirty-two bypassed SIGNs run grant-free** — the whole [`BYPASS_CAP`]
+/// budget, consumed one per operation, with the grant closure never
+/// consulted.
+#[test]
+fn thirty_two_bypassed_signs_run_grant_free() {
+    let (mut app, path) = pin_app("cap-signs");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    for i in 0..BYPASS_CAP {
+        let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+        assert_eq!(sw, SW_OK, "bypassed SIGN #{i} needs no press");
+        assert_eq!(app.bypass_budget(), BYPASS_CAP - 1 - i, "budget counts down");
+    }
+    assert_eq!(presses(), 0, "no press was ever consulted");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The thirty-third requires the press** — the budget exhausted at 0, the
+/// guard behaves exactly as bypass-off: the grant closure is consulted and
+/// the refusal is [`SW_TOUCH_REQUIRED`].
+#[test]
+fn the_thirty_third_requires_the_press() {
+    let (mut app, path) = pin_app("cap-33rd");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    for _ in 0..BYPASS_CAP {
+        let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+        assert_eq!(sw, SW_OK);
+    }
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "a spent budget costs a press");
+    assert_eq!(presses(), 1, "the grant was consulted exactly once");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A pressed 33rd succeeds and does not go negative** — the touch path is
+/// untouched by the accounting: the press grants, the operation runs, and
+/// the budget stays at 0 (saturating, never wrapping).
+#[test]
+fn a_pressed_33rd_succeeds_and_does_not_go_negative() {
+    let (mut app, path) = pin_app("cap-press");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    for _ in 0..BYPASS_CAP {
+        call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    }
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_OK, "the press grants, the operation runs");
+    assert_eq!(app.bypass_budget(), 0, "a touched op burns no budget");
+    assert_eq!(presses(), 1, "the press was real");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The cap counts ENC and DEC too** — the budget is per *session*, not
+/// per verb: 16 ENC + 16 DEC spend it, and the 17th ENC needs the touch.
+#[test]
+fn the_cap_counts_enc_and_dec_too() {
+    let (mut app, path) = pin_app("cap-encdec");
+    let mut app = app
+        .with_presence_grant(counting_deny)
+        .with_rng_provider(|out| out.fill(0x42));
+    app.set_touch_bypass(true);
+    let plaintext = b"budgeted conversation";
+    for i in 0..16u8 {
+        let (ct, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
+        assert_eq!(sw, SW_OK, "bypassed ENC #{i}");
+        let (_, sw) = call(&mut app, &apdu_nip44_decrypt(1, &ct));
+        assert_eq!(sw, SW_OK, "bypassed DEC #{i}");
+    }
+    assert_eq!(app.bypass_budget(), 0, "32 ops spent the session");
+    let (_, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "the 33rd op costs a press");
+    assert_eq!(presses(), 1, "the grant was consulted once");
     std::fs::remove_file(&path).ok();
 }
