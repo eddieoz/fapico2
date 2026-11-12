@@ -902,12 +902,18 @@ impl NostrApp {
         rng: Option<fn(&mut [u8])>,
         grant: fn(u32) -> bool,
         custody_otp: Option<&'static dyn fapico2_platform::otp_cus::OtpAccess>,
+        // US-1844: the monotonic millisecond clock (US-1837's seam) — the
+        // device hands `tasks.rs::now_ms`, the emulator its virtual clock.
+        // Unwired, the bypass never expires; wiring it here is what makes
+        // the accounting real where it matters.
+        now: fn() -> u64,
     ) {
         self.provider = Some(region_provider);
         self.region_source = Some(region_provider);
         self.rng = rng;
         self.presence_grant = Some(grant);
         self.custody_otp = custody_otp;
+        self.now_provider = now;
     }
 
     /// The custody rows' health, decided once per boot (US-1714). The

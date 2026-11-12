@@ -428,7 +428,9 @@ async fn handle_ccid_message(
 /// US-705.1/US-920: monotonic millisecond clock for the pure assemblers'
 /// timeouts (`HidAssembler` transaction window, [`CcidReassembler`] partial
 /// window) — injected so both stay HAL-free and host-testable.
-fn now_ms() -> u64 {
+/// US-1844: the nostr applet's bypass clock rides the same value — wired
+/// through `nostr_shared::install_nostr_providers`.
+pub(crate) fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
 

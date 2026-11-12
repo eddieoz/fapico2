@@ -1337,6 +1337,7 @@ async fn main(spawner: Spawner) -> ! {
         nostr_region,
         if legacy_bringup { Some(nostr_random) } else { None },
         fapico2_firmware::presence::nostr_grant,
+        tasks::now_ms,
     );
 
     // Build + register the dispatcher on the boot path so it too stays off the
@@ -1674,6 +1675,7 @@ async fn entropy_bringup_task() {
                     nostr_region,
                     Some(nostr_random),
                     fapico2_firmware::presence::nostr_grant,
+                    tasks::now_ms,
                 );
                 boot::publish_entropy_ready();
                 defmt::info!("entropy bring-up: ready — creation-class operations unblocked");

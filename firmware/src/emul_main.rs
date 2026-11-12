@@ -854,10 +854,10 @@ fn main() {
     };
     eprintln!("nostr region: {}", nostr_region_path.display());
     let mut nostr_app = match open_or_create_nostr_region(&nostr_region_path) {
-        Some(region) => NostrApp::boot(region),
+        Some(region) => NostrApp::boot(region).with_now_provider(emul_now_ms),
         None => {
             eprintln!("fapico2: nostr region open failed; the applet will refuse its reads");
-            NostrApp::new()
+            NostrApp::new().with_now_provider(emul_now_ms)
         }
     };
     // US-1646: the nostr deny hook — the OATH one's exact shape above. The

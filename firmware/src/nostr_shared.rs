@@ -201,6 +201,12 @@ pub fn install_nostr_providers(
     // the pool. The legacy boot path installs `Some` directly.
     rng: Option<fn(&mut [u8])>,
     grant: fn(u32) -> bool,
+    // US-1844: the monotonic millisecond clock (US-1837's seam) — the
+    // caller's, because `tasks` belongs to the device binary and the lib
+    // cannot name it (the same caller-owned convention as the presence
+    // service's `now_ms`). The device passes `tasks::now_ms`; the bypass's
+    // expiry is what consumes it.
+    now: fn() -> u64,
 ) {
     #[cfg(all(feature = "device", target_arch = "arm"))]
     static NOSTR_CUSTODY_OTP: fapico2_platform::otp_cus::RealOtp =
@@ -210,7 +216,7 @@ pub fn install_nostr_providers(
         Some(&NOSTR_CUSTODY_OTP);
     #[cfg(not(all(feature = "device", target_arch = "arm")))]
     let custody = None;
-    with_nostr(|app| app.install_providers(region, rng, grant, custody));
+    with_nostr(|app| app.install_providers(region, rng, grant, custody, now));
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +296,7 @@ mod us1658_shared_ownership {
         FileKeyRegion::create(&path, TOTAL_SLOTS).expect("a fresh region file");
 
         GRANT_CALLS.store(0, Ordering::SeqCst);
-        super::install_nostr_providers(region_fixture, Some(rng_constant), grant_refuse_after_first);
+        super::install_nostr_providers(region_fixture, Some(rng_constant), grant_refuse_after_first, || 0);
 
         // --- client A: the CCID proxy. Select, then GENERATE (granted).
         let mut proxy = NostrViaMutex;

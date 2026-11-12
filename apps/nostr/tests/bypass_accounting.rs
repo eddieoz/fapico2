@@ -720,3 +720,83 @@ fn get_info_advertises_bypass_accounting_on_both_board_shapes() {
         std::fs::remove_file(&path).ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// US-1844 — the clock is actually wired (the presence.rs source-reading
+// pattern: the wiring gates that cannot fail as unit tests otherwise)
+// ---------------------------------------------------------------------------
+
+/// **The device path wires the monotonic clock** — `install_nostr_providers`
+/// takes the caller's clock (`now: fn() -> u64`, because `tasks` belongs to
+/// the device binary and the lib cannot name it) and main.rs hands it
+/// `tasks::now_ms`, the same millisecond clock the HID assemblers' timeouts
+/// use. Without this the bypass never expires on the device (an unwired
+/// clock reads 0) and the accounting is dead code where it matters.
+#[test]
+fn install_nostr_providers_wires_the_monotonic_clock() {
+    let shared_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/nostr_shared.rs"
+    ))
+    .expect("firmware/src/nostr_shared.rs is readable from the nostr test crate");
+    let signature = shared_rs
+        .split("pub fn install_nostr_providers(")
+        .nth(1)
+        .expect("install_nostr_providers exists");
+    let signature = &signature[..signature
+        .find(") {")
+        .expect("the signature terminates")];
+    assert!(
+        signature.contains("now: fn() -> u64"),
+        "install_nostr_providers must take the caller's clock — the lib cannot \
+         name the device binary's tasks module"
+    );
+    let call = shared_rs
+        .split("install_providers(")
+        .nth(1)
+        .expect("install_nostr_providers calls install_providers");
+    let call = &call[..call.find(";").expect("the install_providers call terminates")];
+    assert!(
+        call.contains(", now)"),
+        "install_nostr_providers must pass the caller's clock into the applet — \
+         without it the bypass never expires on the device"
+    );
+    let main_rs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/main.rs"
+    ))
+    .expect("firmware/src/main.rs is readable from the nostr test crate");
+    let boot_chain = main_rs
+        .split("install_nostr_providers(")
+        .nth(1)
+        .expect("main.rs installs the nostr providers");
+    let boot_chain = &boot_chain[..boot_chain
+        .find(";")
+        .expect("the install_nostr_providers statement terminates")];
+    assert!(
+        boot_chain.contains("tasks::now_ms"),
+        "main.rs must hand the applet the device's monotonic clock — \
+         without it the bypass never expires on the device"
+    );
+}
+
+/// **The emulator wires its virtual clock** — `emul_now_ms` into the booted
+/// nostr applet, so the CCID suites can exercise expiry with real time.
+#[test]
+fn the_emulator_wires_its_virtual_clock_into_the_nostr_applet() {
+    let emul = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../firmware/src/emul_main.rs"
+    ))
+    .expect("firmware/src/emul_main.rs is readable from the nostr test crate");
+    let chain = emul
+        .split("NostrApp::boot(region)")
+        .nth(1)
+        .expect("emul_main.rs boots the nostr applet");
+    let chain = &chain[..chain.find(";").expect("the nostr_app construction terminates")];
+    assert!(
+        chain.contains("with_now_provider"),
+        "the emulator must wire emul_now_ms into the nostr applet — \
+         without it the CCID suites cannot exercise expiry"
+    );
+}
