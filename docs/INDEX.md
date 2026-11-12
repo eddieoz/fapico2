@@ -41,7 +41,7 @@ deliberately **not in git**.
 - [adr/0005-nostr-key-storage.md](adr/0005-nostr-key-storage.md) — the Nostr records' device-bound
   key derivation, the FIDO-range carve and occupancy guard, the deliberate second secp256k1
   implementation, and the scalar RAM-lifetime amendment.
-- [nip-draft/nip-xx.md](nip-draft/nip-xx.md) — the Nostr hardware-signer NIP draft: the vendor-HID transport and
+- [nip-xx.md](nip-xx.md) — the Nostr hardware-signer NIP draft: the vendor-HID transport and
   command dialect (`0x40`–`0x4F`, CBOR `[idx,arg]` → `{1:sw,2?:data}`) written up for
   submission to nostr-protocol/nips, with the touch/PIN custody model and the NIP-07 bridge.
 - [adr/0008-seed-rooted-fido-derivation.md](adr/0008-seed-rooted-fido-derivation.md) — the vendor
