@@ -852,6 +852,24 @@ impl NostrApp {
         self.bypass_audit.clear();
     }
 
+    /// US-1840 + the final review's Important finding: the expiry leg, run
+    /// by **every** path that reads or spends the session — the three
+    /// signing guards inline (they hold field borrows and cannot call a
+    /// `&mut self` method), and [`Self::get_info`] / [`Self::get_audit`]
+    /// through here. Without the read-side leg, ten idle minutes leave the
+    /// advertisement and the audit view claiming an armed session the very
+    /// next signature refuses — the popup would lie about the board.
+    /// Decision recorded with the fix: an expired session's ring dies with
+    /// it, the same rule every other session death obeys (LOCK, failed
+    /// verify, wipe) — the ring accounts the *live* session, and a session
+    /// that died of old age leaves nothing to audit.
+    fn expire_bypass_if_stale(&mut self) {
+        let now = (self.now_provider)();
+        if now.saturating_sub(self.bypass_armed_at_ms) >= BYPASS_SESSION_MS {
+            self.clear_bypass_session();
+        }
+    }
+
     /// US-1837: read the wired clock. Host-only, for the same reason the
     /// state accessors above are: the device-visible view of time is nothing
     /// — time is an input, not state — and this accessor exists so the
@@ -967,6 +985,9 @@ impl NostrApp {
         // The cache reads first: the store borrow must span the identity
         // walk and the pending check, and disjoint locals compose where a
         // `&mut self` read mid-borrow would not.
+        // US-1840 + the final review: the read paths run the expiry leg, so
+        // a stale session is never advertised as armed.
+        self.expire_bypass_if_stale();
         let pin_set = self.pin_set;
         let pin_unlocked = self.pin_unlocked;
         // US-1746: the advertisement is the gate's own field — the same
@@ -2078,6 +2099,10 @@ impl NostrApp {
         if !refuse_payload(data, resp) {
             return;
         }
+        // US-1840 + the final review: the read runs the expiry leg, so a
+        // stale session reads as gone (budget 0, ring empty), never as the
+        // armed state it expired out of.
+        self.expire_bypass_if_stale();
         if self.pin_set && !self.pin_unlocked {
             write_sw(resp, SW_PIN_SESSION_REQUIRED);
             return;

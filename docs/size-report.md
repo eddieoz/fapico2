@@ -128,12 +128,12 @@ Shipping UF2 **3,394 blocks**, sha256 `e3a211be3fcc1f31226bd4f69f61418ab53562042
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 832,932 | `0x10000200` | no (flash) |
-| `.rodata` | 20,968 | `0x100cb7a8` | no (flash) |
-| `.data` | 13,888 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100d3fe0` | non-alloc, not in Berkeley `text` |
-| `.bss` | 400,868 | `0x20003640` | **yes** — zeroed by crt0 |
-| `.uninit` | 1,024 | `0x20065424` | yes |
+| `.text` | 834,004 | `0x10000200` | no (flash) |
+| `.rodata` | 20,972 | `0x100cbbd8` | no (flash) |
+| `.data` | 14,300 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
+| `.gnu.sgstubs` | 0 | `0x100d45c0` | non-alloc, not in Berkeley `text` |
+| `.bss` | 400,868 | `0x200037e0` | **yes** — zeroed by crt0 |
+| `.uninit` | 1,024 | `0x200655c4` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.comment` | 228 | `0x00000000` | non-alloc, not in Berkeley `text` |
 | `.ARM.attributes` | 50 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -153,12 +153,21 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 900,852 B** · **`.data` = 13,888 B** · **`.bss` = 401,892 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 902,340 B** · **`.data` = 14,300 B** · **`.bss` = 401,892 B** · **`.uninit` = 1,024 B**
 
-**RAM statics = 415,780 B** (415,780 B address-to-address: `__sheap` `0x20065824` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x20065824` → **main stack zone = 116,700 B** of 532,480 B of SRAM.
+**RAM statics = 416,192 B** (416,196 B address-to-address: `__sheap` `0x200659c4` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x200659c4` → **main stack zone = 116,284 B** of 532,480 B of SRAM.
 
-`bss + stack zone + .data = 532,480 B` against 532,480 B of RAM, leaving 0 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
+`bss + stack zone + .data = 532,476 B` against 532,480 B of RAM, leaving 4 B of alignment slack: **there is no unallocated SRAM.** Every byte is a static or the stack, so the only thing that catches a regression is the linker refusing to place `.bss` — and the ceiling that turns that from a link error into a dark board is the one this gate enforces.
 <!-- END measured ELF summary -->
+
+**Date: 2026-11-12 (flash ratchet raised 1697 → 1704 KiB, by `raise_flash_budget.py`).**
+
+Reason recorded with the number: the bypass-accounting epic (US-1837..1847): the audit ring, the GET_AUDIT verb and the expiry leg grew the shipping image by 3,072 B over the 1697 KiB anchor; 1704 carries 4 KiB of deliberate headroom above the 1700.0 KiB image
+
+Shipping image at the raise: 1740800 B = 3400 blocks = 1700 KiB. Budget 1704 KiB = 1744896 B, which is 4096 B of headroom.
+
+The ratchet is the only *near-term* bound on the shipping image: the 3.5 MiB text ceiling is ~2 MB above the current build and cannot fire on ordinary growth, and the flash-map geometry (`FIRMWARE_GROWTH_END`) is the hard limit past which the image would link over the trussed filesystem. Headroom here is deliberate and finite — the next raise is a decision, not an accident, which is why the reason is recorded next to the number in `.github/workflows/ci.yml` and in `platform/src/flashmap.rs`.
+
 
 **Date: 2026-10-16 (flash ratchet raised 1680 → 1696 KiB, by `raise_flash_budget.py`).**
 
