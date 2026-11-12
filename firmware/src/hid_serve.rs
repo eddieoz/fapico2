@@ -4541,13 +4541,15 @@ pub(crate) mod tests {
 
         // Pass 1: INIT; Pass 2: a command in the reserved vendor range that
         // names no method this device serves (a client expecting NIP-04
-        // shared-secret semantics would land here).
+        // shared-secret semantics would land here). US-1842: the example
+        // byte moved — 0x50 now maps to GET_AUDIT, so the unsupported
+        // example is 0x51, the byte the wire test pins unmapped.
         bus_n.lock().unwrap().inbound.extend(frame(bc, CTAP_HID_INIT, &[0u8; 8]));
         block_on(
             "US-1662: the INIT pass",
             dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
         );
-        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x50, &encode_request(0, &[]).unwrap()));
+        bus_n.lock().unwrap().inbound.extend(frame(ch, 0x51, &encode_request(0, &[]).unwrap()));
         block_on(
             "US-1662: the unsupported-method pass",
             dual_pass(&mut srv_f, &mut io_f, &mut app, &mut slot_f, &mut srv_n, &mut vend, &mut io_n, &mut slot_n),
@@ -4555,7 +4557,7 @@ pub(crate) mod tests {
 
         let nostr_sent = bus_n.lock().unwrap().sent.clone();
         assert_eq!(nostr_sent.len(), 2);
-        assert_eq!(nostr_sent[1].cmd, 0x50, "answered on the method's own byte");
+        assert_eq!(nostr_sent[1].cmd, 0x51, "answered on the method's own byte");
         assert_ne!(nostr_sent[1].cmd, CTAP_HID_ERROR, "the framing is fine — the method is what is refused");
         let (sw, data) = decode_response(&nostr_sent[1].payload).unwrap();
         assert_eq!(sw, 0x6D00, "SW_INS_NOT_SUPPORTED — the unsupported-method word");

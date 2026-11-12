@@ -168,6 +168,14 @@ pub const INS_CEREMONY_START: u8 = 0x1E;
 /// touch gates.
 pub const INS_SET_TOUCH_POLICY: u8 = 0x1F;
 
+/// US-1842: `GET_AUDIT` — the bypass ring's only wire read. P1 = P2 = 0, no
+/// payload; the body is `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE),
+/// digest(16) }` (22 bytes per record, oldest first). Gated: a PIN-set board
+/// with a closed session answers [`SW_PIN_SESSION_REQUIRED`] — a sessionless
+/// host learns nothing, not even the budget — and a PIN-less board answers
+/// honestly empty, because the bypass can never have been armed there.
+pub const INS_GET_AUDIT: u8 = 0x20;
+
 /// The PIN retry budget, reset to this on every successful verify — the
 /// OATH precedent (`MAX_OTP_COUNTER = 3`): a durable budget makes guessing
 /// cost something a power cycle cannot refund.
@@ -2035,6 +2043,44 @@ impl NostrApp {
         }
     }
 
+    /// US-1842: `GET_AUDIT` (INS `0x20`, P1 = P2 = 0, no payload) — the
+    /// bypass ring's only wire read, and the first *read* the PIN-session
+    /// gate covers: the ring is session-adjacent state, and a sessionless
+    /// host learns nothing from it, not even the budget. The body is
+    /// `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE), digest(16) }`,
+    /// count-first like [`Self::list_keys`]' staging, oldest first. A
+    /// PIN-less board answers honestly empty — the bypass can never have
+    /// been armed there — and a locked session closes the read with it
+    /// (US-1838: the ring dies with the session).
+    fn get_audit(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        resp: &mut HeaplessVec<u8, MAX_RESPONSE>,
+    ) {
+        if p1 != 0x00 || p2 != 0x00 {
+            write_sw(resp, SW_WRONG_P1_P2);
+            return;
+        }
+        if !refuse_payload(data, resp) {
+            return;
+        }
+        if self.pin_set && !self.pin_unlocked {
+            write_sw(resp, SW_PIN_SESSION_REQUIRED);
+            return;
+        }
+        resp.push(self.bypass_budget).ok();
+        resp.push(self.bypass_audit.len() as u8).ok();
+        for record in &self.bypass_audit {
+            resp.push(record.op).ok();
+            resp.push(record.idx).ok();
+            resp.extend_from_slice(&record.ts_ms.to_be_bytes()).ok();
+            resp.extend_from_slice(&record.digest).ok();
+        }
+        write_sw(resp, SW_OK);
+    }
+
     /// US-1714/US-1715: `CEREMONY_START` (INS `0x1E`, P1 = P2 = 0, no
     /// payload) — the explicit custody-migration ceremony. The response
     /// body is `migrated(2 BE) ‖ already(2 BE)`, the reseat report.
@@ -2409,6 +2455,7 @@ impl App for NostrApp {
             INS_LOCK => self.lock(p1, p2, data, resp),
             INS_CEREMONY_START => self.ceremony_start(p1, p2, data, resp),
             INS_SET_TOUCH_POLICY => self.set_touch_policy(p1, p2, data, resp),
+            INS_GET_AUDIT => self.get_audit(p1, p2, data, resp),
             INS_SET_PIN => {
                 if p1 == 0x01 {
                     self.change_pin(p1, p2, data, resp)
