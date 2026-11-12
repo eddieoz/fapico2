@@ -174,6 +174,49 @@ pub const PIN_MIN_LEN: usize = 6;
 /// The longest PIN, in bytes. Longer is `6A80`, never truncated.
 pub const PIN_MAX_LEN: usize = 64;
 
+/// US-1838: how many operations one bypass session may run before the
+/// device falls back to the touch. A spent budget is not an error — the
+/// next operation just needs the press again, which is the same fail-closed
+/// fallback the Passport signer's policy model uses for a failed rule match
+/// (`docs/passport-nostr-signer-comparison.md` §5). Fixed, not configurable:
+/// a configurable bypass is a bypass whose weakest configuration someone
+/// else gets to choose.
+pub const BYPASS_CAP: u8 = 32;
+/// US-1838: how long one bypass session lives, in milliseconds, measured
+/// from the arm press by the injected monotonic clock (US-1837). Past it
+/// the session is dead and the touch is required again.
+pub const BYPASS_SESSION_MS: u64 = 600_000;
+/// US-1838: how many bypassed operations the audit ring remembers. RAM-only
+/// beside the flag trio; the oldest record falls off when the ring is full.
+pub const BYPASS_AUDIT_DEPTH: usize = 16;
+
+/// US-1838: one bypassed operation's audit record — fixed-width, no heap,
+/// the fido `AuditRecord` ring's shape
+/// (`apps/fido/src/vendor41.rs:3768-3805`). Written only on the
+/// bypass-exempt path (a touched op already has its consent artifact);
+/// readable only through [`NostrApp::bypass_audit`] on the host or
+/// `GET_AUDIT` (US-1842) inside an open PIN session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditRecord {
+    /// What ran: [`OP_SIGN`], [`OP_NIP44_ENC`] or [`OP_NIP44_DEC`].
+    pub op: u8,
+    /// The identity index the operation ran against.
+    pub idx: u8,
+    /// The clock at operation time, truncated to u32 for record width —
+    /// the `PresenceCounters` convention (`firmware/src/presence.rs:280-284`).
+    pub ts_ms: u32,
+    /// SHA-256 over the request payload — the sighash for SIGN,
+    /// `peer ‖ payload` for ENC/DEC — truncated to 16 bytes.
+    pub digest: [u8; 16],
+}
+
+/// [`AuditRecord::op`] — SIGN.
+pub const OP_SIGN: u8 = 0;
+/// [`AuditRecord::op`] — NIP-44 encrypt.
+pub const OP_NIP44_ENC: u8 = 1;
+/// [`AuditRecord::op`] — NIP-44 decrypt.
+pub const OP_NIP44_DEC: u8 = 2;
+
 // ---------------------------------------------------------------------------
 // Status words (§2.2.0)
 //
@@ -538,6 +581,24 @@ pub struct NostrApp {
     /// anonymous to the PIN. Default `false` — touch enabled — at every
     /// boot.
     touch_bypass: bool,
+    /// US-1838: the bypass accounting — how much the armed session may
+    /// still do, when it was armed, and what it did. RAM-only beside
+    /// `touch_bypass` (same shared `Mutex`, same lifetime rules): every
+    /// clearer of the flag clears these with it, and deselect/re-select
+    /// preserve them (US-1745's rows apply to the whole privilege).
+    /// `bypass_budget == 0` *means* "not armed"; arming sets [`BYPASS_CAP`]
+    /// and stamps `bypass_armed_at_ms` from the clock seam (US-1837).
+    bypass_budget: u8,
+    /// US-1838: the clock at the arm press. `0` when nothing is armed —
+    /// which is why arming at a clock reading of 0 is indistinguishable
+    /// from unarmed until the budget is spent; the expiry leg (US-1840)
+    /// treats the *pair* as the truth, and the budget is the live half.
+    bypass_armed_at_ms: u64,
+    /// US-1838: what the armed session did — one [`AuditRecord`] per
+    /// bypass-exempt operation, oldest falling off at
+    /// [`BYPASS_AUDIT_DEPTH`]. Read on the host via [`NostrApp::bypass_audit`],
+    /// on the wire via `GET_AUDIT` (US-1842) inside an open PIN session.
+    bypass_audit: HeaplessVec<AuditRecord, BYPASS_AUDIT_DEPTH>,
     /// US-1714: the custody OTP leg — what the ceremony may ask of the OTP
     /// controller (assess, burn, derive) and nothing more. `&'static dyn`
     /// because the OTP controller is a singleton the firmware owns for the
@@ -606,6 +667,9 @@ impl NostrApp {
             pin_set: false,
             pin_unlocked: false,
             touch_bypass: false,
+            bypass_budget: 0,
+            bypass_armed_at_ms: 0,
+            bypass_audit: HeaplessVec::new(),
             custody_otp: None,
             custody: CustodyHealth::Unknown,
             region_source: None,
@@ -642,6 +706,9 @@ impl NostrApp {
                 pin_set: false,
                 pin_unlocked: false,
                 touch_bypass: false,
+                bypass_budget: 0,
+                bypass_armed_at_ms: 0,
+                bypass_audit: HeaplessVec::new(),
                 custody_otp: None,
                 custody: CustodyHealth::Unknown,
                 region_source: None,
@@ -657,6 +724,9 @@ impl NostrApp {
             pin_set,
             pin_unlocked: false,
             touch_bypass: false,
+            bypass_budget: 0,
+            bypass_armed_at_ms: 0,
+            bypass_audit: HeaplessVec::new(),
             custody_otp: None,
             custody: CustodyHealth::Unknown,
             region_source: None,
@@ -736,9 +806,33 @@ impl NostrApp {
     /// is set only by `SET_TOUCH_POLICY`'s disable leg (US-1743: open PIN
     /// session plus a physical press), and the verb does not exist yet when
     /// the state stories run, so the tests arm the flag through this seam.
+    /// US-1838: arming is the whole privilege — the budget fills to
+    /// [`BYPASS_CAP`] and the timestamp is stamped from the wired clock
+    /// (US-1837); disarming drops the flag **and** the accounting, because
+    /// a flag that is down has nothing to account for.
     #[cfg(feature = "host")]
     pub fn set_touch_bypass(&mut self, on: bool) {
-        self.touch_bypass = on;
+        if on {
+            self.touch_bypass = true;
+            self.bypass_budget = BYPASS_CAP;
+            self.bypass_armed_at_ms = (self.now_provider)();
+        } else {
+            self.clear_bypass_session();
+        }
+    }
+
+    /// US-1838: drop the whole bypass privilege — flag, budget, timestamp
+    /// and ring, in one place, so no clearer of the flag can forget the
+    /// accounting (the US-1745 failure mode: a stale privilege surviving a
+    /// session close). Called from every site that cleared the bare flag
+    /// before this epic: LOCK, a failed verify, the factory wipe, the
+    /// first-process boot substitute, and the `boot` constructors start the
+    /// fields down directly.
+    fn clear_bypass_session(&mut self) {
+        self.touch_bypass = false;
+        self.bypass_budget = 0;
+        self.bypass_armed_at_ms = 0;
+        self.bypass_audit.clear();
     }
 
     /// US-1837: read the wired clock. Host-only, for the same reason the
@@ -748,6 +842,29 @@ impl NostrApp {
     #[cfg(feature = "host")]
     pub fn now_ms(&self) -> u64 {
         (self.now_provider)()
+    }
+
+    /// US-1838: read the armed session's remaining budget. Host-only — the
+    /// device-visible view is `GET_AUDIT` (US-1842), which reports the same
+    /// field; a second device-side read would be the divergent source of
+    /// truth §4 forbids. `0` means "not armed".
+    #[cfg(feature = "host")]
+    pub fn bypass_budget(&self) -> u8 {
+        self.bypass_budget
+    }
+
+    /// US-1838: read the armed session's timestamp. Host-only — the pairing
+    /// of [`NostrApp::bypass_budget`]'s note applies.
+    #[cfg(feature = "host")]
+    pub fn bypass_armed_at_ms(&self) -> u64 {
+        self.bypass_armed_at_ms
+    }
+
+    /// US-1838: read the audit ring, oldest first. Host-only — the
+    /// device-visible view is `GET_AUDIT` (US-1842).
+    #[cfg(feature = "host")]
+    pub fn bypass_audit(&self) -> &[AuditRecord] {
+        &self.bypass_audit
     }
 
     /// The in-place form of the three builders, for the one caller that
@@ -984,7 +1101,7 @@ impl NostrApp {
         // Destructure once: the store borrow must coexist with the RNG pool
         // draw, and disjoint field borrows compose where a `&mut self`
         // method call would not.
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
 
         // State before the touch (see the doc comment).
@@ -1082,7 +1199,7 @@ impl NostrApp {
         }
         // IMPORT_KEY draws nothing: the scalar is the host's, and its
         // validity is checked above.
-        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         match writability(&mut store, p1 as u16) {
             Ok(true) => {}
@@ -1128,7 +1245,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1200,7 +1317,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1372,7 +1489,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1439,7 +1556,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, bypass_budget: _, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         // Classify after the form check: a corrupt slot (our tag, a body
         // that will not open) destroys through force_tombstone with no
@@ -1732,8 +1849,10 @@ impl NostrApp {
         // surviving it would let the next VERIFY silently resurrect a
         // touch-free session the user believes they closed. The success
         // arm keeps the flag — the session it was opened in still stands.
+        // US-1838: "the bypass" is the whole privilege now — the accounting
+        // dies with the session, not just the flag.
         if !unlocked {
-            self.touch_bypass = false;
+            self.clear_bypass_session();
         }
     }
 
@@ -1767,7 +1886,8 @@ impl NostrApp {
         // US-1745: the bypass is a session privilege — a stale bypass
         // surviving a lock would mean the next VERIFY silently resurrects
         // a touch-free session the user believes they closed.
-        self.touch_bypass = false;
+        // US-1838: the accounting dies with it.
+        self.clear_bypass_session();
         write_sw(resp, SW_OK);
     }
 
@@ -1798,8 +1918,11 @@ impl NostrApp {
         match p1 {
             // Enable (US-1744): the safe direction — no gate, no grant, no
             // store access, byte-identical reply whatever the board state.
+            // US-1838: re-enabling the touch drops the whole privilege —
+            // an armed-but-unused accounting must not outlive the flag it
+            // belongs to.
             0x00 => {
-                self.touch_bypass = false;
+                self.clear_bypass_session();
                 write_sw(resp, SW_OK);
             }
             // Disable (US-1743): shape → PIN gate → touch → execute. The
@@ -2110,7 +2233,8 @@ impl App for NostrApp {
         self.pin_unlocked = false;
         // US-1745: the flag dies with the wipe — stale "set" would be the
         // lie, the same shape as the pin caches reset beside it.
-        self.touch_bypass = false;
+        // US-1838: the accounting dies with it.
+        self.clear_bypass_session();
     }
 
     /// Dispatch the §2.2 wire table. Unimplemented arms are the US-1642
@@ -2142,13 +2266,27 @@ impl App for NostrApp {
         // writes its own word through the dispatch below, and the cache
         // stays where the fail-closed construction left it.
         if self.region.is_none() {
-            let Self { region, provider, pin_set, pin_unlocked, touch_bypass, .. } = self;
+            let Self {
+                region,
+                provider,
+                pin_set,
+                pin_unlocked,
+                touch_bypass,
+                bypass_budget,
+                bypass_armed_at_ms,
+                bypass_audit,
+                ..
+            } = self;
             if let Some(mut store) = try_attach(region, provider) {
                 *pin_set = pin_boot_classification(store.read_pin());
                 *pin_unlocked = false;
                 // US-1741: the first process call is the boot substitute —
                 // the RAM flag comes up down, exactly as `boot` leaves it.
+                // US-1838: and the accounting comes up down with it.
                 *touch_bypass = false;
+                *bypass_budget = 0;
+                *bypass_armed_at_ms = 0;
+                bypass_audit.clear();
             }
         }
         // Header guard first: a sub-4-byte APDU would index `apdu[2]`/
