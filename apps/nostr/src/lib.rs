@@ -62,6 +62,9 @@ use fapico2_platform::dispatch::{
     SW_OK, SW_WRONG_LENGTH,
 };
 use heapless::Vec as HeaplessVec;
+// US-1841: the audit digest. The trait must be in scope for
+// `Sha256::digest`; the hash itself runs only on the bypass-exempt path.
+use sha2::Digest as _;
 
 /// Nostr applet AID (EPIC design §2.1).
 ///
@@ -1292,6 +1295,12 @@ impl NostrApp {
                 write_sw(resp, SW_OK);
                 if bypassed {
                     *bypass_budget = bypass_budget.saturating_sub(1);
+                    // US-1841: one record per bypassed op — op, identity, the
+                    // clock (truncated to u32, the PresenceCounters
+                    // convention) and a truncated digest of the request
+                    // payload (the sighash).
+                    let full = sha2::Sha256::digest(data);
+                    push_audit(bypass_audit, OP_SIGN, p1, now as u32, full[..16].try_into().expect("16 of 32"));
                 }
             }
             // A stored scalar that would not sign is a record this device
@@ -1403,6 +1412,11 @@ impl NostrApp {
                 write_sw(resp, SW_OK);
                 if bypassed {
                     *bypass_budget = bypass_budget.saturating_sub(1);
+                    // US-1841: the digest covers `peer ‖ plaintext` — the
+                    // whole request payload, so a record identifies the
+                    // counterpart and the content together.
+                    let full = sha2::Sha256::digest(data);
+                    push_audit(bypass_audit, OP_NIP44_ENC, p1, now as u32, full[..16].try_into().expect("16 of 32"));
                 }
             }
             // Unreachable under the caps above; a fault beats a wrong answer.
@@ -1514,6 +1528,10 @@ impl NostrApp {
                 write_sw(resp, SW_OK);
                 if bypassed {
                     *bypass_budget = bypass_budget.saturating_sub(1);
+                    // US-1841: the digest covers `sender ‖ payload` — the
+                    // whole request payload.
+                    let full = sha2::Sha256::digest(data);
+                    push_audit(bypass_audit, OP_NIP44_DEC, p1, now as u32, full[..16].try_into().expect("16 of 32"));
                 }
             }
             Err(_) => {
@@ -2430,6 +2448,25 @@ fn parse_data(apdu: &[u8]) -> Result<&[u8], Sw> {
         return Err(SW_WRONG_DATA);
     }
     Ok(&apdu[5..5 + lc])
+}
+
+/// US-1841: append one [`AuditRecord`] to a bypass ring, oldest falling off
+/// at [`BYPASS_AUDIT_DEPTH`]. A free function because the signing guards
+/// hold `self` in field borrows through the response write — a `&mut self`
+/// call there would fight the borrow of `region`. Called only from the
+/// bypass-exempt path: a touched operation already has its consent
+/// artifact, and the ring is bypass accounting, not an operation log.
+fn push_audit(
+    ring: &mut HeaplessVec<AuditRecord, BYPASS_AUDIT_DEPTH>,
+    op: u8,
+    idx: u8,
+    ts_ms: u32,
+    digest: [u8; 16],
+) {
+    if ring.len() == BYPASS_AUDIT_DEPTH {
+        ring.remove(0);
+    }
+    let _ = ring.push(AuditRecord { op, idx, ts_ms, digest });
 }
 
 fn write_sw(resp: &mut HeaplessVec<u8, MAX_RESPONSE>, sw: Sw) {

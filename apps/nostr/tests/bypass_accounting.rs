@@ -16,7 +16,8 @@
 use fapico2_nostr::{
     crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, BYPASS_SESSION_MS,
     INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN, INS_SIGN,
-    INS_VERIFY_PIN, SW_PIN_SESSION_REQUIRED, SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
+    INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_SESSION_REQUIRED,
+    SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -469,5 +470,130 @@ fn re_arming_while_live_also_resets_the_budget() {
     assert_eq!(sw, SW_OK, "the verb's press re-arms");
     assert_eq!(app.bypass_budget(), BYPASS_CAP, "the budget is whole again");
     assert_eq!(app.bypass_armed_at_ms(), 100, "the stamp is the new clock value");
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1841 — the audit ring
+// ---------------------------------------------------------------------------
+
+/// SHA-256 over the request payload, truncated to 16 — the record digest the
+/// arms write. Mirrored here so the tests verify the *value*, not the code.
+fn digest16(data: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let full = Sha256::digest(data);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+/// **Each bypassed SIGN appends one record** — op, identity index, the
+/// clock at operation time, and the digest of what was signed.
+#[test]
+fn each_bypassed_sign_appends_one_record() {
+    let (mut app, path) = pin_app("ring-sign");
+    let mut app = app
+        .with_presence_grant(counting_deny)
+        .with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    for i in 0..3u8 {
+        advance(10);
+        let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[i.wrapping_add(0x40); 32]));
+        assert_eq!(sw, SW_OK, "bypassed SIGN #{i}");
+    }
+    let ring = app.bypass_audit();
+    assert_eq!(ring.len(), 3, "one record per bypassed op");
+    for (i, r) in ring.iter().enumerate() {
+        let i = i as u8;
+        assert_eq!(r.op, OP_SIGN, "op tag");
+        assert_eq!(r.idx, 1, "identity index");
+        assert_eq!(r.ts_ms, (i as u32 + 1) * 10, "the clock at op time");
+        assert_eq!(
+            r.digest,
+            digest16(&[i.wrapping_add(0x40); 32]),
+            "the digest of what was signed"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The touched 33rd writes no record** — a touched op already has its
+/// consent artifact; the ring is bypass accounting, not an operation log.
+#[test]
+fn the_touched_33rd_writes_no_record() {
+    let (mut app, path) = pin_app("ring-touched");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    for _ in 0..BYPASS_CAP {
+        call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    }
+    assert_eq!(app.bypass_audit().len(), BYPASS_AUDIT_DEPTH, "ring full");
+    let mut app = app.with_presence_grant(counting_allow);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_OK, "the press grants");
+    assert_eq!(
+        app.bypass_audit().len(),
+        BYPASS_AUDIT_DEPTH,
+        "the touched op wrote no record"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **The ring overwrites the oldest** — 17 bypassed operations leave 16
+/// records, and the oldest survivor is operation #1's (zero-indexed #0
+/// fell off).
+#[test]
+fn the_ring_overwrites_the_oldest() {
+    let (mut app, path) = pin_app("ring-overwrite");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    for i in 0..17u8 {
+        let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[i.wrapping_add(0x40); 32]));
+        assert_eq!(sw, SW_OK, "bypassed SIGN #{i}");
+    }
+    let ring = app.bypass_audit();
+    assert_eq!(ring.len(), BYPASS_AUDIT_DEPTH, "16 survivors");
+    assert_ne!(
+        ring[0].digest,
+        digest16(&[0x40; 32]),
+        "operation #0 fell off"
+    );
+    assert_eq!(
+        ring[0].digest,
+        digest16(&[0x41; 32]),
+        "operation #1 is the oldest survivor"
+    );
+    assert_eq!(
+        ring[15].digest,
+        digest16(&[0x50; 32]),
+        "operation #16 is the newest"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **ENC and DEC records carry their op tags and payload digests** — the
+/// whole request payload is digested (`peer ‖ plaintext` / `peer ‖ payload`),
+/// so a record identifies both the counterpart and the content.
+#[test]
+fn enc_and_dec_records_carry_their_op_tags_and_payload_digests() {
+    let (mut app, path) = pin_app("ring-encdec");
+    let mut app = app
+        .with_presence_grant(counting_deny)
+        .with_rng_provider(|out| out.fill(0x42))
+        .with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    let plaintext = b"audited conversation";
+    let (ct, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu_nip44_decrypt(1, &ct));
+    assert_eq!(sw, SW_OK);
+    let ring = app.bypass_audit();
+    assert_eq!(ring.len(), 2);
+    assert_eq!(ring[0].op, OP_NIP44_ENC);
+    let enc_payload: Vec<u8> = peer_x().iter().copied().chain(plaintext.iter().copied()).collect();
+    assert_eq!(ring[0].digest, digest16(&enc_payload));
+    assert_eq!(ring[1].op, OP_NIP44_DEC);
+    let dec_payload: Vec<u8> = peer_x().iter().copied().chain(ct.iter().copied()).collect();
+    assert_eq!(ring[1].digest, digest16(&dec_payload));
     std::fs::remove_file(&path).ok();
 }
