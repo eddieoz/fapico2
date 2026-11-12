@@ -42,7 +42,6 @@ thread_local! {
 /// A bare applet with no clock wired reads `0` — and `0` is a legal value,
 /// not an error (the fido audit ring's caller-owned clock).
 #[test]
-#[ignore = "RED (US-1837): with_now_provider and now_ms do not exist yet"]
 fn default_clock_reads_zero() {
     let app = NostrApp::new();
     assert_eq!(app.now_ms(), 0, "no clock wired reads zero, honestly");
@@ -51,7 +50,6 @@ fn default_clock_reads_zero() {
 /// An injected provider is returned verbatim — the applet is a conduit for
 /// the caller's clock, never a second source of truth.
 #[test]
-#[ignore = "RED (US-1837): with_now_provider and now_ms do not exist yet"]
 fn injected_clock_is_returned_verbatim() {
     let app = NostrApp::new().with_now_provider(|| 12_345);
     assert_eq!(app.now_ms(), 12_345, "the injected clock is the clock");
@@ -60,7 +58,6 @@ fn injected_clock_is_returned_verbatim() {
 /// The clock advances between reads — a fake that never moves would make
 /// every later expiry test vacuous.
 #[test]
-#[ignore = "RED (US-1837): with_now_provider and now_ms do not exist yet"]
 fn clock_advances_between_reads() {
     let app = NostrApp::new().with_now_provider(fake_now);
     let first = app.now_ms();
