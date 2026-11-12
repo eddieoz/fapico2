@@ -544,7 +544,7 @@ fn the_touched_33rd_writes_no_record() {
 /// fell off).
 #[test]
 fn the_ring_overwrites_the_oldest() {
-    let (mut app, path) = pin_app("ring-overwrite");
+    let (app, path) = pin_app("ring-overwrite");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for i in 0..17u8 {
@@ -576,7 +576,7 @@ fn the_ring_overwrites_the_oldest() {
 /// so a record identifies both the counterpart and the content.
 #[test]
 fn enc_and_dec_records_carry_their_op_tags_and_payload_digests() {
-    let (mut app, path) = pin_app("ring-encdec");
+    let (app, path) = pin_app("ring-encdec");
     let mut app = app
         .with_presence_grant(counting_deny)
         .with_rng_provider(|out| out.fill(0x42))
@@ -684,4 +684,36 @@ fn lock_closes_the_read_along_with_the_session() {
     let (_, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
     assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "the read died with the session");
     std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1843 — the capability bit
+// ---------------------------------------------------------------------------
+
+/// **GET_INFO advertises the accounting** on both board shapes — the caps
+/// bit is unconditional (the verb is served whatever the PIN state), the
+/// flags byte is unchanged (bit 3 already carries the live state, and the
+/// US-1840 lazy clear keeps it truthful), and `APPLET_VERSION` is
+/// untouched: a command added is not a layout change.
+#[test]
+fn get_info_advertises_bypass_accounting_on_both_board_shapes() {
+    use fapico2_nostr::{APPLET_VERSION, CAPS, CAP_BYPASS_ACCOUNTING};
+    assert_eq!(CAPS & CAP_BYPASS_ACCOUNTING, CAP_BYPASS_ACCOUNTING);
+    for tag in ["caps-pin", "caps-nopin"] {
+        let path = region_path(tag);
+        std::fs::remove_file(&path).ok();
+        let mut app = NostrApp::boot(fixture_region(&path));
+        if tag == "caps-pin" {
+            let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0x00, b"731742"));
+            assert_eq!(sw, SW_OK);
+        }
+        let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0x00, &[]));
+        assert_eq!(sw, SW_OK);
+        assert_eq!(u16::from_be_bytes([data[2], data[3]]), CAPS, "the advertised caps");
+        assert_eq!(&data[0..2], APPLET_VERSION.as_slice(), "version unchanged");
+        // The flags byte: bit 3 is FLAG_TOUCH_BYPASS and is down here (the
+        // session is not armed); the layout is otherwise the US-1714 shape.
+        assert_eq!(data[7] & !0x08, 0, "no new flag bits — the byte's layout is closed");
+        std::fs::remove_file(&path).ok();
+    }
 }
