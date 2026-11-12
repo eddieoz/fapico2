@@ -15,8 +15,8 @@
 
 use fapico2_nostr::{
     crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, BYPASS_SESSION_MS,
-    INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN, INS_SIGN,
-    INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_SESSION_REQUIRED,
+    INS_GET_AUDIT, INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN,
+    INS_SIGN, INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_SESSION_REQUIRED,
     SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
@@ -595,5 +595,93 @@ fn enc_and_dec_records_carry_their_op_tags_and_payload_digests() {
     assert_eq!(ring[1].op, OP_NIP44_DEC);
     let dec_payload: Vec<u8> = peer_x().iter().copied().chain(ct.iter().copied()).collect();
     assert_eq!(ring[1].digest, digest16(&dec_payload));
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1842 — the GET_AUDIT verb
+// ---------------------------------------------------------------------------
+
+/// The wire body: `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE),
+/// digest(16) }`. Mirrored here so the tests verify the *shape*, not the
+/// code.
+fn parse_audit_body(data: &[u8]) -> (u8, Vec<AuditRecord>) {
+    let budget = data[0];
+    let n = data[1] as usize;
+    let mut records = Vec::new();
+    for i in 0..n {
+        let b = &data[2 + i * 22..2 + (i + 1) * 22];
+        records.push(AuditRecord {
+            op: b[0],
+            idx: b[1],
+            ts_ms: u32::from_be_bytes([b[2], b[3], b[4], b[5]]),
+            digest: b[6..22].try_into().expect("a 16-byte digest"),
+        });
+    }
+    (budget, records)
+}
+
+/// **A closed session is refused** — the ring is session-adjacent state:
+/// the read rides the same gate the secret operations do, so a sessionless
+/// host learns nothing, not even the budget.
+#[test]
+fn a_closed_session_is_refused() {
+    let (app, path) = app_with_identity("audit-closed");
+    let mut app = app.with_rng_provider(|out| out.fill(0x5A));
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0x00, b"731742"));
+    assert_eq!(sw, SW_OK, "the fixture's PIN sets");
+    // No VERIFY — the session is closed.
+    let (_, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "a sessionless host learns nothing");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **An open session reads budget and records** — the body is
+/// `budget ‖ n ‖ records`, well-formed, matching what the arms wrote.
+#[test]
+fn an_open_session_reads_budget_and_records() {
+    let (mut app, path) = pin_app("audit-read");
+    app.set_touch_bypass(true);
+    advance(10);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x41; 32]));
+    advance(10);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x42; 32]));
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, records) = parse_audit_body(&data);
+    assert_eq!(budget, BYPASS_CAP - 2, "the budget is the session's");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].op, OP_SIGN);
+    assert_eq!(records[0].idx, 1);
+    assert_eq!(records[0].ts_ms, 10);
+    assert_eq!(records[0].digest, digest16(&[0x41; 32]));
+    assert_eq!(records[1].ts_ms, 20);
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A PIN-less board answers honestly empty** — the bypass can never have
+/// been armed there, so an empty ring is the truth, not a refusal.
+#[test]
+fn a_pin_less_board_answers_honestly_empty() {
+    let (mut app, path) = app_with_identity("audit-no-pin");
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, records) = parse_audit_body(&data);
+    assert_eq!(budget, 0);
+    assert!(records.is_empty(), "nothing to audit");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **LOCK closes the read along with the session** — the ring dies with the
+/// session (US-1838), and the read dies with it too.
+#[test]
+fn lock_closes_the_read_along_with_the_session() {
+    let (mut app, path) = pin_app("audit-lock");
+    app.set_touch_bypass(true);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    let (_, sw) = call(&mut app, &apdu(INS_LOCK, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (_, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_PIN_SESSION_REQUIRED, "the read died with the session");
     std::fs::remove_file(&path).ok();
 }

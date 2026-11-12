@@ -83,6 +83,10 @@ pub const NOSTR_CMD_CEREMONY_START: u8 = 0x4E;
 /// session. The envelope's idx field rides P1: `0` selects the enable leg
 /// (touch required again), `1` the disable leg (the consented press).
 pub const NOSTR_CMD_SET_TOUCH_POLICY: u8 = 0x4F;
+/// US-1842: the bypass ring's read verb — the audit view the extension
+/// renders (US-1846). No payload; the response body is the applet's
+/// `budget ‖ n ‖ records` (see `apps/nostr::INS_GET_AUDIT`).
+pub const NOSTR_CMD_GET_AUDIT: u8 = 0x50;
 
 /// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
 /// above the applet's `MAX_REQUEST_ARG` is decodable, so every vendor arm
@@ -124,9 +128,10 @@ pub fn is_vendor_command(cmd: u8) -> bool {
 /// SW_INS_NOT_SUPPORTED`] — the D20 refusal — rather than a framing fault.
 pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
     use fapico2_nostr::{
-        INS_CEREMONY_START, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_INFO, INS_GET_PUBKEY,
-        INS_IMPORT_KEY, INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT,
-        INS_SET_LABEL, INS_SET_PIN, INS_SET_TOUCH_POLICY, INS_SIGN, INS_VERIFY_PIN,
+        INS_CEREMONY_START, INS_DELETE_KEY, INS_GENERATE_KEY, INS_GET_AUDIT, INS_GET_INFO,
+        INS_GET_PUBKEY, INS_IMPORT_KEY, INS_LIST_KEYS, INS_LOCK, INS_NIP44_DECRYPT,
+        INS_NIP44_ENCRYPT, INS_SET_LABEL, INS_SET_PIN, INS_SET_TOUCH_POLICY, INS_SIGN,
+        INS_VERIFY_PIN,
     };
     let ins = match cmd {
         NOSTR_CMD_PING => INS_GET_INFO,
@@ -144,6 +149,7 @@ pub fn vendor_to_ins(cmd: u8) -> Option<u8> {
         NOSTR_CMD_LOCK => INS_LOCK,
         NOSTR_CMD_CEREMONY_START => INS_CEREMONY_START,
         NOSTR_CMD_SET_TOUCH_POLICY => INS_SET_TOUCH_POLICY,
+        NOSTR_CMD_GET_AUDIT => INS_GET_AUDIT,
         _ => return None,
     };
     Some(ins)
@@ -494,9 +500,7 @@ mod tests {
     /// next free byte after the ceremony's `0x4E` — mapped to the applet's
     /// `INS_SET_TOUCH_POLICY` (`0x1F`). The leg selection rides the
     /// envelope's idx field onto P1 (the SET_PIN precedent): `[0, b""]` is
-    /// the enable leg, `[1, b""]` the disable leg. `0x50` stays unmapped —
-    /// the in-band refusal for an unmapped byte on the HID arm is the
-    /// standing `vendor_range_and_method_mapping` row.
+    /// the enable leg, `[1, b""]` the disable leg.
     #[test]
     fn set_touch_policy_maps_to_the_policy_ins() {
         assert_eq!(
@@ -510,6 +514,19 @@ mod tests {
             Some((0x01, &[][..])),
             "the leg rides P1 through the envelope, arg intact and empty"
         );
+    }
+
+    /// US-1842: `GET_AUDIT` (`0x50` → `INS 0x20`) — the ring's read verb.
+    /// `0x51` stays unmapped — the in-band refusal for an unmapped byte on
+    /// the HID arm is the standing `vendor_range_and_method_mapping` row.
+    #[test]
+    fn get_audit_maps_to_the_audit_ins() {
+        assert_eq!(
+            vendor_to_ins(0x50),
+            Some(0x20),
+            "0x50 maps to the applet's GET_AUDIT"
+        );
+        assert_eq!(vendor_to_ins(0x51), None, "0x51 stays unmapped");
     }
 
     /// US-1699: the retired `EXPORT_KEY` vendor byte is an **unsupported
@@ -718,8 +735,9 @@ mod tests {
         assert_eq!(vendor_to_ins(NOSTR_CMD_PING), Some(fapico2_nostr::INS_GET_INFO));
         assert_eq!(vendor_to_ins(NOSTR_CMD_SIGN), Some(fapico2_nostr::INS_SIGN));
         assert_eq!(vendor_to_ins(NOSTR_CMD_NIP44_DECRYPT), Some(fapico2_nostr::INS_NIP44_DECRYPT));
+        assert_eq!(vendor_to_ins(NOSTR_CMD_GET_AUDIT), Some(fapico2_nostr::INS_GET_AUDIT));
         assert_eq!(vendor_to_ins(0x7F), None);
-        assert_eq!(vendor_to_ins(0x50), None);
+        assert_eq!(vendor_to_ins(0x51), None);
         // And the refusal is the vocabulary crossing, not a CTAPHID fault:
         // the caller encodes it as any other sw.
         let mut out = HeaplessVec::new();
