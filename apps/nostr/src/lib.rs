@@ -501,6 +501,18 @@ pub struct NostrApp {
     /// it). `None` ⇒ [`default_user_present`] — deny on device, auto-ack on
     /// host — the rescue applet's shape.
     presence_grant: Option<fn(u32) -> bool>,
+    /// US-1837: the monotonic millisecond clock, as an injected `fn` — the
+    /// RNG seam's shape, because the `App` trait has no time and the applet
+    /// must not grow a time dependency to learn how long a session has run.
+    /// Default reads `0`, and `0` is a legal value, not an error: the fido
+    /// audit ring's `uptime_ms` convention ("the clock is the caller's",
+    /// `apps/fido/src/vendor41.rs`). The device wires `tasks.rs::now_ms`,
+    /// the emulator its virtual clock (US-1844), the tests a fake. The only
+    /// consumer is the bypass accounting (US-1840's expiry); a clock that
+    /// never moves can only make the bypass *never expire*, which is the
+    /// pre-epic behavior — the seam cannot invent a session limit the
+    /// caller did not supply.
+    now_provider: fn() -> u64,
     /// PIN custody, cached: a PIN record exists in the PIN slot
     /// (US-1689/US-1690's slot 919). Derived from the store at boot —
     /// **fail-closed**: an Undecodable or unreadable record counts as set,
@@ -590,6 +602,7 @@ impl NostrApp {
             provider: None,
             rng: None,
             presence_grant: None,
+            now_provider: zero_now,
             pin_set: false,
             pin_unlocked: false,
             touch_bypass: false,
@@ -625,6 +638,7 @@ impl NostrApp {
                 provider: None,
                 rng: None,
                 presence_grant: None,
+                now_provider: zero_now,
                 pin_set: false,
                 pin_unlocked: false,
                 touch_bypass: false,
@@ -639,6 +653,7 @@ impl NostrApp {
             provider: None,
             rng: None,
             presence_grant: None,
+            now_provider: zero_now,
             pin_set,
             pin_unlocked: false,
             touch_bypass: false,
@@ -695,6 +710,17 @@ impl NostrApp {
         self
     }
 
+    /// Register the monotonic millisecond clock (US-1837). A capture-free
+    /// `fn` pointer, like every provider seam: the device hands
+    /// `tasks.rs::now_ms`, the emulator its virtual clock, the tests a fake.
+    /// Unwired, the applet reads [`zero_now`] — `0` is a legal value, and a
+    /// clock that never moves can only mean the bypass never expires, which
+    /// is the behavior the world had before accounting existed.
+    pub fn with_now_provider(mut self, now: fn() -> u64) -> Self {
+        self.now_provider = now;
+        self
+    }
+
     /// US-1741: read the touch-bypass flag. Host-only — the device-visible
     /// view of this state is GET_INFO's `FLAG_TOUCH_BYPASS` (US-1746), which
     /// derives from the same field, and a second device-side read would be
@@ -713,6 +739,15 @@ impl NostrApp {
     #[cfg(feature = "host")]
     pub fn set_touch_bypass(&mut self, on: bool) {
         self.touch_bypass = on;
+    }
+
+    /// US-1837: read the wired clock. Host-only, for the same reason the
+    /// state accessors above are: the device-visible view of time is nothing
+    /// — time is an input, not state — and this accessor exists so the
+    /// accounting stories can assert the seam's semantics from a test.
+    #[cfg(feature = "host")]
+    pub fn now_ms(&self) -> u64 {
+        (self.now_provider)()
     }
 
     /// The in-place form of the three builders, for the one caller that
@@ -949,7 +984,7 @@ impl NostrApp {
         // Destructure once: the store borrow must coexist with the RNG pool
         // draw, and disjoint field borrows compose where a `&mut self`
         // method call would not.
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
 
         // State before the touch (see the doc comment).
@@ -1047,7 +1082,7 @@ impl NostrApp {
         }
         // IMPORT_KEY draws nothing: the scalar is the host's, and its
         // validity is checked above.
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         match writability(&mut store, p1 as u16) {
             Ok(true) => {}
@@ -1093,7 +1128,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1165,7 +1200,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1337,7 +1372,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1404,7 +1439,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng: _, presence_grant, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng: _, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass: _, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         // Classify after the form check: a corrupt slot (our tag, a body
         // that will not open) destroys through force_tombstone with no
@@ -2386,6 +2421,16 @@ fn default_user_present() -> bool {
     {
         true
     }
+}
+
+/// The unwired clock (US-1837): reads `0` forever. `0` is a legal value —
+/// the fido audit ring's caller-owned `uptime_ms` convention — and a clock
+/// that never moves can only mean the bypass never expires, which is the
+/// behavior the world had before accounting existed. The device and the
+/// emulator wire a real monotonic clock over [`NostrApp::with_now_provider`]
+/// (US-1844).
+fn zero_now() -> u64 {
+    0
 }
 
 /// The presence tag's domain bit (§2.3.1 requirement 2): bit 30, which
