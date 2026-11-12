@@ -14,9 +14,9 @@
 //! GET_AUDIT verb — each story's scenarios land here RED-first.
 
 use fapico2_nostr::{
-    crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, INS_LOCK, INS_NIP44_DECRYPT,
-    INS_NIP44_ENCRYPT, INS_SET_PIN, INS_SIGN, INS_VERIFY_PIN, SW_PIN_SESSION_REQUIRED,
-    SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
+    crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, BYPASS_SESSION_MS,
+    INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN, INS_SIGN,
+    INS_VERIFY_PIN, SW_PIN_SESSION_REQUIRED, SW_TOUCH_REQUIRED, SW_WRONG_P1_P2,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -83,6 +83,11 @@ fn apdu_nip44_decrypt(idx: u8, payload: &[u8]) -> HeaplessVec<u8, 300> {
     d.extend_from_slice(&peer_x());
     d.extend_from_slice(payload);
     apdu(INS_NIP44_DECRYPT, idx, &d)
+}
+
+/// The `SET_TOUCH_POLICY` verb — INS `0x1F`; P1 selects the leg.
+fn apdu_policy_verb(p1: u8) -> HeaplessVec<u8, 300> {
+    apdu(0x1F, p1, &[])
 }
 
 // ---------------------------------------------------------------------------
@@ -387,5 +392,82 @@ fn the_cap_counts_enc_and_dec_too() {
     let (_, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
     assert_eq!(sw, SW_TOUCH_REQUIRED, "the 33rd op costs a press");
     assert_eq!(presses(), 1, "the grant was consulted once");
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// US-1840 — the expiry
+// ---------------------------------------------------------------------------
+
+/// **Inside the window the bypass still exempts** — one millisecond before
+/// [`BYPASS_SESSION_MS`], the armed session runs grant-free.
+#[test]
+fn inside_the_window_the_bypass_still_exempts() {
+    let (mut app, path) = pin_app("exp-inside");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true); // armed at the clock's 0
+    advance(BYPASS_SESSION_MS - 1);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_OK, "the session lives until the deadline");
+    assert_eq!(presses(), 0, "no press inside the window");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Past the window the press is required and the flag is cleared** — the
+/// expiry is lazy but truthful: the guard clears the session at guard time,
+/// so the very next GET_INFO reports the bypass down.
+#[test]
+fn past_the_window_the_press_is_required_and_the_flag_is_cleared() {
+    let (mut app, path) = pin_app("exp-past");
+    let mut app = app.with_presence_grant(counting_deny);
+    app.set_touch_bypass(true);
+    advance(BYPASS_SESSION_MS);
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "an expired session costs a press");
+    assert_eq!(presses(), 1, "the grant was consulted once");
+    let (data, sw) = call(&mut app, &apdu(INS_GET_INFO, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    assert_eq!(
+        data[7] & 0x08,
+        0,
+        "GET_INFO no longer advertises the bypass — the lazy clear is truthful"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Re-arming after expiry resets the budget and the timestamp** — the
+/// expired session is gone, but the PIN session still stands, so the verb
+/// can arm again; the new session starts whole.
+#[test]
+fn re_arming_after_expiry_resets_the_budget_and_the_timestamp() {
+    let (mut app, path) = pin_app("exp-rearm");
+    let mut app = app.with_presence_grant(counting_allow);
+    app.set_touch_bypass(true);
+    advance(BYPASS_SESSION_MS);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32])); // expires + clears lazily
+    advance(100);
+    let (_, sw) = call(&mut app, &apdu_policy_verb(0x01));
+    assert_eq!(sw, SW_OK, "the PIN session still stands after expiry");
+    assert_eq!(app.bypass_budget(), BYPASS_CAP, "the new session starts whole");
+    assert_eq!(app.bypass_armed_at_ms(), BYPASS_SESSION_MS + 100, "the new stamp");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **Re-arming while live also resets the budget** — arming is the reset:
+/// a half-spent session re-armed by the verb's press starts whole again.
+#[test]
+fn re_arming_while_live_also_resets_the_budget() {
+    let (mut app, path) = pin_app("exp-live");
+    let mut app = app.with_presence_grant(counting_allow);
+    app.set_touch_bypass(true);
+    for _ in 0..5 {
+        call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    }
+    assert_eq!(app.bypass_budget(), BYPASS_CAP - 5);
+    advance(100);
+    let (_, sw) = call(&mut app, &apdu_policy_verb(0x01));
+    assert_eq!(sw, SW_OK, "the verb's press re-arms");
+    assert_eq!(app.bypass_budget(), BYPASS_CAP, "the budget is whole again");
+    assert_eq!(app.bypass_armed_at_ms(), 100, "the stamp is the new clock value");
     std::fs::remove_file(&path).ok();
 }

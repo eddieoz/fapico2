@@ -1245,7 +1245,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1262,6 +1262,19 @@ impl NostrApp {
         // behaves exactly as bypass-off, and the press is the fallback, never
         // an error. The spend lands after the response is written, so a
         // failed operation never burns budget.
+        // US-1840: the expiry is lazy and truthful — past the deadline the
+        // guard clears the whole session at guard time, so the very next
+        // GET_INFO reports the bypass down, and the press is the fallback.
+        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
+        // reach the deadline — a missing clock can only mean "never expires",
+        // the behavior the world had before accounting existed.
+        let now = (*now_provider)();
+        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
+            *touch_bypass = false;
+            *bypass_budget = 0;
+            *bypass_armed_at_ms = 0;
+            bypass_audit.clear();
+        }
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
@@ -1326,7 +1339,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, rng, presence_grant, now_provider: _, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms: _, bypass_audit: _, custody_otp: _, custody: _, region_source: _ } = self;
+        let Self { region, provider, rng, presence_grant, now_provider, pin_set: _, pin_unlocked: _, touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, custody_otp: _, custody: _, region_source: _ } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1338,6 +1351,19 @@ impl NostrApp {
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_ENC runs grant-free.
         // US-1839: budgeted like SIGN — spent means bypass-off, press again.
+        // US-1840: the expiry is lazy and truthful — past the deadline the
+        // guard clears the whole session at guard time, so the very next
+        // GET_INFO reports the bypass down, and the press is the fallback.
+        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
+        // reach the deadline — a missing clock can only mean "never expires",
+        // the behavior the world had before accounting existed.
+        let now = (*now_provider)();
+        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
+            *touch_bypass = false;
+            *bypass_budget = 0;
+            *bypass_armed_at_ms = 0;
+            bypass_audit.clear();
+        }
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
@@ -1438,7 +1464,7 @@ impl NostrApp {
         if self.gate_refuses(resp) {
             return;
         }
-        let Self { region, provider, presence_grant, touch_bypass, bypass_budget, .. } = self;
+        let Self { region, provider, presence_grant, now_provider, touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, .. } = self;
         let Some(mut store) = attach_store(region, provider, resp) else { return };
         let id = match read_identity(&mut store, p1 as u16) {
             Ok(id) => id,
@@ -1450,6 +1476,19 @@ impl NostrApp {
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_DEC runs grant-free.
         // US-1839: budgeted like SIGN — spent means bypass-off, press again.
+        // US-1840: the expiry is lazy and truthful — past the deadline the
+        // guard clears the whole session at guard time, so the very next
+        // GET_INFO reports the bypass down, and the press is the fallback.
+        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
+        // reach the deadline — a missing clock can only mean "never expires",
+        // the behavior the world had before accounting existed.
+        let now = (*now_provider)();
+        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
+            *touch_bypass = false;
+            *bypass_budget = 0;
+            *bypass_armed_at_ms = 0;
+            bypass_audit.clear();
+        }
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
