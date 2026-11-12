@@ -401,6 +401,11 @@ pub const CAP_CEREMONY: u16 = 0x0008;
 /// unknown bits.
 pub const CAP_TOUCH_POLICY: u16 = 0x0010;
 
+/// US-1843: caps bit 5 — `GET_AUDIT` (`0x20`, vendor `0x50`) is served, and
+/// the bypass carries a budget, an expiry and a ring (US-1839..1841). Set in
+/// the same series as the verb; a pre-epic client ignores unknown bits.
+pub const CAP_BYPASS_ACCOUNTING: u16 = 0x0020;
+
 /// What `GET_INFO` advertises: [`CAP_KEY_MGMT`] (the key-management trio
 /// `0x13`–`0x15`, US-1644/US-1645), [`CAP_NIP44`] (the NIP-44 pair
 /// `0x16`/`0x17`, US-1653) and [`CAP_PIN_MGMT`] (the PIN custody dialect,
@@ -408,7 +413,8 @@ pub const CAP_TOUCH_POLICY: u16 = 0x0010;
 /// failure mode (`apps/fido` getInfo history), so this constant changes in
 /// the same commit as the arms it covers — `tests/wire.rs` re-derives the
 /// cap rows and the harness suite asserts the wire value.
-pub const CAPS: u16 = CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT | CAP_CEREMONY | CAP_TOUCH_POLICY;
+pub const CAPS: u16 =
+    CAP_KEY_MGMT | CAP_NIP44 | CAP_PIN_MGMT | CAP_CEREMONY | CAP_TOUCH_POLICY | CAP_BYPASS_ACCOUNTING;
 
 // The `flags` byte of `GET_INFO` (US-1700) — the PIN state bits, derived
 // from the **same cached state the gate and the ceremony read**, so the
