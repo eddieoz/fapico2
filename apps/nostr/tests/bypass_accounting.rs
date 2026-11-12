@@ -712,8 +712,11 @@ fn get_info_advertises_bypass_accounting_on_both_board_shapes() {
         assert_eq!(u16::from_be_bytes([data[2], data[3]]), CAPS, "the advertised caps");
         assert_eq!(&data[0..2], APPLET_VERSION.as_slice(), "version unchanged");
         // The flags byte: bit 3 is FLAG_TOUCH_BYPASS and is down here (the
-        // session is not armed); the layout is otherwise the US-1714 shape.
-        assert_eq!(data[7] & !0x08, 0, "no new flag bits — the byte's layout is closed");
+        // session is not armed); the upper nibble stays unused — the byte's
+        // layout is closed above bit 3 (bits 0-2 carry real board state:
+        // PIN set, session open, migration pending).
+        assert_eq!(data[7] & 0x08, 0, "the bypass flag is down");
+        assert_eq!(data[7] & 0xF0, 0, "no flag bits above bit 3 — the layout is closed");
         std::fs::remove_file(&path).ok();
     }
 }
