@@ -375,7 +375,21 @@ LOCK, a failed verify and the power cycle clear it (deselect preserves
 it), and the
 enable direction is friction-free so the button can always be had back.
 RAM-only — a bypass that survives unplug is a bypass the user forgot
-they owned. The press consents to the **identity**, not the opcode —
+they owned. **The bypass is accounted (US-1837..1847, EPIC
+`NOSTR-BYPASS-ACCOUNTING`)**: a session may run at most `BYPASS_CAP = 32`
+exempt operations and dies `BYPASS_SESSION_MS = 600_000` (10 min) after
+the arm press, by a caller-supplied monotonic clock (`with_now_provider`
+/ `install_providers`'s fifth argument — `tasks::now_ms` on the device,
+`emul_now_ms` in the emulator; unwired it reads 0 and can only mean
+"never expires", the fido audit ring's convention). Over the cap or past
+the deadline the guards fall back to the touch — the press is the
+fallback, never an error. Every bypass-exempt operation appends one
+22-byte `AuditRecord` to a 16-deep RAM ring, readable through `GET_AUDIT`
+(INS `0x20`, vendor `0x50`; body `budget ‖ n ‖ records`) — the first
+*read* the PIN-session gate covers, so a sessionless host learns nothing,
+not even the budget. Arming fills the budget and stamps the clock (both
+the verb and the host seam); re-arming is the reset. The press consents
+to the **identity**, not the opcode —
 the tag is `0x4000_0000 ‖ idx` over CCID and `0x6000_0000 ‖ CID` over HID,
 disjoint from FIDO's `0x8000_0000 ‖ CID` (`apps/nostr/src/lib.rs:1362-1400`).
 Two properties are load-bearing and both came out of the presence audit

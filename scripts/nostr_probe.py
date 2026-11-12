@@ -222,6 +222,127 @@ def main():
         conn.disconnect()
         return
 
+    # ---- US-1847: the optional --audit legs -----------------------------
+    #
+    # --audit walks the bypass accounting over the *device* (CCID): the
+    # caps advertisement, the closed-session refusal on GET_AUDIT, the
+    # armed burst that spends the whole budget, the ring's shape over the
+    # wire, the 33rd operation falling back to a real press, and LOCK
+    # closing the read with the session. Mirror of the --touch-bypass
+    # legs; the transcript goes to docs/audits/ beside them.
+    if "--audit" in sys.argv:
+        import getpass
+
+        INS_GET_AUDIT = 0x20
+        CAP_BYPASS_ACCOUNTING = 0x0020
+        BYPASS_CAP = 32
+        RING_DEPTH = 16
+        RECORD_LEN = 22
+
+        def connect():
+            for r in readers():
+                try:
+                    c = r.createConnection()
+                    c.connect()
+                    if select(c, NOSTR_AID)[0] == SW_OK:
+                        return r.name, c
+                except Exception:
+                    pass
+            sys.exit("no reader selected the Nostr applet")
+
+        def session():
+            n, c = connect()
+            print(f"  (connected via {n})")
+
+            def a(ins, p1=0, data=b""):
+                d, s1, s2 = c.transmit([0x00, ins, p1, 0x00, len(data)] + list(data))
+                return (s1 << 8) | s2, bytes(d)
+
+            return a, c
+
+        def audit_read(a):
+            sw, data = a(INS_GET_AUDIT)
+            if sw != SW_OK:
+                return sw, None, None
+            budget, n = data[0], data[1]
+            records = [
+                {
+                    "op": data[2 + i * RECORD_LEN],
+                    "idx": data[3 + i * RECORD_LEN],
+                    "ts_ms": int.from_bytes(data[4 + i * RECORD_LEN:8 + i * RECORD_LEN], "big"),
+                    "digest": data[8 + i * RECORD_LEN:24 + i * RECORD_LEN].hex(),
+                }
+                for i in range(n)
+            ]
+            return sw, budget, records
+
+        a, conn = session()
+        print("\n[A1] GET_INFO — the caps advertisement")
+        sw, data = a(0x10)
+        assert sw == SW_OK and len(data) == 8
+        caps = int.from_bytes(data[2:4], "big")
+        flags = data[7]
+        assert caps & CAP_BYPASS_ACCOUNTING, f"caps {caps:#06x} lacks the accounting bit"
+        print(f"  -> caps={caps:#06x} flags={flags:#02x} (CAP_BYPASS_ACCOUNTING set)")
+
+        print("\n[A2] GET_AUDIT before any verify — the session gate")
+        sw, budget, records = audit_read(a)
+        if sw == 0x6982:
+            print("  -> SW=6982 (session closed — a sessionless host learns nothing)")
+        else:
+            assert sw == SW_OK and budget == 0 and not records, \
+                "a PIN-less board answers honestly empty"
+            print("  -> SW=9000, budget=0, ring empty (PIN-less board)")
+
+        pin = getpass.getpass("PIN (the board's, to open the session): ").encode()
+        print("\n[A3] VERIFY_PIN")
+        sw, _ = a(INS_VERIFY_PIN, 0, pin)
+        assert sw == SW_OK
+
+        print("\n[A4] SET_TOUCH_POLICY P1=1 — TOUCH the board when the LED lights")
+        input("      (the consent press), then press Enter to send… ")
+        sw, _ = a(INS_SET_TOUCH_POLICY, 1)
+        assert sw == SW_OK
+        sw, data = a(0x10)
+        assert data[7] & FLAG_TOUCH_BYPASS, "the bypass must be armed"
+        print("  -> the bypass is armed; budget is full")
+
+        print(f"\n[A5] the {BYPASS_CAP}-signature burst — DO NOT touch the board; "
+              "if the LED lights, the budget failed")
+        sw, n_id = a(0x11)
+        assert sw == SW_OK and n_id and n_id[0] >= 1, "an identity is needed"
+        for i in range(BYPASS_CAP):
+            sw, _ = a(0x15, 0, bytes([i]) * 32)
+            assert sw == SW_OK, f"sign {i + 1}/{BYPASS_CAP} refused — the budget did not hold"
+        sw, budget, records = audit_read(a)
+        assert sw == SW_OK and budget == 0, f"the budget must be spent (got {budget})"
+        assert len(records) == RING_DEPTH, f"the ring must hold its depth (got {len(records)})"
+        print(f"  -> {BYPASS_CAP}/{BYPASS_CAP} signs grant-free; budget=0, "
+              f"ring={len(records)} (oldest overwritten)")
+
+        print("\n[A6] the 33rd signature — TOUCH the board when the LED lights "
+              "(the fallback press)")
+        input("      (the press), then press Enter to send… ")
+        sw, _ = a(0x15, 0, bytes(32))
+        assert sw == SW_OK, "the press grants, the operation runs"
+        sw, budget, records = audit_read(a)
+        assert sw == SW_OK and budget == 0 and len(records) == RING_DEPTH, \
+            "the touched op burned nothing and wrote no record"
+        print("  -> the touched 33rd answered 9000; budget still 0, ring still "
+              f"{len(records)} — no record for a touched op")
+
+        print("\n[A7] LOCK — the read dies with the session")
+        sw, _ = a(INS_LOCK)
+        assert sw == SW_OK
+        sw, _, _ = audit_read(a)
+        assert sw == 0x6982, f"the read must close with the session (got {sw:#06x})"
+        print("  -> GET_AUDIT answers 6982 after LOCK")
+
+        print("\n--audit legs done; the transcript goes to docs/audits/ "
+              "beside the touch-bypass matrix")
+        conn.disconnect()
+        return
+
     print("\n[0/5] baseline: LIST_KEYS")
     sw, n = list_keys()
     print(f"  -> SW={sw:#06x} n_identities={n}")
