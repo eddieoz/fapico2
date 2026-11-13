@@ -13,7 +13,8 @@ Two emulator instances carry the matrix. The **auto-ack** one answers every
 press, so the whole state machine is driven end to end; the **deny** one
 (`FAPICO2_NOSTR_PRESENCE=deny`) proves the sessionless rows. The budget is
 the cap's observable over CCID: the auto-ack cannot distinguish a consulted
-grant from a skipped one, but the *budget* can — the 33rd operation, going
+grant from a skipped one, but the *budget* can — the next operation past
+the budget, going
 through the touch path, burns nothing and writes no record.
 
 The expiry is not exercised over CCID: the emulator's clock is real wall
@@ -181,8 +182,11 @@ def test_an_open_session_reads_budget_and_records(emu):
 def test_the_cap_is_observable_over_ccid(emu):
     verified_board(emu)
     arm(emu)
-    for _ in range(255):
-        _, sw = emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
+    # A distinct payload per operation: the overwrite-oldest assertion
+    # below must be able to FAIL — identical digests would make it a ghost
+    # (satisfiable by any record, pinning nothing).
+    for i in range(255):
+        _, sw = emu.send(apdu(INS_SIGN, p1=0, data=bytes([i % 256]) * 32))
         assert sw == SW_OK, "the whole budget runs grant-free"
     data, sw = emu.send(apdu(INS_GET_AUDIT))
     budget, age_ms, records = parse_audit_body(bytes(data))
@@ -200,8 +204,10 @@ def test_the_cap_is_observable_over_ccid(emu):
     assert budget == 0, "the touched op past the budget burned nothing"
     assert age_ms == 0, "and its age stays gone"
     assert len(records) == 16, "and wrote no record"
-    # The ring's newest record is still the 128th operation's.
-    assert records[-1]["digest"] == hashlib.sha256(DIGEST).digest()[:16]
+    # The ring's newest record is still the 255th operation's — the touched
+    # op wrote nothing, and every older record has been overwritten away.
+    assert records[-1]["digest"] == hashlib.sha256(bytes([254]) * 32).digest()[:16]
+    assert records[0]["digest"] != hashlib.sha256(bytes([254]) * 32).digest()[:16]
 
 
 def test_re_arming_resets_the_budget(emu):

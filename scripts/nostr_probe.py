@@ -227,7 +227,8 @@ def main():
     # --audit walks the bypass accounting over the *device* (CCID): the
     # caps advertisement, the closed-session refusal on GET_AUDIT, the
     # armed burst that spends the whole budget, the ring's shape over the
-    # wire, the 33rd operation falling back to a real press, and LOCK
+    # wire, the next operation past the budget falling back to a real
+    # press, and LOCK
     # closing the read with the session. Mirror of the --touch-bypass
     # legs; the transcript goes to docs/audits/ beside them.
     if "--audit" in sys.argv:
@@ -263,7 +264,9 @@ def main():
         def audit_read(a):
             sw, data = a(INS_GET_AUDIT)
             if sw != SW_OK:
-                return sw, None, None
+                # The sessionless rows (A2's documented 6982, A7's post-LOCK
+                # read) are the refusal path — callers unpack four.
+                return sw, None, None, None
             budget, n = data[0], data[1]
             age_ms = int.from_bytes(data[2:6], "big")  # US-1849: sampled age
             records = [
