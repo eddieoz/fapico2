@@ -235,7 +235,7 @@ def main():
 
         INS_GET_AUDIT = 0x20
         CAP_BYPASS_ACCOUNTING = 0x0020
-        BYPASS_CAP = 32
+        BYPASS_CAP = 128  # US-1848
         RING_DEPTH = 16
         RECORD_LEN = 22
 
@@ -265,16 +265,17 @@ def main():
             if sw != SW_OK:
                 return sw, None, None
             budget, n = data[0], data[1]
+            age_ms = int.from_bytes(data[2:6], "big")  # US-1849: sampled age
             records = [
                 {
-                    "op": data[2 + i * RECORD_LEN],
-                    "idx": data[3 + i * RECORD_LEN],
-                    "ts_ms": int.from_bytes(data[4 + i * RECORD_LEN:8 + i * RECORD_LEN], "big"),
-                    "digest": data[8 + i * RECORD_LEN:24 + i * RECORD_LEN].hex(),
+                    "op": data[6 + i * RECORD_LEN],
+                    "idx": data[7 + i * RECORD_LEN],
+                    "ts_ms": int.from_bytes(data[8 + i * RECORD_LEN:12 + i * RECORD_LEN], "big"),
+                    "digest": data[12 + i * RECORD_LEN:28 + i * RECORD_LEN].hex(),
                 }
                 for i in range(n)
             ]
-            return sw, budget, records
+            return sw, budget, age_ms, records
 
         a, conn = session()
         print("\n[A1] GET_INFO — the caps advertisement")
@@ -286,7 +287,7 @@ def main():
         print(f"  -> caps={caps:#06x} flags={flags:#02x} (CAP_BYPASS_ACCOUNTING set)")
 
         print("\n[A2] GET_AUDIT before any verify — the session gate")
-        sw, budget, records = audit_read(a)
+        sw, budget, age_ms, records = audit_read(a)
         if sw == 0x6982:
             print("  -> SW=6982 (session closed — a sessionless host learns nothing)")
         else:
@@ -314,27 +315,28 @@ def main():
         for i in range(BYPASS_CAP):
             sw, _ = a(0x15, 0, bytes([i]) * 32)
             assert sw == SW_OK, f"sign {i + 1}/{BYPASS_CAP} refused — the budget did not hold"
-        sw, budget, records = audit_read(a)
+        sw, budget, age_ms, records = audit_read(a)
         assert sw == SW_OK and budget == 0, f"the budget must be spent (got {budget})"
+        assert age_ms == 0, f"the spent session's age must read as gone (got {age_ms})"
         assert len(records) == RING_DEPTH, f"the ring must hold its depth (got {len(records)})"
-        print(f"  -> {BYPASS_CAP}/{BYPASS_CAP} signs grant-free; budget=0, "
+        print(f"  -> {BYPASS_CAP}/{BYPASS_CAP} signs grant-free; budget=0, age=0, "
               f"ring={len(records)} (oldest overwritten)")
 
-        print("\n[A6] the 33rd signature — TOUCH the board when the LED lights "
-              "(the fallback press)")
+        print("\n[A6] one signature past the budget — TOUCH the board when the "
+              "LED lights (the fallback press)")
         input("      (the press), then press Enter to send… ")
         sw, _ = a(0x15, 0, bytes(32))
         assert sw == SW_OK, "the press grants, the operation runs"
-        sw, budget, records = audit_read(a)
+        sw, budget, age_ms, records = audit_read(a)
         assert sw == SW_OK and budget == 0 and len(records) == RING_DEPTH, \
             "the touched op burned nothing and wrote no record"
-        print("  -> the touched 33rd answered 9000; budget still 0, ring still "
+        print("  -> the touched op answered 9000; budget still 0, ring still "
               f"{len(records)} — no record for a touched op")
 
         print("\n[A7] LOCK — the read dies with the session")
         sw, _ = a(INS_LOCK)
         assert sw == SW_OK
-        sw, _, _ = audit_read(a)
+        sw, _, _, _ = audit_read(a)
         assert sw == 0x6982, f"the read must close with the session (got {sw:#06x})"
         print("  -> GET_AUDIT answers 6982 after LOCK")
 
