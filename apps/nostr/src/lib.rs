@@ -195,12 +195,16 @@ pub const PIN_MAX_LEN: usize = 64;
 /// (`docs/passport-nostr-signer-comparison.md` §5). Fixed, not configurable:
 /// a configurable bypass is a bypass whose weakest configuration someone
 /// else gets to choose.
-/// US-1848: 128, not the first cut's 32. The owner's live test showed one
-/// signature fans out to every relay — one exempt operation per relay — so
-/// 32 was minutes of real use, not a meaningful budget. Still fixed, not
-/// configurable: a configurable bypass is a bypass whose weakest
-/// configuration someone else gets to choose.
-pub const BYPASS_CAP: u8 = 128;
+/// US-1855: 255, not the first cut's 128 (which replaced the original 32).
+/// The owner's live measurement on the v0.3 build: one user-visible action
+/// spends ~8 exempt operations — each Nostr signature fans out to every
+/// relay, and NIP-44 encrypt and decrypt pair alongside it — so 128 was
+/// ~16 actions in the 10-minute window. The ask was 256; **255 is the
+/// largest count the 1-byte budget field can name**, so the cap is derived
+/// from the wire, not chosen. Still fixed, not configurable: a
+/// configurable bypass is a bypass whose weakest configuration someone
+/// else gets to choose.
+pub const BYPASS_CAP: u8 = 255;
 /// US-1838: how long one bypass session lives, in milliseconds, measured
 /// from the arm press by the injected monotonic clock (US-1837). Past it
 /// the session is dead and the touch is required again.

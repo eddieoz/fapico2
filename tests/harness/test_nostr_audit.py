@@ -167,7 +167,7 @@ def test_an_open_session_reads_budget_and_records(emu):
     data, sw = emu.send(apdu(INS_GET_AUDIT))
     assert sw == SW_OK
     budget, age_ms, records = parse_audit_body(bytes(data))
-    assert budget == 127, "one operation spent of 128 (US-1848)"
+    assert budget == 254, "one operation spent of 255 (US-1855)"
     assert len(data) == 6 + len(records) * RECORD_LEN, "the v0.3 6-byte header"
     assert len(records) == 1
     r = records[0]
@@ -181,7 +181,7 @@ def test_an_open_session_reads_budget_and_records(emu):
 def test_the_cap_is_observable_over_ccid(emu):
     verified_board(emu)
     arm(emu)
-    for _ in range(128):
+    for _ in range(255):
         _, sw = emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
         assert sw == SW_OK, "the whole budget runs grant-free"
     data, sw = emu.send(apdu(INS_GET_AUDIT))
@@ -211,11 +211,11 @@ def test_re_arming_resets_the_budget(emu):
         emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
     data, _ = emu.send(apdu(INS_GET_AUDIT))
     budget, _, _ = parse_audit_body(bytes(data))
-    assert budget == 118, "ten operations spent of 128"
+    assert budget == 245, "ten operations spent of 255"
     arm(emu)
     data, _ = emu.send(apdu(INS_GET_AUDIT))
     budget, _, _ = parse_audit_body(bytes(data))
-    assert budget == 128, "arming is the reset"
+    assert budget == 255, "arming is the reset"
 
 
 # ---------------------------------------------------------------------------

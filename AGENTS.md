@@ -376,15 +376,18 @@ it), and the
 enable direction is friction-free so the button can always be had back.
 RAM-only — a bypass that survives unplug is a bypass the user forgot
 they owned. **The bypass is accounted (US-1837..1847, EPIC
-`NOSTR-BYPASS-ACCOUNTING`)**: a session may run at most `BYPASS_CAP = 128`
+`NOSTR-BYPASS-ACCOUNTING`)**: a session may run at most `BYPASS_CAP = 255`
 exempt operations and dies `BYPASS_SESSION_MS = 600_000` (10 min) after
 the arm press, by a caller-supplied monotonic clock (`with_now_provider`
 / `install_providers`'s fifth argument — `tasks::now_ms` on the device,
 `emul_now_ms` in the emulator; unwired it reads 0 and can only mean
-"never expires", the fido audit ring's convention). **The cap is 128, not
-the first cut's 32 (US-1848)**: one Nostr signature fans out to every
-relay — one exempt operation per relay — so 32 was minutes of real use,
-and the owner's live test hit the cap long before the timer. Over the cap
+"never expires", the fido audit ring's convention). **The cap is 255, not
+the earlier cuts' 32 and 128 (US-1848, US-1855)**: one Nostr signature
+fans out to every relay — one exempt operation per relay — and NIP-44
+encrypt/decrypt pair alongside, so the owner's live measurement has one
+user-visible action spending ~8 exempt operations; 255 is the largest
+count the 1-byte budget field can name, derived from the wire rather
+than chosen. Over the cap
 or past the deadline the guards fall back to the touch — the press is the
 fallback, never an error. Every bypass-exempt operation appends one
 22-byte `AuditRecord` to a 16-deep RAM ring, readable through `GET_AUDIT`
