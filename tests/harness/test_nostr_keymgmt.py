@@ -47,7 +47,7 @@ def test_get_info_layout_over_ccid(emu):
     assert sw == SW_OK
     # applet_ver(2) ‖ caps(2) ‖ max_plaintext(2) ‖ n_identities(1) ‖ flags(1)
     assert len(data) == 8
-    assert data[0:2] == b"\x00\x02"  # APPLET_VERSION (US-1700 dialect bump)
+    assert data[0:2] == b"\x00\x03"  # APPLET_VERSION (US-1849 audit-body bump)
     caps = int.from_bytes(data[2:4], "big")
     assert caps == 0x003F  # key mgmt + NIP-44 + PIN + ceremony + touch policy + bypass accounting (US-1843)
     # The wire-cap value: the largest plaintext whose chunk-rounded padding

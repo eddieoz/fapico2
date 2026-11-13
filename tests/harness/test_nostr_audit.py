@@ -5,9 +5,9 @@ arm is not exercised here — that is `nostr_probe.py`'s job on the board
 (US-1847), because a green emulator suite says nothing about that arm.
 Everything below drives the applet's own dialect through the dispatcher:
 
-arm → N grant-free operations → GET_AUDIT reads `budget ‖ n ‖ records` →
-the spent session's 33rd operation goes back through the touch → LOCK
-closes the read with the session.
+arm → N grant-free operations → GET_AUDIT reads
+`budget ‖ n ‖ age_ms ‖ records` → the spent session's next operation goes
+back through the touch → LOCK closes the read with the session.
 
 Two emulator instances carry the matrix. The **auto-ack** one answers every
 press, so the whole state machine is driven end to end; the **deny** one
@@ -23,8 +23,12 @@ fake clock), which is the same code the emulator runs.
 
 GET_INFO layout: `applet_ver(2) ‖ caps(2) ‖ max_plaintext(2) ‖
 n_identities(1) ‖ flags(1)` — caps bit 5 = CAP_BYPASS_ACCOUNTING, flags
-bit 3 = FLAG_TOUCH_BYPASS. GET_AUDIT body: `budget(1) ‖ n(1) ‖ n ×
-{ op(1), idx(1), ts(4 BE), digest(16) }` — 22 bytes per record.
+bit 3 = FLAG_TOUCH_BYPASS. GET_AUDIT v0.3 body: `budget(1) ‖ n(1) ‖
+age_ms(4 BE) ‖ n × { op(1), idx(1), ts(4 BE), digest(16) }` — 22 bytes
+per record, from offset 6. `age_ms` is the session's sampled age
+(US-1849): the device clock is monotonic-since-boot, so a raw stamp
+could never be related to host wall time, but an age sampled at read
+time anchors a client-side countdown.
 """
 
 import hashlib
@@ -74,9 +78,10 @@ def read_info(emu):
 def parse_audit_body(data):
     budget = data[0]
     n = data[1]
+    age_ms = int.from_bytes(data[2:6], "big")
     records = []
     for i in range(n):
-        b = data[2 + i * RECORD_LEN : 2 + (i + 1) * RECORD_LEN]
+        b = data[6 + i * RECORD_LEN : 6 + (i + 1) * RECORD_LEN]
         records.append(
             {
                 "op": b[0],
@@ -85,7 +90,7 @@ def parse_audit_body(data):
                 "digest": bytes(b[6:22]),
             }
         )
-    return budget, records
+    return budget, age_ms, records
 
 
 def verified_board(emu):
@@ -133,8 +138,9 @@ def test_a_closed_session_is_refused(emu):
 def test_a_pin_less_board_answers_honestly_empty(emu):
     data, sw = emu.send(apdu(INS_GET_AUDIT))
     assert sw == SW_OK
-    budget, records = parse_audit_body(bytes(data))
+    budget, age_ms, records = parse_audit_body(bytes(data))
     assert budget == 0
+    assert age_ms == 0, "no session, no age"
     assert records == [], "nothing to audit"
 
 
@@ -160,37 +166,41 @@ def test_an_open_session_reads_budget_and_records(emu):
     assert sw == SW_OK
     data, sw = emu.send(apdu(INS_GET_AUDIT))
     assert sw == SW_OK
-    budget, records = parse_audit_body(bytes(data))
-    assert budget == 31, "one operation spent"
+    budget, age_ms, records = parse_audit_body(bytes(data))
+    assert budget == 127, "one operation spent of 128 (US-1848)"
+    assert len(data) == 6 + len(records) * RECORD_LEN, "the v0.3 6-byte header"
     assert len(records) == 1
     r = records[0]
     assert r["op"] == OP_SIGN
     assert r["idx"] == 0
     assert r["digest"] == hashlib.sha256(DIGEST).digest()[:16], "the sighash's digest"
     assert r["ts_ms"] > 0, "the emulator's virtual clock stamped it"
+    assert age_ms < 600_000, "the age of a live session, inside the window"
 
 
 def test_the_cap_is_observable_over_ccid(emu):
     verified_board(emu)
     arm(emu)
-    for _ in range(32):
+    for _ in range(128):
         _, sw = emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
         assert sw == SW_OK, "the whole budget runs grant-free"
     data, sw = emu.send(apdu(INS_GET_AUDIT))
-    budget, records = parse_audit_body(bytes(data))
+    budget, age_ms, records = parse_audit_body(bytes(data))
     assert budget == 0, "the session is spent"
+    assert age_ms == 0, "the spent session's age reads as gone"
     assert len(records) == 16, "the ring holds its depth, oldest overwritten"
 
-    # The 33rd operation goes back through the touch path: on the auto-ack
+    # The next operation goes back through the touch path: on the auto-ack
     # emulator it still answers SW_OK (the press is granted), but it burns
     # nothing and writes no record — the budget is the observable.
     _, sw = emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
     assert sw == SW_OK, "the press is granted on the auto-ack"
     data, sw = emu.send(apdu(INS_GET_AUDIT))
-    budget, records = parse_audit_body(bytes(data))
-    assert budget == 0, "the touched 33rd burned nothing"
+    budget, age_ms, records = parse_audit_body(bytes(data))
+    assert budget == 0, "the touched op past the budget burned nothing"
+    assert age_ms == 0, "and its age stays gone"
     assert len(records) == 16, "and wrote no record"
-    # The ring's newest record is still the 32nd operation's.
+    # The ring's newest record is still the 128th operation's.
     assert records[-1]["digest"] == hashlib.sha256(DIGEST).digest()[:16]
 
 
@@ -200,12 +210,12 @@ def test_re_arming_resets_the_budget(emu):
     for _ in range(10):
         emu.send(apdu(INS_SIGN, p1=0, data=DIGEST))
     data, _ = emu.send(apdu(INS_GET_AUDIT))
-    budget, _ = parse_audit_body(bytes(data))
-    assert budget == 22, "ten operations spent"
+    budget, _, _ = parse_audit_body(bytes(data))
+    assert budget == 118, "ten operations spent of 128"
     arm(emu)
     data, _ = emu.send(apdu(INS_GET_AUDIT))
-    budget, _ = parse_audit_body(bytes(data))
-    assert budget == 32, "arming is the reset"
+    budget, _, _ = parse_audit_body(bytes(data))
+    assert budget == 128, "arming is the reset"
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,7 @@ def test_the_deny_board_reads_an_honestly_empty_ring(deny):
     assert sw == SW_TOUCH_REQUIRED, "the consent press is denied — no arm"
     _, sw = deny.send(apdu(INS_GET_AUDIT))
     assert sw == SW_OK
-    budget, records = parse_audit_body(bytes(deny.send(apdu(INS_GET_AUDIT))[0]))
+    budget, age_ms, records = parse_audit_body(bytes(deny.send(apdu(INS_GET_AUDIT))[0]))
     assert budget == 0, "no press, no bypass"
+    assert age_ms == 0, "no session, no age"
     assert records == [], "no records either"
