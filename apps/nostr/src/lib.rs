@@ -447,9 +447,12 @@ pub const FLAG_SESSION_UNLOCKED: u8 = 0x02;
 /// layout pin twice.
 pub const FLAG_MIGRATION_PENDING: u8 = 0x04;
 /// `flags` bit 3: the touch bypass is armed — the three signing arms skip
-/// the touch until LOCK or power clears it (US-1741/US-1746). Derived from
-/// the **same `self.touch_bypass` field the gate reads** — never a second
-/// read, never a recomputation (the §4 rule the other flag bits follow).
+/// the touch. **Derived from the guards' own predicate**
+/// (`touch_bypass && budget > 0`, US-1856): the session dies at LOCK, a
+/// failed verify, SET_PIN on a set board, the power cycle, the 10-minute
+/// expiry, or the budget's last operation — whichever comes first — and
+/// the wire claim follows the predicate, so a client reading the cheap
+/// flag can never be told "armed" over a guard about to demand the press.
 pub const FLAG_TOUCH_BYPASS: u8 = 0x08;
 
 // ---------------------------------------------------------------------------
@@ -879,9 +882,15 @@ impl NostrApp {
     /// that died of old age leaves nothing to audit.
     fn expire_bypass_if_stale(&mut self) {
         let now = (self.now_provider)();
-        if now.saturating_sub(self.bypass_armed_at_ms) >= BYPASS_SESSION_MS {
-            self.clear_bypass_session();
-        }
+        // US-1856: one expiry body for every site — the read paths and the
+        // guards share `expire_bypass_fields`.
+        expire_bypass_fields(
+            &mut self.touch_bypass,
+            &mut self.bypass_budget,
+            &mut self.bypass_armed_at_ms,
+            &mut self.bypass_audit,
+            now,
+        );
     }
 
     /// US-1837: read the wired clock. Host-only, for the same reason the
@@ -1006,8 +1015,12 @@ impl NostrApp {
         let pin_unlocked = self.pin_unlocked;
         // US-1746: the advertisement is the gate's own field — the same
         // read the signing arms' bypass check consults, so the wire claim
-        // cannot diverge from what the gate honours.
-        let touch_bypass = self.touch_bypass;
+        // cannot diverge from what the gate honours. US-1856: the gate's
+        // predicate is `touch_bypass && budget > 0`, so the flag derives
+        // from exactly that — a spent budget (0 left) is not an armed
+        // bypass, and advertising it was a wire claim the very next SIGN
+        // would refuse with a touch.
+        let touch_bypass = self.touch_bypass && self.bypass_budget > 0;
         let Some(mut store) = self.store(resp) else { return };
         let mut n: u8 = 0;
         for index in 0..NOSTR_SLOTS as u16 {
@@ -1320,19 +1333,11 @@ impl NostrApp {
         // behaves exactly as bypass-off, and the press is the fallback, never
         // an error. The spend lands after the response is written, so a
         // failed operation never burns budget.
-        // US-1840: the expiry is lazy and truthful — past the deadline the
-        // guard clears the whole session at guard time, so the very next
-        // GET_INFO reports the bypass down, and the press is the fallback.
-        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
-        // reach the deadline — a missing clock can only mean "never expires",
-        // the behavior the world had before accounting existed.
+        // US-1840 — the expiry leg, one body for all three guards
+        // (`expire_bypass_fields`, US-1856). `now` stays a local: the
+        // record's timestamp below is the same clock read.
         let now = (*now_provider)();
-        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
-            *touch_bypass = false;
-            *bypass_budget = 0;
-            *bypass_armed_at_ms = 0;
-            bypass_audit.clear();
-        }
+        expire_bypass_fields(touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, now);
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
@@ -1415,19 +1420,11 @@ impl NostrApp {
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_ENC runs grant-free.
         // US-1839: budgeted like SIGN — spent means bypass-off, press again.
-        // US-1840: the expiry is lazy and truthful — past the deadline the
-        // guard clears the whole session at guard time, so the very next
-        // GET_INFO reports the bypass down, and the press is the fallback.
-        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
-        // reach the deadline — a missing clock can only mean "never expires",
-        // the behavior the world had before accounting existed.
+        // US-1840 — the expiry leg, one body for all three guards
+        // (`expire_bypass_fields`, US-1856). `now` stays a local: the
+        // record's timestamp below is the same clock read.
         let now = (*now_provider)();
-        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
-            *touch_bypass = false;
-            *bypass_budget = 0;
-            *bypass_armed_at_ms = 0;
-            bypass_audit.clear();
-        }
+        expire_bypass_fields(touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, now);
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
@@ -1545,19 +1542,11 @@ impl NostrApp {
         // US-1741: the bypass exempts exactly the signing arms — while the
         // flag stands this call is skipped and NIP44_DEC runs grant-free.
         // US-1839: budgeted like SIGN — spent means bypass-off, press again.
-        // US-1840: the expiry is lazy and truthful — past the deadline the
-        // guard clears the whole session at guard time, so the very next
-        // GET_INFO reports the bypass down, and the press is the fallback.
-        // Saturating: an unwired clock reads 0 forever, and 0 - 0 can never
-        // reach the deadline — a missing clock can only mean "never expires",
-        // the behavior the world had before accounting existed.
+        // US-1840 — the expiry leg, one body for all three guards
+        // (`expire_bypass_fields`, US-1856). `now` stays a local: the
+        // record's timestamp below is the same clock read.
         let now = (*now_provider)();
-        if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
-            *touch_bypass = false;
-            *bypass_budget = 0;
-            *bypass_armed_at_ms = 0;
-            bypass_audit.clear();
-        }
+        expire_bypass_fields(touch_bypass, bypass_budget, bypass_armed_at_ms, bypass_audit, now);
         let bypassed = *touch_bypass && *bypass_budget > 0;
         if !bypassed && !user_present(*presence_grant, p1 as u16) {
             write_sw(resp, SW_TOUCH_REQUIRED);
@@ -1794,6 +1783,15 @@ impl NostrApp {
         write_sw(resp, sw.unwrap_or(SW_OK));
         self.pin_set = pin_set;
         self.pin_unlocked = false;
+        // US-1856 (the review's clearing-matrix gap): on an already-set
+        // board this verb answers SW_PIN_ALREADY_SET yet still closes the
+        // session — and a closed session must not leave an armed bypass
+        // behind it, or the next VERIFY resurrects a touch-free signing
+        // session with the residual budget. Every clearer of `pin_unlocked`
+        // clears the bypass with it (US-1838's invariant); this was the one
+        // site missing. Harmless on a PIN-less board, where the bypass can
+        // never have been armed.
+        self.clear_bypass_session();
     }
 
     /// The verify leg US-1692 and US-1693 share: compare `pin` against
@@ -2569,6 +2567,32 @@ fn parse_data(apdu: &[u8]) -> Result<&[u8], Sw> {
 /// call there would fight the borrow of `region`. Called only from the
 /// bypass-exempt path: a touched operation already has its consent
 /// artifact, and the ring is bypass accounting, not an operation log.
+/// US-1856 review: the expiry leg in ONE body. The three signing guards
+/// carried three inline copies that could diverge from each other and
+/// from [`NostrApp::expire_bypass_if_stale`] — the fourth. The guards'
+/// destructured borrows are exactly the fields, so a free function is the
+/// shape that works (the [`push_audit`] precedent).
+fn expire_bypass_fields(
+    touch_bypass: &mut bool,
+    bypass_budget: &mut u8,
+    bypass_armed_at_ms: &mut u64,
+    bypass_audit: &mut HeaplessVec<AuditRecord, BYPASS_AUDIT_DEPTH>,
+    now: u64,
+) {
+    // US-1840: the expiry is lazy and truthful — past the deadline the
+    // session clears at guard/read time, so the very next GET_INFO reports
+    // the bypass down, and the press is the fallback. Saturating: an
+    // unwired clock reads 0 forever, and 0 - 0 can never reach the
+    // deadline — a missing clock can only mean "never expires", the
+    // behavior the world had before accounting existed.
+    if now.saturating_sub(*bypass_armed_at_ms) >= BYPASS_SESSION_MS {
+        *touch_bypass = false;
+        *bypass_budget = 0;
+        *bypass_armed_at_ms = 0;
+        bypass_audit.clear();
+    }
+}
+
 fn push_audit(
     ring: &mut HeaplessVec<AuditRecord, BYPASS_AUDIT_DEPTH>,
     op: u8,
