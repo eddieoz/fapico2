@@ -483,6 +483,15 @@ fn re_arming_while_live_also_resets_the_budget() {
     std::fs::remove_file(&path).ok();
 }
 
+/// **The version advertises the v0.3 layout** — US-1849. The GET_AUDIT body
+/// changed shape (the `age_ms` header field), which is a layout change:
+/// clients branch on the version, not on the caps bit, for body shape.
+#[test]
+fn the_version_advertises_the_v0_3_layout() {
+    use fapico2_nostr::APPLET_VERSION;
+    assert_eq!(APPLET_VERSION, [0x00, 0x03], "US-1849: the body layout changed");
+}
+
 /// **A stale session reads as gone** (the final review's Important finding):
 /// the expiry must not live only in the signing guards — GET_INFO and
 /// GET_AUDIT run the same leg, or ten idle minutes leave the popup
@@ -503,8 +512,9 @@ fn a_stale_session_reads_as_gone() {
     assert_eq!(data[7] & 0x08, 0, "GET_INFO must not advertise a dead session");
     let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
     assert_eq!(sw, SW_OK);
-    let (budget, records) = parse_audit_body(&data);
+    let (budget, age_ms, records) = parse_audit_body(&data);
     assert_eq!(budget, 0, "the stale budget reads as gone");
+    assert_eq!(age_ms, 0, "the dead session's age reads as gone");
     assert!(records.is_empty(), "the dead session's ring reads as gone");
     std::fs::remove_file(&path).ok();
 }
@@ -639,15 +649,16 @@ fn enc_and_dec_records_carry_their_op_tags_and_payload_digests() {
 // US-1842 — the GET_AUDIT verb
 // ---------------------------------------------------------------------------
 
-/// The wire body: `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE),
-/// digest(16) }`. Mirrored here so the tests verify the *shape*, not the
-/// code.
-fn parse_audit_body(data: &[u8]) -> (u8, Vec<AuditRecord>) {
+/// The v0.3 wire body: `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖ n × { op(1),
+/// idx(1), ts(4 BE), digest(16) }` — records start at offset 6. Mirrored
+/// here so the tests verify the *shape*, not the code.
+fn parse_audit_body(data: &[u8]) -> (u8, u32, Vec<AuditRecord>) {
     let budget = data[0];
     let n = data[1] as usize;
+    let age_ms = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
     let mut records = Vec::new();
     for i in 0..n {
-        let b = &data[2 + i * 22..2 + (i + 1) * 22];
+        let b = &data[6 + i * 22..6 + (i + 1) * 22];
         records.push(AuditRecord {
             op: b[0],
             idx: b[1],
@@ -655,7 +666,63 @@ fn parse_audit_body(data: &[u8]) -> (u8, Vec<AuditRecord>) {
             digest: b[6..22].try_into().expect("a 16-byte digest"),
         });
     }
-    (budget, records)
+    (budget, age_ms, records)
+}
+
+/// **An armed session reports its age** — US-1849. The body carries the
+/// session's sampled age (`now − armed_at`, saturating) so a client can
+/// compute a countdown: the device clock is monotonic-since-boot and can
+/// never be related to the host's wall clock, but an age sampled at read
+/// time anchors `remaining = BYPASS_SESSION_MS − age − elapsed-since-poll`.
+#[test]
+fn an_armed_session_reports_its_age() {
+    let (app, path) = pin_app("audit-age");
+    let mut app = app.with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    advance(100_000);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, age_ms, records) = parse_audit_body(&data);
+    assert_eq!(budget, BYPASS_CAP, "the session is whole");
+    assert_eq!(age_ms, 100_000, "the sampled age, not the raw stamp");
+    assert!(records.is_empty(), "no ops yet, no records");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A fresh arm reads age zero** — the sample is taken when the response
+/// is built, and the arm press itself is at `now`.
+#[test]
+fn a_fresh_arm_reads_age_zero() {
+    let (app, path) = pin_app("audit-age-zero");
+    let mut app = app.with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, age_ms, _) = parse_audit_body(&data);
+    assert_eq!(budget, BYPASS_CAP);
+    assert_eq!(age_ms, 0, "armed at now, sampled at now");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **A stale session's age reads as gone with the session** — the expiry
+/// leg runs before the body is built (US-1837..1847 fix pass), so the age
+/// of an expired session is never observable: budget 0, empty ring, age 0
+/// (the arm stamp was cleared with the session).
+#[test]
+fn a_stale_session_reads_age_zero() {
+    let (app, path) = pin_app("audit-age-stale");
+    let mut app = app.with_now_provider(fake_now);
+    app.set_touch_bypass(true);
+    advance(1_000);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    advance(BYPASS_SESSION_MS + 1);
+    let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK);
+    let (budget, age_ms, records) = parse_audit_body(&data);
+    assert_eq!(budget, 0, "the stale budget reads as gone");
+    assert_eq!(age_ms, 0, "the dead session's age reads as gone");
+    assert!(records.is_empty(), "the dead session's ring reads as gone");
+    std::fs::remove_file(&path).ok();
 }
 
 /// **A closed session is refused** — the ring is session-adjacent state:
@@ -673,8 +740,9 @@ fn a_closed_session_is_refused() {
     std::fs::remove_file(&path).ok();
 }
 
-/// **An open session reads budget and records** — the body is
-/// `budget ‖ n ‖ records`, well-formed, matching what the arms wrote.
+/// **An open session reads budget, age and records** — the body is
+/// `budget ‖ n ‖ age_ms ‖ records`, well-formed, matching what the arms
+/// wrote.
 #[test]
 fn an_open_session_reads_budget_and_records() {
     let (mut app, path) = pin_app("audit-read");
@@ -685,7 +753,7 @@ fn an_open_session_reads_budget_and_records() {
     call(&mut app, &apdu(INS_SIGN, 1, &[0x42; 32]));
     let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
     assert_eq!(sw, SW_OK);
-    let (budget, records) = parse_audit_body(&data);
+    let (budget, _age, records) = parse_audit_body(&data);
     assert_eq!(budget, BYPASS_CAP - 2, "the budget is the session's");
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].op, OP_SIGN);
@@ -703,8 +771,9 @@ fn a_pin_less_board_answers_honestly_empty() {
     let (mut app, path) = app_with_identity("audit-no-pin");
     let (data, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
     assert_eq!(sw, SW_OK);
-    let (budget, records) = parse_audit_body(&data);
+    let (budget, age_ms, records) = parse_audit_body(&data);
     assert_eq!(budget, 0);
+    assert_eq!(age_ms, 0, "no session, no age");
     assert!(records.is_empty(), "nothing to audit");
     std::fs::remove_file(&path).ok();
 }
@@ -728,10 +797,10 @@ fn lock_closes_the_read_along_with_the_session() {
 // ---------------------------------------------------------------------------
 
 /// **GET_INFO advertises the accounting** on both board shapes — the caps
-/// bit is unconditional (the verb is served whatever the PIN state), the
-/// flags byte is unchanged (bit 3 already carries the live state, and the
-/// US-1840 lazy clear keeps it truthful), and `APPLET_VERSION` is
-/// untouched: a command added is not a layout change.
+/// bit is unconditional (the verb is served whatever the PIN state), and
+/// the flags byte is unchanged (bit 3 already carries the live state, and
+/// the US-1840 lazy clear keeps it truthful). The version itself moved to
+/// 0.3 in US-1849 — that was the body layout's bump, not the caps row's.
 #[test]
 fn get_info_advertises_bypass_accounting_on_both_board_shapes() {
     use fapico2_nostr::{APPLET_VERSION, CAPS, CAP_BYPASS_ACCOUNTING};
