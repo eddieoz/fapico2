@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:850c316a-edfa-4baa-8924-a9fc2c743b1e",
+  "serialNumber": "urn:uuid:38bc614d-5432-4187-9c2f-7cb1a0c00bd1",
   "metadata": {
-    "timestamp": "2026-10-25T20:02:42.941341516Z",
+    "timestamp": "2026-11-13T20:18:00.009060324Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -14,58 +14,58 @@
     ],
     "component": {
       "type": "application",
-      "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0",
+      "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0",
       "name": "fapico2-firmware",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.",
+      "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.",
       "components": [
         {
           "type": "library",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-0",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-0",
           "name": "fapico2_firmware",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/lib.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/lib.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-1",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-1",
           "name": "bridge",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/bin/bridge.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/bin/bridge.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-2",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-2",
           "name": "bringup",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/bin/bringup.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/bin/bringup.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-3",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-3",
           "name": "fapico2-emulation",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/emul_main.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/emul_main.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-4",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-4",
           "name": "fapico2-firmware",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/main.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/main.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file://./firmware#fapico2-firmware@0.1.0 bin-target-5",
+          "bom-ref": "path+file://../firmware#fapico2-firmware@0.7.0 bin-target-5",
           "name": "hwtest",
-          "version": "0.1.0",
-          "purl": "pkg:cargo/fapico2-firmware@0.1.0?download_url=file://.#src/bin/hwtest.rs"
+          "version": "0.7.0",
+          "purl": "pkg:cargo/fapico2-firmware@0.7.0?download_url=file://.#src/bin/hwtest.rs"
         }
       ]
     },
@@ -79,137 +79,137 @@
   "components": [
     {
       "type": "library",
-      "bom-ref": "path+file://./apps#fapico2-apps@0.1.0",
+      "bom-ref": "path+file://../apps#fapico2-apps@0.7.0",
       "name": "fapico2-apps",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-apps@0.1.0?download_url=file://../apps"
+      "purl": "pkg:cargo/fapico2-apps@0.7.0?download_url=file://../apps"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/fido#fapico2-fido@0.1.0",
+      "bom-ref": "path+file://../apps/fido#fapico2-fido@0.7.0",
       "name": "fapico2-fido",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-fido@0.1.0?download_url=file://../apps/fido"
+      "purl": "pkg:cargo/fapico2-fido@0.7.0?download_url=file://../apps/fido"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
+      "bom-ref": "path+file://../apps/mgmt#fapico2-mgmt@0.7.0",
       "name": "fapico2-mgmt",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-mgmt@0.1.0?download_url=file://../apps/mgmt"
+      "purl": "pkg:cargo/fapico2-mgmt@0.7.0?download_url=file://../apps/mgmt"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/nostr#fapico2-nostr@0.1.0",
+      "bom-ref": "path+file://../apps/nostr#fapico2-nostr@0.7.0",
       "name": "fapico2-nostr",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-nostr@0.1.0?download_url=file://../apps/nostr"
+      "purl": "pkg:cargo/fapico2-nostr@0.7.0?download_url=file://../apps/nostr"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/oath#fapico2-oath@0.1.0",
+      "bom-ref": "path+file://../apps/oath#fapico2-oath@0.7.0",
       "name": "fapico2-oath",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-oath@0.1.0?download_url=file://../apps/oath"
+      "purl": "pkg:cargo/fapico2-oath@0.7.0?download_url=file://../apps/oath"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
+      "bom-ref": "path+file://../apps/openpgp#fapico2-openpgp@0.7.0",
       "name": "fapico2-openpgp",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-openpgp@0.1.0?download_url=file://../apps/openpgp"
+      "purl": "pkg:cargo/fapico2-openpgp@0.7.0?download_url=file://../apps/openpgp"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/piv#fapico2-piv@0.1.0",
+      "bom-ref": "path+file://../apps/piv#fapico2-piv@0.7.0",
       "name": "fapico2-piv",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-piv@0.1.0?download_url=file://../apps/piv"
+      "purl": "pkg:cargo/fapico2-piv@0.7.0?download_url=file://../apps/piv"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/rescue#fapico2-rescue@0.1.0",
+      "bom-ref": "path+file://../apps/rescue#fapico2-rescue@0.7.0",
       "name": "fapico2-rescue",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-rescue@0.1.0?download_url=file://../apps/rescue"
+      "purl": "pkg:cargo/fapico2-rescue@0.7.0?download_url=file://../apps/rescue"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./apps/vendor_led#fapico2-vendor-led@0.1.0",
+      "bom-ref": "path+file://../apps/vendor_led#fapico2-vendor-led@0.7.0",
       "name": "fapico2-vendor-led",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-vendor-led@0.1.0?download_url=file://../apps/vendor_led"
+      "purl": "pkg:cargo/fapico2-vendor-led@0.7.0?download_url=file://../apps/vendor_led"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./platform#fapico2-platform@0.1.0",
+      "bom-ref": "path+file://../platform#fapico2-platform@0.7.0",
       "name": "fapico2-platform",
-      "version": "0.1.0",
+      "version": "0.7.0",
       "scope": "required",
       "licenses": [
         {
           "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/fapico2-platform@0.1.0?download_url=file://../platform"
+      "purl": "pkg:cargo/fapico2-platform@0.7.0?download_url=file://../platform"
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./vendor/ed448-goldilocks#0.7.2",
+      "bom-ref": "path+file://../vendor/ed448-goldilocks#0.7.2",
       "name": "ed448-goldilocks",
       "version": "0.7.2",
       "description": "A pure-Rust implementation of Ed448 and Curve448 and Decaf (fapico2 no_std patch)",
@@ -229,7 +229,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./vendor/opcard#1.8.0",
+      "bom-ref": "path+file://../vendor/opcard#1.8.0",
       "author": "Nitrokey GmbH <info@nitrokey.com>",
       "name": "opcard",
       "version": "1.8.0",
@@ -250,7 +250,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./vendor/trussed-brainpool#0.1.0",
+      "bom-ref": "path+file://../vendor/trussed-brainpool#0.1.0",
       "name": "trussed-brainpool",
       "version": "0.1.0",
       "description": "Software Brainpool trussed backend (ECDSA + ECDH over the bp256 crate, allocation-free — US-944; P-384r1 deferred by US-966). ",
@@ -264,7 +264,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./vendor/trussed-secp256k1#0.1.0",
+      "bom-ref": "path+file://../vendor/trussed-secp256k1#0.1.0",
       "name": "trussed-secp256k1",
       "version": "0.1.0",
       "description": "Software secp256k1 trussed backend (ECDSA + ECDH over the k256 crate, allocation-free — S-724). ",
@@ -278,7 +278,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "path+file://./vendor/x448#0.6.0",
+      "bom-ref": "path+file://../vendor/x448#0.6.0",
       "name": "x448",
       "version": "0.6.0",
       "description": "A pure-Rust implementation of X448 (fapico2 no_std patch: unused std-only hex dependency removed)",
@@ -11585,19 +11585,19 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file://./apps#fapico2-apps@0.1.0",
+      "ref": "path+file://../apps#fapico2-apps@0.7.0",
       "dependsOn": [
-        "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
-        "path+file://./apps/nostr#fapico2-nostr@0.1.0",
-        "path+file://./apps/oath#fapico2-oath@0.1.0",
-        "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
-        "path+file://./platform#fapico2-platform@0.1.0",
-        "path+file://./apps/rescue#fapico2-rescue@0.1.0",
-        "path+file://./apps/vendor_led#fapico2-vendor-led@0.1.0"
+        "path+file://../apps/mgmt#fapico2-mgmt@0.7.0",
+        "path+file://../apps/nostr#fapico2-nostr@0.7.0",
+        "path+file://../apps/oath#fapico2-oath@0.7.0",
+        "path+file://../apps/openpgp#fapico2-openpgp@0.7.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
+        "path+file://../apps/rescue#fapico2-rescue@0.7.0",
+        "path+file://../apps/vendor_led#fapico2-vendor-led@0.7.0"
       ]
     },
     {
-      "ref": "path+file://./apps/fido#fapico2-fido@0.1.0",
+      "ref": "path+file://../apps/fido#fapico2-fido@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#aes@0.8.4",
         "registry+https://github.com/rust-lang/crates.io-index#aes-gcm@0.10.3",
@@ -11607,7 +11607,7 @@
         "registry+https://github.com/rust-lang/crates.io-index#ecdsa@0.16.9",
         "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@2.2.0",
         "registry+https://github.com/rust-lang/crates.io-index#elliptic-curve@0.13.8",
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.12.4",
         "registry+https://github.com/rust-lang/crates.io-index#hmac@0.12.1",
@@ -11617,22 +11617,22 @@
         "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.6.4",
         "registry+https://github.com/rust-lang/crates.io-index#sha1@0.10.7",
         "registry+https://github.com/rust-lang/crates.io-index#sha2@0.10.9",
-        "path+file://./vendor/x448#0.6.0",
+        "path+file://../vendor/x448#0.6.0",
         "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.0"
       ]
     },
     {
-      "ref": "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
+      "ref": "path+file://../apps/mgmt#fapico2-mgmt@0.7.0",
       "dependsOn": [
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0"
       ]
     },
     {
-      "ref": "path+file://./apps/nostr#fapico2-nostr@0.1.0",
+      "ref": "path+file://../apps/nostr#fapico2-nostr@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#chacha20@0.9.1",
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#hmac@0.12.1",
         "registry+https://github.com/rust-lang/crates.io-index#secp256kfun@0.12.1",
@@ -11640,10 +11640,10 @@
       ]
     },
     {
-      "ref": "path+file://./apps/oath#fapico2-oath@0.1.0",
+      "ref": "path+file://../apps/oath#fapico2-oath@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#aes@0.8.4",
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#hmac@0.12.1",
         "registry+https://github.com/rust-lang/crates.io-index#sha1@0.10.7",
@@ -11652,26 +11652,26 @@
       ]
     },
     {
-      "ref": "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
+      "ref": "path+file://../apps/openpgp#fapico2-openpgp@0.7.0",
       "dependsOn": [
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.9.3",
         "registry+https://github.com/rust-lang/crates.io-index#iso7816@0.2.0",
         "registry+https://github.com/rust-lang/crates.io-index#littlefs2-core@0.1.3",
-        "path+file://./vendor/opcard#1.8.0",
+        "path+file://../vendor/opcard#1.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed@0.2.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-core@0.2.2",
         "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.0"
       ]
     },
     {
-      "ref": "path+file://./apps/piv#fapico2-piv@0.1.0",
+      "ref": "path+file://../apps/piv#fapico2-piv@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#aes@0.8.4",
         "registry+https://github.com/rust-lang/crates.io-index#cipher@0.4.4",
         "registry+https://github.com/rust-lang/crates.io-index#des@0.8.1",
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.12.4",
         "registry+https://github.com/rust-lang/crates.io-index#hmac@0.12.1",
@@ -11681,21 +11681,21 @@
       ]
     },
     {
-      "ref": "path+file://./apps/rescue#fapico2-rescue@0.1.0",
+      "ref": "path+file://../apps/rescue#fapico2-rescue@0.7.0",
       "dependsOn": [
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0"
       ]
     },
     {
-      "ref": "path+file://./apps/vendor_led#fapico2-vendor-led@0.1.0",
+      "ref": "path+file://../apps/vendor_led#fapico2-vendor-led@0.7.0",
       "dependsOn": [
-        "path+file://./platform#fapico2-platform@0.1.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0"
       ]
     },
     {
-      "ref": "path+file://./firmware#fapico2-firmware@0.1.0",
+      "ref": "path+file://../firmware#fapico2-firmware@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#cortex-m@0.7.9",
         "registry+https://github.com/rust-lang/crates.io-index#cortex-m-rt@0.7.6",
@@ -11708,22 +11708,22 @@
         "registry+https://github.com/rust-lang/crates.io-index#embassy-sync@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#embassy-time@0.5.1",
         "registry+https://github.com/rust-lang/crates.io-index#env_logger@0.11.11",
-        "path+file://./apps#fapico2-apps@0.1.0",
-        "path+file://./apps/fido#fapico2-fido@0.1.0",
-        "path+file://./apps/mgmt#fapico2-mgmt@0.1.0",
-        "path+file://./apps/nostr#fapico2-nostr@0.1.0",
-        "path+file://./apps/oath#fapico2-oath@0.1.0",
-        "path+file://./apps/openpgp#fapico2-openpgp@0.1.0",
-        "path+file://./apps/piv#fapico2-piv@0.1.0",
-        "path+file://./platform#fapico2-platform@0.1.0",
-        "path+file://./apps/rescue#fapico2-rescue@0.1.0",
-        "path+file://./apps/vendor_led#fapico2-vendor-led@0.1.0",
+        "path+file://../apps#fapico2-apps@0.7.0",
+        "path+file://../apps/fido#fapico2-fido@0.7.0",
+        "path+file://../apps/mgmt#fapico2-mgmt@0.7.0",
+        "path+file://../apps/nostr#fapico2-nostr@0.7.0",
+        "path+file://../apps/oath#fapico2-oath@0.7.0",
+        "path+file://../apps/openpgp#fapico2-openpgp@0.7.0",
+        "path+file://../apps/piv#fapico2-piv@0.7.0",
+        "path+file://../platform#fapico2-platform@0.7.0",
+        "path+file://../apps/rescue#fapico2-rescue@0.7.0",
+        "path+file://../apps/vendor_led#fapico2-vendor-led@0.7.0",
         "registry+https://github.com/rust-lang/crates.io-index#heapless@0.8.0",
         "registry+https://github.com/rust-lang/crates.io-index#rp-pac@7.0.0"
       ]
     },
     {
-      "ref": "path+file://./platform#fapico2-platform@0.1.0",
+      "ref": "path+file://../platform#fapico2-platform@0.7.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#aes@0.8.4",
         "registry+https://github.com/rust-lang/crates.io-index#aes-gcm@0.10.3",
@@ -11749,24 +11749,24 @@
         "registry+https://github.com/rust-lang/crates.io-index#trussed@0.2.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-auth@0.5.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-auth-backend@0.2.0",
-        "path+file://./vendor/trussed-brainpool#0.1.0",
+        "path+file://../vendor/trussed-brainpool#0.1.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-chunked@0.3.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-core@0.2.2",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-rsa-alloc@0.5.0",
-        "path+file://./vendor/trussed-secp256k1#0.1.0",
+        "path+file://../vendor/trussed-secp256k1#0.1.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-staging@0.5.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-wrap-key-to-file@0.3.0",
         "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.0"
       ]
     },
     {
-      "ref": "path+file://./vendor/ed448-goldilocks#0.7.2",
+      "ref": "path+file://../vendor/ed448-goldilocks#0.7.2",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#subtle@2.6.1"
       ]
     },
     {
-      "ref": "path+file://./vendor/opcard#1.8.0",
+      "ref": "path+file://../vendor/opcard#1.8.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#bitflags@2.13.1",
         "registry+https://github.com/rust-lang/crates.io-index#cbor-smol@0.5.1",
@@ -11783,18 +11783,18 @@
         "registry+https://github.com/rust-lang/crates.io-index#trussed@0.2.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-auth@0.5.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-auth-backend@0.2.0",
-        "path+file://./vendor/trussed-brainpool#0.1.0",
+        "path+file://../vendor/trussed-brainpool#0.1.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-chunked@0.3.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-core@0.2.2",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-rsa-alloc@0.5.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-rsa-types@0.2.0",
-        "path+file://./vendor/trussed-secp256k1#0.1.0",
+        "path+file://../vendor/trussed-secp256k1#0.1.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-staging@0.5.0",
         "registry+https://github.com/rust-lang/crates.io-index#trussed-wrap-key-to-file@0.3.0"
       ]
     },
     {
-      "ref": "path+file://./vendor/trussed-brainpool#0.1.0",
+      "ref": "path+file://../vendor/trussed-brainpool#0.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#bp256@0.14.0",
         "registry+https://github.com/rust-lang/crates.io-index#ecdsa@0.17.0",
@@ -11806,7 +11806,7 @@
       ]
     },
     {
-      "ref": "path+file://./vendor/trussed-secp256k1#0.1.0",
+      "ref": "path+file://../vendor/trussed-secp256k1#0.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#k256@0.13.4",
         "registry+https://github.com/rust-lang/crates.io-index#trussed@0.2.0",
@@ -11814,9 +11814,9 @@
       ]
     },
     {
-      "ref": "path+file://./vendor/x448#0.6.0",
+      "ref": "path+file://../vendor/x448#0.6.0",
       "dependsOn": [
-        "path+file://./vendor/ed448-goldilocks#0.7.2",
+        "path+file://../vendor/ed448-goldilocks#0.7.2",
         "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.5.1"
       ]
     },
