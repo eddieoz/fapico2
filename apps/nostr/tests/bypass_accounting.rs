@@ -319,11 +319,21 @@ fn deselect_preserves_the_accounting_state() {
 // US-1839 — the cap
 // ---------------------------------------------------------------------------
 
-/// **Thirty-two bypassed SIGNs run grant-free** — the whole [`BYPASS_CAP`]
-/// budget, consumed one per operation, with the grant closure never
-/// consulted.
+/// **The cap is 128, literally** — US-1848. The owner's live test showed
+/// one signature fans out to every relay, so 32 exempt operations were
+/// minutes of real use; 128 is the number the owner named. The value is
+/// pinned here so a future "tune the cap" edit is a conscious test change,
+/// not an incidental constant drift.
 #[test]
-fn thirty_two_bypassed_signs_run_grant_free() {
+fn the_cap_is_128() {
+    assert_eq!(BYPASS_CAP, 128, "US-1848: the owner's number");
+}
+
+/// **The whole 128-bypassed-SIGN budget runs grant-free** — every
+/// [`BYPASS_CAP`] operation consumed one per run, with the grant closure
+/// never consulted.
+#[test]
+fn the_whole_budget_runs_grant_free() {
     let (app, path) = pin_app("cap-signs");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
@@ -336,12 +346,12 @@ fn thirty_two_bypassed_signs_run_grant_free() {
     std::fs::remove_file(&path).ok();
 }
 
-/// **The thirty-third requires the press** — the budget exhausted at 0, the
-/// guard behaves exactly as bypass-off: the grant closure is consulted and
-/// the refusal is [`SW_TOUCH_REQUIRED`].
+/// **The next operation past the budget requires the press** — the budget
+/// exhausted at 0, the guard behaves exactly as bypass-off: the grant
+/// closure is consulted and the refusal is [`SW_TOUCH_REQUIRED`].
 #[test]
-fn the_thirty_third_requires_the_press() {
-    let (app, path) = pin_app("cap-33rd");
+fn the_next_op_past_the_budget_requires_the_press() {
+    let (app, path) = pin_app("cap-next");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
     for _ in 0..BYPASS_CAP {
@@ -354,11 +364,11 @@ fn the_thirty_third_requires_the_press() {
     std::fs::remove_file(&path).ok();
 }
 
-/// **A pressed 33rd succeeds and does not go negative** — the touch path is
-/// untouched by the accounting: the press grants, the operation runs, and
-/// the budget stays at 0 (saturating, never wrapping).
+/// **A pressed op past the spent budget succeeds and does not go negative**
+/// — the touch path is untouched by the accounting: the press grants, the
+/// operation runs, and the budget stays at 0 (saturating, never wrapping).
 #[test]
-fn a_pressed_33rd_succeeds_and_does_not_go_negative() {
+fn a_pressed_op_on_a_spent_budget_does_not_go_negative() {
     let (app, path) = pin_app("cap-press");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);
@@ -383,15 +393,15 @@ fn the_cap_counts_enc_and_dec_too() {
         .with_rng_provider(|out| out.fill(0x42));
     app.set_touch_bypass(true);
     let plaintext = b"budgeted conversation";
-    for i in 0..16u8 {
+    for i in 0..(BYPASS_CAP / 2) {
         let (ct, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
         assert_eq!(sw, SW_OK, "bypassed ENC #{i}");
         let (_, sw) = call(&mut app, &apdu_nip44_decrypt(1, &ct));
         assert_eq!(sw, SW_OK, "bypassed DEC #{i}");
     }
-    assert_eq!(app.bypass_budget(), 0, "32 ops spent the session");
+    assert_eq!(app.bypass_budget(), 0, "the whole budget spent the session");
     let (_, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
-    assert_eq!(sw, SW_TOUCH_REQUIRED, "the 33rd op costs a press");
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "an op past the budget costs a press");
     assert_eq!(presses(), 1, "the grant was consulted once");
     std::fs::remove_file(&path).ok();
 }
@@ -543,10 +553,11 @@ fn each_bypassed_sign_appends_one_record() {
     std::fs::remove_file(&path).ok();
 }
 
-/// **The touched 33rd writes no record** — a touched op already has its
-/// consent artifact; the ring is bypass accounting, not an operation log.
+/// **A touched op past the budget writes no record** — a touched op already
+/// has its consent artifact; the ring is bypass accounting, not an
+/// operation log.
 #[test]
-fn the_touched_33rd_writes_no_record() {
+fn the_touched_op_past_the_budget_writes_no_record() {
     let (app, path) = pin_app("ring-touched");
     let mut app = app.with_presence_grant(counting_deny);
     app.set_touch_bypass(true);

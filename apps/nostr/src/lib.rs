@@ -192,7 +192,12 @@ pub const PIN_MAX_LEN: usize = 64;
 /// (`docs/passport-nostr-signer-comparison.md` §5). Fixed, not configurable:
 /// a configurable bypass is a bypass whose weakest configuration someone
 /// else gets to choose.
-pub const BYPASS_CAP: u8 = 32;
+/// US-1848: 128, not the first cut's 32. The owner's live test showed one
+/// signature fans out to every relay — one exempt operation per relay — so
+/// 32 was minutes of real use, not a meaningful budget. Still fixed, not
+/// configurable: a configurable bypass is a bypass whose weakest
+/// configuration someone else gets to choose.
+pub const BYPASS_CAP: u8 = 128;
 /// US-1838: how long one bypass session lives, in milliseconds, measured
 /// from the arm press by the injected monotonic clock (US-1837). Past it
 /// the session is dead and the touch is required again.

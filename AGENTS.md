@@ -376,16 +376,23 @@ it), and the
 enable direction is friction-free so the button can always be had back.
 RAM-only — a bypass that survives unplug is a bypass the user forgot
 they owned. **The bypass is accounted (US-1837..1847, EPIC
-`NOSTR-BYPASS-ACCOUNTING`)**: a session may run at most `BYPASS_CAP = 32`
+`NOSTR-BYPASS-ACCOUNTING`)**: a session may run at most `BYPASS_CAP = 128`
 exempt operations and dies `BYPASS_SESSION_MS = 600_000` (10 min) after
 the arm press, by a caller-supplied monotonic clock (`with_now_provider`
 / `install_providers`'s fifth argument — `tasks::now_ms` on the device,
 `emul_now_ms` in the emulator; unwired it reads 0 and can only mean
-"never expires", the fido audit ring's convention). Over the cap or past
-the deadline the guards fall back to the touch — the press is the
+"never expires", the fido audit ring's convention). **The cap is 128, not
+the first cut's 32 (US-1848)**: one Nostr signature fans out to every
+relay — one exempt operation per relay — so 32 was minutes of real use,
+and the owner's live test hit the cap long before the timer. Over the cap
+or past the deadline the guards fall back to the touch — the press is the
 fallback, never an error. Every bypass-exempt operation appends one
 22-byte `AuditRecord` to a 16-deep RAM ring, readable through `GET_AUDIT`
-(INS `0x20`, vendor `0x50`; body `budget ‖ n ‖ records`) — the first
+(INS `0x20`, vendor `0x50`; v0.3 body `budget ‖ n ‖ age_ms(4 BE) ‖
+records`, US-1849 — `age_ms` is the session's sampled age,
+`now − armed_at` saturating, because a device-monotonic timestamp can
+never be related to a host's wall clock but a sampled age can anchor a
+client-side countdown) — the first
 *read* the PIN-session gate covers, so a sessionless host learns nothing,
 not even the budget. Arming fills the budget and stamps the clock (both
 the verb and the host seam); re-arming is the reset. The press consents
