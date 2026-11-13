@@ -1311,7 +1311,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "fapico2-apps"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "fapico2-mgmt",
  "fapico2-nostr",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-fido"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-firmware"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-mgmt"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "fapico2-fido",
  "fapico2-oath",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-nostr"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "chacha20",
  "fapico2-platform",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-oath"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "fapico2-platform",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-openpgp"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "bp256",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-piv"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "cipher",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-platform"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-rescue"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "fapico2-mgmt",
  "fapico2-platform",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "fapico2-vendor-led"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "fapico2-platform",
  "heapless 0.8.0",

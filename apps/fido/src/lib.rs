@@ -229,7 +229,7 @@ const fn const_decimal(i: &mut usize, b: &[u8]) -> u32 {
 /// Sourced from the crate version rather than hand-written so a release
 /// cannot ship a stale number, and resolved at compile time so it costs
 /// nothing at runtime on the device. The workspace version is currently
-/// `0.1.0`, which packs to `0x000001` and renders as `"0.1"` — a real,
+/// `0.7.0`, which packs to `0x000007` and renders as `"0.7"` — a real,
 /// non-zero version; bumping `[workspace.package] version` is a separate,
 /// workspace-wide decision and will change this constant with no code edit.
 pub const FIRMWARE_VERSION: u32 = pack_firmware_version(env!("CARGO_PKG_VERSION"));
