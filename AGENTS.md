@@ -371,7 +371,10 @@ exactly SIGN, NIP44 ENC and NIP44 DEC from the touch; GENERATE, IMPORT,
 SET_LABEL and DELETE never skip it. The bypass is a **PIN-session
 privilege**: a board with no PIN can never arm it, the disable leg's
 touch sits after the PIN gate and every refusal eats an armed grant,
-LOCK, a failed verify and the power cycle clear it (deselect preserves
+LOCK, a failed verify, **SET_PIN on an already-set board** (US-1856: the
+verb still refuses `SW_PIN_ALREADY_SET`, but it closes the session, and a
+closed session must not leave an armed bypass behind it) and the power
+cycle clear it (deselect preserves
 it), and the
 enable direction is friction-free so the button can always be had back.
 RAM-only — a bypass that survives unplug is a bypass the user forgot

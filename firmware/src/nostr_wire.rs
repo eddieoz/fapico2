@@ -84,8 +84,8 @@ pub const NOSTR_CMD_CEREMONY_START: u8 = 0x4E;
 /// (touch required again), `1` the disable leg (the consented press).
 pub const NOSTR_CMD_SET_TOUCH_POLICY: u8 = 0x4F;
 /// US-1842: the bypass ring's read verb — the audit view the extension
-/// renders (US-1846). No payload; the response body is the applet's
-/// `budget ‖ n ‖ records` (see `apps/nostr::INS_GET_AUDIT`).
+/// renders (US-1846). No payload; the v0.3 response body is the applet's
+/// `budget ‖ n ‖ age_ms(4 BE) ‖ records` (see `apps/nostr::INS_GET_AUDIT`).
 pub const NOSTR_CMD_GET_AUDIT: u8 = 0x50;
 
 /// The §2.2.1 wire cap, enforced at the **parse layer**: no request argument
