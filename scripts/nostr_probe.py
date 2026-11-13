@@ -235,7 +235,7 @@ def main():
 
         INS_GET_AUDIT = 0x20
         CAP_BYPASS_ACCOUNTING = 0x0020
-        BYPASS_CAP = 128  # US-1848
+        BYPASS_CAP = 255  # US-1855: the budget byte's largest count
         RING_DEPTH = 16
         RECORD_LEN = 22
 

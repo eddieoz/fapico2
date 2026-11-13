@@ -319,14 +319,17 @@ fn deselect_preserves_the_accounting_state() {
 // US-1839 — the cap
 // ---------------------------------------------------------------------------
 
-/// **The cap is 128, literally** — US-1848. The owner's live test showed
-/// one signature fans out to every relay, so 32 exempt operations were
-/// minutes of real use; 128 is the number the owner named. The value is
-/// pinned here so a future "tune the cap" edit is a conscious test change,
-/// not an incidental constant drift.
+/// **The cap is 255, literally** — US-1855. The owner's live measurement
+/// on the v0.3 build: one user-visible action spends ~8 exempt operations
+/// (each Nostr signature fans out to every relay, and NIP-44 encrypt and
+/// decrypt pair alongside it), so 128 was ~16 actions in the 10-minute
+/// window. The ask was 256; 255 is the largest count the 1-byte budget
+/// field can name — the cap is derived from the wire, not chosen. Pinned
+/// so a future "tune the cap" edit is a conscious test change, not
+/// constant drift.
 #[test]
-fn the_cap_is_128() {
-    assert_eq!(BYPASS_CAP, 128, "US-1848: the owner's number");
+fn the_cap_is_255() {
+    assert_eq!(BYPASS_CAP, 255, "US-1855: the budget byte's largest count");
 }
 
 /// **The whole 128-bypassed-SIGN budget runs grant-free** — every
@@ -393,14 +396,18 @@ fn the_cap_counts_enc_and_dec_too() {
         .with_rng_provider(|out| out.fill(0x42));
     app.set_touch_bypass(true);
     let plaintext = b"budgeted conversation";
+    // The cap is odd (255 — the budget byte's largest count, US-1855), so
+    // the pairs run to one short: 127 pairs = 254 ops, one exempt op left.
     for i in 0..(BYPASS_CAP / 2) {
         let (ct, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
         assert_eq!(sw, SW_OK, "bypassed ENC #{i}");
         let (_, sw) = call(&mut app, &apdu_nip44_decrypt(1, &ct));
         assert_eq!(sw, SW_OK, "bypassed DEC #{i}");
     }
-    assert_eq!(app.bypass_budget(), 0, "the whole budget spent the session");
-    let (_, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
+    assert_eq!(app.bypass_budget(), 1, "the pairs spent all but one");
+    let (ct, sw) = call(&mut app, &apdu_nip44_encrypt(1, plaintext));
+    assert_eq!(sw, SW_OK, "the 255th — ENC counts too — spent the last one");
+    let (_, sw) = call(&mut app, &apdu_nip44_decrypt(1, &ct));
     assert_eq!(sw, SW_TOUCH_REQUIRED, "an op past the budget costs a press");
     assert_eq!(presses(), 1, "the grant was consulted once");
     std::fs::remove_file(&path).ok();
