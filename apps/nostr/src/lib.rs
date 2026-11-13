@@ -169,8 +169,11 @@ pub const INS_CEREMONY_START: u8 = 0x1E;
 pub const INS_SET_TOUCH_POLICY: u8 = 0x1F;
 
 /// US-1842: `GET_AUDIT` — the bypass ring's only wire read. P1 = P2 = 0, no
-/// payload; the body is `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE),
-/// digest(16) }` (22 bytes per record, oldest first). Gated: a PIN-set board
+/// payload; the v0.3 body (US-1849) is `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖
+/// n × { op(1), idx(1), ts(4 BE), digest(16) }` — `age_ms` is the session's
+/// sampled age (`now − armed_at`, saturating), the countdown anchor a
+/// host can actually use, and records are 22 bytes each, oldest first.
+/// Gated: a PIN-set board
 /// with a closed session answers [`SW_PIN_SESSION_REQUIRED`] — a sessionless
 /// host learns nothing, not even the budget — and a PIN-less board answers
 /// honestly empty, because the bypass can never have been armed there.
@@ -340,12 +343,14 @@ pub const SW_CEREMONY_NOT_NEEDED: Sw = 0x6F02;
 // GET_INFO fields
 // ---------------------------------------------------------------------------
 
-/// The applet protocol version, `(0, 2)` — bumped when the wire layout
+/// The applet protocol version, `(0, 3)` — bumped when the wire layout
 /// changes, not when commands are added (clients branch on caps for that).
 /// `(0, 1)` → `(0, 2)` is US-1700: `EXPORT_KEY` retired (US-1699), the PIN
 /// custody dialect (`0x1B`–`0x1D`) in the table, and a live `INFO_FLAGS`
-/// byte where v0.2.0 readers saw a reserved zero.
-pub const APPLET_VERSION: [u8; 2] = [0x00, 0x02];
+/// byte where v0.2.0 readers saw a reserved zero. `(0, 2)` → `(0, 3)` is
+/// US-1849: the GET_AUDIT body grew the `age_ms` header field, so a v0.2
+/// reader of a v0.3 body would misparse every record's offset.
+pub const APPLET_VERSION: [u8; 2] = [0x00, 0x03];
 
 /// The largest NIP-44 plaintext the applet will accept or return (§2.2.1).
 ///
@@ -2085,7 +2090,9 @@ impl NostrApp {
     /// bypass ring's only wire read, and the first *read* the PIN-session
     /// gate covers: the ring is session-adjacent state, and a sessionless
     /// host learns nothing from it, not even the budget. The body is
-    /// `budget(1) ‖ n(1) ‖ n × { op(1), idx(1), ts(4 BE), digest(16) }`,
+    /// `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖ n × { op(1), idx(1), ts(4 BE),
+    /// digest(16) }` (US-1849: the sampled session age, read after the
+    /// expiry leg so an expired session reports 0),
     /// count-first like [`Self::list_keys`]' staging, oldest first. A
     /// PIN-less board answers honestly empty — the bypass can never have
     /// been armed there — and a locked session closes the read with it
@@ -2114,6 +2121,19 @@ impl NostrApp {
         }
         resp.push(self.bypass_budget).ok();
         resp.push(self.bypass_audit.len() as u8).ok();
+        // US-1849: the session's sampled age — `now − armed_at`, saturating,
+        // read after the expiry leg and only while the session is up
+        // (budget > 0 *means* armed): a dead session's age reads as 0, not
+        // as the whole uptime against the cleared arm stamp. The device
+        // clock is monotonic-since-boot and can never be related to a
+        // host's wall clock; a sampled age is what anchors a client-side
+        // countdown.
+        let age_ms = if self.bypass_budget > 0 {
+            (self.now_provider)().saturating_sub(self.bypass_armed_at_ms)
+        } else {
+            0
+        };
+        resp.extend_from_slice(&(age_ms.min(u32::MAX as u64) as u32).to_be_bytes()).ok();
         for record in &self.bypass_audit {
             resp.push(record.op).ok();
             resp.push(record.idx).ok();
