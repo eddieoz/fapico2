@@ -125,18 +125,18 @@ The board asks for the BOOTSEL press on every command that uses or changes the p
 
 On a PIN-set board there is a gate in front of the touch: an unverified session is refused before the button ever lights, and the popup routes you to the verify screen instead (section 5). A touch you press while the session is closed consents to nothing — the refusal consumes the armed grant, never a signature.
 
-### The touch bypass — one consent press opens the signing chain
+### The touch bypass — one consent press, 255 operations, 10 minutes
 
 Nostr platforms send chains of events, and a touch per signature makes a 10-event chain 10 presses. The board therefore offers a **touch bypass** for exactly the three signing commands — **sign, NIP-44 encrypt, NIP-44 decrypt** — and nothing else. The model is the PIN session's twin, and it is worth reading the asymmetry once:
 
-- **Turning it off (silencing the button) is the dangerous direction**, so it costs the most: an **open PIN session** and a **physical press on the board**. Unchecking *"Require touch for signing"* on the popup's PIN manage screen lights the board's LED; the press is you consenting to go touch-free. The firmware enforces both — the extension can only ask.
-- **Turning it on again (the button back) is the safe direction** and is friction-free: checking the box answers instantly, no session, no press, whatever the board's state.
-- **The bypass is RAM-only and dies with the session it was opened in.** LOCK, a failed verify, and a power cycle clear it; a deselect/re-select keeps it. Unplug the board and it is gone — *a bypass that survives unplug is a bypass the user forgot they owned*. The checkbox re-renders checked on the next connect because the board says so, not because the extension remembered anything.
-- **A board with no PIN can never arm the bypass.** The privilege is anchored in the PIN session: no PIN record, no disable.
+- **Arming it (silencing the button) is the dangerous direction**, so it costs the most: an **open PIN session** and a **physical press on the board**. Checking *"Bypass active — signatures run without a touch"* on the popup's PIN manage screen lights the board's LED; the press is you consenting to go touch-free. The firmware enforces both — the extension can only ask.
+- **Disarming it (the button back) is the safe direction** and is friction-free: unchecking the box answers instantly, no session, no press, whatever the board's state.
+- **The bypass is RAM-only and dies with the session it was opened in.** LOCK, a failed verify, **setting a PIN on a board that already has one** (the verb refuses the set but closes the session with it), and a power cycle clear it; a deselect/re-select keeps it. Unplug the board and it is gone — *a bypass that survives unplug is a bypass the user forgot they owned*. The checkbox renders the board's own advertisement, not a preference the extension keeps.
+- **A board with no PIN can never arm the bypass.** The privilege is anchored in the PIN session: no PIN record, no bypass.
 
-While the bypass is armed, a 10-event chain costs **one press total** — the consent press itself. Every signature after it runs grant-free, and the popup's checkbox shows unchecked (*Require touch for signing* off) exactly as long as the board is in that state — the checkbox renders the board's own advertisement, not a preference the extension keeps.
+The chain is bounded, and the bounds are the point: **255 exempt operations and 10 minutes**, per consent press — roughly 30 user-visible actions at the ~8 exempt operations one action costs (each signature fans out to every relay, and the NIP-44 pair rides alongside). The popup shows the session's status line — *"Bypass active — signatures run without a touch"* with a live countdown and a ledger of every exempted operation — and the checkbox shows **checked** exactly as long as the board is in that state. When either bound is reached, the board simply asks for the press again on the next operation — no error, the button is the fallback. Unchecking the box ends the bypass early; re-checking starts a fresh 255/10-minute allowance.
 
-If the consent press never comes (the window is ~15 s), the disable is refused with the touch word, the checkbox snaps back to checked, and the status line says why — the board never half-applies a policy. The full error rows are in [troubleshooting](../troubleshooting/nostr.md).
+If the consent press never comes (the window is ~15 s), the arm is refused with the touch word, the checkbox snaps back to unchecked, and the status line says why — the board never half-applies a policy. On a board whose firmware predates the status line, the popup says so ("the bypass status needs a firmware update — this board predates it") instead of showing nothing. The full error rows are in [troubleshooting](../troubleshooting/nostr.md).
 
 The amber touch bar appears the moment the board asks; keepalives keep it live while the board waits. If no press comes, the device refuses with its touch status word and the extension reports it in plain words:
 
@@ -149,6 +149,7 @@ The amber touch bar appears the moment the board asks; keepalives keep it live w
 | *the device refused the command length* | the counterparty's key is not a valid curve point (`6A87` on the device — the extension's map words it as a length refusal) | check the counterparty's npub |
 | *the device could not complete the operation — its store faulted* | the store refused (`6F00`) — boot degraded or a slot that would not open | reflash/recovery; see [troubleshooting](../troubleshooting/nostr.md) |
 | *the device does not serve that command* | unknown command (`6D00`) — usually a firmware older than the extension | update the board's firmware |
+| *touch mid-chain — the board asks for the press again* | the bypass budget (255) or the 10-minute window ended — the fallback working, not a fault | press once; the session continues with a fresh 255/10-minute allowance |
 | *your PIN is needed first* | a gated command answered `6982` — the session is closed (fresh power-up, or LOCK) | verify the PIN; the interrupted operation resumes |
 | *wrong PIN — N attempts left* | the budget answered (`63C1`–`63C3`) | the count is durable; enter the right one |
 | *the device is locked — too many wrong PINs. Recovery is a factory reset from the management applet, which destroys every identity on the board* | `63C0` — the three-attempt budget is spent | deliberate act only; see [what management RESET does](#9-what-management-reset-does) |

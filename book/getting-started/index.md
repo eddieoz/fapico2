@@ -22,7 +22,7 @@ Linux users who prefer the command line: [`scripts/bootsel.py`](https://github.c
 
 ## Talking to it
 
-The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID device. Set a FIDO2 PIN first (`ykman fido access change-pin` or the browser prompt): on a PIN-set board every operation requires the PIN and a touch. Then per host:
+The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID device. Set a FIDO2 PIN first (`ykman fido access change-pin` or the browser prompt): on a PIN-set board every operation requires the PIN and a touch (the Nostr applet has one bounded exception, [its how-to](../how-to/nostr.md)). Then per host:
 
 ### Linux
 

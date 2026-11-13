@@ -13,7 +13,7 @@ Two consequences shaped the design, both recorded in [ADR 0005](https://github.c
 
 ## The command surface
 
-One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 00 00 02` and speaks plain ISO-7816 APDUs — the `INS` column below. Over **USB HID** it answers a third interface (interface 3, vendor usage page `0xFF00`) speaking CTAPHID framing with vendor command bytes `0x40`–`0x4F` and a CBOR payload — the byte column. Same applet, same consent rules, two clients:
+One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 00 00 02` and speaks plain ISO-7816 APDUs — the `INS` column below. Over **USB HID** it answers a third interface (interface 3, vendor usage page `0xFF00`) speaking CTAPHID framing with vendor command bytes `0x40`–`0x50` and a CBOR payload — the byte column. Same applet, same consent rules, two clients:
 
 | Command | CCID `INS` | HID vendor byte | Touch? | Request → response |
 |---|---|---|---|---|
@@ -33,13 +33,15 @@ One applet, two transports. Over **CCID** the applet is selected by AID `F0 00 0
 | `LOCK` | `0x1D` | `0x4D` | no | — → — ; closes the session |
 | `CEREMONY_START` | `0x1E` | `0x4E` | no | — → migrated(2 BE) ‖ already(2 BE) |
 | `SET_TOUCH_POLICY` | `0x1F`, P1 `0x00`/`0x01` | `0x4F` | no² | — → — ; sets the signing-arm touch policy |
+| `GET_AUDIT` | `0x20` | `0x50` | no³ | — → `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖ n × 22-byte records` |
 
 ¹ the three signing arms skip the touch while the touch bypass is armed — see [the touch bypass](#the-touch-bypass-consented-session-bound-ram-only) below.
-² the verb itself is never touch-gated; its **disable leg** (P1 `0x01`) demands an open PIN session plus a physical press of its own.
+² the verb itself is never touch-gated; its **arm leg** (P1 `0x01`) demands an open PIN session plus a physical press of its own.
+³ touch-free but **session-gated**: a closed session on a PIN-set board answers `6982` — a sessionless host learns nothing, not even the budget (US-1842).
 
 The PIN verbs are touch-free by design — the PIN *is* the consent — and the ceremony's consent is its dialog plus its own refusal gates (below), not the button. `EXPORT_KEY` (`0x1A`/`0x48`) is **retired** (US-1699): the constant survives so the negative tests can name the byte, but the dispatcher has no arm for it and it answers `6D00` on every transport, on every board, with no grandfathering. On a PIN-set board the six touch-gated commands answer `6982` *before* the touch check until `VERIFY_PIN` opens a session — see [PIN custody](#pin-custody-and-the-session).
 
-The command surface is fixed in `apps/nostr/src/lib.rs:108-166`; the HID vendor-byte mapping is `firmware/src/nostr_wire.rs:121-146`. `SIGN` answers with the npub *alongside* the signature (`apps/nostr/src/lib.rs:721-726`) — a host that signed against the wrong identity cannot paper over it, because the answer names the key that produced the signature.
+The command surface is fixed in `apps/nostr/src/lib.rs:108-180`; the HID vendor-byte mapping is `firmware/src/nostr_wire.rs:121-146`. `SIGN` answers with the npub *alongside* the signature (`apps/nostr/src/lib.rs:721-726`) — a host that signed against the wrong identity cannot paper over it, because the answer names the key that produced the signature.
 
 Three touch-free reads, and only three. An npub is public; a label is owner-authored text — listed without a touch, so a label is part of the public surface by definition. Everything that uses or changes the private set presses the button — with exactly **one deliberate exception**: the touch bypass [below](#the-touch-bypass-consented-session-bound-ram-only), which exempts the three signing arms and nothing else. The four key-management commands (generate, import, label, delete) have no bypass, no config bit, and no exemption on any board in any state.
 
@@ -66,7 +68,15 @@ Three touch-free reads, and only three. An npub is public; a label is owner-auth
 
 `SET_TOUCH_POLICY` (US-1742..1746, EPIC `NOSTR-TOUCH-BYPASS`) is the touch analogue of the PIN session. P1 = `0x00` re-enables the touch (the safe direction: no gate, no grant, no store access — byte-identical `9000` whatever the board's state, so the verb cannot fingerprint the board); P1 = `0x01` arms the bypass for the three signing arms, and is the *consented* direction: shape → **PIN gate** (`6A82` with no record, `6982` with the session closed — every refusal eats an armed grant) → **a physical press** (`6985` if the window closed untouched) → the flag stands. The press consents to going touch-free, the dangerous direction; the enable direction is friction-free so the button can always be had back.
 
-The flag is RAM-only beside the session flag behind the shared applet mutex — it spans CCID and vendor-HID for free, and it dies with the thing it was opened in: **LOCK, a failed verify, the factory wipe and every boot clear it; deselect/re-select preserves it.** GET_INFO advertises the verb unconditionally (caps bit 4, `0x0010`) and the live state from the same field the gate reads (flags bit 3, `0x08`) — the advertisement cannot lie about the command paths. The user-facing walkthrough — the extension's checkbox, the consent press, what a 10-event chain costs — is in [the how-to](../how-to/nostr.md#the-touch-bypass--one-consent-press-opens-the-signing-chain); the error rows are in [troubleshooting](../troubleshooting/nostr.md).
+The flag is RAM-only beside the session flag behind the shared applet mutex — it spans CCID and vendor-HID for free, and it dies with the thing it was opened in: **LOCK, a failed verify, setting a PIN on a board that already has one (the verb refuses `SW_PIN_ALREADY_SET` but closes the session with it), the factory wipe and every boot clear it; deselect/re-select preserves it.** GET_INFO advertises the verb unconditionally (caps bit 4, `0x0010`).
+
+### The accounting — the weakening has bounds (US-1837..1847, US-1855/1856)
+
+The bypass is **accounted**. One armed session may run at most **`BYPASS_CAP = 255`** exempt operations — the largest count the 1-byte budget field can name, sized from the measured reality that one user-visible action costs ~8 exempt operations (each Nostr signature fans out to every relay, and the NIP-44 encrypt/decrypt pair alongside it), so ≈30 actions per session — and dies **`BYPASS_SESSION_MS = 600_000` (10 minutes)** after the arm press, by the device's monotonic clock (injected via the `with_now_provider` seam; unwired it reads 0 and can only mean "never expires"). Past either bound the guards fall back to the touch — **the press is the fallback, never an error**.
+
+Every exempt operation appends one 22-byte `AuditRecord` (op, identity index, timestamp, 16-byte payload digest) to a **16-deep RAM ring**, readable through **`GET_AUDIT`** (INS `0x20`, vendor `0x50`; the v0.3 body is `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖ records` — `age_ms` is the session's sampled age, the countdown anchor a host can actually use, since a device-monotonic stamp can never be related to wall time). It is the first *read* the PIN-session gate covers: a closed session on a PIN-set board answers `6982` — a sessionless host learns nothing, not even the budget.
+
+GET_INFO advertises the accounting with caps bit 5 (`0x0020`) — the full caps word is `0x003F` — and the applet version is `0.3` (the body-layout bump). Flags bit 3 (`0x08`) derives from the guards' own predicate `touch_bypass && budget > 0`: **a spent budget reads as not armed on the wire** even while the session is still open, so the cheap check every client reads can never claim armed over a guard about to demand the press. The user-facing walkthrough — the extension's checkbox, status line, countdown and ledger — is in [the how-to](../how-to/nostr.md#the-touch-bypass--one-consent-press-255-operations-10-minutes); the error rows are in [troubleshooting](../troubleshooting/nostr.md).
 
 ## The touch, in three tag domains
 

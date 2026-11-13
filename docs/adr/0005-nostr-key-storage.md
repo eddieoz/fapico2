@@ -109,11 +109,13 @@ The rules that follow (design requirements, not suggestions):
 
 What the user gets — and the design claims nothing beyond it: a Nostr identity is
 not extractable from flash without the OTP row *and* the chip-id, unreadable by
-other applets, and unusable without a physical touch — including `EXPORT_KEY`,
-the one command that hands the key to a host at all. That property holds until the
-user presses once on `EXPORT_KEY`; the README (US-1676) recommends
-generate-in-software-then-`IMPORT_KEY` precisely so the user chooses which posture
-they are in.
+other applets, and unusable without a physical touch. *(Amended: `EXPORT_KEY`
+no longer exists — import-only custody retired it (US-1699, see
+[ADR 0006](0006-nostr-pin-custody.md)) — and since US-1741 the three signing
+arms can run grant-free inside a consented, accounted bypass session, also
+amended in [ADR 0006](0006-nostr-pin-custody.md). The README (US-1676)
+recommendation stands: generate-in-software-then-`IMPORT_KEY` so the user
+chooses which posture they are in.)*
 
 ### Rejected storage backends
 

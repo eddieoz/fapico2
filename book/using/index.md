@@ -1,6 +1,6 @@
 # Using the device
 
-The whole operating model in one paragraph: a board with a PIN set asks for **the PIN and a touch on every operation**, and nothing in a WebAuthn request can switch either off. That is deliberate — a board that leaves your pocket opens nothing by itself. (On a stock Pico 2, the touch is the **BOOTSEL button** — the same button that flashes the board.) Everything below is the daily consequence of that one decision.
+The whole operating model in one paragraph: a board with a PIN set asks for **the PIN and a touch on every operation**, and nothing in a WebAuthn request can switch either off — the sole deliberate exception is the Nostr applet's bounded touch bypass (255 signing operations or 10 minutes per consent press, audited on-device; [the Nostr how-to](../how-to/nostr.md#the-touch-bypass--one-consent-press-255-operations-10-minutes)). That is deliberate — a board that leaves your pocket opens nothing by itself. (On a stock Pico 2, the touch is the **BOOTSEL button** — the same button that flashes the board.) Everything below is the daily consequence of that one decision.
 
 ## The default PINs
 
@@ -53,7 +53,7 @@ Slot and status behavior is configurable from PicoForge. The LED is the only out
 
 ## Nostr identities
 
-The board holds up to eight BIP-340 Nostr identities and signs with them through the [fapico2 Nostr extension](../how-to/nostr.md) — the browser asks, you approve in a small window, and the physical touch signs. The private keys live in the same sealed store as everything else and never leave the board — custody is import-only — and an optional board PIN can put the whole set behind a verify that dies with the power cycle. The full walk: [Nostr identities](../how-to/nostr.md).
+The board holds up to eight BIP-340 Nostr identities and signs with them through the [fapico2 Nostr extension](../how-to/nostr.md) — the browser asks, you approve in a small window, and the physical touch signs — unless you armed the bounded touch bypass, in which case the approval window is still every signature's first consent and the board's button comes back after the 255-operation budget or the 10-minute window. The private keys live in the same sealed store as everything else and never leave the board — custody is import-only — and an optional board PIN can put the whole set behind a verify that dies with the power cycle. The full walk: [Nostr identities](../how-to/nostr.md).
 
 ## No board yet?
 

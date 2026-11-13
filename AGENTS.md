@@ -400,7 +400,10 @@ records`, US-1849 — `age_ms` is the session's sampled age,
 never be related to a host's wall clock but a sampled age can anchor a
 client-side countdown) — the first
 *read* the PIN-session gate covers, so a sessionless host learns nothing,
-not even the budget. Arming fills the budget and stamps the clock (both
+not even the budget. GET_INFO's flags bit 3 derives from the guards' own
+predicate `touch_bypass && budget > 0` (US-1856) — a spent budget reads
+as not armed on the wire while the session is still open. Arming fills
+the budget and stamps the clock (both
 the verb and the host seam); re-arming is the reset. The press consents
 to the **identity**, not the opcode —
 the tag is `0x4000_0000 ‖ idx` over CCID and `0x6000_0000 ‖ CID` over HID,
@@ -468,7 +471,7 @@ no PIN, no sealed records, or the marker already stands), and its response
 body is `migrated(2 BE) ‖ already(2 BE)`. `GET_INFO` advertises the offer
 with flags bit 2 (`FLAG_MIGRATION_PENDING = 0x04`, set iff
 `pin_set && !reseat_complete()`) and the capability with
-`CAP_CEREMONY = 0x0008` (`CAPS = 0x000F`). After the marker stands, **no
+`CAP_CEREMONY = 0x0008` (`CAPS = 0x003F`: bits 0-2 keymgmt/NIP-44/PIN, bit 3 ceremony, bit 4 touch policy, bit 5 bypass accounting). After the marker stands, **no
 record — including the PIN record — opens under the legacy KDF**
 (`no_record_opens_under_legacy_after_marker`, re-checked at every boot attach
 in `nostr_custody_region`: marker stands → the dual-KDF window closes). A
@@ -625,7 +628,7 @@ firmware/src/
   tasks.rs       CCID task, the dual-serve HID task (CTAPHID + Nostr vendor interface)
   otp_hid.rs     YubiOTP HID frame handler (runs one INS 0x01 OTP APDU)
   ctap_hid.rs    CTAPHID assembler, CID allocator, HID command constants
-  nostr_wire.rs  the vendor wire dialect: 0x40–0x4A ↔ INS, CBOR [idx, arg], APDU bridge
+  nostr_wire.rs  the vendor wire dialect: 0x40–0x50 ↔ INS, CBOR [idx, arg], APDU bridge
   nostr_shared.rs the shared NOSTR_APP mutex, the CCID proxy, the APDU scratch statics
   emul_main.rs   host emulation binary over TCP sockets (`--features emulation`)
   bin/{bringup,bridge,hwtest}.rs

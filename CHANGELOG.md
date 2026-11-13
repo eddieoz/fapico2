@@ -7,6 +7,49 @@ short index of what changed and when, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.7.0] — 2026-11-13
+
+Full notes in [`docs/release-notes-alpha-v0.7.0.md`](docs/release-notes-alpha-v0.7.0.md).
+
+### Added — the bypass, accounted (EPICs `NOSTR-BYPASS-ACCOUNTING` / `NOSTR-BYPASS-USABILITY`, US-1837..1856)
+
+- **The touch bypass is accounted.** The consented, session-bound exemption of
+  SIGN / NIP-44 encrypt/decrypt now runs under a per-session budget
+  (`BYPASS_CAP = 255` — the largest count the 1-byte budget field can name)
+  and a deadline (`BYPASS_SESSION_MS = 600_000`, 10 minutes from the arm
+  press, by an injected monotonic clock). Past either bound the touch is the
+  fallback, never an error.
+- **Every exempt operation is recorded** in a 16-deep RAM audit ring,
+  readable through `GET_AUDIT` (vendor `0x50` → INS `0x20`; v0.3 body
+  `budget ‖ n ‖ age_ms(4 BE) ‖ records` — the sampled session age anchors a
+  client-side countdown). The first *read* the PIN-session gate covers:
+  a sessionless host learns nothing, not even the budget.
+  `CAP_BYPASS_ACCOUNTING = 0x0020`; `APPLET_VERSION` 0.3.
+- **The clearing matrix is complete**: LOCK, a failed verify, SET_PIN on an
+  already-set board (US-1856 — the verb refuses but closes the session),
+  the factory wipe, every boot and the expiry all clear the bypass; deselect
+  preserves. GET_INFO's flags bit 3 derives from the guards' predicate
+  `touch_bypass && budget > 0`.
+- **The extension renders the state honestly**: the status line with a live
+  countdown, the operation ledger, the checkbox checked = bypass active
+  (arm-on-check; the consent press belongs to the arm direction), and a
+  firmware-update notice on boards predating the surface.
+
+### Fixed
+
+- SET_PIN on a set board no longer leaves an armed bypass behind the session
+  it closes (US-1856).
+- The bypass advertisement can no longer claim armed over a spent budget
+  (US-1856).
+
+## [0.6.0] — 2026-11-08
+
+Full notes in [`docs/release-notes-alpha-v0.6.0.md`](docs/release-notes-alpha-v0.6.0.md).
+
+## [0.5.0] — 2026-11-04
+
+Full notes in [`docs/release-notes-alpha-v0.5.0.md`](docs/release-notes-alpha-v0.5.0.md) — the touch bypass ships here (US-1741..1749).
+
 ## [0.4.0] — 2026-10-31
 
 Released as [`fapico2-release-alpha-v0.4.0`](https://github.com/eddieoz/fapico2/releases/tag/fapico2-release-alpha-v0.4.0);
