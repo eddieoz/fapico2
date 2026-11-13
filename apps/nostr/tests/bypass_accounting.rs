@@ -16,8 +16,8 @@
 use fapico2_nostr::{
     crypto, NostrApp, AuditRecord, BYPASS_AUDIT_DEPTH, BYPASS_CAP, BYPASS_SESSION_MS,
     INS_GET_AUDIT, INS_GET_INFO, INS_LOCK, INS_NIP44_DECRYPT, INS_NIP44_ENCRYPT, INS_SET_PIN,
-    INS_SIGN, INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_SESSION_REQUIRED,
-    SW_TOUCH_REQUIRED,
+    INS_SIGN, INS_VERIFY_PIN, OP_NIP44_DEC, OP_NIP44_ENC, OP_SIGN, SW_PIN_ALREADY_SET,
+    SW_PIN_SESSION_REQUIRED, SW_TOUCH_REQUIRED,
 };
 use fapico2_platform::dispatch::{App, Sw, SW_OK};
 use fapico2_platform::keyregion::crypto::{derive_payload_key, NOSTR_PAYLOAD_SECRET};
@@ -239,6 +239,58 @@ fn the_host_seam_arms_the_budget_and_stamps_the_clock() {
     assert_eq!(app.bypass_armed_at_ms(), 100, "the clock is read at arm time");
 }
 
+/// **US-1856 — SET_PIN on an already-set board closes the bypass with the
+/// session** (the review's clearing-matrix gap): the verb answers
+/// `SW_PIN_ALREADY_SET` and still ends the custody session; the armed
+/// bypass must not survive it, or the next VERIFY resurrects a touch-free
+/// signing session with the residual budget — exactly the resurrection
+/// LOCK and the failed verify were taught to prevent.
+#[test]
+fn set_pin_on_a_set_board_closes_the_bypass_with_the_session() {
+    let (app, path) = pin_app("acct-setpin");
+    // A denying press is the observable here: the default host presence
+    // auto-acks, which would make the resurrected bypass indistinguishable
+    // from a granted touch.
+    let mut app = app.with_presence_grant(counting_deny);
+    advance(1_000);
+    app.set_touch_bypass(true);
+    call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    let (_, sw) = call(&mut app, &apdu(INS_SET_PIN, 0x00, b"731742"));
+    assert_eq!(sw, SW_PIN_ALREADY_SET, "the verb still refuses the reset");
+    assert_eq!(app.bypass_budget(), 0, "the bypass died with the session");
+    assert_eq!(app.bypass_armed_at_ms(), 0, "the stamp died with the session");
+    assert!(app.bypass_audit().is_empty(), "the ring died with the session");
+    // Re-verify opens a NEW session — and must not resurrect the bypass.
+    let (_, sw) = call(&mut app, &apdu(INS_VERIFY_PIN, 0x00, b"731742"));
+    assert_eq!(sw, SW_OK, "the new session opens");
+    let (data, _) = call(&mut app, &apdu(INS_GET_INFO, 0x00, &[]));
+    assert_eq!(data[7] & 0x08, 0, "the flag reads as gone: no resurrection");
+    let (_, sw) = call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    assert_eq!(sw, SW_TOUCH_REQUIRED, "signing needs the touch again");
+    std::fs::remove_file(&path).ok();
+}
+
+/// **US-1856 — the flag derives from the gate's predicate** (the review's
+/// wire-truth finding): a spent budget is not an armed bypass. GET_INFO
+/// advertises bit 3 from `touch_bypass && budget > 0` — the very
+/// predicate the next SIGN consults — so the cheap check every client
+/// reads can never claim armed over a guard that will demand the press.
+#[test]
+fn the_flag_derives_from_the_guards_predicate() {
+    let (mut app, path) = pin_app("flag-predicate");
+    app.set_touch_bypass(true);
+    for _ in 0..BYPASS_CAP {
+        call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
+    }
+    let (data, _) = call(&mut app, &apdu(INS_GET_INFO, 0x00, &[]));
+    assert_eq!(data[7] & 0x08, 0, "a spent budget reads as not armed on the wire");
+    // The session itself is still open — only the bypass is spent; the
+    // gate-closed read (6982) would be a different, wrong story.
+    let (_, sw) = call(&mut app, &apdu(INS_GET_AUDIT, 0x00, &[]));
+    assert_eq!(sw, SW_OK, "the session survives the spent budget");
+    std::fs::remove_file(&path).ok();
+}
+
 /// **LOCK clears the accounting state** — the US-1745 rationale applies to
 /// every field of the session privilege, not just the flag.
 #[test]
@@ -332,7 +384,7 @@ fn the_cap_is_255() {
     assert_eq!(BYPASS_CAP, 255, "US-1855: the budget byte's largest count");
 }
 
-/// **The whole 128-bypassed-SIGN budget runs grant-free** — every
+/// **The whole 255-bypassed-SIGN budget runs grant-free** — every
 /// [`BYPASS_CAP`] operation consumed one per run, with the grant closure
 /// never consulted.
 #[test]
@@ -387,7 +439,8 @@ fn a_pressed_op_on_a_spent_budget_does_not_go_negative() {
 }
 
 /// **The cap counts ENC and DEC too** — the budget is per *session*, not
-/// per verb: 16 ENC + 16 DEC spend it, and the 17th ENC needs the touch.
+/// per verb: 127 ENC+DEC pairs leave one, the 255th ENC spends it, and
+/// the next DEC needs the touch.
 #[test]
 fn the_cap_counts_enc_and_dec_too() {
     let (app, path) = pin_app("cap-encdec");
@@ -508,8 +561,7 @@ fn the_version_advertises_the_v0_3_layout() {
 /// wipe): the ring accounts the *live* session.
 #[test]
 fn a_stale_session_reads_as_gone() {
-    let (app, path) = pin_app("stale-read");
-    let mut app = app.with_now_provider(fake_now);
+    let (mut app, path) = pin_app("stale-read");
     app.set_touch_bypass(true);
     call(&mut app, &apdu(INS_SIGN, 1, &[0x5A; 32]));
     advance(BYPASS_SESSION_MS + 1);
