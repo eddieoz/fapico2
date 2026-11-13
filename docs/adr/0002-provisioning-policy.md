@@ -22,8 +22,10 @@ The posture is carried by **image provenance, not by build flags**:
 | alpha / beta images | **available** | **none** |
 | `-release` tagged images | the boundary where the closure **will** apply — the mechanism is decided when the system is more mature | none today |
 
-**Tag convention:** release tags carry a `-release` suffix (`vX.Y.Z-release`). The repository
-currently carries no tags; the convention binds from the first tag. A `-release` tag asserts
+**Tag convention:** release tags carry a `-release` suffix (`vX.Y.Z-release`). Tags exist
+from `fapico2-release-alpha-v0.1.0` (2026-10-04) onward — all alpha-class, named
+`fapico2-release-alpha-vX.Y.Z` — and **no `-release` boundary tag has been created yet**;
+the convention binds from the first one. A `-release` tag asserts
 "this image is the class the future provisioning epic targets", so a board's provenance is
 readable from what flashed it.
 

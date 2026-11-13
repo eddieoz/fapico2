@@ -20,7 +20,7 @@ Capacity and source. This holds 848 resident passkeys to a YubiKey 5's 100, and 
 No. Passkey sync means a vendor's cloud holds a usable copy of your credential and you hold an account with that vendor. A resident passkey here exists on one board you control — that is the whole trade.
 
 **Why does everything ask for the PIN and a touch once the PIN is set?**
-Deliberate. The firmware requires both on every operation of a PIN-set board, and no WebAuthn option can switch either off — a board that leaves your pocket opens nothing by itself. The reasoning is on the [Security](../security/index.md) page.
+Deliberate. The firmware requires both on every operation of a PIN-set board, and no WebAuthn option can switch either off — the Nostr applet's touch bypass is the one deliberate exception, and it is bounded (255 signing operations or 10 minutes per consent press, on-device audit ring; see [the Nostr applet](../features/nostr.md#the-touch-bypass-consented-session-bound-ram-only)). A board that leaves your pocket opens nothing by itself. The reasoning is on the [Security](../security/index.md) page.
 
 **Is U2F supported?**
 No — FIDO2/CTAP2 only. Every browser and FIDO tool in current use speaks CTAP2; the legacy U2F path was left out on purpose, and nothing modern misses it.
@@ -37,7 +37,7 @@ A login credential whose private key is generated on the device and never leaves
 A CTAP2.1 extension that lets a site or a tool derive a secret on the device — the mechanism behind FIDO2 disk encryption (LUKS / `systemd-cryptenroll`) and part of what the [SSH how-to](../how-to/ssh.md) relies on.
 
 **What is credProtect?**
-A policy extension that tells the device when a credential may be used without user verification. This firmware requires the PIN and the touch on every operation of a PIN-set board regardless, so credProtect cannot weaken anything here.
+A policy extension that tells the device when a credential may be used without user verification. This firmware requires the PIN and the touch on every FIDO operation of a PIN-set board regardless, so credProtect cannot weaken anything here.
 
 **What are credBlob and largeBlobKey / large blobs?**
 Two ways a site can store data alongside a credential: credBlob carries a small blob (32 bytes) readable without unlocking; largeBlobKey points at a large blob stored through `authenticatorLargeBlobs`. The store behind it is deliberately small on this board — about 960 bytes — so it carries protocol payloads, not files.

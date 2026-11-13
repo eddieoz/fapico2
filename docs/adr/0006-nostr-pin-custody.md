@@ -40,7 +40,9 @@ first:
    HID arm, and a power cycle clears it. Every identity-touching command
    (`SIGN`, `NIP44 ENC/DEC`, `IMPORT`, `GENERATE`, `DELETE`, `SET_LABEL`)
    refuses `6982` while `pin_set && !pin_unlocked`; the three touch-free reads
-   stay open, and the touch layer is unchanged.
+   stay open, and the touch layer is unchanged
+   (amended — see **the touch-bypass amendment** at the end of this ADR; the
+   thief sentence in decision 2 carries the same carve-out).
 3. **The forgotten-PIN inversion: import-only custody is what makes PIN-bound
    signing admissible.** Research round 1 rejected PIN-bound signing on one
    ground — forgotten PIN = destroyed non-revocable identities. That objection
@@ -52,7 +54,10 @@ first:
    seed. Import-only and the PIN are complementary: import-only makes the PIN
    safe (nothing irrecoverable behind it); the PIN makes the device copy
    worthless to a thief (they may press the button; they cannot sign, import,
-   delete, or generate without it). Round 1's constraint ranking
+   delete, or generate without it — and, since US-1741, a thief who knows the
+   PIN can arm the three signing arms only by spending the bypass's own
+   consent press, which the accounting then bounds; see the amendment below).
+   Round 1's constraint ranking
    ("narrowed-export > any PIN") was derived under device-only custody and does
    not survive the inversion.
 4. **The torn-record policy fails closed.** A pin slot that reads back
@@ -157,3 +162,59 @@ discharged each:
   protection.** The custody domain is Nostr's keyregion only; PIN-less
   boards never migrate (nothing to protect — the gate does not exist), and
   no other applet's records are re-seated by the ceremony.
+
+## Amendment (US-1741..1749/1855/1856, 2026-11-13): the touch bypass is a carve-out of this gate, accounted and bounded
+
+US-1741..1749 (EPIC `NOSTR-TOUCH-BYPASS`) carved one deliberate exception into
+decision 2's "the touch layer is unchanged", and US-1837..1856
+(EPICs `NOSTR-BYPASS-ACCOUNTING` / `NOSTR-BYPASS-USABILITY`) bounded it. This
+amendment is the decision's versioned home; AGENTS.md §8 carries the
+implementer's trap list.
+
+**What is carved out.** `SET_TOUCH_POLICY` (INS `0x1F`, vendor `0x4F`) lets an
+open PIN session plus a physical consent press exempt exactly **`SIGN` and the
+NIP-44 encrypt/decrypt pair** from the touch. The four key-management commands
+(generate, import, label, delete) never skip the touch; the PIN gate itself is
+untouched; the press consents to the identity, not the opcode.
+
+**What bounds the carve-out — the accounting decision.**
+
+- **`BYPASS_CAP = 255` exempt operations per session.** Not 256: the budget
+  rides a 1-byte wire field, and 255 is the largest count it can name — the
+  cap is derived from the wire, not chosen. Sizing came from the owner's
+  live measurement that one user-visible action costs ~8 exempt operations
+  (each signature fans out to every relay; the NIP-44 pair rides alongside),
+  so one session ≈ 30 actions. Still fixed, not configurable: a configurable
+  bypass is a bypass whose weakest configuration someone else gets to choose.
+- **`BYPASS_SESSION_MS = 600_000` (10 minutes)** from the arm press, by a
+  caller-supplied monotonic clock (`with_now_provider`; unwired it reads 0
+  and can only mean "never expires" — the fido audit ring's convention).
+  Past either bound the guards fall back to the touch — **the press is the
+  fallback, never an error**.
+- **Every exempt operation appends one 22-byte `AuditRecord`** to a 16-deep
+  RAM ring, readable through `GET_AUDIT` (INS `0x20`, vendor `0x50`; v0.3
+  body `budget(1) ‖ n(1) ‖ age_ms(4 BE) ‖ records` — the sampled age, not a
+  raw device-monotonic stamp, because only an age anchors a client-side
+  countdown). It is the first *read* the PIN-session gate covers: a
+  sessionless host learns nothing, not even the budget. Advertised as caps
+  bit 5 (`CAP_BYPASS_ACCOUNTING = 0x0020`); `APPLET_VERSION` bumped to 0.3
+  for the body layout.
+- **The RAM-only rule is inherited unchanged**: the bypass, budget, clock
+  stamp and ring die with the session — LOCK, a failed verify, SET_PIN on an
+  already-set board (the verb refuses `SW_PIN_ALREADY_SET` but closes the
+  session, and the bypass dies with it; US-1856's clearing-matrix fix), the
+  factory wipe, every boot, and the expiry; deselect preserves. GET_INFO's
+  flags bit 3 derives from the guards' own predicate
+  `touch_bypass && budget > 0` — a spent budget reads as not armed on the
+  wire while the session is still open, so the cheap check every client
+  reads cannot claim armed over a guard about to demand the press.
+
+**Why this is admissible under this ADR's own logic.** Decision 3 made
+PIN-bound signing admissible by removing what a forgotten PIN destroys; the
+bypass does not reopen that objection — it is a session privilege anchored in
+the same PIN session, it cannot be armed without the PIN *and* a physical
+press, it cannot survive unplug, and the accounting bounds what a distracted
+"armed and forgot" costs to at most 255 signing operations inside 10 minutes,
+each of them recorded where the session's own host can read them. The threat
+the accounting answers is the one decision 2 already named: not the thief
+with the board, but the user who armed and walked away.

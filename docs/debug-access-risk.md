@@ -25,9 +25,10 @@ secure debug enable:    1
 ```
 
 **The closure is the first `-release` tag**, per
-[`adr/0002-provisioning-policy.md`](adr/0002-provisioning-policy.md). The
-repository carries no tags, so every image built so far is pre-release and
-this reading is *consistent with policy* — it is not evidence of a defect.
+[`adr/0002-provisioning-policy.md`](adr/0002-provisioning-policy.md). Every
+repository tag so far is alpha-class (`fapico2-release-alpha-v0.1.0` onward),
+so every image built so far is pre-release and this reading is *consistent
+with policy* — it is not evidence of a defect.
 What it does mean is that the window is **open today**, and "consistent with"
 is not the same as verified, which is what US-1613 exists to change.
 
