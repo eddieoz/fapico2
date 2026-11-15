@@ -128,10 +128,10 @@ Shipping UF2 **3,394 blocks**, sha256 `e3a211be3fcc1f31226bd4f69f61418ab53562042
 | `.secure_partition` | 32,768 | `0x103f0000` | **no** — NOLOAD flash address space |
 | `.vector_table` | 276 | `0x10000000` | no (flash) |
 | `.start_block` | 20 | `0x10000114` | no (flash) |
-| `.text` | 834,004 | `0x10000200` | no (flash) |
-| `.rodata` | 20,972 | `0x100cbbd8` | no (flash) |
+| `.text` | 834,048 | `0x10000200` | no (flash) |
+| `.rodata` | 20,980 | `0x100cbc00` | no (flash) |
 | `.data` | 14,300 | `0x20000000` | **yes** — initialized, copied from flash by crt0 |
-| `.gnu.sgstubs` | 0 | `0x100d45c0` | non-alloc, not in Berkeley `text` |
+| `.gnu.sgstubs` | 0 | `0x100d45e0` | non-alloc, not in Berkeley `text` |
 | `.bss` | 400,868 | `0x200037e0` | **yes** — zeroed by crt0 |
 | `.uninit` | 1,024 | `0x200655c4` | yes |
 | `.defmt` | 42 | `0x00000000` | non-alloc, not in Berkeley `text` |
@@ -153,7 +153,7 @@ after: +332 B, which is `CounterWindow` exactly, and the +336 in Berkeley
 of which moved.
 
 <!-- BEGIN measured ELF summary (check_size_report.py) -->
-**Rust device `text` = 902,340 B** · **`.data` = 14,300 B** · **`.bss` = 401,892 B** · **`.uninit` = 1,024 B**
+**Rust device `text` = 902,392 B** · **`.data` = 14,300 B** · **`.bss` = 401,892 B** · **`.uninit` = 1,024 B**
 
 **RAM statics = 416,192 B** (416,196 B address-to-address: `__sheap` `0x200659c4` − RAM origin `0x20000000`). `_stack_start` `0x20082000`, `_stack_end` `0x200659c4` → **main stack zone = 116,284 B** of 532,480 B of SRAM.
 
