@@ -122,6 +122,16 @@ refused to run twice on the same value — the reason is in `ci.yml`).
 Shipping UF2 **3,394 blocks**, sha256 `e3a211be3fcc1f31226bd4f69f61418ab53562042106103b4b86922b38b1924c`.
 `check_boot_chain.py` worst call chain **93,572 ≤ 98,304 B**.
 
+**Date: 2026-11-13 (v0.7.0 — the bypass accounting series).**
+
+`text` 900,852 → **902,392 B (+1,540)**: the bypass accounting — the 16-deep
+audit ring, GET_AUDIT, the injected monotonic clock and its gates — plus the
+CTAPHID INIT reply's Nostr version byte. Berkeley `.bss` **401,892 B
+(unchanged)**. Task arena demand **14,400 B** (unchanged; the stamp the series
+left stale is re-measured — the demand did not move). Shipping UF2
+**3,400 blocks**, sha256 `9b7000a3aceea7d8492618cb7f4485ac1b85a324d13166781652209cb11c379b`.
+`check_boot_chain.py` worst call chain **93,572 ≤ 98,304 B** (unchanged).
+
 <!-- BEGIN measured ELF sections (check_size_report.py) -->
 | section | bytes | addr | in RAM? |
 |---|---:|---:|:---:|
