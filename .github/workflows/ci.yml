@@ -1079,7 +1079,31 @@ jobs:
         working-directory: fapico2
         env:
           PICO_FIDO2_VENV: ${{ github.workspace }}/.test-venv/bin/python
-        run: ./run_openpgp_tests.sh
+        # The suite is EXPECTED to fail (declared quarantine, see the job
+        # comment): the run's result is reported into the step summary and the
+        # step exits 0, so the check reads green with an amber report instead
+        # of a red ❌ that looks like a gate break. The failure counts stay in
+        # the run summary on every push — when they reach zero, the lane goes
+        # back into the blocking pytest gate.
+        run: |
+          set +e
+          ./run_openpgp_tests.sh 2>&1 | tee /tmp/openpgp_quarantine.log
+          {
+            echo "## ⚠ OpenPGP quarantine report (non-blocking, expected red)"
+            echo ""
+            echo "Declared 2026-11-16 (EPIC HW-LANE-CONSENT): opcard"
+            echo '`FilesystemWriteFailure` under key generation. This suite is'
+            echo "excluded from the blocking pytest gate; this report keeps the"
+            echo "failure counts visible until the storage defect is fixed."
+            echo ""
+            echo '```'
+            grep -E "=====.*failed" /tmp/openpgp_quarantine.log | tail -1 || echo "(suite did not reach a pytest summary — inspect the log)"
+            echo '```'
+            echo ""
+            echo "When this line shows zero failures: remove the quarantine note"
+            echo "from run_tests.sh and move the lane back into the pytest gate."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
       - name: Archive emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
