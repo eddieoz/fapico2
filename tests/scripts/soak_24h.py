@@ -73,6 +73,15 @@ Pass criteria:
     - Memory stable (no growth signal via operation latency drift)
 """
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board unattended for 24 hours — one U2F register, then OATH CALCULATE, OpenPGP PSO:SIGN and FIDO authenticate every 5 minutes over CCID+HID (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=True,
+)
+
 import sys
 import os
 import time

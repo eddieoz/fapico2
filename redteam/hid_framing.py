@@ -1,6 +1,16 @@
 """CTAPHID framing abuse on a single persistent fd, plus the INIT-preemption
 race the firmware documents as an exemption (US-705.1).
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — framing-abuse PING/WINK/CBOR frames and the INIT-preemption race on a single persistent fd',
+    destructive=False,
+)
+
 import os, struct, time, select, sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 

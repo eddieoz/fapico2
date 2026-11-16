@@ -11,6 +11,16 @@ Authority per apps/fido/src/vendor41.rs `decision()`:
   ATT_IMPORT 0x09 Touch | ATT_CLEAR 0x0A Touch  | ATT_STATE 0x0B StatusOnly
   CONFIG_WRITE 0x0C Touch | CONFIG_READ 0x0D Ungated | AUDIT_CONFIG 0x0E StatusOnly
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — the RS-Key vendor-0x41 channel (MSE/EXPORT/LOAD/STATE/audit legs; the touch-gated ones prompt the physical button)',
+    destructive=False,
+)
+
 import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID

@@ -2,6 +2,16 @@
 
 Bypasses python-fido2 so we can send malformed/unexpected frames.
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — the redteam CTAPHID driver, opens the device on CTAPHID() construction (also imported as a helper by other redteam scripts)',
+    destructive=False,
+)
+
 import os, struct, time
 
 DEV = os.environ.get("FA_HIDRAW", "/dev/hidraw8")

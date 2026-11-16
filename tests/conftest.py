@@ -39,6 +39,15 @@ from fido2.cose import ES256
 DEFAULT_PIN='12345678'
 
 
+class EmulatorAbsentError(RuntimeError):
+    """Raised when the emulator socket shim yields no usable transport.
+
+    Deliberately a loud construction-time failure (not a skip, not a
+    sys.exit): a gate whose fixture is absent must say so, naming the port
+    it was supposed to find (US-1907, EPIC HW-LANE-CONSENT).
+    """
+
+
 def _pin_protocol(info):
     """The strongest pinUvAuthProtocol the authenticator advertises.
 
@@ -93,22 +102,29 @@ class Device():
         self.__origin = origin
         self.__user_interaction = user_interaction
 
-        # Locate a device
-        self.__dev = next(CtapHidDevice.list_devices(), None)
+        # Locate a device — the emulator's socket shim is the ONLY transport
+        # these suites may use. There is deliberately no PC/SC fallback: one
+        # would attach Fido2Client to the first real PC/SC reader the moment
+        # HID discovery returned empty (US-1907, EPIC HW-LANE-CONSENT), and
+        # test_010_pin.py would then reproduce the 2026-11-16 incident on a
+        # production board.
+        _enum_error = None
+        try:
+            self.__dev = next(CtapHidDevice.list_devices(), None)
+        except OSError as e:
+            self.__dev = None
+            _enum_error = e
         self.dev = self.__dev
         if self.__dev is not None:
             print("Use USB HID channel.")
         else:
-            try:
-                from fido2.pcsc import CtapPcscDevice
-                self.__dev = next(CtapPcscDevice.list_devices(), None)
-                print("Use NFC channel.")
-            except Exception as e:
-                print("NFC channel search error:", e)
-
-        if not self.__dev:
-            print("No FIDO device found")
-            sys.exit(1)
+            raise EmulatorAbsentError(
+                "No FIDO emulator device reachable: the HID shim found no usable "
+                "transport on 127.0.0.1:35962%s. Tests never attach to real "
+                "hardware — start the emulator (./run_tests.sh does it) and rerun."
+                % (" (%s: %s)" % (type(_enum_error).__name__, _enum_error)
+                   if _enum_error is not None else "")
+            )
 
         extensions = [
             HmacSecretExtension(allow_hmac_secret=True),

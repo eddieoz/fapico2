@@ -13,6 +13,15 @@ records verbatim and exits non-zero without retrying.
 Output: docs/tasks/evidence/p7-d2/p7d2-J-mgmt-caps.log (row 4)
         docs/tasks/evidence/p7-d2/p7d2-K-write-config-pre-cycle.log (row 5)
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's mgmt applet over pyusb raw-CCID (fa20:0002) — READ_CONFIG and the WRITE_CONFIG persistence-arm marker that mutates stored device config (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import os
 import sys
 

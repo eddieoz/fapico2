@@ -412,6 +412,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="where to archive logs (default logs/soak-<UTC-stamp>)")
     args = ap.parse_args(argv)
 
+    # Consent gate (EPIC HW-LANE-CONSENT, US-1905): gate the TRANSPORT, not
+    # the file. The emulator transport is socket-bound to 127.0.0.1 and never
+    # touches hardware, so it stays ungated; the usb transport drives the
+    # REAL board for 24 h unattended and needs explicit operator consent.
+    if args.transport == "usb":
+        _repo_root = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        import hw_guard
+        hw_guard.require(
+            what="the REAL RP2350 board over the usb transport — 24 h "
+                 "unattended hammering of CCID (pyscard), HID FIDO2 "
+                 "(python-fido2) and the probe-rs RTT panic-counter stream",
+            destructive=True)
+
     here = os.path.dirname(os.path.abspath(__file__))
     log_dir = args.log_dir or os.path.join(
         here, "logs", "soak-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))

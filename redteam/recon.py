@@ -1,4 +1,14 @@
 """Phase 1 recon: capture device identity on every interface an attacker sees."""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first real hidraw device (raw CTAPHID) plus the first PC/SC CCID reader — CTAPHID INIT/PING/WINK, CTAP2 getInfo and CCID SELECT across every applet AID; read-mostly',
+    destructive=False,
+)
+
 import sys, json
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID

@@ -120,6 +120,17 @@ python3 tests/scripts/check_picoforge_compat_docs.py
 # bypass is reported even when a later gate is also red.
 python3 tests/scripts/check_rng_path.py
 
+# Hardware-lane isolation gate (US-1906, EPIC HW-LANE-CONSENT): pins the
+# boundary between the emulator gate (this script's pytest suites, bound to
+# 127.0.0.1:35962) and the device lanes (redteam/, tests/hardware/,
+# tests/soak/, the tests/scripts device scripts). Rule 1: every device-lane
+# script carries hw_guard.require, before any device-capable import, and is
+# on the guarded inventory. Rule 2: collected tests never import
+# fido2.pcsc/smartcard or call .list_devices(. Rule 3: the conftest PC/SC
+# fallback stays removed (US-1907). A new unguarded device script fails here
+# instead of shipping as one more unconsented hidraw opener.
+python3 tests/scripts/check_hw_isolation.py
+
 # Flash-erase budget gate (US-1010, RS-KEY-ADOPT Phase 2): re-measures what
 # `FlashSlotSink::program` asks the driver to erase per persist and fails while
 # `docs/erase-budget.md` disagrees. It runs here, before the suites, because the
@@ -168,7 +179,22 @@ if printf '%s\n' "$@" | grep -q "tests/harness/"; then
     exit 0
 fi
 
-# Start the CCID relay first (the emulator dials 127.0.0.1:35963 at startup)
+# Start the CCID relay first (the emulator dials 127.0.0.1:35963 at startup).
+#
+# US-1909 (EPIC HW-LANE-CONSENT): a stale emulator/relay from a crashed prior
+# run holds the ports, the fresh one dies on AddrInUse, and pytest silently
+# drives the STALE binary — reporting a full suite of results for code that
+# is not on disk (the failure run_openpgp_tests.sh documents and refuses).
+# Same rule here, for both the relay's dial-in and the emulator's HID port.
+for _port in 35963 35962; do
+    if ss -ltn 2>/dev/null | grep -q ":$_port"; then
+        echo "ERROR: port $_port is already listening before this run started." >&2
+        echo "       A stale fapico2-emulation or ccid_relay is holding it; pytest would" >&2
+        echo "       silently test that stale binary instead of the one just built." >&2
+        echo "       Find it with:  ss -ltnp | grep $_port" >&2
+        exit 1
+    fi
+done
 python3 tests/harness/ccid_relay.py >/tmp/fapico2_relay.log 2>&1 &
 RELAY_PID=$!
 
@@ -208,11 +234,31 @@ for _ in $(seq 1 50); do
 done
 
 # Start the emulator in the background
-./target/x86_64-unknown-linux-gnu/debug/fapico2-emulation &
+./target/x86_64-unknown-linux-gnu/debug/fapico2-emulation >/tmp/fapico2_emul.log 2>&1 &
 EMULATOR_PID=$!
 
-# Wait for the emulator to start
-sleep 1
+# US-1909: wait for the emulator to actually attach to THIS relay rather than
+# sleeping a fixed interval and hoping. Dying is the common case (AddrInUse,
+# a bad keystore) and must abort the run here — before pytest — so a dead
+# emulator can never yield a partially-green gate.
+emulator_connected=0
+for _ in $(seq 1 100); do
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+        echo "ERROR: fapico2-emulation exited during startup." >&2
+        echo "       last emulator log lines:" >&2
+        sed -n '1,20p' /tmp/fapico2_emul.log >&2
+        exit 1
+    fi
+    if grep -q "emulator connected" /tmp/fapico2_relay.log 2>/dev/null; then
+        emulator_connected=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$emulator_connected" -ne 1 ]; then
+    echo "ERROR: fapico2-emulation is running but never attached to the relay on 35963." >&2
+    exit 1
+fi
 
 # Run the tests. Bare runs invoke pytest once per suite directory: pytest's
 # conftest import is a single module name, so a full-discovery run lets
@@ -236,11 +282,26 @@ if [ $# -gt 0 ]; then
         SUITE_FAILURES=1
     fi
 else
-    for suite in tests/pico-fido tests/piv tests/openpgp tests/harness \
-                 tests/test_openpgp_genkey.py tests/test_openpgp_kdf.py \
-                 tests/test_openpgp_key_import.py tests/test_openpgp_lifecycle.py \
-                 tests/test_openpgp_pso.py tests/test_openpgp_security_dos.py \
-                 tests/test_openpgp_verify.py; do
+    # tests/openpgp and the six root test_openpgp_*.py files are QUARANTINED
+    # (declared 2026-11-16, EPIC HW-LANE-CONSENT recorded outcomes): the suite
+    # fails 179 pre-existing tests against the emulator — opcard
+    # `FilesystemWriteFailure` under key generation (US-1538's
+    # Location::External storage series is the prime suspect) — and was never
+    # re-run green after the v1.0 import. Until 2026-11-16 its red was
+    # ABSORBED by the piv pattern-kill killing the shared emulator first, so
+    # every openpgp test silently skipped and the gate read green. US-1908
+    # removed that mechanism, so the suite now runs and fails; a blocking red
+    # on a pre-existing firmware defect is not this gate's subject, and a
+    # silent skip is the defect this epic exists to prevent. The lane is
+    # therefore DECLARED out of this gate: it still runs on every push in a
+    # non-blocking CI job (ci.yml `openpgp-quarantine`), and standalone via
+    # ./run_openpgp_tests.sh for whoever works the storage defect.
+    echo "NOTE: tests/openpgp + the root test_openpgp_*.py files are quarantined"
+    echo "      (179 pre-existing failures, opcard FilesystemWriteFailure) and are"
+    echo "      NOT part of this gate. They run non-blocking in CI (openpgp-quarantine"
+    echo "      job) and standalone via ./run_openpgp_tests.sh. See EPIC"
+    echo "      HW-LANE-CONSENT, docs/tasks/EPIC-hardware-lane-consent.md."
+    for suite in tests/pico-fido tests/piv tests/harness; do
         if ! $PYTEST "$suite" -q; then
             SUITE_FAILURES=1
         fi

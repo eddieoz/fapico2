@@ -29,6 +29,15 @@ Usage:
 Prints a PASS/FAIL table with per-case timings — append it to
 docs/tasks/security-hardware-bdd.md as the US-914 evidence.
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over pcscd/CCID — the OpenPGP applet; its "
+         "setup MUTATES the card (personalizes PW1/PW3 away from factory "
+         "defaults and generates fresh Ed25519/X25519 keys into B6/B8/A4)",
+    destructive=False)
 import argparse
 import hashlib
 import sys

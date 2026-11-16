@@ -9,6 +9,16 @@ Tests the classic OpenPGP card attack surface:
   6. ECDH/PSO:DECIPHER oracle — uniform error for malformed points
   7. Resetting code / RESET RETRY COUNTER without it
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first PC/SC CCID reader, OpenPGP card applet — unauthenticated DO reads, PW-status, PSO:CDS/INTERNAL AUTHENTICATE and key-import probes without PW1',
+    destructive=False,
+)
+
 import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ccid import Card

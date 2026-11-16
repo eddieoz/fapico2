@@ -10,6 +10,15 @@ One attempt each; on unexpected SW record verbatim and exit non-zero.
 
 Output: docs/tasks/evidence/p7-d2/p7d2-M-readconfig-post-cycle.log
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's mgmt applet over pyusb raw-CCID — SELECT + READ_CONFIG after the user's physical USB replug (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import os
 import sys
 

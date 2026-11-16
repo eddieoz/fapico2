@@ -9,6 +9,16 @@ Reads the counter, tells the operator to power-cycle, then re-reads.
 
     exit 0  counter persisted (brute force bounded)   ·  exit 1 RESET (defect)
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first real hidraw device (FIDO/CTAPHID clientPIN getPinRetries) across an operator-performed power cycle — the PIN brute-force-boundedness question: whether the retry attempts survive replug',
+    destructive=True,
+)
+
 import sys, time
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from fido2.hid import CtapHidDevice
