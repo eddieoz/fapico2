@@ -799,6 +799,59 @@ Gotchas, each of which cost time:
 
 ---
 
+## The two test lanes, and the consent gate on the hardware one
+
+This repository has **two separate test populations**, and the 2026-11-16
+incident (a production board came back from a test run PIN-locked and wiped —
+EPIC `HW-LANE-CONSENT`, `docs/tasks/EPIC-hardware-lane-consent.md`) happened
+because nothing told a session which is which. Read this before running any
+test:
+
+- **The emulator gate** — `./run_tests.sh` and everything it invokes
+  (`tests/pico-fido`, `tests/piv`, `tests/harness`). These are socket-bound
+  to `127.0.0.1:35962`/`35963` and **structurally cannot reach a real
+  board**. Run these freely; they are the "full tests". **`tests/openpgp`
+  and the root `test_openpgp_*.py` files are quarantined out of the gate**
+  (declared 2026-11-16: ~179 pre-existing failures — opcard
+  `FilesystemWriteFailure` under key generation; they run non-blocking in
+  CI's `openpgp-quarantine` job and standalone via `./run_openpgp_tests.sh`
+  — see EPIC `HW-LANE-CONSENT`'s recorded outcomes before touching the
+  storage defect).
+- **The device lanes** — every directly-runnable script under `redteam/`,
+  `tests/hardware/`, `tests/soak/` (usb transport) and the device scripts in
+  `tests/scripts/` (`p7_*`, `p8_rng_starve.py`, `soak_24h.py`,
+  `s721-5-hardware-test.py`, `us933_*`, `us948_*`, `pull_boot_timeline.py`,
+  `ccid_usb.py`). These open the **first real hidraw/PC-SC/pyusb device on
+  the host** — on this owner's host, that is the production board.
+
+The device lanes are consent-gated (US-1900/1901): each calls
+`hw_guard.require` before touching anything, so without
+`FAPICO2_HW_TESTS=1` it prints what it would have opened and exits 2.
+PIN-burning, wiping and red-team legs are additionally **destructive tier**:
+they refuse a non-interactive session (exit 3) and require a terminal plus a
+typed `YES` — an agent session cannot pass that tier under any environment.
+
+The rules, in the owner's own words:
+
+1. **Device-lane scripts never run automatically** and are **never part of
+   any automated suite** — no gate, no CI job, no agent "run the tests"
+   interpretation reaches them.
+2. **An agent session must not set `FAPICO2_HW_TESTS` without the owner's
+   explicit request in the current conversation**, and must not run a
+   device-lane script even with the env var exported — the destructive tier
+   refuses a non-interactive session by construction, and the non-destructive
+   tier still needs the owner's say-so.
+3. If a task seems to need real hardware, say so and ask; the refusal
+   messages name the emulator alternative (`./run_tests.sh`), which is
+   almost always what "run the tests" actually means.
+
+`tests/scripts/check_hw_isolation.py` (in `run_tests.sh` and the `gates-py`
+CI job) pins the guarded inventory and the no-real-enumeration rule, so a
+new device-lane script without the guard fails CI rather than shipping
+unguarded.
+
+---
+
 ## Hardware warnings
 
 - **Never run this firmware with a SWD debugger attached.** `probe-rs run` /

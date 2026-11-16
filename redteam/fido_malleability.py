@@ -13,6 +13,16 @@ Malleability questions that need no credential:
 command" — was advertised here but never implemented; see
 docs/audits/2026-11-05-redteam-quality-audit.md T3. Implement it before re-adding the claim.)
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — getInfo determinism, uv/up flag coercion and a token-less store flood (hammering credMgmt/largeBlobs/makeCredential) that can churn device state',
+    destructive=True,
+)
+
 import sys, time, cbor2
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID, DEV

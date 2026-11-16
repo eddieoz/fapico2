@@ -6,6 +6,16 @@ Tests the three attack classes that need no PIN knowledge:
   3. seed poisoning — can PUT overwrite/add a credential without VALIDATE,
      letting an attacker predict future OTPs?
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first PC/SC CCID reader, OATH (YKOATH) applet — LIST/CALC enumeration and validation-bypass probes, plus PUT seed-poisoning attempts, without VALIDATE',
+    destructive=False,
+)
+
 import sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ccid import Card

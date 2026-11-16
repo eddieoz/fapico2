@@ -7,10 +7,11 @@ data-object / key helpers.
 
 The Rust firmware under test is the single merged emulation binary built with
 ``--features emulation`` (``target/x86_64-unknown-linux-gnu/debug/
-fapico2-emulation``). It dials ``127.0.0.1:35963`` at start-up; the relay
-(``tests/harness/ccid_relay.py``) binds that port and exposes the client port
-``35970``. Both directions are ``[u16 BE length]``-framed; power-on is a single
-``0x04`` byte answered by the ATR.
+fapico2-emulation``). Since US-1908 (EPIC HW-LANE-CONSENT) the suite runs a
+PRIVATE relay pair (36025/36026, see ccid_relay.py's port map) and points its
+emulator at it via ``FAPICO2_CCID_PORT``/``FAPICO2_HID_PORT`` — it neither
+binds nor kills the shared pair run_tests.sh starts. Both directions are
+``[u16 BE length]``-framed; power-on is a single ``0x04`` byte answered by the ATR.
 
 Reuses the shared harness machinery (``tests/harness/ccid.py``:
 ``EmulatedCard`` + ``resolve_emulator_binary``) rather than re-implementing the
@@ -31,7 +32,6 @@ is a live TDD record of the US-374/375 contract.
 from __future__ import annotations
 
 import os
-import signal
 import socket
 import struct
 import subprocess
@@ -105,8 +105,12 @@ def verify_ecdsa(der_sig: bytes, msg: bytes, pub_point: bytes, curve, hash_alg) 
     pub.verify(der_sig, msg, _ec.ECDSA(hash_alg))  # raises InvalidSignature on mismatch
 
 # --- transport / ports (FIXED by the harness; see AGENTS.md) -----------------
-CCID_PORT = 35963        # emulator dials in here
-CLIENT_PORT = 35970      # test clients connect here
+# PRIVATE pair (US-1908, EPIC HW-LANE-CONSENT): the piv relay/emulator must
+# not fight run_tests.sh's shared pair (35963/35970) — and must not kill it
+# either. Registered in ccid_relay.py's port map.
+CCID_PORT = 36025        # emulator dials in here (FAPICO2_CCID_PORT)
+CLIENT_PORT = 36026      # test clients connect here
+HID_PORT = 36125         # the private emulator's HID port (FAPICO2_HID_PORT)
 RELAY = str(HARNESS / "ccid_relay.py")
 PYTHON = sys.executable
 
@@ -121,51 +125,28 @@ def _emulator_binary() -> str:
     return resolve_emulator_binary()
 
 
-def _own_ancestor_pids() -> set:
-    """This process's PID plus every ancestor (so orphan cleanup never self-kills)."""
-    skip = {os.getpid()}
-    pid = os.getpid()
-    for _ in range(128):
-        try:
-            with open("/proc/%d/stat" % pid) as f:
-                # field 4 (ppid) follows "(comm)", which may contain spaces/parens.
-                ppid = f.read().rsplit(")", 1)[1].split()[1]
-            pid = int(ppid)
-        except (OSError, IndexError, ValueError):
-            break
-        if pid <= 1 or pid in skip:
-            break
-        skip.add(pid)
-    return skip
+def kill_recorded(*procs: "subprocess.Popen | None") -> None:
+    """Terminate exactly the recorded Popen handles — never a pattern match.
 
-
-def _pkill(*patterns: str) -> None:
-    """Best-effort orphan cleanup that can never signal this harness.
-
-    ``pkill -f PATTERN`` matches any process whose *command line* contains
-    PATTERN — including an ancestor ``bash -c`` wrapper that merely mentions the
-    name (the classic self-match gotcha). We collect our own PID and the full
-    ancestor chain and skip those, so a stray ``fapico2-emulation`` /
-    ``ccid_relay.py`` orphan is reaped without risking the tree running this test.
+    The old pattern-based cleanup (``pgrep -f`` + SIGTERM over every process
+    whose command line contains ``fapico2-emulation`` / ``ccid_relay.py``) was
+    ownership-blind: under ``./run_tests.sh`` it killed the SHARED relay and
+    emulator (not ancestors of this process), which silently skipped every
+    suite after piv that needs the shared pair (US-1908, EPIC
+    HW-LANE-CONSENT). This helper kills only what the session itself
+    spawned; a stale process from a crashed prior run now makes the next
+    start fail loudly at the relay's READY check instead of being mass-killed.
     """
-    skip = _own_ancestor_pids()
-    for pat in patterns:
-        try:
-            out = subprocess.run(["pgrep", "-f", pat], stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL)
-        except (OSError, FileNotFoundError):
+    for proc in procs:
+        if proc is None:
             continue
-        for tok in out.stdout.split():
-            try:
-                pid = int(tok)
-            except ValueError:
-                continue
-            if pid in skip:
-                continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+        if proc.poll() is not None:
+            continue  # already exited — idempotent
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 # --- PIV protocol constants (C `pico-openpgp/src/openpgp/piv.c` / `files.h`) --
@@ -326,8 +307,9 @@ class PivSession:
         self.emu: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
         self.card: EmulatedCard | None = None
-        _pkill("fapico2-emulation", "ccid_relay.py")
-        time.sleep(0.4)
+        # US-1908: no pattern kill here — a stale process from a crashed run
+        # now fails loudly at the relay READY check instead of being
+        # mass-killed along with the shared emulator.
         self._start()
 
     # -- lifecycle ------------------------------------------------------------
@@ -338,10 +320,14 @@ class PivSession:
         self._wait_ready(self.relay)
         env = dict(os.environ)
         env["FAPICO2_PIV_KEYSTORE"] = self.keystore
+        # the private relay pair (US-1908): without these the emulator would
+        # dial the shared 35963 and bind the shared HID port 35962
+        env["FAPICO2_CCID_PORT"] = str(CCID_PORT)
+        env["FAPICO2_HID_PORT"] = str(HID_PORT)
         self.emu = subprocess.Popen(
             [self.bin], env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-        time.sleep(1.1)  # emulator dials 35963 at start-up
+        time.sleep(1.1)  # emulator dials the private CCID port at start-up
         self.sock = socket.create_connection(("127.0.0.1", CLIENT_PORT), timeout=5)
         self.sock.settimeout(20)
         self.card = EmulatedCard(self.sock)
@@ -360,27 +346,15 @@ class PivSession:
         raise TimeoutError("ccid_relay did not become ready within %.0fs" % timeout)
 
     def stop(self) -> None:
-        if self.emu is not None and self.emu.poll() is None:
-            self.emu.terminate()
-            try:
-                self.emu.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.emu.kill()
         if self.card is not None:
             self.card.close()
-        if self.relay is not None and self.relay.poll() is None:
-            self.relay.terminate()
-            try:
-                self.relay.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.relay.kill()
+        # recorded handles only (US-1908) — never a pattern kill
+        kill_recorded(self.emu, self.relay)
         self.emu = self.relay = self.card = self.sock = None
 
     def restart(self) -> None:
         """Stop relay+emulator, bring both back up against the same keystore."""
         self.stop()
-        _pkill("fapico2-emulation", "ccid_relay.py")
-        time.sleep(0.4)
         self._start()
 
     def __enter__(self) -> "PivSession":
@@ -534,7 +508,6 @@ def piv(piv_keystore: str) -> PivSession:
     session = PivSession(emulator_bin=_emulator_binary(), keystore=piv_keystore)
     yield session
     session.stop()
-    _pkill("fapico2-emulation", "ccid_relay.py")
 
 
 @pytest.fixture(autouse=True)

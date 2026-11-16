@@ -41,8 +41,22 @@ Usage:
     python3 tests/hardware/boot_time_probe.py --label arm-c-different-image
     python3 tests/hardware/boot_time_probe.py --after-enter --label arm-a
 """
+from __future__ import annotations  # noqa: E402  (must precede the guard)
 
-from __future__ import annotations
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+
+if __name__ == "__main__":
+    # Consent gate. Gated on a direct run only: importing this module (e.g.
+    # test_boot_ladder.py's classifier import, which is exempt from the gate)
+    # executes no device contact — just constants and pure functions — so
+    # the guard still precedes every hardware touch of the script itself.
+    hw_guard.require(
+        what="the RP2350 board over the host USB bus (pyusb enumeration "
+             "watch) across a BOOTSEL reflash or power-cycle boot",
+        destructive=False)
 
 import argparse
 import json

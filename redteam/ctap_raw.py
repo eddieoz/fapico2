@@ -10,6 +10,16 @@ them:
 Also centralizes the hidraw path so `FA_HIDRAW` is honoured everywhere (the
 QUALITY_AUDIT G3 ghost).
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='whatever device lane its caller wires in — hidraw FIDO/CTAPHID or the PC/SC CCID reader; shared redteam_main() plumbing that opens the device inside the attack callable (also imported as a helper by other redteam scripts)',
+    destructive=False,
+)
+
 import os
 
 DEV = os.environ.get("FA_HIDRAW", "/dev/hidraw8")

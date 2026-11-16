@@ -1,3 +1,12 @@
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board over HID FIDO — setPIN('1234'), wrong-PIN and get_pin_token legs burn PIN retry attempts, and makeCredential/credMgmt/largeBlobs mutate device state (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=True,
+)
+
 import fido2.ctap2.base as base
 _orig = base.Ctap2.send_cbor
 def _relaxed(self, cmd, data=None, event=None, on_keepalive=None):

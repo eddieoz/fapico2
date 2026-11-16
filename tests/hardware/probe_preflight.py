@@ -47,8 +47,16 @@ Usage:
     python3 tests/hardware/probe_preflight.py
     python3 tests/hardware/probe_preflight.py --require-bootsel
 """
+from __future__ import annotations  # noqa: E402  (must precede the guard)
 
-from __future__ import annotations
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the host USB bus (pyusb/lsusb enumeration) to assert no SWD probe "
+         "is attached before a US-1301 baseline run against the board",
+    destructive=False)
 
 import argparse
 import subprocess

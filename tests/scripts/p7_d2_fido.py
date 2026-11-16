@@ -17,6 +17,15 @@ and exit non-zero without retrying.
 Output: docs/tasks/evidence/p7-d2/p7d2-C2-fido-getinfo.log
         docs/tasks/evidence/p7-d2/p7d2-C3-fido-u2f.log
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board over HID FIDO — one U2F register consumes a credential slot permanently and CTAP1 authenticate bumps the signature counter (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=True,
+)
+
 import os
 import sys
 import hashlib

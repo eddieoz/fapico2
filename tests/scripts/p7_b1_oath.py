@@ -32,6 +32,15 @@ Transports (US-130):
 
 Exit 0 = every check passed; exit 1 = at least one failure.
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's OATH applet over pcscd/CCID (pyscard) — the full YKOATH lifecycle: RESET wipes all OATH credentials, PUT/SET_PIN/SET_CODE mutate them (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import os
 import sys
 import hmac as _hmac

@@ -2,6 +2,16 @@
 hostility, largeBlobs, and the vendor 0x41 channel. Success = the device
 survives every input with a defined response (no hang, no drop-off).
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — CID flood, framing abuse, parser-hostile CBOR and largeBlobs/vendor-0x41 fuzzing that can wedge the device or drop it off the bus',
+    destructive=True,
+)
+
 import sys, os, struct, time, select
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID

@@ -45,8 +45,17 @@ Usage:
     python3 us1301_cycle.py --arm flash --uf2 ../../../fapico2/fapico2.uf2
     python3 us1301_cycle.py --arm save
 """
+from __future__ import annotations  # noqa: E402  (must precede the guard)
 
-from __future__ import annotations
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over CCID/pyusb — a rescue REBOOT to "
+         "BOOTSEL followed by a UF2 reflash (flash arm) or a freeze "
+         "reproduction cycle on real hardware",
+    destructive=False)
 
 import argparse
 import json

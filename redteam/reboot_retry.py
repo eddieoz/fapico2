@@ -1,4 +1,14 @@
 """Check retry counter persistence across an unauthenticated REBOOT."""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first real hidraw device (FIDO clientPIN getPinRetries) plus the CCID Rescue applet — issues an unauthenticated normal REBOOT (P1=0x00) and waits for the board to re-enumerate',
+    destructive=False,
+)
+
 import sys, time
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from fido2.hid import CtapHidDevice

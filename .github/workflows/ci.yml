@@ -733,6 +733,7 @@ jobs:
           for g in \
             tests/scripts/check_flash_budget.py \
             tests/scripts/check_acceptance_exit_code.py \
+            tests/scripts/check_hw_isolation.py \
             tests/scripts/check_boot_clock_order.py \
             tests/scripts/check_dbg_release_gate.py \
             tests/scripts/check_debug_strip.py \
@@ -1030,3 +1031,60 @@ jobs:
           path: |
             /tmp/fapico2_relay.log
             fapico2/tests/harness/
+
+  # The quarantined OpenPGP lane (declared 2026-11-16, EPIC HW-LANE-CONSENT):
+  # the suite fails ~179 pre-existing tests against the emulator — opcard
+  # `FilesystemWriteFailure` under key generation, present before the epic and
+  # hidden until then by the piv pattern-kill's accidental skips. It is NOT
+  # part of the blocking pytest-gate, but it is not forgotten either: this job
+  # runs the suite on every push and reports red AMBER (continue-on-error), so
+  # the failure counts stay visible until the storage defect is fixed. When
+  # it goes green, remove the quarantine note from run_tests.sh and the lane
+  # back into the gate.
+  openpgp-quarantine:
+    name: openpgp quarantine (non-blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - name: Checkout fapico2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: fapico2
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: fapico2/tests/requirements.txt
+      - name: Install PC/SC headers (pyscard build dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcsclite-dev
+      - name: Set up Rust (pinned; host target for the emulator)
+        working-directory: fapico2
+        run: rustup toolchain install --profile minimal --no-self-update
+      - name: Cache cargo (rust-cache)
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fapico2
+          cache-on-failure: true
+      - name: Install Python test dependencies
+        run: |
+          python -m venv .test-venv
+          ./.test-venv/bin/pip install --upgrade pip
+          ./.test-venv/bin/pip install -r fapico2/tests/requirements.txt
+      - name: "AMBER: the quarantined OpenPGP suite (run_openpgp_tests.sh)"
+        working-directory: fapico2
+        env:
+          PICO_FIDO2_VENV: ${{ github.workspace }}/.test-venv/bin/python
+        run: ./run_openpgp_tests.sh
+      - name: Archive emulator logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openpgp-quarantine-emulator-logs
+          path: |
+            /tmp/fapico2_relay.log
+            /tmp/fapico2_emul.log

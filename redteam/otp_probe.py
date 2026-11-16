@@ -7,6 +7,16 @@ hidraw exposes those as ioctls, which need no libusb interface claim.
   HIDIOCSFEATURE(dir=WRITE, 'H', 0x06, len)
   HIDIOCGFEATURE(dir=READ,  'H', 0x07, len)
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the YubiOTP HID interface via hidraw feature-report ioctls (HIDIOCSFEATURE/HIDIOCGFEATURE) — CAPABILITIES/SERIAL/CHALLENGE_OTP/SCAN_MAP probes on every candidate hidraw node',
+    destructive=False,
+)
+
 import fcntl, os
 
 def ioc(direction, typ, nr, size):

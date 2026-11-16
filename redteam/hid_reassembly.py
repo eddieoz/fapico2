@@ -1,6 +1,16 @@
 """Reassembly test with a CORRECTLY extracted CID: does the device accept
 multi-frame messages (continuation packets) at all, and with which seq bit?
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — multi-frame continuation-packet reassembly probes with a correctly extracted CID',
+    destructive=False,
+)
+
 import os, struct, time, select, sys
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 

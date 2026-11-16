@@ -7,6 +7,10 @@ host-testable precisely because the classifier does no timing and no USB. A
 story that needed the hardware to prove the classifier is a function of an
 integer would be testing the wrong thing.
 
+This test therefore opens no device at all — it runs entirely on in-process
+fixtures and never enumerates USB, CCID or HID, which is why it is exempt
+from the `hw_guard` consent gate (EPIC HW-LANE-CONSENT, US-1905).
+
 Transition counts, not light levels
 -----------------------------------
 

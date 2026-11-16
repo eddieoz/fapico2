@@ -32,8 +32,16 @@ Usage (needs the test venv for python-fido2):
 Exit status: 0 = the PIN authenticates (store intact), 1 = it does not
 (store wiped or the PIN is different), 2 = the device was not reachable.
 """
+from __future__ import annotations  # noqa: E402  (must precede the guard)
 
-from __future__ import annotations
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over CTAP2 HID (python-fido2) — sets/clears "
+         "and verifies the FIDO PIN held in the device's sealed secure store",
+    destructive=False)
 
 import sys
 

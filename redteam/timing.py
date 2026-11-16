@@ -18,6 +18,16 @@ script spends exactly RETRY_BUDGET of the remaining attempts and refuses to
 run below a safety floor. Exit codes: 0 no gross anomaly · 1 gross timing
 defect · 2 environment/insufficient budget.
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first real hidraw device (FIDO/CTAPHID) — burns RETRY_BUDGET (3) PIN retry attempts with timed wrong-PIN getPinToken legs, floor-guarded',
+    destructive=True,
+)
+
 import sys, time, statistics
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from fido2.hid import CtapHidDevice

@@ -25,6 +25,15 @@ Cases:
 
 Run: python3 tests/hardware/us928_wipe_reprobe.py [--yes]
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over pcscd/CCID — drives the management "
+         "RESET that WIPES the device (OpenPGP PW1/PW3, retry counters, "
+         "DOs, secure-store state are destroyed)",
+    destructive=True)
 
 import argparse
 import sys
