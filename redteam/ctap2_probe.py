@@ -1,4 +1,14 @@
 """CTAP2 auth-state probes: PIN state, token-less ops, vendor channels, largeBlobs."""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='a raw hidraw CTAPHID channel (FA_HIDRAW, default /dev/hidraw8) — clientPIN/authenticatorConfig auth-state probes, token-less makeCredential/getAssertion and largeBlobs',
+    destructive=False,
+)
+
 import sys, time
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from ctaphid import CTAPHID

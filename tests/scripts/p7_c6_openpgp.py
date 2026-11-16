@@ -44,6 +44,15 @@ Usage:
 
 Exit 0 = every check passed; exit 1 = at least one failure.
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's OpenPGP card over pcscd/CCID (pyscard) — factory PW1/PW3 VERIFY, on-card GENERATE (burns key slots), PSO:SIGN/INTERNAL AUTHENTICATE and GET CHALLENGE (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import argparse
 import hashlib
 import os

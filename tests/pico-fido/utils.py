@@ -31,14 +31,11 @@ import math
 from threading import Event, Timer
 from numbers import Number
 
-import sys
-try:
-    from smartcard.CardType import AnyCardType
-    from smartcard.CardRequest import CardRequest
-    from smartcard.Exceptions import CardRequestTimeoutException, CardConnectionException
-except ModuleNotFoundError:
-    print('ERROR: smarctard module not found! Install pyscard package.\nTry with `pip install pyscard`')
-    sys.exit(-1)
+# pyscard: only CardConnectionException is used (send_apdu's reconnect leg).
+# The dead AnyCardType/CardRequest/CardRequestTimeoutException imports were
+# removed (US-1907, EPIC HW-LANE-CONSENT) — a collected-test file must not
+# carry PC/SC machinery it does not call (rule 2 of check_hw_isolation.py).
+from smartcard.Exceptions import CardConnectionException
 
 class APDUResponse(Exception):
     def __init__(self, sw1, sw2):

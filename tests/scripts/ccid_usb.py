@@ -8,6 +8,15 @@ detach is scoped to the CCID interface only (the original detached both
 interfaces, which killed the board's FIDO hidraw node), and close()
 re-attaches the detached kernel driver.
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's CCID interface over pyusb (fa20:0002) — claims the interface and detaches/re-attaches the kernel driver (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import struct
 import sys
 import usb.core

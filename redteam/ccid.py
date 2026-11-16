@@ -1,4 +1,14 @@
 """CCID/PC-SC APDU driver for redteam use — every applet via SELECT AID."""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first PC/SC CCID reader — the redteam APDU driver, connects on Card() construction and SELECTs every applet AID (also imported as a helper by other redteam scripts)',
+    destructive=False,
+)
+
 from smartcard.System import readers
 from smartcard.util import toBytes
 

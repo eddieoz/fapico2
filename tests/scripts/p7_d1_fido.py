@@ -13,6 +13,15 @@ authoritative changes (S-731-1 brief):
 Writes one verbatim evidence file per step into
 docs/tasks/evidence/p7-d1/ (p7d1-C…p7d1-H), like the p7-c7 pattern.
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board over HID FIDO — get_pin_token('1234') burns a PIN retry attempt on every run, and setPIN/credMgmt/largeBlobs mutate device state (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=True,
+)
+
 import sys
 import os
 import hmac as _hmac

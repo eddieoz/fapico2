@@ -15,6 +15,15 @@ Tests the full OpenPGP card functionality over real CCID (pcscd/pyscard):
 Predictions pre-registered in docs/tasks/phase7-ladder.md P7-C6.
 """
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL board's OpenPGP card over pcscd/CCID (pyscard) — VERIFY with factory PW1, key export, PSO:SIGN/DECIPHER, GET CHALLENGE and a PIN change (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import sys
 import time
 import hashlib

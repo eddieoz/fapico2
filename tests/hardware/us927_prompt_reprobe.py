@@ -24,6 +24,15 @@ Cases:
 
 Run: python3 tests/hardware/us927_prompt_reprobe.py [--filter P1-wc-refused] [--yes]
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over pcscd/CCID — refused/granted mgmt "
+         "WRITE_CONFIG and RESET legs, with the operator's eyes on the LED "
+         "touch prompt (P3 optionally grants a RESET)",
+    destructive=False)
 
 import argparse
 import sys

@@ -1,8 +1,8 @@
 #!/bin/bash
 # US-385 — 24-h soak runner.
 #
-# Builds the emulator (emu transport), frees any *leaked* emulator from a prior
-# run, then runs the soak and reports. All arguments pass through to soak.py:
+# Builds the emulator (emu transport), then runs the soak and reports. All
+# arguments pass through to soak.py:
 #
 #   ./run_soak.sh                                   24-h emu soak (default)
 #   ./run_soak.sh --max-cycles 200                  short emu verification
@@ -35,21 +35,37 @@ if [ "${1:-}" != "--transport" ]; then
   fi
 fi
 
-# --- free leaked emulators from a prior run ---------------------------------
-# The emulator's TCP ports (HID 35962 / CCID 35963) are hardcoded, so a leaked
-# instance blocks the next soak. Kill ONLY orphaned ones (PPID=1: their
-# controlling shell is gone — a leak), never a live process.
-for pid in $(pgrep -f 'fapico2-emulation|fapico2/build/pico_fido2' 2>/dev/null); do
-  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-  if [ "$ppid" = "1" ]; then
-    kill "$pid" 2>/dev/null && echo ">> killed orphaned (leaked) emulator pid $pid"
-  fi
-done
-sleep 1
+# --- run the soak; cleanup touches only PIDs THIS script spawned -------------
+# EPIC HW-LANE-CONSENT US-1905: the old pre-run block pattern-pkilled
+# 'fapico2-emulation|fapico2/build/pico_fido2', which also killed the SHARED
+# emulator that other suites keep running. Killing by name is gone entirely:
+# cleanup below is scoped to the PIDs this run recorded spawning — the soak
+# process ($SOAK_PID, captured with $!) and, while it is still alive so they
+# are still attributable to it, its own children (the emulator / probe-rs
+# relay soak.py started).
+"$PYTHON" "$SOAK/soak.py" "$@" &
+SOAK_PID=$!
 
-echo "======================================================================"
-echo " US-385 soak"
-echo "   interpreter : $PYTHON"
-echo "   command     : soak.py $*"
-echo "======================================================================"
-exec "$PYTHON" "$SOAK/soak.py" "$@"
+on_signal() {
+  # Snapshot the soak's live children BEFORE killing it: once the soak
+  # process dies, its children reparent to init and can no longer be
+  # attributed to this run.
+  local kids
+  kids=$(ps -o pid= --ppid "$SOAK_PID" 2>/dev/null | tr -d ' \t')
+  [ -n "$kids" ] && kill $kids 2>/dev/null
+  kill "$SOAK_PID" 2>/dev/null
+  # Wait for the recorded PIDs to actually go, then force any straggler.
+  for pid in $kids "$SOAK_PID"; do
+    for _ in 1 2 3 4 5; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null
+  done
+}
+trap on_signal INT TERM
+
+wait "$SOAK_PID"
+status=$?
+trap - INT TERM
+exit "$status"

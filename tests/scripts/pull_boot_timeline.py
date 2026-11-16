@@ -37,6 +37,15 @@ Usage:
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the REAL flashed board's CTAP-HID drain — reads the boot-timeline capture build's E_PHASE ring after USB enumeration (the emulator suites live under tests/, run ./run_tests.sh instead)",
+    destructive=False,
+)
+
 import argparse
 import sys
 from pathlib import Path

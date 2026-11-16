@@ -38,6 +38,15 @@ Usage:
   python3 tests/hardware/redteam_hw_bdd.py --filter N1,N2 --yes
   python3 tests/hardware/redteam_hw_bdd.py --list     # show cases only
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import hw_guard
+hw_guard.require(
+    what="the live RP2350 board over CCID/HID — red-team attack replays "
+         "(N1 token-less GA, N2 forged-pinUvAuthParam) that burn PIN retry "
+         "attempts and hammer real device state",
+    destructive=True)
 import argparse
 import os
 import struct

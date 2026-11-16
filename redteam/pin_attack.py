@@ -1,4 +1,14 @@
 """PIN retry counter state machine + timing, with minimal retry burn."""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first real hidraw device (FIDO/CTAPHID) — burns PIN retry attempts with deliberate wrong-PIN getPinToken legs and probes the CTAP1 U2F downgrade path',
+    destructive=True,
+)
+
 import sys, time, statistics
 sys.path.insert(0, "/home/eddieoz/Projects/git/pico/fapico2/redteam")
 from fido2.hid import CtapHidDevice

@@ -608,6 +608,38 @@ _B_LED_POLARITY = Break(
     "the tree is green — the state a gate has to be trustworthy in",
 )
 
+# --- US-1906: the hardware-lane isolation gate (EPIC HW-LANE-CONSENT) -------
+
+# Rule 1 (guarded inventory): the guard call disappears from a wired script.
+_B_HW_ISOL_GUARD = Break(
+    "redteam/pin_attack.py",
+    "hw_guard.require(",
+    "_hw_guard_never_called(",
+    why="the consent call is renamed away — the script enumerates a real "
+        "device unconsented again, the incident's original shape",
+)
+
+# Rule 1 (inventory rot): the inventory entry is renamed, leaving the real
+# script present but unlisted.
+_B_HW_ISOL_INVENTORY = Break(
+    "tests/scripts/check_hw_isolation.py",
+    '("redteam/pin_attack.py", "destructive: deliberate wrong-PIN legs"),',
+    '("redteam/pin_attack_RENAMED.py", "destructive: deliberate wrong-PIN legs"),',
+    why="the guarded inventory no longer names a file that exists — the "
+        "sweep must flag the now-unlisted script",
+)
+
+# Rule 3 (fallback stays closed): the PC/SC import sneaks back into the
+# collected-test entry point.
+_B_HW_ISOL_FALLBACK = Break(
+    "tests/conftest.py",
+    "class EmulatorAbsentError(RuntimeError):",
+    "from fido2.pcsc import CtapPcscDevice  # US-nominated break: the fallback is back\n"
+    "class EmulatorAbsentError(RuntimeError):",
+    why="a CtapPcscDevice reference returns to tests/conftest.py — rule 3 "
+        "must name the line and go red",
+)
+
 GATES: tuple[Gate, ...] = (
     Gate(
         "check_persist_gate.py",
@@ -766,6 +798,14 @@ GATES: tuple[Gate, ...] = (
         "the hardware-requiring runner; that is the note the next reader needs, "
         "since the gate's subject (`run_acceptance.py`) otherwise looks "
         "untestable here.",
+    ),
+    Gate(
+        "check_hw_isolation.py",
+        breaks=(_B_HW_ISOL_GUARD, _B_HW_ISOL_INVENTORY, _B_HW_ISOL_FALLBACK),
+        note="inventory + ordering + fallback-closure over source (US-1906, "
+        "EPIC HW-LANE-CONSENT): rule 1 pins the guarded device-lane inventory "
+        "and the guard-before-import order, rule 2 keeps collected tests clean "
+        "of real-device machinery, rule 3 pins the US-1907 fallback removal",
     ),
 )
 

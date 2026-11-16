@@ -11,6 +11,16 @@ Three classes:
   C. DDO/PSO structural — malformed TLVs in the data object, oversized blobs,
      truncation at every boundary. Uniform error is the pass condition.
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import hw_guard
+hw_guard.require(
+    what='the first PC/SC CCID reader, OpenPGP card applet — PSO:DECIPHER/PSO:CDS malleability battery (mutated ephemeral keys, hash-alg and digest-length variation, malformed DDO TLVs) fired at the signature/decipher path',
+    destructive=True,
+)
+
 import sys, time, collections
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from ccid import Card
