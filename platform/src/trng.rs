@@ -175,54 +175,71 @@ pub trait EntropyClock {
 /// Wall-clock ceiling on **one** wait for a validated EHR block, in
 /// milliseconds.
 ///
-/// # Where the number comes from
+/// # Where the number comes from (US-1927: measured, via RS-Key)
 ///
-/// `embassy-rp`'s own `Config` documentation quotes RP2350 §12.12.2 verbatim
-/// (`embassy-rp-0.10.0/src/trng.rs:78-83`):
+/// This value used to be a datasheet *average* × 10 (20 ms over §12.12.2's
+/// "~2 ms" for the 20–25-sample configuration), reasoned and not measured —
+/// and the 2026-11-19 retail incident showed exactly how that void opens:
+/// on a cold, long-dwell peripheral the *health-test loop* at
+/// `sample_cnt1: 25` never converges inside any reasonable multiple of the
+/// average, the budget expired, and the fresh-install boot parked
+/// (`docs/audits/2026-11-19-retail-first-boot-dark-park.md`).
 ///
-/// > For acceptable results with an average generation time of about 2
-/// > milliseconds, use ROSC chain length settings of 0 or 1 and sample count
-/// > settings of 20-25.
-///
-/// `Config::default()` is exactly that configuration (sample count 25, all
-/// three health tests enabled), so **2 ms is the datasheet's average
-/// generation time for the config this probe is calibrated against.** The same
-/// passage is also the reason for the safety factor:
-///
-/// > Results occasionally take an especially long time to generate.
-///
-/// So 2 ms is an *average*, and the datasheet itself warns about the tail. A
-/// budget set at the average would refuse roughly half of all healthy draws,
-/// which on this device means a boot brick. **20 ms is a 10x safety factor**
-/// on that average — generous enough to absorb the tail the datasheet
-/// describes, and still bounded.
-///
-/// # Not measured on silicon
-///
-/// **No RP2350 board was attached when this value was chosen.** It is derived
-/// from a datasheet *average*, not from a measured *maximum*. A silicon part
-/// slower than 10x the datasheet average would return
-/// [`TrngError::Stalled`] and refuse to seed — and because `init_drbg` is
-/// fatal by design, that is a refusal to boot. That is the correct
-/// fail-closed direction (a bounded, reportable refusal beats an unbounded
-/// hang, and beats a generator fed a constant), but the operator should know
-/// it is possible. Recorded as a standing divergence in
-/// `docs/known-gate-divergences.md` (D-8) and re-check by US-1007 on
-/// hardware.
+/// The fix is the one RS-Key — the reference firmware that had the same
+/// stall — measured and shipped: tune the peripheral so a healthy draw
+/// succeeds on the **first** generation, and size the budget to that
+/// measurement. `../RS-Key` `firmware/src/main.rs:601-609` sets
+/// `sample_count = 1000` and measures **48 B ≈ 1.5 s** on silicon
+/// (HW-verified there); at that tuning the autocorrelation health check
+/// passes on the first generation instead of looping. One EHR block is
+/// [`EHR_BLOCK_BYTES`] = 24 bytes, so the per-block generation time is
+/// [`MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG`] = 750 ms, and this budget is
+/// **2000 ms ≥ 2×** that — the tail the datasheet warns about
+/// ("results occasionally take an especially long time to generate")
+/// absorbed with margin, still bounded. The consistency test
+/// ([`tests::the_budget_covers_the_measured_generation_time_of_the_shipped_configuration`])
+/// pins the relation; the configuration/budget/cap triple is one fact.
 ///
 /// # What this value assumes, and who checks it
 ///
-/// It is a **wall-clock** budget, so it is only 20 ms of anything at all if
+/// It is a **wall-clock** budget, so it is only 2 s of anything at all if
 /// the clock behind it is counting. That used to be an assumption, and a
 /// recent one: on 2026-09-29 a device came up dark on a wait whose clock
 /// nobody had verified, the budget was therefore unreachable, and the wait
 /// reported a peripheral stall for a deadline that had never been measured.
 /// It is not an assumption any more — [`TrngProbe::await_ready`] checks the
 /// clock at the point of use and returns [`TrngError::ClockStalled`] if it is
-/// not moving (see [`CLOCK_LIVENESS_SPINS`] and D-12) — but the *size* of
-/// this number remains reasoned, not measured, and that part no host test
-/// can reach.
-pub const MAX_ENTROPY_WAIT_MS: u32 = 20;
+/// not moving (see [`CLOCK_LIVENESS_SPINS`] and D-12) — and the *size* is
+/// now anchored to a measured figure (RS-Key's) rather than a datasheet
+/// average. The health tests are untouched: the tuning only decorrelates
+/// ROSC samples (RS-Key's finding: entropy quality unchanged); no bypass
+/// bit, no weakened test.
+pub const MAX_ENTROPY_WAIT_MS: u32 = 2000;
+
+/// The measured per-block generation time at the **shipped** configuration,
+/// in milliseconds — the number [`MAX_ENTROPY_WAIT_MS`] is calibrated
+/// against, kept next to it so the configuration/budget pair is one fact
+/// (US-1927).
+///
+/// # Where the number comes from
+///
+/// **RS-Key** — the reference firmware that had this exact stall and fixed
+/// it at the peripheral layer — sets `sample_count = 1000`
+/// (`../RS-Key` `firmware/src/main.rs:601-609`) and measures **48 bytes ≈
+/// 1.5 s** per generation, hardware-verified on their board: the
+/// autocorrelation health check passes on the *first* generation at that
+/// tuning, where the datasheet's 20–25-sample configuration spends its time
+/// inside the health-test loop on a cold peripheral (the 2026-11-19 retail
+/// incident's mechanism, `docs/audits/2026-11-19-retail-first-boot-dark-park.md`).
+/// One validated EHR block is [`EHR_BLOCK_BYTES`] = 24 bytes, so the
+/// per-block time is half the per-draw figure: **750 ms**.
+///
+/// The budget must cover at least **two** of these — the datasheet's own
+/// warning ("results occasionally take an especially long time to generate")
+/// is a tail, not a bound, and a budget at the average refuses healthy
+/// draws. The consistency test below pins the relation; moving one member
+/// of the triple (config, budget, cap) without the others goes red.
+pub const MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG: u64 = 750;
 
 // ---------------------------------------------------------------------------
 // The configuration a TRNG soft reset destroys (US-1005 fix).
@@ -244,14 +261,17 @@ pub const MAX_ENTROPY_WAIT_MS: u32 = 20;
 ///
 /// # The numbers, and where they come from
 ///
-/// `embassy-rp-0.10.0/src/trng.rs:110-121`, `Config::default()`:
-/// `inverter_chain_length: InverterChainLength::One` (the enum's
-/// `One = 1`, `trng.rs:45-51`) and `sample_count: 25`. Both are the values
-/// the datasheet's own guidance names — §12.12.2, quoted verbatim in
-/// `embassy-rp`'s `Config` docs, asks for "ROSC chain length settings of 0 or
-/// 1 and sample count settings of 20-25" to get "an average generation time
-/// of about 2 milliseconds", which is the 2 ms [`MAX_ENTROPY_WAIT_MS`] is
-/// sized as 10x.
+/// **RS-Key's measured-good tuning (US-1927)**: `rnd_src_sel: 1`,
+/// `sample_cnt1: 1000` — `../RS-Key` `firmware/src/main.rs:601-609` sets
+/// `sample_count = 1000` and measures **48 B ≈ 1.5 s** on silicon, with the
+/// autocorrelation health check passing on the *first* generation. That is
+/// the configuration [`MAX_ENTROPY_WAIT_MS`] is now calibrated against, and
+/// the one `Rp2350Trng::from_peri` is built with on the boot path. (The
+/// datasheet's 20–25-sample guidance and its "~2 ms" average —
+/// `embassy-rp-0.10.0/src/trng.rs:110-121`'s old `Config::default()` —
+/// remain quoted in [`MAX_ENTROPY_WAIT_MS`]'s doc as the history of the old
+/// calibration: the retail incident showed the health-test loop at those
+/// settings is what stalls a cold peripheral.)
 ///
 /// # The void condition, and why a silent mismatch is expensive
 ///
@@ -259,7 +279,7 @@ pub const MAX_ENTROPY_WAIT_MS: u32 = 20;
 /// power-on defaults are in force instead, and the datasheet's own ordering —
 /// "As average generation time increases, result quality increases" — runs
 /// the wrong way for a **deadline**: a slower generator needs a *longer*
-/// budget than the one calibrated for the faster, correctly-configured part.
+/// budget than the one calibrated for the correctly-configured part.
 /// A probe that re-arms without restoring spends the rest of its life on a
 /// deadline that was measured for a different peripheral, and the failure it
 /// produces is [`TrngError::Stalled`] on a **healthy** TRNG — which, because
@@ -269,18 +289,26 @@ pub const MAX_ENTROPY_WAIT_MS: u32 = 20;
 pub struct TrngConfig {
     /// `TRNG_CONFIG.rnd_src_sel` — the ROSC inverter chain length.
     pub rnd_src_sel: u8,
-    /// `SAMPLE_CNT1` — the sample period in system clock ticks.
-    pub sample_cnt1: u8,
+    /// `SAMPLE_CNT1` — the sample period in system clock ticks. `u32`: the
+    /// register is 32 bits wide (the write path always cast to `u32`) and
+    /// the budgeted tuning ([`BUDGET_SAMPLE_CNT1`] = 1000) does not fit a
+    /// `u8` — the narrowing was never the register's (US-1927).
+    pub sample_cnt1: u32,
 }
 
+/// The `SAMPLE_CNT1` value [`MAX_ENTROPY_WAIT_MS`] is calibrated against:
+/// RS-Key's measured-good tuning, named so [`TrngConfig::is_budget_nominal`]
+/// and the tests cite one constant rather than repeating the literal.
+pub const BUDGET_SAMPLE_CNT1: u32 = 1000;
+
 impl Default for TrngConfig {
-    /// Exactly `embassy_rp::trng::Config::default()`, which is the
+    /// RS-Key's measured-good tuning (see the struct doc): the
     /// configuration `Rp2350Trng::from_peri` is built with on the boot path
     /// and therefore the one [`MAX_ENTROPY_WAIT_MS`] is calibrated against.
     fn default() -> Self {
         Self {
-            rnd_src_sel: 1,  // InverterChainLength::One
-            sample_cnt1: 25,
+            rnd_src_sel: 1, // InverterChainLength::One
+            sample_cnt1: BUDGET_SAMPLE_CNT1,
         }
     }
 }
@@ -291,7 +319,7 @@ impl TrngConfig {
     /// `trng_config`; the rest of that word is left alone by the write
     /// path, so widening this to the whole word would discard bits this
     /// module has no business touching.
-    pub const fn capture(trng_config: u32, sample_cnt1: u8) -> Self {
+    pub const fn capture(trng_config: u32, sample_cnt1: u32) -> Self {
         Self {
             rnd_src_sel: (trng_config & 0x3) as u8,
             sample_cnt1,
@@ -299,6 +327,14 @@ impl TrngConfig {
     }
 
     /// Whether this configuration is the one the budget assumes.
+    ///
+    /// An **exact match** against the budgeted pair — chain 1 and
+    /// [`BUDGET_SAMPLE_CNT1`] — not a band. The old 20–25 window was the
+    /// *fast* configuration's window, and the budget no longer assumes it
+    /// (US-1927): a part running `sample_cnt1: 20` is a part the 2000 ms
+    /// budget was not measured for. After a soft reset the registers read
+    /// `rnd_src_sel: 0, sample_cnt1: 0` and this predicate is false — the
+    /// restore discipline still has something to restore.
     ///
     /// Not enforced at runtime today — nothing on the boot path has a
     /// non-nominal configuration to catch, and inventing a refusal for a
@@ -308,15 +344,58 @@ impl TrngConfig {
     /// pins that the power-on values fail it, which is the whole point of
     /// restoring at all.
     pub const fn is_budget_nominal(&self) -> bool {
-        // Datasheet-valid generation configurations: chain 0 or 1 (which
-        // cannot be made faster by this register), sample count 20-25.
-        self.rnd_src_sel <= 1 && self.sample_cnt1 >= 20 && self.sample_cnt1 <= 25
+        self.rnd_src_sel == 1 && self.sample_cnt1 == BUDGET_SAMPLE_CNT1
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TrngConfig, MAX_ENTROPY_WAIT_MS};
+    use super::{
+        TrngConfig, CLOCK_LIVENESS_SPINS, MAX_ENTROPY_POLLS, MAX_ENTROPY_WAIT,
+        MAX_ENTROPY_WAIT_MS, MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG,
+    };
+
+    /// US-1927: the configuration/budget triple is **one fact**. The budget is
+    /// sized against the RS-Key measurement of the shipped configuration
+    /// (48 B ≈ 1.5 s at `sample_cnt1: 1000`, so one 24-byte EHR block ≈ 750 ms
+    /// — `../RS-Key`'s fix for this exact stall, HW-verified there), and the
+    /// poll cap must sit above the wall budget so a live clock's wait ends at
+    /// the budget, never the cap (`trng.rs`'s `liveness < WAIT < POLLS`
+    /// ordering). Move one member without the others and this goes red.
+    #[test]
+    fn the_budget_covers_the_measured_generation_time_of_the_shipped_configuration() {
+        assert!(
+            MAX_ENTROPY_WAIT_MS as u64 >= 2 * MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG,
+            "MAX_ENTROPY_WAIT_MS ({MAX_ENTROPY_WAIT_MS}) is below 2x the measured \
+             per-block generation time at the shipped configuration ({MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG} ms): \
+             the budget is no longer calibrated to the configuration that runs (US-1927)"
+        );
+    }
+
+    /// US-1927: the shipped configuration is RS-Key's measured-good tuning —
+    /// `sample_count = 1000` passes the autocorrelation health check on the
+    /// **first** generation there (RS-Key `firmware/src/main.rs:601-609`,
+    /// HW-verified), which is the whole point of leaving the stock 25-sample
+    /// config whose health-test loop stalls on a cold peripheral. And the
+    /// config field must hold the tuning — a `u8` field would wrap it (the
+    /// register write always cast to `u32`; the type was narrowed for no
+    /// reason the register names).
+    #[test]
+    fn the_shipped_configuration_is_the_measured_good_tuning() {
+        let shipped = TrngConfig::default();
+        assert_eq!(shipped.rnd_src_sel, 1);
+        assert_eq!(shipped.sample_cnt1, 1000);
+    }
+
+    /// US-1927: the three bounds stay ordered — a dead clock lands on the
+    /// liveness bound, a healthy wait ends at the wall budget, and only a
+    /// pathologically slow live clock ever reaches the poll cap. Re-derived
+    /// whenever either the budget or the cap moves.
+    #[test]
+    fn the_poll_cap_stays_above_the_wall_budget() {
+        assert!(u64::from(CLOCK_LIVENESS_SPINS) < MAX_ENTROPY_WAIT);
+        assert!(MAX_ENTROPY_WAIT < MAX_ENTROPY_POLLS as u64);
+    }
 
     /// The restore is only meaningful because the values it restores are
     /// **not** what a soft reset leaves behind. If a future driver changed
@@ -326,7 +405,7 @@ mod tests {
     #[test]
     fn a_reset_default_configuration_is_not_the_budgeted_one() {
         // TRNG_CONFIG power-on default: rnd_src_sel 0. SAMPLE_CNT1 power-on
-        // default: 0 (sample every cycle — not a 20-25 sample period).
+        // default: 0 (sample every cycle — not the budgeted sample period).
         let reset_defaults = TrngConfig::capture(0x0000_0000, 0);
         assert!(!reset_defaults.is_budget_nominal());
         assert!(TrngConfig::default().is_budget_nominal());
@@ -339,30 +418,27 @@ mod tests {
         let budgeted = TrngConfig::default();
         // `rnd_src_sel` is bits 1:0 of TRNG_CONFIG; a word with other bits
         // set must not leak them into the captured value.
-        let captured = TrngConfig::capture(0xFFFF_FFF9, 25);
+        let captured = TrngConfig::capture(0xFFFF_FFF9, 1000);
         assert_eq!(captured, budgeted);
         assert_eq!(captured.rnd_src_sel, 1);
-        assert_eq!(captured.sample_cnt1, 25);
+        assert_eq!(captured.sample_cnt1, 1000);
     }
 
-    /// A sample count above the datasheet's recommended band is rejected by
-    /// the same predicate — the band is two-sided, not a floor.
+    /// The budget-nominal predicate is an **exact match** on the budgeted
+    /// pair (US-1927) — anything other than chain 1 at
+    /// [`BUDGET_SAMPLE_CNT1`] is not the configuration the 2000 ms budget
+    /// was measured for, including the old fast-config window this
+    /// predicate used to admit.
     #[test]
-    fn a_configuration_outside_the_datasheet_band_is_not_nominal() {
-        assert!(!TrngConfig { rnd_src_sel: 1, sample_cnt1: 19 }.is_budget_nominal());
-        assert!(!TrngConfig { rnd_src_sel: 1, sample_cnt1: 26 }.is_budget_nominal());
-        assert!(!TrngConfig { rnd_src_sel: 2, sample_cnt1: 25 }.is_budget_nominal());
-        assert!(TrngConfig { rnd_src_sel: 0, sample_cnt1: 20 }.is_budget_nominal());
-    }
-
-    /// The budget is a multiple of the 2 ms average this configuration
-    /// produces, and it is not small enough to be the datasheet average
-    /// itself — the arithmetic D-8 rests on, pinned so a later edit to
-    /// `MAX_ENTROPY_WAIT_MS` cannot quietly make it true.
-    #[test]
-    fn the_budget_is_the_documented_multiple_of_the_datasheet_average() {
-        const DATASHEET_AVERAGE_MS: u32 = 2;
-        assert_eq!(MAX_ENTROPY_WAIT_MS, 10 * DATASHEET_AVERAGE_MS);
+    fn a_configuration_other_than_the_budgeted_one_is_not_nominal() {
+        assert!(!TrngConfig { rnd_src_sel: 1, sample_cnt1: 999 }.is_budget_nominal());
+        assert!(!TrngConfig { rnd_src_sel: 1, sample_cnt1: 1001 }.is_budget_nominal());
+        assert!(!TrngConfig { rnd_src_sel: 1, sample_cnt1: 25 }.is_budget_nominal());
+        assert!(!TrngConfig { rnd_src_sel: 2, sample_cnt1: 1000 }.is_budget_nominal());
+        assert!(!TrngConfig { rnd_src_sel: 0, sample_cnt1: 1000 }.is_budget_nominal());
+        // The old fast configuration is deliberately *not* nominal any more:
+        // the budget no longer assumes the datasheet's 20–25-sample window.
+        assert!(!TrngConfig { rnd_src_sel: 0, sample_cnt1: 20 }.is_budget_nominal());
     }
 }
 
@@ -408,7 +484,7 @@ pub const MAX_ENTROPY_WAIT: u64 = MAX_ENTROPY_WAIT_MS as u64 * ENTROPY_CLOCK_TIC
 ///
 /// A false positive therefore needs a clock ticking slower than ~2 kHz, and
 /// the same 2 kHz figure is what would make [`ENTROPY_CLOCK_TICKS_PER_MS`]
-/// wrong by a factor of ~500 — at which point the 20 ms budget *is not 20 ms*
+/// wrong by a factor of ~500 — at which point the 2 s budget *is not 2 s*
 /// and every other deadline in this firmware is already wrong by the same
 /// factor. There is no clock slow enough to trip this bound for which the
 /// remaining arithmetic is still meaningful, so the check cannot cost a
@@ -438,7 +514,7 @@ pub const CLOCK_LIVENESS_SPINS: u32 = 256;
 /// standing between a dead clock and an infinite loop, and it was sized for
 /// that job by arithmetic nobody had checked. It is now the *third* bound,
 /// behind the liveness check, and its job is narrower: to stop a clock that
-/// **is** counting but so slowly that 20 ms of its ticks would take an
+/// **is** counting but so slowly that 2 s of its ticks would take an
 /// unreasonable number of spins. A clock that never moves no longer reaches
 /// this constant at all — it is refused at the liveness bound — which is
 /// what makes the cap's reachability something that has to be argued rather
@@ -461,52 +537,58 @@ pub const CLOCK_LIVENESS_SPINS: u32 = 256;
 /// of nanoseconds. (The same comment previously said 133 MHz, which is not
 /// the clock this firmware configures.)
 ///
-/// # The derivation
+/// # The derivation (US-1927: re-derived for the tuned budget)
 ///
-/// The cap must clear two ceilings, in this order, and the smaller of the two
-/// multiples is what sizes it:
+/// The cap must clear two ceilings, in this order:
 ///
 /// 1. **It must never pre-empt the wall-clock budget.** The wait ticks the
 ///    clock at least once per iteration, so the budget's worst-case
-///    iteration count is `MAX_ENTROPY_WAIT` (20,000) ticks at the *cheapest*
-///    plausible loop body (~0.5 µs) and 10,000 at the dearest (~2 µs). A cap
-///    below 20,000 would end a wait at the cap on a healthy peripheral, which
-///    is the `MAX_ENTROPY_POLLS = 64` defect this module was grown to remove
+///    iteration count is `MAX_ENTROPY_WAIT` (2,000,000) ticks. A cap below
+///    that would end a wait at the cap on a healthy peripheral, which is
+///    the `MAX_ENTROPY_POLLS = 64` defect this module was grown to remove
 ///    and a boot brick, because a seed refusal is fatal.
-/// 2. **It must clear one healthy generation many times over.** ~2 ms
-///    (RP2350 §12.12.2, quoted in `embassy-rp`'s own `Config` docs, and the
-///    configuration `Config::default()` actually is: sample count 25, chain
-///    length 1) is ~1,000–4,000 iterations of this loop.
+/// 2. **It must clear one healthy generation many times over.** At the
+///    shipped configuration (RS-Key's measured-good tuning,
+///    [`BUDGET_SAMPLE_CNT1`] = 1000), one generation is
+///    [`MEASURED_EHR_GEN_MS_AT_SHIPPED_CONFIG`] = 750 ms of wall time —
+///    ~375,000–750,000 iterations of this loop at its 1–2 µs cost.
 ///
-/// `2^19 = 524,288` clears both:
+/// `2^21 = 2,097,152` clears both:
 ///
 /// | against | ratio |
 /// |---|---|
-/// | the budget's worst-case iteration count (20,000) | **26x** |
-/// | one healthy generation (~1,000–4,000) | **130–520x** |
-/// | the liveness bound (256) | **2,048x** |
+/// | the budget's worst-case iteration count (2,000,000) | **1.05x** |
+/// | one healthy generation (~375k–750k) | **2.8–5.6x** |
+/// | the liveness bound (256) | **8,192x** |
 ///
-/// It was raised from `2^18` (262,144) for this defect fix. At 2^18 the
-/// multiple over the budget was only 13x, which is thin for a bound whose
-/// per-iteration cost is itself uncertain by a factor of four — and the
-/// whole complaint against the old value was that it was too small to serve
-/// as the safety net it claimed to be.
+/// The headroom over the budget is deliberately thin — 4.9% — because the
+/// budget is now anchored to a *measured* generation time (RS-Key's), not
+/// a datasheet average: the cap exists to catch a clock so slow that the
+/// tick count outruns the wall budget, and at 1 tick per iteration a clock
+/// that reaches the cap has run 4.9% past the deadline. The margin that
+/// used to live here (26x over the budget) is no longer the safety net it
+/// claimed to be — the liveness check is what stops a dead clock, and the
+/// wall budget is what stops a slow one. It was raised from `2^19`
+/// (524,288), which at the tuned budget would have capped a full
+/// 2-second wait short — the `liveness < WAIT < POLLS` ordering below is
+/// the invariant, and it was violated by the budget's move until this
+/// constant moved with it (US-1927; O-29(b)).
 ///
 /// # What it costs, honestly
 ///
-/// `2^19 x 1–2 µs` is **0.5–1.0 s** of spinning. That is the price of a bound
+/// `2^21 x 1–2 µs` is **2.1–4.2 s** of spinning. That is the price of a bound
 /// that is not a timer, and it is only paid in the case where the clock is
-/// alive and slower than one tick per 26 iterations — a condition under
+/// alive but slower than one tick per iteration — a condition under
 /// which [`ENTROPY_CLOCK_TICKS_PER_MS`] is already wrong by more than an
-/// order of magnitude and the 20 ms budget is not 20 ms.
+/// order of magnitude and the 2 s budget is not 2 s.
 ///
 /// # The ordering a future edit must preserve
 ///
 /// ```text
 /// CLOCK_LIVENESS_SPINS (256)
-///   < budget's iteration count (MAX_ENTROPY_WAIT = 20,000)
-///     < MAX_ENTROPY_POLLS (2^19)
-///       >> one healthy generation (~10^3)
+///   < budget's iteration count (MAX_ENTROPY_WAIT = 2,000,000)
+///     < MAX_ENTROPY_POLLS (2^21)
+///       >> one healthy generation (~10^5–10^6 at the shipped tuning)
 /// ```
 ///
 /// Only the budget and the healthy generation are policy; the other two
@@ -524,7 +606,7 @@ pub const CLOCK_LIVENESS_SPINS: u32 = 256;
 /// figure, not a substitute for one. Same standing caveat as
 /// [`MAX_ENTROPY_WAIT_MS`] above; recorded in
 /// `docs/known-gate-divergences.md` (D-8, extended by D-12).
-pub const MAX_ENTROPY_POLLS: u32 = 1 << 19;
+pub const MAX_ENTROPY_POLLS: u32 = 1 << 21;
 
 
 /// Outcome of one TRNG generation attempt, as seen by the wait loop.
@@ -875,7 +957,8 @@ pub const MIGRATION_NONCE_LEN: usize = 12;
 /// [`MAX_ENTROPY_WAIT_MS`] is calibrated against.
 ///
 /// Stated as a compile-time assertion rather than prose because it is a
-/// budget claim the gate cannot see: the 20 ms figure is a *per-block*
+/// budget claim the gate cannot see: the budget figure
+/// ([`MAX_ENTROPY_WAIT_MS`], 2 s at the shipped tuning) is a *per-block*
 /// allowance, so a 12-byte draw spends exactly one of them and a 32-byte seed
 /// draw spends two. `platform/tests/migration_nonce.rs` states the same
 /// arithmetic from the host side; a length that grew past [`EHR_BLOCK_BYTES`]
@@ -1279,10 +1362,10 @@ pub mod rp2350 {
     /// [`TrngProbe::probe_bytes`] is inherited: the wait terminates on
     /// whichever of three bounds expires first — [`CLOCK_LIVENESS_SPINS`]
     /// consecutive reads with no clock movement at all
-    /// ([`TrngError::ClockStalled`], D-12), [`MAX_ENTROPY_WAIT`] (20 ms — a
-    /// 10x safety factor on the ~2 ms average generation time the RP2350
-    /// datasheet quotes for `embassy-rp`'s default `Config`), or
-    /// [`MAX_ENTROPY_POLLS`] (2^19) status reads — and the last two both
+    /// ([`TrngError::ClockStalled`], D-12), [`MAX_ENTROPY_WAIT`] (2 s — at
+    /// least 2x the measured per-block generation time at the shipped
+    /// configuration, US-1927), or
+    /// [`MAX_ENTROPY_POLLS`] (2^21) status reads — and the last two both
     /// answer [`TrngError::Stalled`]. The inherited semantics apply unchanged
     /// on device:
     ///
@@ -1297,7 +1380,7 @@ pub mod rp2350 {
     /// * An empty `buf` is a no-op, and the budget is per **EHR block**: a
     ///   [`crate::drbg::NONCE_LEN`]-byte seed draw crosses
     ///   `ceil(32 / 24) == 2` blocks, each with its own budget, so one seed
-    ///   draw's effective ceiling is 2 x [`MAX_ENTROPY_WAIT`] = 40 ms (and
+    ///   draw's effective ceiling is 2 x [`MAX_ENTROPY_WAIT`] = 4 s (and
     ///   2 x [`MAX_ENTROPY_POLLS`] status reads). The constants' own docs say
     ///   the values are per-block, so this is the documented meaning rather
     ///   than a widened one.

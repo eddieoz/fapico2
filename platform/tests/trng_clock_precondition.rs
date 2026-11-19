@@ -52,7 +52,7 @@
 
 use fapico2_platform::trng::{
     EntropyClock, ProbeStatus, TrngError, TrngProbe, CLOCK_LIVENESS_SPINS, ENTROPY_CLOCK_TICKS_PER_MS,
-    MAX_ENTROPY_POLLS, MAX_ENTROPY_WAIT,
+    MAX_ENTROPY_POLLS, MAX_ENTROPY_WAIT, MAX_ENTROPY_WAIT_MS,
 };
 
 /// Byte the fake peripheral stamps in, so a test can tell a delivered block
@@ -418,7 +418,8 @@ fn a_live_clock_fast_enough_reaches_the_budget_not_the_cap() {
     // of the constants will trip over it.
     assert_eq!(
         MAX_ENTROPY_WAIT,
-        20 * ENTROPY_CLOCK_TICKS_PER_MS,
-        "the budget is 20 ms expressed in 1 MHz timer ticks"
+        MAX_ENTROPY_WAIT_MS as u64 * ENTROPY_CLOCK_TICKS_PER_MS,
+        "the budget is MAX_ENTROPY_WAIT_MS expressed in 1 MHz timer ticks \
+         (2000 ms at the shipped tuning, US-1927)"
     );
 }

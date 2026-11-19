@@ -62,6 +62,13 @@ const MARKER: u8 = 0xA5;
 /// literal, so it cannot drift away from the constant it is compared against.
 const DATASHEET_AVG_GENERATION_TICKS: u64 = 2 * ENTROPY_CLOCK_TICKS_PER_MS;
 
+/// One tick of the deadline fixtures' fake clock, in budget ticks: the
+/// budget divided by 10, so a probe that goes `Ready` on the tenth poll
+/// lands exactly on the deadline. Derived from [`MAX_ENTROPY_WAIT`] rather
+/// than written as a literal, so a budget move re-derives the fixtures
+/// instead of stranding them (US-1927).
+const BUDGET_POLL_TICKS: u64 = MAX_ENTROPY_WAIT / 10;
+
 /// A fake wall clock whose advance per poll the test controls.
 ///
 /// This is the whole point of the [`EntropyClock`] seam: the budget is
@@ -105,11 +112,13 @@ const _: () = assert!(
 );
 const _: () = assert!(
     MAX_ENTROPY_WAIT_MS >= 20,
-    "MAX_ENTROPY_WAIT_MS must stay at or above 10x the RP2350 datasheet's ~2 ms \
-     AVERAGE generation time for embassy-rp's default Config (RP2350 §12.12.2); \
-     the datasheet also warns that results 'occasionally take an especially \
-     long time to generate'. A budget at or below the average refuses roughly \
-     half of all healthy draws, and a seed refusal is fatal at boot."
+    "MAX_ENTROPY_WAIT_MS must stay at or above twice the measured per-block \
+     generation time at the shipped configuration (US-1927: RS-Key measured \
+     48 B ≈ 1.5 s at sample_cnt1 1000, so one 24-byte block ≈ 750 ms and the \
+     budget floor is 1500 ms). The datasheet also warns that results \
+     'occasionally take an especially long time to generate'; a budget at or \
+     below the average refuses healthy draws, and a seed refusal is fatal at \
+     boot."
 );
 
 /// Host stand-in for the TRNG peripheral: a scripted poll sequence plus a
@@ -262,16 +271,17 @@ fn invalid_ehr_returns_stalled_within_the_bound() {
 /// passed every other test in this file. The bound is a ceiling, not a budget
 /// that has to be spent.
 ///
-/// The clock advances 2 ms per poll — the RP2350 datasheet's own quoted
-/// **average** generation time for this configuration (RP2350 §12.12.2) — so
-/// `Ready` lands on poll 10, which is the poll on which the budget expires.
+/// The clock advances 200 ms of budget per poll — a fixture rate, chosen so
+/// `Ready` lands on poll 10, which is the poll on which the budget expires
+/// (`MAX_ENTROPY_WAIT / BUDGET_POLL_TICKS = 10`, re-derived from the
+/// constant so a budget move does not strand the fixture: US-1927).
 /// That ordering is deliberate: the `Ready` test runs before the deadline
 /// test, so a block arriving exactly on the deadline is served rather than
 /// refused, and a budget checked the wrong way round is a brick.
 #[test]
 fn a_slow_peripheral_that_becomes_ready_is_still_served() {
     let mut probe = ScriptedProbe::new(ProbeStatus::Busy)
-        .ticking(2_000)
+        .ticking(BUDGET_POLL_TICKS)
         .ready_after(9);
     let mut buf = [0u8; 32];
 
@@ -282,8 +292,8 @@ fn a_slow_peripheral_that_becomes_ready_is_still_served() {
          mistaken for a stall"
     );
     assert_eq!(
-        probe.polls,
-        MAX_ENTROPY_WAIT as u32 / 2_000,
+        probe.polls as u64,
+        MAX_ENTROPY_WAIT / BUDGET_POLL_TICKS,
         "the wait used exactly the budget it was allowed and no more"
     );
     assert_eq!(buf, [MARKER; 32], "the whole buffer must be filled");
@@ -297,12 +307,12 @@ fn a_slow_peripheral_that_becomes_ready_is_still_served() {
 #[test]
 fn a_peripheral_that_becomes_ready_too_late_is_stalled() {
     let mut probe = ScriptedProbe::new(ProbeStatus::Busy)
-        .ticking(2_000)
+        .ticking(BUDGET_POLL_TICKS)
         .ready_after(10);
     let mut buf = [0u8; 32];
 
     assert_eq!(probe.probe_bytes(&mut buf), Err(TrngError::Stalled));
-    assert_eq!(probe.polls, MAX_ENTROPY_WAIT as u32 / 2_000);
+    assert_eq!(probe.polls as u64, MAX_ENTROPY_WAIT / BUDGET_POLL_TICKS);
     assert_eq!(
         buf, [0u8; 32],
         "a stalled wait must not hand back a half-written buffer"
