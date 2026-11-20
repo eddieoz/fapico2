@@ -10,7 +10,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 
 If you self-custody bitcoin, you already know the drill: keys generated on hardware you own, never on an exchange, never on a machine you don't control. Your credentials deserve the same discipline — and they guard far more than your sats. The passkey to your email, the PGP key that signs your commits, your Nostr identity, your TOTP codes: today most of them live on someone else's server, synced to someone else's cloud, revocable by someone else's policy.
 
-fapico2 applies the same rule to all of them. Keys are generated on the device and never leave it; everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your board is inert somewhere else. One ~$5 board, no account to suspend, no server to breach, no vendor deciding whether your country gets served.
+fapico2 applies the same rule to all of them. Keys are generated on the device and never leave it; everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your **fused** board is inert somewhere else (a never-fused board says so itself and seals degenerately until provisioned; the security model below owns that boundary). One ~$5 board, no account to suspend, no server to breach, no vendor deciding whether your country gets served.
 
 Krux and SeedSigner sign the transaction; fapico2 authenticates the human operating them. Open Bitcoin self-custody hardware, extended from coins to credentials.
 
@@ -71,7 +71,7 @@ Every ceiling's derivation — and which numbers are measured versus reserved �
 ## Security model, in plain terms
 
 - **Keys are generated on the device** from the RP2350's hardware TRNG and used only there — signing happens on the chip.
-- **At rest, everything is sealed.** Records are AEAD-encrypted under a root key derived from `otp_key_1` (a one-way-fused OTP row) plus the chip's own identity. The firmware **refuses to boot** if that row is unavailable — there is no public-constant fallback. A flash dump alone does not open the store; the store key is not in it.
+- **At rest, everything is sealed.** Records are AEAD-encrypted under a root key derived from `otp_key_1` (a one-way-fused OTP row) plus the chip's own identity. The firmware **refuses to boot** if that row cannot be read — there is no public-constant fallback, so a flash dump of a fused board does not open the store. One honest boundary: on a board whose row has **never been fused** (every factory-fresh Pico, until ADR 0002's provisioning story lands) the root key degenerates to a public derivation and the at-rest seal is a delay, not a barrier — the firmware advertises that state (`row-unfused`) over every management interface instead of hiding it.
 - **One bad record is not a bad day.** The per-record store commits a single credential per write, survives torn writes, and a FIDO reset cannot take OATH's credentials with it.
 - **Signed secure boot is available** (`./build-signed.sh`): the bootrom refuses unsigned images. Opt-in, and off by default in the alpha.
 - What the above does *not* protect against today is the next section.
@@ -82,13 +82,13 @@ Every ceiling's derivation — and which numbers are measured versus reserved �
 2. **Not independently audited.** The published [red-team assessment](docs/archive/SECURITY-ASSESSMENT-ROUND2.md) is of an earlier build; some of it has been addressed, not all. No warranty.
 3. **Not certified and not ruggedized.** No FIPS/Common Criteria evaluation, and no NFC — a Pico 2 has no radio.
 4. **Not anonymously attributable.** Default builds carry a public development attestation key, so their attestation proves nothing about key provenance.
-5. **Not finshed on every front.** PIV is deferred; Brainpool P-384r1 is absent from OpenPGP; CTAP1/U2F register attestation fails client-side verification (CTAP2 is unaffected); a known RSA timing advisory (RUSTSEC-2023-0071) has no upstream fix ([`docs/supply-chain.md`](docs/supply-chain.md)).
+5. **Not finished on every front.** PIV is deferred; Brainpool P-384r1 is absent from OpenPGP; CTAP1/U2F register attestation fails client-side verification (CTAP2 is unaffected); a known RSA timing advisory (RUSTSEC-2023-0071) has no upstream fix ([`docs/supply-chain.md`](docs/supply-chain.md)).
 
 ## Getting started
 
 **0. What you need:** one Raspberry Pi Pico 2 (RP2350). That is the whole shopping list.
 
-**1. Get an image.** Either download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) from the alpha release (sha256 in its release notes) or build from source — see [For developers](#for-developers). A first build takes tens of minutes on Linux/macOS/WSL.
+**1. Get an image.** Either download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) from the alpha release (sha256 in its release notes) or build from source — see [For developers](#for-developers). A first build takes tens of minutes on Linux/macOS/WSL. **The published alpha image predates the first-boot fix** (2026-11-20): on a factory-new board it blinks for minutes and never enumerates — build from source, or use a build newer than that date, before flashing a fresh board ([the record](docs/audits/2026-11-20-retail-virgin-otp-row-brick.md)).
 
 **2. Flash it.** Hold **BOOTSEL**, plug the board in, copy the UF2 onto the `RP2350` drive that mounts, and wait — re-enumeration can take up to a minute and that is normal. The Rust build supports **physical BOOTSEL** only (hold BOOTSEL while plugging in, or BOOTSEL + tap RESET); the C firmware additionally accepts a programmatic rescue APDU via `scripts/bootsel.py`. Full procedure, both firmwares, recovery paths: [`docs/bootsel.md`](docs/bootsel.md).
 

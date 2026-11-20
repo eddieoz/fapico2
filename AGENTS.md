@@ -567,6 +567,46 @@ untestable without a nuke) are recorded there rather than re-argued here.
 
 ---
 
+## 10. The boot's entropy path: freshness never parks, state parks legibly
+
+ADR 0004 amendments 6/7 and US-1929/1931/1932/1933/1935 own the domain. The
+trap list comes from the 2026-11-20 retail brick
+([`docs/audits/2026-11-20-retail-virgin-otp-row-brick.md`](docs/audits/2026-11-20-retail-virgin-otp-row-brick.md)) —
+three field units + the owner's fresh-board A/B, misdiagnosed for a week as a
+TRNG dwell stall before the real arm was found:
+
+- **A factory-zero OTP key row is a supported boot state.** `NeverBootC` was a
+  migration-era guard that bricked every retail board: `derive_drbg_seed`
+  refused the seed in-process — before the TRNG was ever touched — and only
+  pico-fido/RS-Key's own first-boot OTP burns made those boards work with our
+  firmware. Never re-add a zero-row refusal to the seed path;
+  `derive_kbase`/`derive_kbase_c` keep theirs (migration semantics), and that
+  asymmetry is recorded as a follow-up, not an oversight.
+- **The freshness/state split is one fact**: `drbg_seed::refusal_is_freshness`
+  (host-pinned in `platform/tests/drbg_seed.rs`). Only `SeedError::Trng`
+  re-arms forever (US-1929); everything else parks. The record site's closure
+  erases by type — every `TrngError` variant is freshness **by contract**, and
+  a new variant must be classified at that site before it can park anywhere
+  (comment in `boot.rs`).
+- **The construction config and the budget are one fact.** `main.rs` passes
+  the tuned `sample_count` to `from_peri` (US-1933: embassy's default 25 was
+  the autocorrelation-stall configuration RS-Key measured, and US-1927's
+  tuning reached the registers only through the soft-reset re-arm until then).
+  `check_rng_path.py`'s CONFIG-PIN pins the spelling at the call site —
+  window-scoped, so a planted matching line elsewhere cannot keep a reverted
+  call green.
+- **The pin vocabulary**: `0011` = TIMER0 clock liveness (infrastructure),
+  `0100` = permanent seed-state fault (US-1932), `1011` = the record could not
+  be established (US-1935 — the record site parks at the fault instead of
+  letting the seed site misattribute it). `DrbgRefused`'s old freshness
+  reading is dead. Halt sites are **25** (`region_degradation.rs` ratchet;
+  re-derive the delta for any change).
+- The "TRNG stall after long dwell" attribution of the 2026-11-09/19 audits is
+  **superseded for the retail incidents** — they were `NeverBootC`. A genuine
+  dwell stall remains a separate, unmeasured question (US-1835/US-1926).
+
+---
+
 ## A yellow "Online - FIDO" in PicoForge is usually the USB identity, not a bug in the applet
 
 Read this before blaming the Rescue applet, and before blaming `pcscd`. Both
@@ -675,9 +715,10 @@ that already work with Yubico software.
 
 **Tag convention ([ADR 0002](docs/adr/0002-provisioning-policy.md)):** release tags carry a `-release` suffix (`vX.Y.Z-release`).
 Alpha/beta images keep the debug port available and burn nothing irreversible; `-release` images
-are the boundary where the `DEBUG_DISABLE` closure will apply. The repository carries **no tags
-yet** — `git tag -l` returns empty as of 2026-10-04 — so the convention binds from the first
-one, and no tag is created by ADR 0002.
+are the boundary where the `DEBUG_DISABLE` closure will apply. The repository's tags are all
+alpha-lineage (`fapico2-release-alpha-v0.1.0` … `v0.7.0`, 2026-10-04 onward — they have carried
+the convention since the first one); **no non-alpha `vX.Y.Z-release` tag exists yet**, so the
+debug-port closure has never applied, and ADR 0002 itself creates no tag.
 
 **Commit messages carry no AI trailers.** Do not add `Co-Authored-By`, a
 `Generated with …` line, or any other AI-attribution footer — whatever the
