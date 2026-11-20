@@ -326,3 +326,68 @@ obligation to it today.
 manifest, keystore boot — identity and integrity. Not freshness. A cold
 morning can no longer make the device invisible; it can only make it
 wait for randomness, visibly, while serving everything deterministic.
+
+## Amendment 5, 2026-11-19 — the retail incident: the fresh-install carve-out is the last freshness park, and it is the bug
+
+*(Written as the record of the incident that forced amendment 6; the
+policy change itself is amendment 6.)*
+
+Two v0.7.0 boards bought at Robocore blinked fast ~60 s, stopped, and
+never enumerated — a customer's first contact with the product was a
+dark device. The diagnosis
+([`docs/audits/2026-11-19-retail-first-boot-dark-park.md`](../audits/2026-11-19-retail-first-boot-dark-park.md))
+pinned the exact path this file's amendment 4 deliberately kept: a
+never-booted board takes `boot_needs_legacy_bringup == true` and runs
+the pre-epic blocking bring-up **before USB**, and on a TRNG stalled by
+a long-dwell cold episode the two 60 s budgets expire and the board
+parks — signature `0011` (`TrngRefused`) then, on a later window,
+`0100` (`DrbgRefused`). Warehouse + shelf storage is the longest dwell
+a board ever experiences, and the hardware validation of
+WARM-BOOT-SERVE (US-1831/1832) never covered a fresh install on a
+stalled TRNG. The two Robocore units are that missing film.
+
+## Amendment 6, 2026-11-20 — freshness failures never park at boot, on any arm (FRESH-BOOT-SERVE Phase 0, US-1929)
+
+**Decision:** the fresh-install carve-out's parks are removed entirely.
+`boot.rs::seed_drbg_blocking` and `boot.rs::ensure_boot_entropy_blocking`
+— the two blocking sites amendment 4 retained "deliberately staged" for
+first installs — now **re-arm their retry loop forever** at a budget
+expiry: no `fatal_boot`, no signature, no give-up. A budget sizes one
+step of the wait; it is not an outcome. Amendment 4's sentence "fresh
+installs keep a blocking boot" survives as behaviour (the bring-up still
+precedes enumeration on a fresh board), but its parks do not — the
+carve-out's legibility obligation is discharged by the **progress
+bursts** (US-1928: every 5 s of waiting adds one pulse naming the
+waiting site by its on-time, 120 ms = record, 300 ms = seed), which is
+what the park used to buy minus the dark board.
+
+**The park domain is now identity plus clock-liveness, and nothing
+else.** `TrngRefused`/`DrbgRefused` remain reachable only through the
+TIMER0 clock-liveness parks in `main.rs` — a clock that is not counting
+is infrastructure, not freshness, and keeps its signature. The halt-site
+count moves 23 → 21 (`apps/fido/tests/region_degradation.rs`, delta
+commented). Every identity park (`OtpKeyRow`/`ChipId`, the store key,
+the OATH seal, the migrations) is untouched.
+
+**Citations.** (1) The 2026-11-19 retail incident (amendment 5's
+diagnosis): the park is the outcome the customer saw, and the outcome is
+the bug. (2) The RS-Key finding: the reference firmware that had the
+same stall fixed it at the peripheral layer
+(`sample_count = 1000`, **48 B ≈ 1.5 s** measured, health check passing
+on the first generation) and has **no** "give up" outcome on the entropy
+path — neither has pico-fido. US-1927 adopts the measured-good tuning
+and re-anchors the budget to the measurement; the hardware re-validation
+of the tuned numbers is US-1926's owner-run decode (**measured pending**
+— the 2026-11-09 ≥ 20.4 s settle and the 2026-11-10 > 4.4 min
+four-window refusal are the stock-config baseline until then). (3) The
+bounded-reboot machinery of amendment 3 was already unwired dead code
+since US-1825; this amendment supersedes its mechanism permanently, and
+`entropy_reset.rs` carries the superseded-mechanism note.
+
+**The honest ceiling moves into the docs.** A warming wait can run
+minutes (measured > 4.4 min on a long-dwell board at the stock
+configuration); unplug/wait-5-s/replug is safe on a fresh board and is
+the measured accelerator for a stalled episode. `docs/boot-freeze.md`
+and the book's troubleshooting page own the reading tables; the v0.7.0
+field-unit row (which still parks) stays live there, annotated, until
+those units are reflashed or pre-warmed (US-1922's QC pre-warm).
