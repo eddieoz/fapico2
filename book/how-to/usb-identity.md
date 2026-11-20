@@ -41,7 +41,7 @@ python3 scripts/fix_usb_identity.py --set 1D50:619B
 ## After the change
 
 - **Check the host sees it:** `lsusb` should show the new pair.
-- **If the new pair is not in libccid's table**, do the [PC/SC allowlist edit](https://github.com/eddieoz/fapico2/blob/main/docs/identity.md#pcsc-allowlist-libccid) for it — the reader stays invisible to `pcscd` otherwise.
+- **If the new pair is not in libccid's table**, do the [allowlist edit](./smartcard-allowlist.md) for it — the reader stays invisible to `pcscd` otherwise.
 - **To go back:** `--set FA20:0002` restores the build default.
 
 ## Phones need a Yubico identity

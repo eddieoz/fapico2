@@ -2,6 +2,7 @@
 
 End-to-end guides for the things people actually do with the device. Every command here runs against real hardware.
 
+- [Making the smartcard reader appear (Linux & macOS)](./smartcard-allowlist.md) — the one-time libccid allowlist edit that lets `pcscd` see the CCID reader. Needed before the OpenPGP, OATH and OTP guides.
 - [SSH keys](./ssh.md) — FIDO2 resident keys for OpenSSH: the private key never leaves the device.
 - [Linux local authentication](./linux-auth.md) — require the device at login with PAM.
 - [Unlocking disk encryption](./disk-encryption.md) — LUKS volumes whose secret is derived on the board.
