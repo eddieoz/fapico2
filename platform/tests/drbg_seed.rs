@@ -502,29 +502,46 @@ fn an_unreadable_store_refuses() {
     );
 }
 
-/// An all-zero OTP row is a device the C firmware never initialized
-/// (`NeverBootC`, US-918). The seed refuses it with **its own** error even
-/// when the record is present, so the error names the real fault rather than
-/// a downstream symptom of a missing one — and with both faults present the
-/// OTP row is still the one reported, because `derive_drbg_seed` checks it
-/// first (the same ordering `ckey` pins for `derive_kbase`).
+/// US-1931 (EPIC `FRESH-BOOT-SERVE`, the 2026-11-20 retail incident): a
+/// factory-fresh board — unfused zero OTP row, record drawn and persisted,
+/// healthy TRNG — MUST seed. `NeverBootC` is a migration-era guard ("the C
+/// firmware never initialized this device"); on a tree that is not a C port,
+/// "C never booted" is the normal factory state, and the boot path already
+/// advertises it (`otp_row_unfused` / `ENTROPY_FLAG_ROW_UNFUSED`). The seed's
+/// entropy is the record plus the fresh per-seed draw; a zero IKM row
+/// degenerates the *binding* — the residual `store_v3::derive_store_key`
+/// already accepts and documents — not the entropy. Refusing it bricks every
+/// retail unit before USB: the field symptom, reproduced in process.
+/// Replaces `an_uninitialized_device_refuses_with_its_own_error`, which
+/// pinned the brick as intended (US-918's migration-era ordering); the
+/// inversion is the story, and the control below keeps the fail-closed half.
 #[test]
-fn an_uninitialized_device_refuses_with_its_own_error() {
+fn a_fresh_unfused_board_with_a_drawn_record_seeds() {
     let device = Device::never_booted();
-    let mut provisioned = MemStore::provisioned();
+    let mut store = MemStore::provisioned();
+    let mut probe = ScriptedProbe::healthy();
+    assert!(
+        device.seed(&mut store, &mut probe).is_ok(),
+        "fresh install: record present + healthy TRNG must seed"
+    );
+    assert_eq!(probe.draws, 1, "a successful seed spends exactly one draw");
+}
+
+/// The fail-closed half of US-1931: removing the zero-row refusal must not
+/// remove the record refusal. A zero row with **no** record still refuses
+/// (`MissingBootEntropy`), and the refusal still precedes the peripheral —
+/// a misprovisioned device never spends a probe budget.
+#[test]
+fn a_fresh_unfused_board_without_a_record_still_refuses() {
+    let device = Device::never_booted();
+    let mut bare = MemStore::new();
     let mut probe = ScriptedProbe::healthy();
     assert_eq!(
-        device.seed(&mut provisioned, &mut probe).err(),
-        Some(SeedError::CKey(CKeyError::NeverBootC)),
-        "a valid record must not paper over an uninitialized OTP row"
-    );
-
-    let mut bare = MemStore::new();
-    assert_eq!(
         device.seed(&mut bare, &mut probe).err(),
-        Some(SeedError::CKey(CKeyError::NeverBootC)),
-        "the OTP row is checked before the absent record is reported"
+        Some(SeedError::CKey(CKeyError::MissingBootEntropy)),
+        "no record, no seed — the zero row is not a fallback entropy source"
     );
+    assert_eq!(probe.draws, 0, "the refusal precedes the peripheral");
 }
 
 /// A record that is present, correctly sized, and carries **no entropy** —

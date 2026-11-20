@@ -223,33 +223,55 @@ const DRBG_SEED_LABEL: &[u8] = b"DRBG/SEED";
 /// `seed = HKDF-SHA256(ikm = otp_key_1, salt = serial_hash ‖
 /// chipid.to_be_bytes() ‖ boot_entropy, info = "DRBG/SEED")`.
 ///
-/// The same input material and the same fail-closed policy as
-/// [`derive_kbase`], under a different label: a leaked OTP row alone is
-/// still insufficient, and a missing `boot_entropy` record is still
-/// [`CKeyError::MissingBootEntropy`] with no fallback to the two-input KDF.
-/// (The C-compat root is not a fallback here either — the seed is not
-/// derived from `derive_kbase`'s output at all, so a compromise of the root
-/// does not reach the keystream.)
+/// The same input material as [`derive_kbase`], under a different label: a
+/// leaked OTP row alone is still insufficient, and a missing `boot_entropy`
+/// record is still [`CKeyError::MissingBootEntropy`] with no fallback to the
+/// two-input KDF. (The C-compat root is not a fallback here either — the seed
+/// is not derived from `derive_kbase`'s output at all, so a compromise of the
+/// root does not reach the keystream.)
 ///
-/// # Three refusals, and why the third is here
+/// # Two refusals, and why the zero row is not one (US-1931)
 ///
-/// * an all-zero OTP row is [`CKeyError::NeverBootC`];
 /// * a **missing** record is [`CKeyError::MissingBootEntropy`];
 /// * a record that is present, correctly sized, and **all zero** is
 ///   [`CKeyError::DepletedBootEntropy`].
 ///
-/// The third is not a duplicate of the second. "Absent" and "present but
+/// An all-zero OTP row is **accepted** here, unlike [`derive_kbase`] and
+/// [`derive_kbase_c`]. `NeverBootC` is a migration-era guard — "the C firmware
+/// never initialized this device, there is no C material to open" — and on a
+/// tree that is not a C port, "C never booted" is the normal factory state:
+/// every retail board's row reads zero until something burns it, and the boot
+/// path already advertises that state (`otp_row_unfused`,
+/// `ENTROPY_FLAG_ROW_UNFUSED`). Keeping the guard here made the seed
+/// unreachable on exactly those boards: the 2026-11-20 retail incident, field
+/// units that blinked forever before USB and only booted after pico-fido or
+/// RS-Key burned the row on their own first boot
+/// (`docs/audits/2026-11-20-retail-virgin-otp-row-brick.md`).
+///
+/// The attack the guard claimed to stop — a seed computable offline from
+/// constant inputs — is already closed by the two refusals above plus the
+/// mandatory fresh per-seed TRNG draw in [`crate::drbg_seed::FuseSeedSource`]:
+/// with a genuine record and a fresh nonce, a zero IKM row does not yield a
+/// constant seed. What a zero row degenerates is the *binding*, not the
+/// entropy: a seal key over `{0³², chipid}` is public, which is the residual
+/// `store_v3::derive_store_key` already accepts and documents for the whole
+/// store (US-1030's `kbase_c_unchecked` carries the same argument for the OATH
+/// seal). Refusing the seed bought no protection the store does not already
+/// concede, and cost every factory-fresh unit its boot — AGENTS.md §5's exact
+/// case. Provisioning (burning the row) remains ADR 0002's deferred epic, not
+/// a boot-time refusal.
+///
+/// The second refusal is not a duplicate of the first. "Absent" and "present but
 /// constant" produce *the same key*, and that key is a keystream any
 /// attacker can compute offline without ever touching the device — which is
 /// strictly worse than having no record at all, because a missing record at
-/// least refuses. The check lives here as well as in
-/// [`crate::drbg_seed::FuseSeedSource`] on purpose: the source reports it as
-/// its own, more specific [`crate::drbg::SeedError`], but a direct caller of
-/// this function — which is `pub` — must not be able to skip the invariant
-/// the prose above claims it enforces. `derive_kbase` does **not** take this
-/// check: a constant *key* is catastrophic for a generator, which must never
-/// repeat, and merely degenerate for a long-lived root, where the same
-/// constant is already implied by a constant OTP row.
+/// least refuses. The check lives here as well as in the drbg_seed module's
+/// FuseSeedSource on purpose: the source reports it as its own, more specific
+/// SeedError, but a direct caller of this public function must not be able to
+/// skip the invariant the prose above claims it enforces. derive_kbase does
+/// **not** take this check: a constant *key* is catastrophic for a generator,
+/// which must never repeat, and merely degenerate for a long-lived root,
+/// where the same constant is already implied by a constant OTP row.
 ///
 /// # Why the salt is zeroized
 ///
@@ -263,9 +285,8 @@ pub fn derive_drbg_seed(
     chipid: u64,
     boot_entropy: Option<&[u8; BOOT_ENTROPY_LEN]>,
 ) -> Result<[u8; KEY_LEN], CKeyError> {
-    if otp_key_1.iter().all(|&b| b == 0) {
-        return Err(CKeyError::NeverBootC);
-    }
+    // US-1931: no zero-OTP-row refusal — the row is binding material, not
+    // entropy; see the function doc for the incident and the argument.
     let Some(entropy) = boot_entropy else {
         return Err(CKeyError::MissingBootEntropy);
     };
