@@ -1111,41 +1111,50 @@ fn seed_drbg_attempt() -> Result<(), fapico2_platform::drbg::SeedError> {
 /// retained for the first-install path only. A fresh board's construction
 /// draws (hkey, attestation, keystore) still need a live generator before
 /// the applets can boot, so this path blocks on the [`otp_retry`] budget
-/// exactly as the pre-epic boot did, and parks legibly on a refusal across
-/// the whole budget — the bounded-reboot machinery is deleted (post-boot
-/// there is nothing to reboot, and on the boot path a park is the legible
-/// outcome ADR 0004 demands; the 2026-11-10 measurement showed the reboots
-/// bought nothing).
+/// exactly as the pre-epic boot did.
 ///
-/// The message still names the site, and names the one deterministic
-/// non-TRNG cause worth ruling out: a failed `store.write` in the record
-/// draw leaves the seed record absent (logged there, invisible without a
-/// probe), and the seed path fail-closes on it.
+/// **US-1929 (FRESH-BOOT-SERVE Phase 0): freshness never parks.** The
+/// pre-1929 behaviour — a refusal across the whole budget parked legibly,
+/// signed `0100` (`DrbgRefused`) — is the 2026-11-19 retail incident's
+/// outcome, and the outcome is the bug: both reference firmwares have no
+/// "give up" on the entropy path at all. A budget expiry now **re-arms the
+/// retry forever**; there is no `fatal_boot` here any more. While it waits
+/// the site plays the warming blink, and every 5 s of waiting adds one
+/// 300 ms-lit burst pulse naming this site (`wait_blink::ProgressSite::Seed`)
+/// — the wait is legible from video, which is what the park used to buy
+/// (O-28), minus the dark board. USB still comes up only after this
+/// returns (the fresh-install bring-up precedes enumeration by design);
+/// VBUS removal clears a stalled cold episode and loses nothing on a fresh
+/// board.
 pub fn seed_drbg_blocking() {
     // Idempotent (US-1825 fix-up): the foreign-image wipe arm calls this
     // after the legacy path may already have seeded — and on the legacy
     // path it always has (the arm runs below `init_drbg_cell` +
     // `seed_drbg_blocking`). Re-seeding a live cell is the
     // `SeedError::AlreadySeeded` bug the cell asserts; retrying it for the
-    // whole budget would park a perfectly seeded board signed
-    // `DrbgRefused`. Already seeded → publish (no-op) and return.
+    // whole budget would be nonsense on a perfectly seeded board. Already
+    // seeded → publish (no-op) and return.
     if drbg_cell().is_ready() {
         publish_entropy_ready();
         return;
     }
-    if fapico2_firmware::otp_retry::retry(
-        || seed_drbg_attempt().ok().map(drop),
-        entropy_wait_sleep,
-        fapico2_firmware::otp_retry::STEP_MS,
-        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
-    )
-    .is_none()
-    {
-        fatal_boot(
-            "drbg: seed refused across the whole retry budget — no generator \
-             (if the TRNG reads healthy, check whether boot.entropy.v1 persisted)",
-            fatal_sig::Reason::DrbgRefused,
-        );
+    // US-1929: each pass is one full [`otp_retry::ENTROPY_DEADLINE_MS`]
+    // budget (60 s of counted sleep); a refusal across it re-arms the outer
+    // loop instead of parking. The wait-sleep wrapper counts the steps and
+    // plays the seed site's progress bursts, so a video decoder sees which
+    // site is waiting and for how long.
+    loop {
+        if fapico2_firmware::otp_retry::retry(
+            || seed_drbg_attempt().ok().map(drop),
+            entropy_wait_sleep_seed,
+            fapico2_firmware::otp_retry::STEP_MS,
+            fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
+        )
+        .is_some()
+        {
+            break;
+        }
+        defmt::debug!("drbg: seed refused across one budget — re-arming (US-1929: freshness never parks)");
     }
     publish_entropy_ready();
 }
@@ -1204,11 +1213,20 @@ pub fn boot_needs_legacy_bringup(store: &mut DeviceStore) -> bool {
 }
 
 /// The legacy inline record draw (US-1825): the pre-epic `ensure_boot_entropy`
-/// body, retained for the first-install path only. Same budgets, same
-/// blink window, same `entropy_draw_notice`; the bounded reboot is deleted —
-/// a refusal across the whole budget parks legibly with the same signature
-/// this site has always emitted (`0011`), and VBUS removal (the 2026-11-10
-/// measured fix) clears the episode.
+/// body, retained for the first-install path only. Same budget, same
+/// blink window, same `entropy_draw_notice`.
+///
+/// **US-1929 (FRESH-BOOT-SERVE Phase 0): freshness never parks.** The
+/// pre-1929 behaviour — a refusal across the whole budget parked legibly,
+/// signed `0011` (`TrngRefused`) — is the 2026-11-19 retail incident's
+/// outcome, and the outcome is the bug. A budget expiry now **re-arms the
+/// retry forever**; there is no `fatal_boot` here any more. While it waits
+/// the site plays the warming blink, and every 5 s of waiting adds one
+/// 120 ms-lit burst pulse naming this site
+/// (`wait_blink::ProgressSite::Record`) — the wait stays legible from
+/// video, which is what the park used to buy (O-28), minus the dark board.
+/// The US-918 unreadable-slot refusal is untouched (no redraw, no park) and
+/// the 400 ms draw notice still opens each draw attempt.
 // US-939: `#[inline(never)]` -- async-main frame discipline.
 #[inline(never)]
 pub fn ensure_boot_entropy_blocking(
@@ -1226,19 +1244,22 @@ pub fn ensure_boot_entropy_blocking(
         }
     }
     entropy_draw_notice();
-    if fapico2_firmware::otp_retry::retry(
-        || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
-        entropy_wait_sleep,
-        fapico2_firmware::otp_retry::STEP_MS,
-        fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
-    )
-    .is_none()
-    {
-        fatal_boot(
-            "boot entropy: TRNG refused across the whole retry budget; nothing to \
-             guarantee the slot with",
-            fatal_sig::Reason::TrngRefused,
-        );
+    // US-1929: each pass is one full [`otp_retry::ENTROPY_DEADLINE_MS`]
+    // budget (60 s of counted sleep); a refusal across it re-arms the outer
+    // loop instead of parking. The wait-sleep wrapper counts the steps and
+    // plays the record site's progress bursts.
+    loop {
+        if fapico2_firmware::otp_retry::retry(
+            || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
+            entropy_wait_sleep_record,
+            fapico2_firmware::otp_retry::STEP_MS,
+            fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
+        )
+        .is_some()
+        {
+            break;
+        }
+        defmt::debug!("boot entropy: TRNG refused across one budget — re-arming (US-1929: freshness never parks)");
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
@@ -1963,47 +1984,125 @@ fn entropy_draw_notice() {
     led.set_low();
 }
 
-/// US-1806: the entropy wait's sleep — one wait-blink step per 250 ms retry
-/// step, so a window that lasts seconds blinks `.--.--.--.` instead of
-/// sitting dark looking dead (the owner's 2026-11-09 decision; see
-/// [`fapico2_firmware::wait_blink`] for the rhythm and its collision test).
+/// US-1929: the two entropy sites' failed-attempt step counters. Boot path,
+/// pre-task, single-core: each is touched only by the retry closure of the
+/// one site that owns it, so the atomics are bookkeeping, not
+/// synchronisation (the same discipline as [`FATAL_LED_MOUNTED`]). `U32`
+/// because the target has no 64-bit atomics; a wrap is 2^32 x 250 ms of
+/// continuous stepping, i.e. never on a real boot.
+static RECORD_WAIT_STEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SEED_WAIT_STEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// US-1806/US-1929: the record site's wait-sleep — one wait-blink step per
+/// 250 ms retry step, plus the record site's progress burst when one is due
+/// (120 ms-lit pulses; [`fapico2_firmware::wait_blink::ProgressSite::Record`]).
+fn entropy_wait_sleep_record(ms: u64) {
+    entropy_wait_sleep_counted(
+        ms,
+        &RECORD_WAIT_STEPS,
+        fapico2_firmware::wait_blink::ProgressSite::Record,
+    );
+}
+
+/// US-1806/US-1929: the seed site's wait-sleep — the same shape, with the
+/// seed site's bursts (300 ms-lit pulses;
+/// [`fapico2_firmware::wait_blink::ProgressSite::Seed`]).
+fn entropy_wait_sleep_seed(ms: u64) {
+    entropy_wait_sleep_counted(
+        ms,
+        &SEED_WAIT_STEPS,
+        fapico2_firmware::wait_blink::ProgressSite::Seed,
+    );
+}
+
+/// The two wait-sleep wrappers' shared body: play one blink step (if this is
+/// a blink-sized sleep), count the failed-attempt step, and play the burst
+/// due on each 5-second unit ([`fapico2_firmware::wait_blink::
+/// PROGRESS_BURST_EVERY_STEPS`]) at `site`.
 ///
-/// The shape is [`entropy_draw_notice`]'s: gate on [`FATAL_LED_MOUNTED`]
-/// (same discipline — before `mark_fatal_led_ready()` there is no pin to
-/// drive, and an entropy wait on such a path stays silent rather than
-/// writing through an uninitialised slot), drive the level sequence from
+/// Zero cost on success: the retry loop calls this only between failed
+/// attempts, so a first-attempt draw never reaches the counter or the pin.
+/// The burst time is *extra* to the counted budget — the retry loop counts
+/// only the 250 ms step — by design: the budget sizes a wait, the burst is
+/// the diagnostic channel on top of it.
+///
+/// The blink half keeps the US-1806 discipline: gate on [`FATAL_LED_MOUNTED`]
+/// (before `mark_fatal_led_ready()` there is no pin to drive, and an entropy
+/// wait on such a path stays silent rather than writing through an
+/// uninitialised slot), drive the level sequence from
 /// [`fapico2_firmware::wait_blink::step_levels`], park dark on exit. The
 /// blink is deliberately not a rung: the ladder's pulse count is a monotone
-/// progress counter whose meaning an extra pulse would corrupt.
-///
-/// The entropy sites pass [`fapico2_firmware::otp_retry::STEP_MS`] only —
-/// one call per attempt, one dot-dash pair per call. Anything else falls
-/// back to [`busy_sleep_ms`], so a caller that mis-hands this closure is a
-/// silent wait, never a wrong rhythm: the wait-blink's reading
-/// (`docs/boot-freeze.md`) stays owned by exactly one driver.
-fn entropy_wait_sleep(ms: u64) {
-    if ms != fapico2_firmware::wait_blink::WAIT_BLINK_PERIOD_MS
-        || !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire)
+/// progress counter whose meaning an extra pulse would corrupt. Anything
+/// that is not a blink-sized sleep falls back to [`busy_sleep_ms`], so a
+/// caller that mis-hands this closure is a silent wait, never a wrong
+/// rhythm: the wait-blink's reading (`docs/boot-freeze.md`) stays owned by
+/// exactly one driver.
+fn entropy_wait_sleep_counted(
+    ms: u64,
+    steps: &core::sync::atomic::AtomicU32,
+    site: fapico2_firmware::wait_blink::ProgressSite,
+) {
+    if ms == fapico2_firmware::wait_blink::WAIT_BLINK_PERIOD_MS
+        && FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire)
     {
+        // SAFETY: the `LED_OUT` slot is written exactly once at the top of
+        // `main` before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`;
+        // this is the pre-task boot path, single-core, so no heartbeat or
+        // trussed-UI driver shares the pin.
+        let led: &mut Output<'static> =
+            unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
+        for level in fapico2_firmware::wait_blink::step_levels() {
+            // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303); park dark on exit.
+            match level {
+                fapico2_firmware::boot_ladder::Level::On => {
+                    led.set_high();
+                    busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_ON_MS * 1000) as u32);
+                }
+                fapico2_firmware::boot_ladder::Level::Off => {
+                    led.set_low();
+                    busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_OFF_MS * 1000) as u32);
+                }
+            }
+        }
+    } else {
         busy_sleep_ms(ms);
+    }
+    // Count the step whether or not the blink played (each call is one
+    // failed attempt's sleep), and play the burst due on the 5-second-unit
+    // boundary — a no-op below the first unit, and silent when the LED is
+    // not mounted (the burst's own gate, [`entropy_draw_notice`]'s shape).
+    let step = steps.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if u64::from(step) % fapico2_firmware::wait_blink::PROGRESS_BURST_EVERY_STEPS == 0 {
+        play_progress_burst(site, u64::from(step));
+    }
+}
+
+/// US-1928 on device: play the burst due after `steps` failed-attempt steps
+/// at `site` — `wait_blink::progress_burst_pulses(steps)` pulses of the
+/// site's 450 ms period, ending dark. A no-op when the LED is not mounted,
+/// on the same gate and discipline as [`entropy_draw_notice`].
+fn play_progress_burst(site: fapico2_firmware::wait_blink::ProgressSite, steps: u64) {
+    if !FATAL_LED_MOUNTED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
+    let on_us = (fapico2_firmware::wait_blink::burst_on_ms(site) * 1000) as u32;
+    let off_us = (fapico2_firmware::wait_blink::burst_off_ms(site) * 1000) as u32;
     // SAFETY: the `LED_OUT` slot is written exactly once at the top of `main`
     // before `mark_fatal_led_ready()` flips `FATAL_LED_MOUNTED`; this is the
     // pre-task boot path, single-core, so no heartbeat or trussed-UI driver
     // shares the pin.
     let led: &mut Output<'static> =
         unsafe { (&mut *core::ptr::addr_of_mut!(LED_OUT)).assume_init_mut() };
-    for level in fapico2_firmware::wait_blink::step_levels() {
+    for level in fapico2_firmware::wait_blink::progress_burst_levels(site, steps) {
         // GPIO25 on the Pico 2 is ACTIVE-HIGH (US-1303); park dark on exit.
         match level {
             fapico2_firmware::boot_ladder::Level::On => {
                 led.set_high();
-                busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_ON_MS * 1000) as u32);
+                busy_wait_us(on_us);
             }
             fapico2_firmware::boot_ladder::Level::Off => {
                 led.set_low();
-                busy_wait_us((fapico2_firmware::wait_blink::WAIT_BLINK_OFF_MS * 1000) as u32);
+                busy_wait_us(off_us);
             }
         }
     }
