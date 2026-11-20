@@ -1681,6 +1681,15 @@ async fn entropy_bringup_task() {
                 defmt::info!("entropy bring-up: ready — creation-class operations unblocked");
                 return;
             }
+            Err(e) if !fapico2_platform::drbg_seed::refusal_is_freshness(&e) => {
+                // US-1932: a permanent state refusal is not warming; park
+                // legibly (ADR 0004's identity domain) rather than
+                // warn-and-retry forever on the serving arm too.
+                boot::fatal_boot(
+                    "entropy bring-up: seed refused by device state, not freshness (US-1932)",
+                    fapico2_firmware::fatal_sig::Reason::DrbgRefused,
+                );
+            }
             Err(_) => {
                 attempts += 1;
                 if attempts == 1 || attempts.is_multiple_of(16) {

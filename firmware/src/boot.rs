@@ -1145,7 +1145,16 @@ pub fn seed_drbg_blocking() {
     // site is waiting and for how long.
     loop {
         if fapico2_firmware::otp_retry::retry(
-            || seed_drbg_attempt().ok().map(drop),
+            || match seed_drbg_attempt() {
+                Ok(()) => Some(()),
+                // US-1932: freshness retries forever (US-1929); a permanent
+                // state refusal parks legibly instead of blinking forever.
+                Err(e) if fapico2_platform::drbg_seed::refusal_is_freshness(&e) => None,
+                Err(_) => fatal_boot(
+                    "drbg: seed refused by device state, not freshness (US-1932)",
+                    fatal_sig::Reason::DrbgRefused,
+                ),
+            },
             entropy_wait_sleep_seed,
             fapico2_firmware::otp_retry::STEP_MS,
             fapico2_firmware::otp_retry::ENTROPY_DEADLINE_MS,
