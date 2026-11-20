@@ -414,7 +414,11 @@ The domain is now three-way, classified by
   `AlreadySeeded`): park with the existing `DrbgRefused` signature, on both
   arms (the legacy `seed_drbg_blocking` and the bring-up task). Halt sites
   21 → 23, delta recorded in `region_degradation.rs`. These are identity-
-  domain faults that waiting cannot clear.
+  domain faults that waiting cannot clear. *(US-1935 refinement: a fault in
+  the record itself — the slot unreadable, the drawn record refused for
+  persistence — parks at the record site under its own `EntropyRecord`
+  signature, so the pin names the store-record fault instead of
+  misattributing it to the seed; halt sites 23 → 25.)*
 * **Identity and clock-liveness**: unchanged — and `NeverBootC` leaves the
   *seed* path entirely: the zero OTP row is a supported boot state (the
   documented `store_v3` residual; US-1030's argument), advertised by

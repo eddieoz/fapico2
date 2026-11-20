@@ -11,8 +11,11 @@
 //! | flash UID | on-flash chip identity | so a leaked OTP row does not reconstruct another board |
 //! | `boot.entropy.v1` | the AEAD-sealed secure store | so a leaked OTP row does not reconstruct *this* board |
 //!
-//! — through [`ckey::derive_drbg_seed`], the same HKDF shape and the same
-//! fail-closed policy as the bound device root.
+//! — through [`ckey::derive_drbg_seed`], the same HKDF shape as the bound
+//! device root, and — since US-1931 — one deliberate divergence from its
+//! fail-closed policy: the zero OTP row is accepted here (it is binding
+//! material, not entropy) where the root refuses it. The function's doc
+//! carries the incident and the argument.
 //!
 //! # A key is not entropy: the fresh draw (C-1)
 //!

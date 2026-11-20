@@ -287,11 +287,11 @@ fn rust_files(rel: &str) -> Vec<std::path::PathBuf> {
 /// * a line naming `fatal_boot::` — a path reference, which this tree does not
 ///   use today but which is not an invocation.
 ///
-/// What survives is a line that *calls* `fatal_boot(`. 22 of them: 15 in
-/// `boot.rs`, 7 in `main.rs`, and none anywhere else. (The header comment
+/// What survives is a line that *calls* `fatal_boot(`. 25 of them: 17 in
+/// `boot.rs`, 8 in `main.rs`, and none anywhere else. (The header comment
 /// above US-1558's baseline said "23: 18 in boot.rs, 5 in main.rs" — the
-/// split had already drifted from the total; the total was the assertion,
-/// and US-1808/1809's delta is recorded at it below.)
+/// split has drifted from the total before; the total is the assertion,
+/// and each phase's delta is recorded at it below.)
 fn fatal_boot_call_sites(rel: &str) -> Vec<String> {
     let mut out = Vec::new();
     for path in rust_files(rel) {
@@ -382,8 +382,16 @@ fn no_new_halt_site_is_reachable_from_the_key_region() {
     // `drbg_seed::refusal_is_freshness` and is host-pinned. Two sites
     // regain `fatal_boot`: the legacy `seed_drbg_blocking` and the
     // bring-up task's warm arm. The freshness half of US-1929 is intact.
+    //
+    // **US-1935 (the review pass) moved it once more.** 23 → 25: the record
+    // site's two log-and-continue arms — the US-918 unreadable-slot arm and
+    // the record-persist arm — park at the fault site under the new
+    // `EntropyRecord` signature instead of continuing into a seed that
+    // parks `0100` misattributed. The review trace showed the downstream
+    // park names the seed while the real fault is the store read/write, and
+    // on hardware the log line is unreachable (no USB, no SWD).
     let sites = all_halt_sites();
-    assert_eq!(sites.len(), 23, "the fatal_boot call-site count must not change without US-1929/US-1932's recorded deltas:\n{}", sites.join("\n"));
+    assert_eq!(sites.len(), 25, "the fatal_boot call-site count must not change without US-1929/US-1932/US-1935's recorded deltas:\n{}", sites.join("\n"));
 
     // **The second scenario's first clause, checked where it can actually
     // fail.** Not "the total is 22" — "there is no `fatal_boot` anywhere under

@@ -113,8 +113,10 @@ deferred epic; the boot must not demand it.
    settles — and now, at the tuned construction config, that should be
    RS-Key's ~1.5 s, not minutes (US-1926's measurement finally measures this).
 3. **A board with a genuinely broken seed** (e.g. torn record, unreadable
-   store) on the post-US-1932 firmware parks with the `0100` signature within
-   one 60 s budget instead of blinking forever — legible again.
+   store) on the post-US-1932 firmware parks with a signature within seconds
+   instead of blinking forever — legible again. Post-US-1935 the record-site
+   faults (slot unreadable, persist refused) carry their own `1011`
+   signature, parked at the fault site; seed-state faults keep `0100`.
 
 ## Residuals
 

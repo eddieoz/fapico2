@@ -36,10 +36,13 @@
 //! The two boot-entropy sites (US-1802..1810, EPIC
 //! `COLD-BOOT-ENTROPY-WINDOW`) pass [`ENTROPY_DEADLINE_MS`] and a
 //! **blinking** sleep ([`crate::wait_blink`]: 80 ms lit / 170 ms dark, one
-//! pair per step), and their refusal **re-arms the retry forever**
-//! (US-1929, EPIC `FRESH-BOOT-SERVE` Phase 0: freshness never parks) — a
-//! 60 s window never reads as a dead board, and a budget expiry is not an
-//! outcome at all: the budget sizes one step of the wait, not a give-up.
+//! pair per step), and their **freshness** refusals re-arm the retry
+//! forever (US-1929, EPIC `FRESH-BOOT-SERVE` Phase 0: freshness never
+//! parks) — a 60 s window never reads as a dead board, and a budget expiry
+//! is not an outcome at all: the budget sizes one step of the wait, not a
+//! give-up. Permanent state refusals park legibly instead (US-1932/US-1935:
+//! the split lives in `drbg_seed::refusal_is_freshness` and the record
+//! site's own `EntropyRecord` signature).
 //! (The bounded-reboot machinery this paragraph used to name —
 //! [`crate::entropy_reset`], ADR 0004 amendment 3 — was unwired by US-1825
 //! and is now a superseded mechanism; see that module's doc.)
@@ -88,7 +91,8 @@ pub const ENTROPY_DEADLINE_MS: u64 = 60_000;
 /// up to ~[`DEADLINE_MS`] is documented operator behavior, and a real
 /// refusal parks immediately; the two boot-entropy sites pass
 /// [`ENTROPY_DEADLINE_MS`] and a blinking sleep ([`crate::wait_blink`]) and
-/// their refusal re-arms the retry forever (US-1929).
+/// their freshness refusals re-arm the retry forever (US-1929) while
+/// permanent state refusals park legibly (US-1932/US-1935).
 pub fn retry<T>(
     mut read: impl FnMut() -> Option<T>,
     mut sleep_ms: impl FnMut(u64),

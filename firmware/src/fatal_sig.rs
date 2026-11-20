@@ -142,12 +142,19 @@ pub enum Reason {
     MigrationFailed = 9,
     /// A panic — the runtime's own refusal, distinct from every refusal above.
     Panic = 10,
+    /// The `boot.entropy.v1` record could not be established on this store:
+    /// the drawn record was refused for persistence, or the existing slot
+    /// read back as unreadable (US-918's no-redraw posture). The record draw
+    /// itself is freshness and never parks — this variant is the store's
+    /// refusal of the record, one operator action (power cycle, then report
+    /// if recurring) for both arms.
+    EntropyRecord = 11,
 }
 
 /// Every reason, in id order. Used by the host tests to assert that no two
 /// reasons encode identically, which is the property that makes the signature
 /// worth reading.
-pub const ALL_REASONS: [Reason; 10] = [
+pub const ALL_REASONS: [Reason; 11] = [
     Reason::OtpKeyRow,
     Reason::ChipId,
     Reason::TrngRefused,
@@ -158,6 +165,7 @@ pub const ALL_REASONS: [Reason; 10] = [
     Reason::KeystoreFailed,
     Reason::MigrationFailed,
     Reason::Panic,
+    Reason::EntropyRecord,
 ];
 
 /// Bits in the encoded id field. Four covers ten reasons with room to spare,

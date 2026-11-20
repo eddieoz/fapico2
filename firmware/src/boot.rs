@@ -1117,13 +1117,21 @@ fn seed_drbg_attempt() -> Result<(), fapico2_platform::drbg::SeedError> {
 /// the applets can boot, so this path blocks on the [`otp_retry`] budget
 /// exactly as the pre-epic boot did.
 ///
-/// **US-1929 (FRESH-BOOT-SERVE Phase 0): freshness never parks.** The
-/// pre-1929 behaviour — a refusal across the whole budget parked legibly,
-/// signed `0100` (`DrbgRefused`) — is the 2026-11-19 retail incident's
-/// outcome, and the outcome is the bug: both reference firmwares have no
-/// "give up" on the entropy path at all. A budget expiry now **re-arms the
-/// retry forever**; there is no `fatal_boot` here any more. While it waits
-/// the site plays the warming blink, and every 5 s of waiting adds one
+/// **US-1929 (FRESH-BOOT-SERVE Phase 0): freshness never parks — and
+/// US-1932 keeps the split honest.** The pre-1929 behaviour — a refusal
+/// across the whole budget parked legibly, signed `0100` (`DrbgRefused`) —
+/// was the 2026-11-19 retail incident's outcome, and for a FRESHNESS
+/// refusal the outcome was the bug: both reference firmwares have no "give
+/// up" on the entropy path at all. A peripheral refusal (`SeedError::Trng`)
+/// therefore re-arms the retry forever; a **permanent state refusal**
+/// (missing or depleted record, unreadable store, derivation refusal)
+/// parks legibly with the same `0100` signature — a fault waiting cannot
+/// clear is identity-domain, not freshness (ADR 0004 amendment 7), and
+/// US-1929's variant-erasing loop turned that class into a silent infinite
+/// blink on the 2026-11-20 retail board. A fault in the record itself
+/// parks earlier, at the record site, under its own `EntropyRecord`
+/// signature (US-1935). While the site waits it plays the warming blink,
+/// and every 5 s of waiting adds one
 /// 300 ms-lit burst pulse naming this site (`wait_blink::ProgressSite::Seed`)
 /// — the wait is legible from video, which is what the park used to buy
 /// (O-28), minus the dark board. USB still comes up only after this
@@ -1253,7 +1261,15 @@ pub fn ensure_boot_entropy_blocking(
         Ok(_) | Err(SecureStoreError::NotFound) => {} // draw below
         Err(_) => {
             defmt::error!("boot entropy: slot unreadable; refusing to redraw (US-918)");
-            return;
+            // US-1935: park HERE, under the record's own signature, instead
+            // of returning and letting the seed site park `0100` one step
+            // later — the review pass showed that downstream park names the
+            // seed while the real fault is this store read, and on hardware
+            // the log line is unreachable (no USB, no SWD).
+            fatal_boot(
+                "boot entropy: record slot unreadable (US-918)",
+                fatal_sig::Reason::EntropyRecord,
+            );
         }
     }
     entropy_draw_notice();
@@ -1263,6 +1279,11 @@ pub fn ensure_boot_entropy_blocking(
     // plays the record site's progress bursts.
     loop {
         if fapico2_firmware::otp_retry::retry(
+            // Contract: every TrngError variant is freshness (US-1929, ADR
+            // 0004 amendment 7) — this closure erases by type, so a new
+            // variant must be classified here before it can park anywhere.
+            // The seed sites route through refusal_is_freshness instead;
+            // the review pass left this site type-erased on purpose.
             || fapico2_platform::trng::try_fresh_bytes(probe, &mut buf).ok(),
             entropy_wait_sleep_record,
             fapico2_firmware::otp_retry::STEP_MS,
@@ -1276,6 +1297,14 @@ pub fn ensure_boot_entropy_blocking(
     }
     if store.write(migration::SLOT_BOOT_ENTROPY, &buf).is_err() {
         defmt::error!("boot entropy: could not persist the drawn entropy (US-918)");
+        // US-1935: the draw succeeded (freshness was fine); the store
+        // refused the record. Park here under `EntropyRecord` rather than
+        // continuing into a seed that reads no record and parks `0100`
+        // misattributed — the same review-pass finding as the slot arm.
+        fatal_boot(
+            "boot entropy: record persist refused (US-918)",
+            fatal_sig::Reason::EntropyRecord,
+        );
     }
 }
 
