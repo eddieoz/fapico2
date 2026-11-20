@@ -720,6 +720,13 @@ alpha-lineage (`fapico2-release-alpha-v0.1.0` … `v0.7.0`, 2026-10-04 onward �
 the convention since the first one); **no non-alpha `vX.Y.Z-release` tag exists yet**, so the
 debug-port closure has never applied, and ADR 0002 itself creates no tag.
 
+**Every git action is signed (2026-11-20).** Commits and tags carry GPG
+signatures — `commit.gpgsign` and `tag.gpgsign` are true, and the signing key
+is `3480FB98373B56FB` (Edilson Osorio Jr. <eddieoz@pm.me>, on hardware card
+FFFE 11334953). A commit that lands unsigned is a defect: re-sign it with
+`git commit --amend --no-edit -S` (mid-branch, re-sign by rebase). A PR
+carries its verification through its commits, and a release signs its tag.
+
 **Commit messages carry no AI trailers.** Do not add `Co-Authored-By`, a
 `Generated with …` line, or any other AI-attribution footer — whatever the
 model behind the harness calls itself. ZCode is Claude Code under a different
