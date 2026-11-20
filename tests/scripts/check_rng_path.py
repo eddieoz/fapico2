@@ -918,23 +918,52 @@ def check_construction_config(root: Path) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"{'/'.join(CONFIG_PIN_FILE)} not found under {root}"
     code = strip_comments(path.read_text(encoding="utf-8"))
-    if not CONFIG_PIN_ANCHOR.search(code):
+    anchor = CONFIG_PIN_ANCHOR.search(code)
+    if not anchor:
         return False, (
             "no Rp2350Trng::from_peri site in main.rs — the pin's anchor is "
             "stale and must be updated with the construction site"
         )
-    if CONFIG_PIN_REQUIRE.search(code):
+    # US-1935 (the review pass): the REQUIRE is scoped to the from_peri
+    # call's own argument span — from the anchor to the balanced close of the
+    # call's opening paren — not the whole file. The review's mutation M2
+    # (an honestly-reverted call plus one unrelated matching line planted
+    # anywhere in main.rs) passed a file-wide search vacuously; a
+    # window-scoped one fails it. Comments cannot satisfy the pin either
+    # way (strip_comments runs first), and deleting the site fails loud on
+    # the anchor check above.
+    open_paren = code.find("(", anchor.start())
+    depth = 0
+    close = None
+    for i in range(open_paren, len(code)):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                close = i
+                break
+    if close is None:
+        return False, (
+            "the from_peri site's parens do not balance after the anchor — "
+            "the pin's window logic is stale and must be updated with the "
+            "construction site"
+        )
+    window = code[anchor.start() : close + 1]
+    if CONFIG_PIN_REQUIRE.search(window):
         return True, (
             "from_peri passes sample_count from TrngConfig::default()."
-            "sample_cnt1 — construction runs the tuned configuration"
+            "sample_cnt1 at the construction site — construction runs the "
+            "tuned configuration"
         )
     return False, (
         "main.rs's Rp2350Trng::from_peri does not pass the tuned sample "
-        "count (sample_count: TrngConfig::default().sample_cnt1). The "
-        "peripheral then initializes at embassy's stock sample_count 25 — "
-        "the autocorrelation-stall configuration — and US-1927's tuning "
-        "reaches the registers only through the soft-reset re-arm. "
-        "US-1933: the construction config and the budget's config are one fact."
+        "count at the call site (sample_count: TrngConfig::default()."
+        "sample_cnt1). The peripheral then initializes at embassy's stock "
+        "sample_count 25 — the autocorrelation-stall configuration — and "
+        "US-1927's tuning reaches the registers only through the soft-reset "
+        "re-arm. US-1933/US-1935: the construction config and the budget's "
+        "config are one fact, pinned at the site."
     )
 
 

@@ -69,13 +69,14 @@ Read the four bits left to right as a binary number, most-significant bit first.
 | 1 | `0001` | OTP key row unreadable | power cycle (off **≥ 5 s**) and retry; recovery is a power cycle, not a reset button |
 | 2 | `0010` | chip identity row unreadable | power cycle as above |
 | 3 | `0011` | TRNG wait had no deadline — the board's timer was not counting (infrastructure, not freshness) | power cycle (off ≥ 5 s) and retry. On builds older than 2026-11-20 this reason instead meant "the randomness draw refused its whole budget" — that park is gone; current builds never give up on freshness |
-| 4 | `0100` | DRBG seed refused *(superseded reading — kept so older builds' videos still decode)* | current builds do not emit this from the boot path: the seed re-arms forever. If you see it, the board runs a pre-2026-11-20 image; power cycle and re-flash |
+| 4 | `0100` | DRBG seed refused by **device state** — a missing or depleted entropy record, an unreadable store, or a derivation refusal (ADR 0004 amendment 7, US-1932) | power cycle (off ≥ 5 s) and retry; if it recurs on the latest firmware, report it with the signature. *(Older reading, kept for old videos: on pre-2026-11-20 images this meant "the seed gave up" — those images park here on first boot; re-flash. Freshness refusals never emit this — they blink and settle.)* |
 | 5 | `0101` | store content failed verification | re-flash the firmware; if it recurs, the store was deliberately refused — report it |
 | 6 | `0110` | store could not be written durably | power cycle; if it recurs, report |
 | 7 | `0111` | backend failed to mount | power cycle and retry |
 | 8 | `1000` | a keystore failed to open | power cycle and retry |
 | 9 | `1001` | schema migration failed | power cycle and retry |
 | 10 | `1010` | a firmware panic | power cycle; if it recurs on the latest firmware, report it with the signature |
+| 11 | `1011` | the boot-entropy record could not be established — the store refused to persist it, or its slot read back unreadable | power cycle (off ≥ 5 s) and retry; if it recurs on the latest firmware, report it with the signature |
 
 After any signature, unplug, **wait at least 5 seconds**, and plug back in. The wait is load-bearing: several of these conditions clear on a real power cycle and not on a quick replug or a reset button.
 

@@ -1632,7 +1632,10 @@ pub mod rp2350 {
         /// be wrong — and being wrong here is silent by construction. The
         /// only cost of taking it as an argument is that a caller can pass
         /// something else, which is why the boot path passes the same
-        /// `Config::default()` constant it passes to `from_peri`.
+        /// `TrngConfig::default()` values to both this constructor and
+        /// `from_peri`'s `sample_count` (US-1933; between US-1927 and
+        /// US-1933 they were different constants — the divergence the
+        /// `check_rng_path.py` CONFIG-PIN now pins).
         pub fn new(
             peri: embassy_rp::Peri<'d, embassy_rp::peripherals::TRNG>,
             clock: ClockReady,
