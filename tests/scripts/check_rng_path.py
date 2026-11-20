@@ -299,6 +299,15 @@ SEAM_MOD_FILE = ("platform", "src", "lib.rs")
 SEAM_MOD_DECL = "pub mod entropy_starve;"
 SEAM_REQUIRED_CFG = '#[cfg(all(feature = "emulation", not(target_arch = "arm")))]'
 
+# US-1933: the construction config pin — see check_construction_config. The
+# from_peri site must pass the tuned sample count the entropy budget is
+# calibrated against; embassy's own Config::default() is the stall config.
+CONFIG_PIN_FILE = ("firmware", "src", "main.rs")
+CONFIG_PIN_ANCHOR = re.compile(r"\bRp2350Trng::from_peri\b")
+CONFIG_PIN_REQUIRE = re.compile(
+    r"sample_count\s*[:=]\s*TrngConfig::default\(\)\.sample_cnt1"
+)
+
 # Directories that never hold hand-written Rust source.
 SKIP_DIRS = {".git", "target", ".test-venv", ".serena", "node_modules", ".cargo"}
 
@@ -887,6 +896,48 @@ def check_seam_cfg(root: Path) -> tuple[bool, str]:
     )
 
 
+def check_construction_config(root: Path) -> tuple[bool, str]:
+    """US-1933: the peripheral's construction config is the tuned one.
+
+    A property of the file's CODE, not of a comment. The comment above
+    ``main.rs``'s probe construction claims the probe's ``TrngConfig`` is
+    "the same value ``from_peri`` was given above, from the same constant" —
+    a claim that became false when US-1927 tuned ``TrngConfig::default()`` to
+    ``sample_cnt1: 1000`` while the ``from_peri`` call kept embassy's
+    ``Config::default()`` (``sample_count: 25``, the autocorrelation-stall
+    configuration RS-Key measured). The registers then ran the stock config
+    at every cold boot, and the tuning reached the silicon only through the
+    soft-reset re-arm. The pin: the ``from_peri`` call must spell
+
+        sample_count: TrngConfig::default().sample_cnt1
+
+    so the two constants stay one fact — US-1927's consistency test covers
+    the platform side, and this pin covers the construction site.
+    """
+    path = root.joinpath(*CONFIG_PIN_FILE)
+    if not path.is_file():
+        return False, f"{'/'.join(CONFIG_PIN_FILE)} not found under {root}"
+    code = strip_comments(path.read_text(encoding="utf-8"))
+    if not CONFIG_PIN_ANCHOR.search(code):
+        return False, (
+            "no Rp2350Trng::from_peri site in main.rs — the pin's anchor is "
+            "stale and must be updated with the construction site"
+        )
+    if CONFIG_PIN_REQUIRE.search(code):
+        return True, (
+            "from_peri passes sample_count from TrngConfig::default()."
+            "sample_cnt1 — construction runs the tuned configuration"
+        )
+    return False, (
+        "main.rs's Rp2350Trng::from_peri does not pass the tuned sample "
+        "count (sample_count: TrngConfig::default().sample_cnt1). The "
+        "peripheral then initializes at embassy's stock sample_count 25 — "
+        "the autocorrelation-stall configuration — and US-1927's tuning "
+        "reaches the registers only through the soft-reset re-arm. "
+        "US-1933: the construction config and the budget's config are one fact."
+    )
+
+
 def scan_file(path: Path) -> list[tuple[int, str, str]]:
     """Return (lineno, flag_name, matched_text) for each code-level occurrence.
 
@@ -970,6 +1021,7 @@ def main(argv: list[str]) -> int:
     # reported whether it passes or not — a structural check that only
     # prints on failure is a check nobody notices has stopped running.
     seam_ok, seam_detail = check_seam_cfg(root)
+    cfg_ok, cfg_detail = check_construction_config(root)
 
     def _rel(p: Path) -> Path:
         try:
@@ -987,6 +1039,11 @@ def main(argv: list[str]) -> int:
     else:
         offenders.append((root.joinpath(*SEAM_MOD_FILE), 0,
                           f"seam cfg: {seam_detail}"))
+    if cfg_ok:
+        print(f"  [CONFIG-PIN OK] {'/'.join(CONFIG_PIN_FILE)}: {cfg_detail}")
+    else:
+        offenders.append((root.joinpath(*CONFIG_PIN_FILE), 0,
+                          f"construction config: {cfg_detail}"))
     for path, lineno, sym in offenders:
         if lineno:
             print(f"  [FAIL] {_rel(path)}:{lineno}: {sym}")
