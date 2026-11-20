@@ -72,6 +72,10 @@ hw_guard.require(
          "assertions without a device (run ./run_tests.sh instead)",
 )
 
+# The plain names the body uses (os.urandom, sys.exit) — the _os/_sys
+# aliases above exist only for the repo-root path setup.
+import os
+import sys
 import threading
 import time
 
