@@ -108,7 +108,7 @@ If a board ever shows the blinking window on **every** boot (healthy boards sett
 
 One more thing worth knowing: the seed for the board's randomness generator involves **one more** draw from the same hardware source after the store's entropy record is guaranteed — and it gets the same treatment (blink + bursts, waiting as long as the episode takes). So on a cold boot after the board has been unplugged for a while, the window can appear one step later than the fresh-store draw; the burst's pulse length tells you which step is waiting.
 
-**Which firmware does my board run?** The first cold boot answers by itself: **a long-flash signature (`0011`/`0100`) during the first boot means the older v0.7.0 image** — re-flash the current firmware and the behaviour below is yours. **A first boot that blinks (with 5-second bursts) and then settles — no signature, however long it took — means the fixed firmware.** One reassurance worth keeping: **after one successful boot, this never happens again** — it is a first-boot defect only; every later cold boot draws from a permanently stored record.
+**Which firmware does my board run?** The first cold boot answers by itself: **a long-flash signature (`0011`/`0100`) during the first boot means the v0.7.0 image**, and **a first boot that blinks for minutes with no signature at all means the v0.7.1 image** — both are first-boot defects fixed since; re-flash the current firmware. **A first boot that settles — blink with 5-second bursts, then the steady heartbeat, however long it took — means the fixed firmware.** One reassurance worth keeping: **after one successful boot, this never happens again** — it is a first-boot defect only; every later cold boot draws from a permanently stored record.
 
 ## A worked example
 
