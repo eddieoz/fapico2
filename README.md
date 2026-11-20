@@ -10,7 +10,7 @@ fapico2 turns a ~$5 [Raspberry Pi Pico 2](https://www.raspberrypi.com/products/r
 
 If you self-custody bitcoin, you already know the drill: keys generated on hardware you own, never on an exchange, never on a machine you don't control. Your credentials deserve the same discipline — and they guard far more than your sats. The passkey to your email, the PGP key that signs your commits, your Nostr identity, your TOTP codes: today most of them live on someone else's server, synced to someone else's cloud, revocable by someone else's policy.
 
-fapico2 applies the same rule to all of them. Keys are generated on the device and never leave it; everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your **fused** board is inert somewhere else (a never-fused board says so itself and seals degenerately until provisioned; the security model below owns that boundary). One ~$5 board, no account to suspend, no server to breach, no vendor deciding whether your country gets served.
+fapico2 applies the same rule to all of them. Keys are generated on the device and never leave it; everything at rest is sealed under a root key derived from a chip-unique OTP row — a flash dump lifted off your fused board is inert somewhere else. One ~$5 board, no account to suspend, no server to breach, no vendor deciding whether your country gets served.
 
 Krux and SeedSigner sign the transaction; fapico2 authenticates the human operating them. Open Bitcoin self-custody hardware, extended from coins to credentials.
 
@@ -71,7 +71,7 @@ Every ceiling's derivation — and which numbers are measured versus reserved �
 ## Security model, in plain terms
 
 - **Keys are generated on the device** from the RP2350's hardware TRNG and used only there — signing happens on the chip.
-- **At rest, everything is sealed.** Records are AEAD-encrypted under a root key derived from `otp_key_1` (a one-way-fused OTP row) plus the chip's own identity. The firmware **refuses to boot** if that row cannot be read — there is no public-constant fallback, so a flash dump of a fused board does not open the store. One honest boundary: on a board whose row has **never been fused** (every factory-fresh Pico, until ADR 0002's provisioning story lands) the root key degenerates to a public derivation and the at-rest seal is a delay, not a barrier — the firmware advertises that state (`row-unfused`) over every management interface instead of hiding it.
+- **At rest, everything is sealed.** Records are AEAD-encrypted under a root key derived from `otp_key_1` (a one-way-fused OTP row) plus the chip's own identity. The firmware **refuses to boot** if that row cannot be read — there is no public-constant fallback, so a flash dump of a fused board does not open the store. One honest boundary: on a board whose row has **never been fused** the root key degenerates to a public derivation and the at-rest seal is a delay, not a barrier — the firmware advertises that state (`row-unfused`) over every management interface instead of hiding it.
 - **One bad record is not a bad day.** The per-record store commits a single credential per write, survives torn writes, and a FIDO reset cannot take OATH's credentials with it.
 - **Signed secure boot is available** (`./build-signed.sh`): the bootrom refuses unsigned images. Opt-in, and off by default in the alpha.
 - What the above does *not* protect against today is the next section.
