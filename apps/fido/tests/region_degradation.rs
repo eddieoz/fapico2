@@ -357,8 +357,20 @@ fn no_new_halt_site_is_reachable_from_the_key_region() {
     // is not freshness; ADR 0004's domain shrinks only by the freshness
     // carve-out, and on a provisioned board (no legacy path taken) none of
     // the three entropy-adjacent sites is even reachable.
+    //
+    // **US-1929 (FRESH-BOOT-SERVE Phase 0) moved it again, deliberately.**
+    // 23 → 21: the two freshness parks die. `seed_drbg_blocking` and
+    // `ensure_boot_entropy_blocking` re-arm their retry loop **forever**
+    // instead of calling `fatal_boot` at the budget's expiry — freshness
+    // never parks (O-28, the 2026-11-19 retail incident's outcome is the
+    // bug). `TrngRefused`/`DrbgRefused` stay reachable only through the
+    // TIMER0 clock-liveness parks in `main.rs` — a dead clock is
+    // infrastructure, not freshness, and keeps its signature. Every identity
+    // park (`OtpKeyRow`/`ChipId`, the store key, the OATH seal, the
+    // migrations) is untouched: ADR 0004's park domain is identity plus
+    // clock-liveness.
     let sites = all_halt_sites();
-    assert_eq!(sites.len(), 23, "the fatal_boot call-site count must not change without US-1825's recorded delta:\n{}", sites.join("\n"));
+    assert_eq!(sites.len(), 21, "the fatal_boot call-site count must not change without US-1929's recorded delta:\n{}", sites.join("\n"));
 
     // **The second scenario's first clause, checked where it can actually
     // fail.** Not "the total is 22" — "there is no `fatal_boot` anywhere under

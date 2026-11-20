@@ -1,5 +1,20 @@
 //! US-1804: the entropy-refusal bounded-reboot decision, as a pure core.
 //!
+//! **SUPERSEDED MECHANISM (US-1929, EPIC `FRESH-BOOT-SERVE` Phase 0;
+//! unwired since US-1825, WARM-BOOT-SERVE).** This module has had **zero
+//! callers** since US-1825 deleted `boot.rs::entropy_reboot_or_park` — it
+//! is declared in `lib.rs` and never called. US-1929 removes the parks the
+//! bounded reboot used to eventually take: the two boot-entropy sites
+//! (`boot.rs::ensure_boot_entropy_blocking`, `boot.rs::seed_drbg_blocking`)
+//! re-arm their retry **forever**, so "reboot and re-roll, a bounded number
+//! of times, then park legibly" describes a mechanism that can never run
+//! again. The module stays, host-tested, as the record of ADR 0004
+//! amendment 3's decision and of the measurement below (`sys_reset` does
+//! *not* clear the settle — the finding that made the reboots pointless in
+//! the first place). The policy that replaced it is ADR 0004 amendment 6:
+//! freshness failures never park at boot, on any arm; the park domain is
+//! identity plus clock-liveness.
+//!
 //! # What this decides, and why anything has to
 //!
 //! ADR [`0004`](../docs/adr/0004-fatal-boot-recovery-policy.md) refused a

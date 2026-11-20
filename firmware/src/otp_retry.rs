@@ -34,12 +34,15 @@
 //! Two caller policies share this core. The OTP reads keep the original one:
 //! a **silent** window of up to [`DEADLINE_MS`], refusal → immediate park.
 //! The two boot-entropy sites (US-1802..1810, EPIC
-//! `COLD-BOOT-ENTROPY-WINDOW`) now pass [`ENTROPY_DEADLINE_MS`] and a
+//! `COLD-BOOT-ENTROPY-WINDOW`) pass [`ENTROPY_DEADLINE_MS`] and a
 //! **blinking** sleep ([`crate::wait_blink`]: 80 ms lit / 170 ms dark, one
-//! pair per step), and their refusal reboots boundedly
-//! ([`crate::entropy_reset`], ADR 0004 amendment 3) — a 60 s window never
-//! reads as a dead board, and a transient settle self-recovers instead of
-//! parking.
+//! pair per step), and their refusal **re-arms the retry forever**
+//! (US-1929, EPIC `FRESH-BOOT-SERVE` Phase 0: freshness never parks) — a
+//! 60 s window never reads as a dead board, and a budget expiry is not an
+//! outcome at all: the budget sizes one step of the wait, not a give-up.
+//! (The bounded-reboot machinery this paragraph used to name —
+//! [`crate::entropy_reset`], ADR 0004 amendment 3 — was unwired by US-1825
+//! and is now a superseded mechanism; see that module's doc.)
 
 /// Sleep between attempts, in ms. Small enough to ride out a rail that
 /// settles within seconds, coarse enough that the worst case does not turn
@@ -67,8 +70,10 @@ pub const DEADLINE_MS: u64 = 20_000;
 /// that already covered its measured window — and their refusal still parks
 /// immediately. Only the two entropy sites pass this constant; `retry`
 /// takes the deadline as an argument, so nothing else's behaviour moves.
-/// These two sites blink while they wait (`crate::wait_blink`) and reboot
-/// boundedly on refusal (`crate::entropy_reset`, ADR 0004 amendment 3).
+/// These two sites blink while they wait (`crate::wait_blink`) and re-arm
+/// the retry forever on refusal (US-1929: freshness never parks; the
+/// bounded-reboot mechanism of ADR 0004 amendment 3 was unwired by US-1825
+/// and superseded).
 pub const ENTROPY_DEADLINE_MS: u64 = 60_000;
 
 /// Retry `read` on `None`, sleeping `step_ms` between attempts, until it
@@ -83,7 +88,7 @@ pub const ENTROPY_DEADLINE_MS: u64 = 60_000;
 /// up to ~[`DEADLINE_MS`] is documented operator behavior, and a real
 /// refusal parks immediately; the two boot-entropy sites pass
 /// [`ENTROPY_DEADLINE_MS`] and a blinking sleep ([`crate::wait_blink`]) and
-/// their refusal reboots boundedly ([`crate::entropy_reset`]).
+/// their refusal re-arms the retry forever (US-1929).
 pub fn retry<T>(
     mut read: impl FnMut() -> Option<T>,
     mut sleep_ms: impl FnMut(u64),

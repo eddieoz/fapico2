@@ -2,20 +2,31 @@
 //!
 //! # What this is, and why it exists
 //!
-//! The two boot-entropy sites (`ensure_boot_entropy`'s record draw,
-//! `init_drbg`'s DRBG seed nonce) can now wait up to
+//! The two boot-entropy sites (`ensure_boot_entropy_blocking`'s record draw,
+//! `seed_drbg_blocking`'s DRBG seed nonce) can now wait up to
 //! [`otp_retry::ENTROPY_DEADLINE_MS`](crate::otp_retry::ENTROPY_DEADLINE_MS)
-//! — a 2026-11-09 decode measured a cold episode settling at ≥ 20.4 s, so the
-//! budget is sized past it ([`docs/audits/2026-11-09-cold-boot-entropy-window.md`]).
-//! A board sitting dark for up to a minute reads as dead to its owner; the
-//! owner's decision (2026-11-09) is that the wait must be *visible*: during
-//! the wait the pin drives a fast blink between longer dark —
+//! per budget pass — and since US-1929 a refusal re-arms the pass **forever**
+//! (freshness never parks), so the wait can run minutes. A board sitting
+//! dark for up to a minute reads as dead to its owner; the owner's decision
+//! (2026-11-09) is that the wait must be *visible*: during the wait the pin
+//! drives a fast blink between longer dark —
 //!
 //! ```text
 //! .--.--.--.      dots are the blinks (80 ms lit), dashes are the dark
 //!                 spaces (170 ms); the pattern repeats for every 250 ms
 //!                 retry step of the wait.
 //! ```
+//!
+//! # The progress burst (US-1928)
+//!
+//! A continuous blink tells a video decoder nothing about *which* site is
+//! waiting or *how long* it has waited — the owner's 2026-11-20 direction
+//! (O-28, EPIC `FRESH-BOOT-SERVE`). So every 20 failed-attempt steps (one
+//! 5-second unit) the waiting site layers a **progress burst** on the blink:
+//! K pulses of 450 ms period, K = 5-s-units waited capped at 9, the site
+//! named by its on-time (120 ms lit = the record draw, 300 ms lit = the
+//! seed). See [`ProgressSite`] and the collision test below — nothing else
+//! on GPIO25 can produce either shape.
 //!
 //! # Why the rhythm is collision-tested
 //!
@@ -168,11 +179,15 @@ pub fn burst_off_ms(site: ProgressSite) -> u64 {
 /// `site`: `progress_burst_pulses(steps)` × (lit, dark), ending at
 /// [`Level::Off`], the pin's resting level.
 ///
-/// Same split as the blink: the durations are the site's constants
-/// ([`burst_on_ms`]/[`burst_off_ms`]) the device driver busy-waits over; the
-/// generator yields whole pulses. Zero pulses (a healthy draw, or anything
-/// short of the first 5-second unit) yields nothing at all.
-pub fn progress_burst_levels(site: ProgressSite, steps: u64) -> impl Iterator<Item = Level> {
+/// The `site` argument does not change the *sequence* — every site's burst
+/// alternates lit/dark — but it stays in the signature so the device
+/// driver's call site names what it is emitting, alongside the duration
+/// accessors it reads at the same site ([`burst_on_ms`]/[`burst_off_ms`]).
+/// Same split as the blink: the durations are the site's constants the
+/// device driver busy-waits over; the generator yields whole pulses. Zero
+/// pulses (a healthy draw, or anything short of the first 5-second unit)
+/// yields nothing at all.
+pub fn progress_burst_levels(_site: ProgressSite, steps: u64) -> impl Iterator<Item = Level> {
     let pulses = progress_burst_pulses(steps);
     (0..pulses).flat_map(|_| step_levels())
 }
