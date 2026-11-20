@@ -246,8 +246,10 @@ reboot readings are superseded (ADR 0004 amendment 4).
 
 **US-1831/1832's full acceptance** ("the epic's goal sentence, on video")
 needs the long-dwell cold episode filmed with the turnkey probe rolling:
-`scripts/probe_warm_boot_validation.py --assert-touch --pin --max-wait
+`tests/scripts/probe_warm_boot_validation.py --assert-touch --pin --max-wait
 3600` (run before power-on; PicoForge closed; PIN prompted; button on the
-LED prompt). Everything the probe claims is already exercised by the
+LED prompt; the probe moved from `scripts/` into `tests/scripts/` by US-1924
+— a device lane belongs where the isolation gate can see it). Everything the
+probe claims is already exercised by the
 suites; what the film adds is the owner-visible reading of the warming
 window on a genuinely cold episode.

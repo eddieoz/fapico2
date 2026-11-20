@@ -107,6 +107,10 @@ GUARDED: tuple[tuple[str, str], ...] = (
     ("tests/scripts/us933_pull_trace.py", "probe: vendor-channel pull trace"),
     ("tests/scripts/us933_replay.py", "probe: vendor-channel replay"),
     ("tests/scripts/us948_kdf_storage_trace.py", "probe: KDF storage trace"),
+    ("tests/scripts/probe_warm_boot_validation.py",
+     "probe: warm/fresh-boot validation over HID + CCID (US-1831/1832; "
+     "US-1924 moved it in from scripts/ — a device lane belongs where the "
+     "gate can see it; any wipe leg must flip to destructive=True)"),
     ("tests/scripts/pull_boot_timeline.py", "probe: boot timeline capture"),
     ("tests/scripts/ccid_usb.py", "probe: raw CCID-over-USB APDU client (kernel driver detach)"),
     # tests/hardware — the hardware BDD lane

@@ -29,6 +29,14 @@ Usage:  probe_warm_boot_validation.py [--assert-touch] [--max-wait SECS]
         be sitting unplugged while the probe and the camera are rolling).
         --assert-touch waits for the button on the assertion/mint steps;
         without it the script still decodes everything else.
+        --fresh-install asserts the FRESH-BOOT-SERVE posture (US-1924): the
+        device must attach while Warming (a fresh or long-dwell boot), the
+        warming window's duration is measured and printed for the audit
+        table, and the post-Ready makeCredential must SUCCEED (the
+        refuses-then-serves ceremony). The LED legs of the decode —
+        ladder -> warming blink -> 1 Hz, and no 0011/0100 anywhere in the
+        take — are the film's; this script prints the checklist to tick off
+        while watching the take.
 
 Every line is prefixed with a monotonic timestamp so the film and the log
 correlate. Exit code 0 when the epic's claims all held; 1 with the failed
@@ -37,8 +45,33 @@ claims listed otherwise.
 
 import argparse
 import hashlib
-import os
-import sys
+import os as _os
+import sys as _sys
+
+# Moved from scripts/ into tests/scripts/ (US-1924, EPIC FRESH-BOOT-SERVE):
+# this is a device lane, and the device lanes live where the isolation gate
+# can see them. Three dirnames = the repo root from tests/scripts/.
+_sys.path.insert(
+    0,
+    _os.path.dirname(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    ),
+)
+# HW-LANE-CONSENT (US-1900/1901): this probe drives the FIRST real HID
+# FIDO device on the host — on the owner's host that is the production
+# board. Probe tier: everything below reads, enumerates, and (post-Ready)
+# registers a throwaway credential. If a wipe leg is ever added to this
+# script it MUST flip to destructive=True (TTY + typed YES) — the
+# check_hw_isolation.py GUARDED note says the same thing.
+import hw_guard
+
+hw_guard.require(
+    what="the REAL board over HID FIDO + CCID — enumerates it, mints a "
+         "throwaway credential post-Ready, and (with --pin) prompts for the "
+         "board's PIN; the emulator suites under tests/ cover the same "
+         "assertions without a device (run ./run_tests.sh instead)",
+)
+
 import threading
 import time
 
@@ -129,6 +162,11 @@ def main() -> int:
                          "pinUvAuthToken (required on a PIN-set board)")
     ap.add_argument("--max-wait", type=int, default=1800,
                     help="seconds to wait for attach/Ready before failing")
+    ap.add_argument("--fresh-install", action="store_true",
+                    help="assert the FRESH-BOOT-SERVE posture (US-1924): the "
+                         "device must attach while Warming, the warming "
+                         "window's duration is measured for the audit table, "
+                         "and the LED film checklist is printed")
     args = ap.parse_args()
 
     log("probe start — start filming now; power-on should precede this")
@@ -152,10 +190,26 @@ def main() -> int:
     from fido2.ctap2 import Ctap2
 
     log(f"enumerated; entropy status: {status}")
+    attached_at = time.monotonic() - T0
 
-    # Claim 3: a makeCredential right at attach. While Warming the expected
-    # answer is 0x7F; post-Ready (with no PIN and up=True) it either serves
-    # (needs a touch) or asks for one.
+    # US-1924 --fresh-install: the attachment point itself is a claim. A
+    # fresh-install validation run must catch the board Warming — an attach
+    # that finds Ready means the unit had already completed a boot (QC
+    # pre-warm, ADR 0002 amendment) and this take cannot decode the fresh
+    # posture. The measured window (attach -> Ready, printed at the end)
+    # is the number the audit table and US-1926's decode compare.
+    fresh_install = args.fresh_install
+    warming_at_attach = status is not None and not status["ready"]
+    if fresh_install and not warming_at_attach:
+        log("FAIL: --fresh-install attached with entropy already READY — "
+            "this unit has completed a boot; wipe it or take a fresh unit "
+            "for the fresh-install take")
+        failures.append("fresh-install-attached-ready")
+    if fresh_install:
+        log("LED film checklist (watch the take, not the screen): "
+            "ladder -> warming blink -> bursts every ~5 s -> 1 Hz settle; "
+            "NO 0011/0100 long-flash signature anywhere")
+
     # Claim 3: a makeCredential right at attach. While Warming the expected
     # answer is 0x7F (the pool is empty, the gate is before the PIN policy).
     # Once the pool is filled the gate passes and the request proceeds to the
@@ -216,6 +270,15 @@ def main() -> int:
     if not ready:
         log("FAIL: entropy never reached Ready")
         failures.append("never-ready")
+    ready_at = time.monotonic() - T0
+    # US-1924: the warming window's measured duration — the number the
+    # audit table and US-1926's tuned-config decode compare (stock baseline:
+    # >= 20.4 s settle on 2026-11-09, > 4.4 min across four windows on
+    # 2026-11-10; the tuned peripheral targets ~1.5 s per draw).
+    log(f"MEASURED: enumerate at {attached_at:.1f}s, Ready at {ready_at:.1f}s "
+        f"— warming window ~{ready_at - attached_at:.1f}s "
+        "(attach-side lower bound; the true window started before the host "
+        "saw the device)")
 
     # Claims 1/2: a real creation + assertion ceremony once Ready. On a
     # PIN-set board the ceremony needs a pinUvAuthToken (--pin prompts for
