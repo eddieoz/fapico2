@@ -121,6 +121,35 @@ ignore = [
   # already carries, but the honest label is "no patch exists for the
   # versions we are pinned to", not "not affected".
   "RUSTSEC-2026-0387",
+  # RUSTSEC-2026-0574..0582 — nine unsound-condition advisories in one crate
+  # (`heapless` 0.8.0), published 2026-11 and caught by the advisory DB
+  # growing; the locked graph did not move. Fixes exist only in heapless
+  # >= 0.9.4, which the graph cannot take: embassy-rp requires heapless 0.8,
+  # and the 0.9.3 entry riding another dependency is itself below the fix.
+  # The tree's own usage is heapless::Vec exclusively (the consumer map,
+  # US-1821); every named type — Spsc, Deque, SortedLinkedList, IndexMap,
+  # FindMutView, the treiber stack — sits inside embassy/heapless internals
+  # this firmware does not call. Tracked until embassy moves to heapless
+  # 0.9; re-derive when it does.
+  #
+  # RUSTSEC-2026-0574: FindMutView::pop use-after-free.
+  "RUSTSEC-2026-0574",
+  # RUSTSEC-2026-0575: Spsc::peek Relaxed-instead-of-Acquire ordering.
+  "RUSTSEC-2026-0575",
+  # RUSTSEC-2026-0576: IndexMap::truncate inconsistent state.
+  "RUSTSEC-2026-0576",
+  # RUSTSEC-2026-0577: panicking Drop could lead to UB.
+  "RUSTSEC-2026-0577",
+  # RUSTSEC-2026-0578: SortedLinkedList::zeroize inconsistent state.
+  "RUSTSEC-2026-0578",
+  # RUSTSEC-2026-0579: Deque TryFrom-when-full.
+  "RUSTSEC-2026-0579",
+  # RUSTSEC-2026-0580: treiber-stack race condition.
+  "RUSTSEC-2026-0580",
+  # RUSTSEC-2026-0581: Deque::make_contiguous inconsistent state.
+  "RUSTSEC-2026-0581",
+  # RUSTSEC-2026-0582: IndexMap::insert broken invariant at u16::MAX.
+  "RUSTSEC-2026-0582",
 ]
 
 # ---------------------------------------------------------------------------

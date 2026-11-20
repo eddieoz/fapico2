@@ -394,10 +394,15 @@ jobs:
           fi
           echo "boot-chain gate PASS"
       # US-389: the device feature must be clippy-clean (-D warnings), same
-      # bar as the host clippy step.
+      # bar as the host clippy step. `--no-deps` keeps the bar on OUR crates:
+      # without it, clippy also lints the vendored path dependencies
+      # (vendor/ed448-goldilocks' upstream field-math style), so the gate
+      # passed on a warm rust-cache (vendor already compiled, not re-linted)
+      # and failed on a cold one — non-deterministic in exactly the way a
+      # gate must not be (run 44809764858).
       - name: "Clippy — device feature, -D warnings"
         working-directory: fapico2
-        run: cargo clippy --target thumbv8m.main-none-eabi -- -D warnings
+        run: cargo clippy --target thumbv8m.main-none-eabi --no-deps -- -D warnings
       # Size gate (US-382): the merged firmware must never silently cross the
       # RP2350 4 MiB flash budget. Ceiling = 4 MiB flash - 0.5 MiB
       # keystore/headroom = 3.5 MiB of text. Measured with the ARM binutils
