@@ -6,7 +6,7 @@ One Raspberry Pi Pico 2 (RP2350) and a USB cable. That is all the hardware there
 
 ## Where the image comes from
 
-Download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) from the release (sha256 in its release notes) or build from source — see [Contributing](../contributing/index.md) for build instructions. A first build takes tens of minutes on Linux/macOS/WSL.
+Download the prebuilt [`fapico2.uf2`](https://github.com/eddieoz/fapico2/releases) from the release (sha256 in its release notes) or build from source — see [Contributing](../contributing/index.md) for build instructions. A first build takes tens of minutes on Linux/macOS/WSL. **The published alpha image predates the first-boot fix** (2026-11-20): on a factory-new board it blinks for minutes and never enumerates — build from source, or use a build newer than that date ([the record](../../docs/audits/2026-11-20-retail-virgin-otp-row-brick.md)).
 
 ## Putting it on the board
 
@@ -53,19 +53,22 @@ The firmware enumerates as **`fa20:0002`** — manufacturer "The BLOCO Community
 - **Enrol your TOTP codes** with `ykman oath` once the allowlist edit is done.
 - **Generate your PGP key on the card** with `gpg --card-status` and `gpg --change-pin` for the card's own PIN.
 
-## Randomness warming: what a fresh board shows (2026-11-10)
+## Randomness warming: what a fresh board shows (updated 2026-11-20)
 
 A freshly flashed board has to draw its own randomness once — the entropy
-record its keys are bound to — and on a **cold day**, or a board that sat
-unplugged for a long time, the generator (TRNG) can take tens of seconds,
-occasionally minutes, to settle. This is normal and measured, not a fault
-(see [the boot troubleshooting table](../troubleshooting/boot.md)).
+record its keys are bound to. On current firmware the tuned generator
+settles in **a few seconds** per draw; the minutes-long waits measured
+earlier belong to the old images (v0.7.0/v0.7.1, which predate the
+first-boot fix) and to a genuine long-dwell stall, which remains possible
+and is being measured (see [the boot troubleshooting
+table](../troubleshooting/boot.md)). Either way it is working, not a fault.
 
 What you will see, in order:
 
 1. **The boot ladder**, then on a fresh install **one ~0.4 s flash** (the
    entropy-draw notice), then possibly the **fast-blink rhythm**
-   (`.--.--.--.`) for up to about a minute while the generator settles.
+   (`.--.--.--.`) while the generator settles — seconds on current
+   firmware; minutes only on the old images or a stalled episode.
 2. **PicoForge / the management config shows the board as alive the whole
    time.** The entropy state is readable over every interface: management
    `READ_CONFIG` (CCID), the CTAP config read (0x42), and the OTP
@@ -81,10 +84,12 @@ What you will see, in order:
    into the steady **1 Hz heartbeat** (and the config bit flips to ready).
 4. **Power-cycling is the accelerator.** The settle is a property of a
    power episode, not of the board: unplugging for ≥ 5–10 seconds and
-   replugging gives the generator a fresh episode that usually settles in
-   seconds. If a fresh install's draw exhausts its whole budget and parks
-   (a long-flash signature, then dark), power-cycle and retry — after one
-   success the entropy record is stored permanently.
+   replugging gives the generator a fresh episode. The draw itself **never
+   parks** — a long-flash signature on current firmware means a *state*
+   fault, not the draw: `0011` = the board's timer (infrastructure), `0100`
+   = a seed-state fault, `1011` = the entropy record could not be stored.
+   Power-cycle once (≥ 5 s); if the signature recurs on the latest
+   firmware, report it with the pattern.
 
 **The row-unfused warning.** A board whose OTP key row has never been
 written (for example a browser-only first install that never ran the
