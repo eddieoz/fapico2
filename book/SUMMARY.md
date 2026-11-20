@@ -5,6 +5,7 @@
 - [Compatible devices](./hardware/index.md)
 - [Using the device](./using/index.md)
 - [How-tos](./how-to/index.md)
+    - [Making the smartcard reader appear (Linux & macOS)](./how-to/smartcard-allowlist.md)
     - [SSH keys](./how-to/ssh.md)
     - [Linux local authentication](./how-to/linux-auth.md)
     - [Unlocking disk encryption](./how-to/disk-encryption.md)

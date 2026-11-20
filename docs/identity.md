@@ -230,10 +230,29 @@ the Rescue applet's, and they are runtime state rather than identity — see
 
 Because `0xFA20` is **not** a USB-IF-registered vendor ID, macOS and Linux need
 libccid's `Info.plist` allowlist edited — it has no wildcard, so the CCID
-reader is invisible to `pcscd` until `0xFA20` / `0x0002` are appended to its
-`ifdVendorID` / `ifdProductID` / `ifdFriendlyName` arrays, then
-`sudo systemctl restart pcscd`. On Debian/Ubuntu `ifd-ccid.bundle` is a symlink
-to `/etc/libccid_Info.plist`. CTAP-HID (`usbhid`) is unaffected everywhere.
+reader is invisible to `pcscd` until the board's identity is added to the
+`ifdVendorID` / `ifdProductID` / `ifdFriendlyName` arrays and the daemon is
+restarted. CTAP-HID (`usbhid`) is unaffected everywhere.
+
+**The user-facing, step-by-step how-to — with per-OS paths, the exact XML to
+paste, the daemon restart for each OS, and a still-not-appearing checklist —
+lives in the book:
+[`book/how-to/smartcard-allowlist.md`](../book/how-to/smartcard-allowlist.md).**
+What follows is the mechanism and the facts a developer needs; send users to
+the book page.
+
+| OS | plist path |
+|---|---|
+| Debian / Ubuntu | `/etc/libccid_Info.plist` — `/usr/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist` is a symlink to it, so the `/etc` copy is the persistent one |
+| other Linux | `<usbdropdir>/ifd-ccid.bundle/Contents/Info.plist`, typically `/usr/lib/pcsc/drivers/` (`pkg-config --variable=usbdropdir libpcsclite` prints it) |
+| macOS | `/usr/libexec/SmartCardServices/drivers/ifd-ccid.bundle/Contents/Info.plist` |
+
+The three arrays are **paired by index** — `ifdVendorID[n]` goes with
+`ifdProductID[n]` and `ifdFriendlyName[n]` — so an edit must add exactly one
+entry to each array and keep the lengths equal; an unpaired entry can take the
+whole table down. The book page's verification step reads the table back with
+`scripts/fix_usb_identity.py --list-known`, so the advice does not go stale
+with the driver version.
 
 This is a `pcscd` gate, so it binds any PC/SC application, not just one client;
 the reader-ordering hazard that remains after allowlisting is a client bug, not

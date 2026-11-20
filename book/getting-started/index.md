@@ -27,13 +27,13 @@ The board enumerates as `fa20:0002` "fapico2", a composite CCID + CTAP-HID devic
 ### Linux
 
 - **FIDO2 — nothing to install.** The kernel's `usbhid` driver picks the board up; Chrome, `ykman`, and Yubico Authenticator work immediately.
-- **Smartcard applets (OpenPGP, OATH, OTP) need a one-time libccid allowlist edit.** libccid has no wildcard, so the reader is invisible to `pcscd` until you append `0xFA20` / `0x0002` to the `ifdVendorID` / `ifdProductID` / `ifdFriendlyName` arrays in `/etc/libccid_Info.plist` (on Debian/Ubuntu, `ifd-ccid.bundle` is a symlink to that file) and run `sudo systemctl restart pcscd`. Without it your host sees *no smartcard reader at all* — that looks like broken hardware and is not. Full procedure: [`docs/identity.md`](https://github.com/eddieoz/fapico2/blob/main/docs/identity.md#pcsc-allowlist-libccid).
+- **Smartcard applets (OpenPGP, OATH, OTP) need a one-time libccid allowlist edit.** libccid has no wildcard, so the reader is invisible to `pcscd` until you add `0xFA20` / `0x0002` to its `Info.plist` and restart the daemon. Without it your host sees *no smartcard reader at all* — that looks like broken hardware and is not. The step-by-step, with copy-paste blocks for Linux and macOS: [Making the smartcard reader appear](../how-to/smartcard-allowlist.md).
 - **Building from source** is native — see [Contributing](../contributing/index.md).
 
 ### macOS
 
 - **FIDO2 — works immediately**, in Safari, Chrome and libfido2-based tools; no driver step exists on macOS for the HID interface.
-- **Smartcard applets need the same libccid allowlist edit** as Linux — the plist lives wherever libccid is installed on your system. Until then the CCID reader does not appear, which again looks like broken hardware and is not. See [`docs/identity.md`](https://github.com/eddieoz/fapico2/blob/main/docs/identity.md#pcsc-allowlist-libccid).
+- **Smartcard applets need the same libccid allowlist edit** as Linux — same three entries, macOS's own plist path, and its own daemon restart. The step-by-step: [Making the smartcard reader appear](../how-to/smartcard-allowlist.md). Until then the CCID reader does not appear, which again looks like broken hardware and is not.
 - **Building from source** is native — see [Contributing](../contributing/index.md).
 
 ### Windows
