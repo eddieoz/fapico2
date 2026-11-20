@@ -256,6 +256,24 @@ impl<K: SecureStore, P: TrngProbe> SeedSource for FuseSeedSource<'_, K, P> {
     }
 }
 
+/// US-1932 (EPIC `FRESH-BOOT-SERVE`): is this seed refusal *freshness* —
+/// something waiting can clear — or permanent device state?
+///
+/// Only [`SeedError::Trng`] is freshness: the peripheral may settle, and the
+/// boot's retry loops (the legacy `seed_drbg_blocking` and the bring-up task)
+/// re-arm it forever (US-1929). Every other variant is a state fault — a
+/// missing or depleted record, an unreadable store, a derivation refusal, a
+/// seeded-once violation — that no amount of waiting changes. Retrying those
+/// forever is the silent infinite blink of the 2026-11-20 retail incident:
+/// US-1929 removed the park from the freshness sites, and the loops then
+/// swallowed permanent refusals with it. The callers park state refusals
+/// legibly (ADR 0004's identity domain) and retry only what this predicate
+/// names. Pure, so the split is host-assertable
+/// (`platform/tests/drbg_seed.rs::only_a_peripheral_refusal_is_freshness`).
+pub fn refusal_is_freshness(e: &SeedError) -> bool {
+    matches!(e, SeedError::Trng(_))
+}
+
 /// A short note kept next to the code it constrains, because the alternative
 /// is a future edit that reads the draw is "just a formality".
 ///

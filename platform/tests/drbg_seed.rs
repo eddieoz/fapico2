@@ -544,6 +544,26 @@ fn a_fresh_unfused_board_without_a_record_still_refuses() {
     assert_eq!(probe.draws, 0, "the refusal precedes the peripheral");
 }
 
+/// US-1932: the boot retry loops must tell freshness from state. Only a
+/// peripheral refusal can clear by waiting; every other variant is a
+/// permanent device-state fault, and retrying it forever is what turned the
+/// 2026-11-20 retail refusal into a silent infinite blink instead of a
+/// legible park. The classifier is pure so the split is assertable on host.
+#[test]
+fn only_a_peripheral_refusal_is_freshness() {
+    use fapico2_platform::drbg::SeedError;
+    use fapico2_platform::drbg_seed::refusal_is_freshness;
+    use fapico2_platform::trng::TrngError;
+    assert!(refusal_is_freshness(&SeedError::Trng(TrngError::Stalled)));
+    assert!(refusal_is_freshness(&SeedError::Trng(TrngError::ClockStalled)));
+    assert!(refusal_is_freshness(&SeedError::Trng(TrngError::Entropy)));
+    assert!(!refusal_is_freshness(&SeedError::CKey(CKeyError::NeverBootC)));
+    assert!(!refusal_is_freshness(&SeedError::CKey(CKeyError::MissingBootEntropy)));
+    assert!(!refusal_is_freshness(&SeedError::DepletedBootEntropy));
+    assert!(!refusal_is_freshness(&SeedError::Store(SecureStoreError::Io)));
+    assert!(!refusal_is_freshness(&SeedError::AlreadySeeded));
+}
+
 /// A record that is present, correctly sized, and carries **no entropy** —
 /// an erased or zeroized slot. Every US-918 length rule waves this through,
 /// and it is the worst case of the three: a constant seed, so a keystream

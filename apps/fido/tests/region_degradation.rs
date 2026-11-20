@@ -369,8 +369,21 @@ fn no_new_halt_site_is_reachable_from_the_key_region() {
     // park (`OtpKeyRow`/`ChipId`, the store key, the OATH seal, the
     // migrations) is untouched: ADR 0004's park domain is identity plus
     // clock-liveness.
+    //
+    // **US-1932 (FRESH-BOOT-SERVE) moved it again, deliberately.** 21 → 23:
+    // the seed retry loops regain their parks, but only for *permanent
+    // state* refusals — a missing/depleted record, an unreadable store, a
+    // derivation refusal (`SeedError::Trng` remains freshness and still
+    // re-arms forever). US-1929's loops erased every error variant with
+    // `.ok()`, which turned the 2026-11-20 retail incident's `NeverBootC`
+    // into a silent infinite blink instead of the legible park the
+    // pre-1929 code emitted. A permanent refusal is identity-domain (ADR
+    // 0004), not freshness: the classification lives in
+    // `drbg_seed::refusal_is_freshness` and is host-pinned. Two sites
+    // regain `fatal_boot`: the legacy `seed_drbg_blocking` and the
+    // bring-up task's warm arm. The freshness half of US-1929 is intact.
     let sites = all_halt_sites();
-    assert_eq!(sites.len(), 21, "the fatal_boot call-site count must not change without US-1929's recorded delta:\n{}", sites.join("\n"));
+    assert_eq!(sites.len(), 23, "the fatal_boot call-site count must not change without US-1929/US-1932's recorded deltas:\n{}", sites.join("\n"));
 
     // **The second scenario's first clause, checked where it can actually
     // fail.** Not "the total is 22" — "there is no `fatal_boot` anywhere under
