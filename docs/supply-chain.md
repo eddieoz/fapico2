@@ -91,6 +91,15 @@ reason in `deny.toml` and checked by the gate:
 | RUSTSEC-2026-0110 | `bare-metal` | Deprecated, via `cortex-m -> embassy-rp`. Embassy 0.10 has not moved off it. |
 | RUSTSEC-2024-0436 | `paste` | Unmaintained, via `pio -> embassy-rp`. Archived. |
 | RUSTSEC-2026-0173 | `proc-macro-error2` | Unmaintained, via `pio -> embassy-rp`. Build-time only; also Mozilla-audited. |
+| RUSTSEC-2026-0574 | `heapless` 0.8.0 | Unsound: `FindMutView::pop` use-after-free. Fixes only in heapless ≥ 0.9.4, which the graph cannot take (`embassy-rp` pins 0.8). The tree's own usage is `heapless::Vec` exclusively; the named types sit in embassy/heapless internals. Published 2026-11 — the advisory DB grew, the locked graph did not. |
+| RUSTSEC-2026-0575 | `heapless` 0.8.0 | Unsound: `Spsc::peek` Relaxed-instead-of-Acquire ordering. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0576 | `heapless` 0.8.0 | Unsound: `IndexMap::truncate` inconsistent state. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0577 | `heapless` 0.8.0 | Unsound: panicking `Drop` could lead to UB. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0578 | `heapless` 0.8.0 | Unsound: `SortedLinkedList::zeroize` inconsistent state. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0579 | `heapless` 0.8.0 | Unsound: `Deque` `TryFrom`-when-full. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0580 | `heapless` 0.8.0 | Unsound: treiber-stack race condition. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0581 | `heapless` 0.8.0 | Unsound: `Deque::make_contiguous` inconsistent state. Same crate and fix-bound as 0574 above. |
+| RUSTSEC-2026-0582 | `heapless` 0.8.0 | Unsound: `IndexMap::insert` broken invariant at `u16::MAX` elements. Same crate and fix-bound as 0574 above. Tracked until `embassy-rp` moves to heapless 0.9. |
 
 The Marvin advisory is the one to read twice. It is a real vulnerability with
 no fix, it is in the shipped image, and its timing surface is a USB cable.
