@@ -502,7 +502,25 @@ async fn main(spawner: Spawner) -> ! {
         not(any(feature = "dbg-log", feature = "apdu-trace")),
         allow(unused_mut, unused_variables)
     )]
-    let mut trng = Rp2350Trng::from_peri(p.TRNG, TrngIrqs, Config::default());
+    let mut trng = Rp2350Trng::from_peri(
+        p.TRNG,
+        TrngIrqs,
+        // US-1933: the construction config IS the tuned one — the same
+        // constant the probe's entropy budget is calibrated against, and
+        // RS-Key's stall fix (../RS-Key firmware/src/main.rs:601-609 applies
+        // at Trng::new, which is this call). Embassy's own default is
+        // sample_count 25, the autocorrelation-stall configuration; US-1927's
+        // tuning reached the registers only through the soft-reset re-arm
+        // until this line passed it in. check_rng_path.py's CONFIG-PIN pins
+        // the spelling.
+        {
+            // `Config` is #[non_exhaustive]: no struct-update expression, so
+            // the tuned field rides on the default by assignment.
+            let mut cfg = Config::default();
+            cfg.sample_count = TrngConfig::default().sample_cnt1;
+            cfg
+        },
+    );
     // US-1005: the bounded probe is built HERE rather than further down,
     // because the boot sanity draw below is routed through it. The ordering
     // constraint that matters is the opposite one: the probe must be built
@@ -526,11 +544,12 @@ async fn main(spawner: Spawner) -> ! {
         Ok(clock) => clock,
         Err(_) => boot::fatal_boot("trng: TIMER0 is not counting; the entropy wait has no deadline", fapico2_firmware::fatal_sig::Reason::TrngRefused),
     };
-    // US-1005 fix: the third argument is the configuration the probe
-    // re-applies after an autocorrelation error. It is the same value
-    // `from_peri` was given above, from the same constant, so the probe
-    // cannot be built against a configuration the entropy budget was not
-    // calibrated for. See `platform::trng::TrngConfig` for why the budget is
+    // US-1005 fix + US-1933: the third argument is the configuration the
+    // probe re-applies after an autocorrelation error, and `from_peri` above
+    // now passes the SAME constant to embassy's `Config.sample_count` (the
+    // claim below was false between US-1927 and US-1933: `Config::default()`
+    // there was embassy's stock 25-sample stall config). One fact, two
+    // register writes. See `platform::trng::TrngConfig` for why the budget is
     // only valid for one pair of register values, and D-8 for the window
     // this closes.
     let mut seed_probe = Rp2350Probe::new(seed_probe_peri, clock, TrngConfig::default());
