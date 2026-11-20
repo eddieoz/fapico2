@@ -78,3 +78,34 @@ permanently opaque on provisioned boards.
 - Release **images** still ship with no software debug, by the existing gates.
 - The refusal to boot without a usable OTP key row is untouched (`boot.rs:1191-1197`) — a
   missing root halts, it never falls back to a serial-derived key.
+
+## Amendment, 2026-11-20 — QC pre-warm is provisioning policy (FRESH-BOOT-SERVE, US-1922)
+
+**Decision: every unit is powered once, to a completed boot, before sale.** The
+2026-11-19 retail incident (two v0.7.0 units at Robocore parked dark on their
+first boot — [`docs/audits/2026-11-19-retail-first-boot-dark-park.md`](../audits/2026-11-19-retail-first-boot-dark-park.md))
+made this the cheapest control in the pipeline: one completed boot persists the
+boot-entropy record and the identity material, and **permanently converts the
+unit to the serve-while-warming path** — a board that has booted once never
+again blocks enumeration on a stalled TRNG (firmware from 2026-11-20; ADR 0004
+amendment 6). Zero firmware dependency on the QC step itself, no host needed:
+power, watch, done.
+
+**The completion instrument is the LED**, and it is pass/fail:
+
+| what QC sees | verdict |
+|---|---|
+| boot ladder → warming blink (fast `.--.--.--.`, possibly with 5-second progress bursts) → **settles to a steady 1 Hz heartbeat** | **pass** — the unit has completed a boot; ship it |
+| a **long-flash signature** (`0011`/`0100` — one ~1.2 s flash, pause, four bits) | **retry the power cycle** (off ≥ 5 s, replug). On v0.7.0's legacy path a stalled TRNG parks legibly here — at QC that is the desired outcome: the unit *selects against itself* instead of failing at a customer's desk. Two consecutive signatures = hold the unit back |
+| ladder stops with no blink and no signature | infrastructure park (identity read) — hold back, do not ship |
+
+The existing stock in the Robocore channel gets the same one-time power-on —
+it can be done in the box, before the units reach a shelf. A board that fails
+QC repeatedly (a TRNG that stalls across multiple power episodes) is a
+hardware finding, exactly the thing QC exists to catch before sale.
+
+**This is provisioning policy, not a firmware feature**: nothing in the image
+changes, no gate runs on it, and the policy's whole content is "give each unit
+one boot before it meets its owner". It sits in this ADR because it is a
+pipeline decision about what a shipped unit has experienced, the same register
+as the burn schedule the ADR already owns.
