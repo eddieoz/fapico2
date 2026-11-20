@@ -19,6 +19,7 @@
 - [What it works with](./interop/index.md)
 - [Troubleshooting](./troubleshooting/index.md)
     - [Troubleshooting the boot](./troubleshooting/boot.md)
+    - [A primeira inicialização (pt-BR seller insert)](./troubleshooting/primeira-inicializacao.md)
     - [Troubleshooting Nostr](./troubleshooting/nostr.md)
 - [FAQ](./faq/index.md)
 - [Security](./security/index.md)
