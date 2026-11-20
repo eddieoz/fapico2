@@ -391,3 +391,39 @@ the measured accelerator for a stalled episode. `docs/boot-freeze.md`
 and the book's troubleshooting page own the reading tables; the v0.7.0
 field-unit row (which still parks) stays live there, annotated, until
 those units are reflashed or pre-warmed (US-1922's QC pre-warm).
+
+## Amendment 7, 2026-11-20 — permanent seed refusals park again; the zero row is a supported boot state (US-1931/US-1932)
+
+Amendment 6's symmetry held the domain on the assumption that every seed
+refusal is freshness. The third field video (and the owner's own fresh-board
+reproduction) broke that assumption: the retail boards were refusing
+**permanently** — `derive_drbg_seed`'s migration-era `NeverBootC` guard fired
+on the factory-zero OTP key row before the TRNG was ever touched — and
+amendment 6's variant-erasing retry loop answered a permanent state fault
+with a silent infinite blink where the pre-1929 code had parked legibly. A
+park is not only the outcome being a bug; **losing the park on a permanent
+fault is also a bug** — it is the difference between a diagnosable board and
+a blinking one.
+
+The domain is now three-way, classified by
+`drbg_seed::refusal_is_freshness` (host-pinned):
+
+* **Freshness** (`SeedError::Trng(_)`): re-arms forever, never parks —
+  amendment 6 stands for exactly this class (US-1929).
+* **Permanent seed-state faults** (`CKey`/`Store`/`DepletedBootEntropy`/
+  `AlreadySeeded`): park with the existing `DrbgRefused` signature, on both
+  arms (the legacy `seed_drbg_blocking` and the bring-up task). Halt sites
+  21 → 23, delta recorded in `region_degradation.rs`. These are identity-
+  domain faults that waiting cannot clear.
+* **Identity and clock-liveness**: unchanged — and `NeverBootC` leaves the
+  *seed* path entirely: the zero OTP row is a supported boot state (the
+  documented `store_v3` residual; US-1030's argument), advertised by
+  `ENTROPY_FLAG_ROW_UNFUSED`, and refusing it bricked every factory board.
+  `derive_kbase`/`derive_kbase_c` keep the guard where migration semantics
+  actually apply.
+
+**Citations.** [`2026-11-20-retail-virgin-otp-row-brick.md`](../audits/2026-11-20-retail-virgin-otp-row-brick.md)
+— three field units + the owner's A/B reproduction (pico-fido/RS-Key burn the
+row on their own first boot; the same board then boots our firmware);
+AGENTS.md §5 (the guard stopped no attack the record refusals and the fresh
+draw do not already stop).

@@ -1004,7 +1004,11 @@ pub fn publish_entropy_ready() {
 /// config TLV instead of silent. **No burn is added here**: fusing after
 /// first use would orphan everything created under the zero row — the
 /// fuse-vs-first-use ordering is ADR 0002's deferred provisioning epic's
-/// first story.
+/// first story. (US-1931: this paragraph became true — until then the
+/// DRBG seed refused the zero row with `NeverBootC`, bricking exactly
+/// these boards before USB; see the 2026-11-20 retail audit. The bound
+/// root `derive_kbase` still refuses the row; that asymmetry is recorded
+/// there and is a follow-up story's to decide.)
 ///
 /// Reads the row from the write-once [`DRBG_OTP_KEY`] slot rather than the
 /// fuse window again: `init_drbg_cell` performed the (budgeted, park-on-
